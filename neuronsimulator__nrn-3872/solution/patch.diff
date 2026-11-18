@@ -1,0 +1,246 @@
+diff --git a/docs/capi.rst b/docs/capi.rst
+index 6278a35682..76db19129b 100644
+--- a/docs/capi.rst
++++ b/docs/capi.rst
+@@ -1785,7 +1785,13 @@ Miscellaneous
+     Execute a HOC command string. HOC is NEURON's built-in scripting language.
+ 
+     :param command: Null-terminated string containing the HOC command.
+-    :returns: Status code
++    :returns: 0 on success, 1 when the top-level interpreter catches an error.
++
++    Top-level error recovery releases interpreter frames and temporary objects,
++    then removes operands left by the failed command back to the entry stack
++    depth. Repeated runtime errors therefore do not accumulate operand-stack
++    entries. When called within an existing interpreter exception boundary,
++    errors continue to propagate to that enclosing boundary.
+ 
+     **Usage Pattern:**
+ 
+diff --git a/src/oc/code.cpp b/src/oc/code.cpp
+index 0a35ae6655..108fc028f5 100644
+--- a/src/oc/code.cpp
++++ b/src/oc/code.cpp
+@@ -305,6 +305,10 @@ int get_legacy_int_type(StackDatum const& entry) {
+ }
+ }  // namespace
+ 
++std::size_t hoc_stack_size() {
++    return stack.size();
++}
++
+ /** Get the type of the top entry.
+  */
+ int hoc_stack_type() {
+@@ -613,8 +617,19 @@ int hoc_ParseExec(int yystart) {
+ 
+     Frame *sframe, *sfp;
+     Inst *sprogbase, *sprogp, *spc, *sprog_parse_recover;
+-    Symlist* sp_symlist;
+     std::size_t sstack{}, sstackp{};
++    // Nested execute errors must not lose the outer statement's parser symbols.
++    // Stack and frame recovery remain owned by the enclosing error boundary.
++    struct SymlistRestore {
++        Symlist* saved{};
++        bool active{false};
++        ~SymlistRestore() {
++            if (active) {
++                hoc_free_list(&hoc_p_symlist);
++                hoc_p_symlist = saved;
++            }
++        }
++    } symlist_guard;
+ 
+     if (yystart) {
+         sframe = rframe;
+@@ -624,7 +639,8 @@ int hoc_ParseExec(int yystart) {
+         spc = pc, sprog_parse_recover = hoc_prog_parse_recover;
+         sstackp = stack.size();
+         sstack = rstack;
+-        sp_symlist = hoc_p_symlist;
++        symlist_guard.saved = hoc_p_symlist;
++        symlist_guard.active = true;
+         rframe = fp;
+         rstack = stack.size();
+         hoc_progbase = hoc_progp;
+@@ -658,7 +674,6 @@ int hoc_ParseExec(int yystart) {
+         }
+         stack.resize(sstackp);
+         rstack = sstack;
+-        hoc_p_symlist = sp_symlist;
+     }
+ 
+     return yret;
+diff --git a/src/oc/hoc.cpp b/src/oc/hoc.cpp
+index b41d52392f..526778047e 100644
+--- a/src/oc/hoc.cpp
++++ b/src/oc/hoc.cpp
+@@ -1338,12 +1338,18 @@ int hoc_oc(const char* buf, std::ostream& os) {
+     } else {
+         // This is the highest level try/catch
+         try_catch_depth_increment tell_children_we_will_catch{};
++        auto const stack_size = hoc_stack_size();
+         try {
+             signal_handler_guard _{};
+             kernel();
+         } catch (std::exception const& e) {
+             os << "hoc_oc caught exception: " << e.what() << std::endl;
+             hoc_initcode();
++            // initcode releases frame/temporary objects, but leaves operands.
++            // Keep entries owned by the caller below this command's stack.
++            while (hoc_stack_size() > stack_size) {
++                hoc_nopop();
++            }
+             hoc_intset = 0;
+             return 1;
+         }
+diff --git a/src/oc/oc_ansi.h b/src/oc/oc_ansi.h
+index 206a8ddae1..c88b7bfa41 100644
+--- a/src/oc/oc_ansi.h
++++ b/src/oc/oc_ansi.h
+@@ -2,6 +2,7 @@
+ #include "neuron/container/data_handle.hpp"
+ #include "neuron/container/generic_data_handle.hpp"
+ 
++#include <cstddef>
+ #include <cstdio>
+ #include <functional>
+ #include <memory>
+@@ -184,6 +185,7 @@ void hoc_pushi(int);
+ void hoc_push_ndim(int);
+ int hoc_pop_ndim();
+ int hoc_stack_type();
++std::size_t hoc_stack_size();
+ bool hoc_stack_type_is_ndim();
+ 
+ namespace neuron::oc::detail {
+diff --git a/test/api/CMakeLists.txt b/test/api/CMakeLists.txt
+index 278a3562da..7c86446212 100644
+--- a/test/api/CMakeLists.txt
++++ b/test/api/CMakeLists.txt
+@@ -7,6 +7,7 @@ foreach(
+   object_new_nothrow.cpp
+   object_new_wrap.cpp
+   object_ptr_push.cpp
++  raw_hoc_errors.cpp
+   runtime_pythonobject_marshaling.cpp
+   section_tree.cpp
+   sectionlist_to_array.cpp
+diff --git a/test/api/raw_hoc_errors.cpp b/test/api/raw_hoc_errors.cpp
+new file mode 100644
+index 0000000000..992b4be655
+--- /dev/null
++++ b/test/api/raw_hoc_errors.cpp
+@@ -0,0 +1,112 @@
++#include "neuronapi.h"
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <iostream>
++#include <unistd.h>
++
++extern "C" void modl_reg() {}
++
++static const char* read_failure(Object*, Symbol*, int, int) {
++    return "component read failed";
++}
++
++static const char* write_failure(Object*) {
++    return "component write failed";
++}
++
++static bool check(bool condition, const char* message) {
++    if (!condition) {
++        std::cerr << "FAIL: " << message << '\n';
++    }
++    return condition;
++}
++
++// Suppress expected interpreter diagnostics without changing the error boundary.
++// Scope exit restores stderr before assertions, including an early loop failure.
++class StderrSilencer {
++  public:
++    StderrSilencer() {
++        std::fflush(stderr);
++        saved_ = dup(STDERR_FILENO);
++        auto sink = std::fopen("/dev/null", "w");
++        if (saved_ == -1 || !sink || dup2(fileno(sink), STDERR_FILENO) == -1) {
++            std::perror("redirect stderr");
++            std::exit(1);
++        }
++        std::fclose(sink);
++    }
++    ~StderrSilencer() {
++        std::fflush(stderr);
++        if (dup2(saved_, STDERR_FILENO) == -1) {
++            std::cout << "FAIL: restore stderr" << std::endl;
++            std::exit(1);
++        }
++        close(saved_);
++    }
++    StderrSilencer(const StderrSilencer&) = delete;
++    StderrSilencer& operator=(const StderrSilencer&) = delete;
++
++  private:
++    int saved_;
++};
++
++int main() {
++    std::array<const char*, 4> args = {"raw_hoc_errors", "-nogui", "-nopython", nullptr};
++    nrn_init(3, args.data());
++    char error[1024]{};
++    if (!check(nrn_template_set_component_hooks(
++                   nrn_symbol("PythonObject"), read_failure, write_failure, error, sizeof(error)),
++               "register failing provider") ||
++        !check(nrn_hoc_call("objref raw_provider, raw_vectors\n"
++                            "raw_provider = new PythonObject()\n"
++                            "raw_vectors = new List(\"Vector\")\n"
++                            "raw_marks = 0\n"
++                            "proc raw_fail_object() { execerror(\"object failure\") }") == 0,
++               "initialize HOC test state")) {
++        return 1;
++    }
++    // Each path exceeds the old ~1000-failure stack overflow threshold. The
++    // provider leaves its complete frame for the interpreter to recover.
++    const std::array<const char*, 7> commands = {
++        "{ execerror(\"raw boom\") raw_marks += 1 }",
++        "{ raw_x = raw_provider.bad raw_marks += 1 }",
++        "{ raw_provider.fail() raw_marks += 1 }",
++        "{ raw_provider.bad = 3 raw_marks += 1 }",
++        "{ raw_x = raw_provider._[2] raw_marks += 1 }",
++        "{ raw_fail_object(new Vector(3)) raw_marks += 1 }",
++        "{ execute(\"execerror(\\\"nested boom\\\")\") raw_marks += 1 }"};
++    for (auto command: commands) {
++        nrn_double_push(89.25);
++        nrn_int_push(37);
++        bool reported_failure = true;
++        {
++            StderrSilencer silence;
++            for (int i = 0; i < 1200; ++i) {
++                if (nrn_hoc_call(command) == 0) {
++                    reported_failure = false;
++                    break;
++                }
++            }
++        }
++        if (!check(reported_failure, "raw command reports failure")) {
++            return 1;
++        }
++        if (!check(nrn_stack_type() == STACK_IS_INT, "no operands remain above caller sentinels") ||
++            !check(nrn_int_pop() == 37, "integer sentinel preserved") ||
++            !check(nrn_double_pop() == 89.25, "numeric sentinel preserved") ||
++            !check(nrn_hoc_call("hoc_ac_ = raw_marks") == 0, "command after errors succeeds") ||
++            !check(*nrn_symbol_dataptr(nrn_symbol("hoc_ac_")) == 0.0,
++                   "no continuation after failure") ||
++            !check(nrn_hoc_call("hoc_ac_ = raw_vectors.count()") == 0,
++                   "query temporary object ownership") ||
++            !check(*nrn_symbol_dataptr(nrn_symbol("hoc_ac_")) == 0.0,
++                   "temporary Vector released after failure")) {
++            return 1;
++        }
++    }
++    if (!check(nrn_hoc_call("hoc_ac_ = 23") == 0, "subsequent assignment succeeds") ||
++        !check(*nrn_symbol_dataptr(nrn_symbol("hoc_ac_")) == 23.0, "exact result after errors")) {
++        return 1;
++    }
++}

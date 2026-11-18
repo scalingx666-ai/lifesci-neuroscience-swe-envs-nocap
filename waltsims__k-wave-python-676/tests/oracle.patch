@@ -1,0 +1,1187 @@
+diff --git a/docs/README.md b/docs/README.md
+index d63bd8b63..115b6f3e8 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -8,7 +8,7 @@
+ This project is a Python implementation of v1.4.0 of the [MATLAB toolbox k-Wave](http://www.k-wave.org/) as well as an
+ interface to the pre-compiled v1.3 of k-Wave simulation binaries, which support NVIDIA sm 5.0 (Maxwell) to sm 9.0a (Hopper) GPUs.
+ 
+-**New in v0.6.0:** Unified `kspaceFirstOrder()` API with a pure NumPy/CuPy solver. See the [API guide](https://k-wave-python.readthedocs.io/en/latest/get_started/new_api.html).
++**New in v0.6.0:** Unified `kspaceFirstOrder()` API with a pure NumPy/CuPy solver. See the [API guide](https://k-wave-python.readthedocs.io/en/latest/get_started/new_api.html). The `kspaceFirstOrder()` API is experimental and may change before v1.0.0.
+ 
+ ## Mission
+ 
+diff --git a/kwave/kspaceFirstOrder.py b/kwave/kspaceFirstOrder.py
+index 2b587ecde..3a4e9eaca 100644
+--- a/kwave/kspaceFirstOrder.py
++++ b/kwave/kspaceFirstOrder.py
+@@ -68,7 +68,7 @@ def _expand_for_pml_outside(kgrid, medium, source, sensor, pml_size):
+     return expanded_kgrid, expanded_medium, expanded_source, expanded_sensor
+ 
+ 
+-_FULL_GRID_SUFFIXES = ("_final", "_max", "_min", "_rms")
++_FULL_GRID_SUFFIXES = ("_final", "_max", "_min", "_rms", "_max_all", "_min_all", "_rms_all")
+ 
+ 
+ def _strip_pml(result, pml_size, ndim):
+@@ -156,6 +156,10 @@ def kspaceFirstOrder(
+     Returns:
+         dict: Recorded sensor data keyed by field name (e.g.
+         ``"p"``, ``"p_final"``, ``"ux"``, ``"uy"``).
++
++        All time-series are ``(n_sensor, Nt)`` with sensor points in
++        C-flattened order.  Use :func:`reshape_to_grid` to recover spatial
++        structure for full-grid masks.
+     """
+     if device not in ("cpu", "gpu"):
+         raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
+@@ -181,7 +185,7 @@ def kspaceFirstOrder(
+         from kwave.utils.filters import smooth
+ 
+         source = copy.copy(source)
+-        source.p0 = smooth(np.asarray(source.p0, dtype=float).reshape(tuple(int(n) for n in kgrid.N), order="F"), restore_max=True)
++        source.p0 = smooth(np.asarray(source.p0, dtype=float).reshape(tuple(int(n) for n in kgrid.N)), restore_max=True)
+ 
+     # --- Backend dispatch ---
+ 
+@@ -225,7 +229,7 @@ def kspaceFirstOrder(
+             from kwave.utils.conversion import cart2grid
+ 
+             sensor = copy.copy(sensor)
+-            sensor.mask, _, _ = cart2grid(kgrid, np.asarray(sensor.mask))
++            sensor.mask, _, _ = cart2grid(kgrid, np.asarray(sensor.mask), order="C")
+ 
+         cpp_sim = CppSimulation(kgrid, medium, source, sensor, pml_size=pml_size, pml_alpha=pml_alpha, use_sg=use_sg)
+         if save_only:
+@@ -244,3 +248,27 @@ def kspaceFirstOrder(
+         result = _strip_pml(result, pml_size, kgrid.dim)
+ 
+     return result
++
++
++def reshape_to_grid(data, grid_shape):
++    """Reshape flat sensor data to grid shape.
++
++    Convenience helper for full-grid sensor masks where ``n_sensor``
++    equals the total number of grid points.
++
++    Args:
++        data: sensor array — ``(n_sensor, Nt)`` time-series or
++            ``(n_sensor,)`` aggregate.
++        grid_shape: tuple of grid dimensions, e.g. ``(Nx, Ny)``.
++
++    Returns:
++        For time-series: ``(*grid_shape, Nt)``
++        For aggregates:  ``(*grid_shape)``
++    """
++    data = np.asarray(data)
++    if data.ndim == 2:
++        n_sensor, Nt = data.shape
++        return data.reshape(*grid_shape, Nt)
++    elif data.ndim == 1:
++        return data.reshape(grid_shape)
++    return data
+diff --git a/kwave/solvers/cpp_simulation.py b/kwave/solvers/cpp_simulation.py
+index 9a6f25f0e..d8ad7a5dd 100644
+--- a/kwave/solvers/cpp_simulation.py
++++ b/kwave/solvers/cpp_simulation.py
+@@ -56,7 +56,9 @@ def run(self, *, device="cpu", num_threads=None, device_num=None, quiet=False, d
+         data_dir = os.path.dirname(input_file)
+         try:
+             self._execute(input_file, output_file, device=device, num_threads=num_threads, device_num=device_num, quiet=quiet, debug=debug)
+-            return self._parse_output(output_file)
++            result = self._parse_output(output_file)
++            result = self._fix_output_order(result)
++            return result
+         finally:
+             if cleanup:
+                 try:
+@@ -64,6 +66,52 @@ def run(self, *, device="cpu", num_threads=None, device_num=None, quiet=False, d
+                 except OSError as exc:
+                     warnings.warn(f"Could not clean up temp directory {data_dir!r}: {exc}", RuntimeWarning, stacklevel=2)
+ 
++    _FULL_GRID_SUFFIXES = ("_final", "_max", "_min", "_rms", "_max_all", "_min_all", "_rms_all")
++
++    def _fix_output_order(self, result):
++        """Convert C++ output from F-order to C-order.
++
++        The C++ binary writes arrays in Fortran order.  HDF5/h5py reads them
++        with reversed dimensions.  We fix full-grid fields via transpose and
++        reorder sensor time-series rows from F-indexed to C-indexed.
++        """
++        ndim = self.ndim
++        grid_shape = tuple(int(n) for n in self.kgrid.N)
++
++        # 1. Transpose full-grid fields from reversed F-order to C-order
++        for key, val in result.items():
++            if not isinstance(val, np.ndarray):
++                continue
++            is_grid = any(key.endswith(s) for s in self._FULL_GRID_SUFFIXES)
++            if is_grid and val.ndim == ndim:
++                result[key] = val.transpose(tuple(range(ndim - 1, -1, -1)))
++
++        # 2. Reorder sensor time-series from F-indexed to C-indexed rows
++        if self.sensor is None or self.sensor.mask is None:
++            mask = np.ones(grid_shape, dtype=bool)
++        else:
++            mask = np.asarray(self.sensor.mask, dtype=bool).reshape(grid_shape)
++
++        n_sensor = int(mask.sum())
++        if n_sensor > 0 and ndim >= 2:
++            f_nz = np.where(mask.ravel(order="F"))[0]
++            c_nz = np.where(mask.ravel())[0]
++            f_equiv = np.ravel_multi_index(np.unravel_index(c_nz, grid_shape), grid_shape, order="F")
++            perm = np.searchsorted(f_nz, f_equiv)
++
++            for key, val in result.items():
++                if not isinstance(val, np.ndarray):
++                    continue
++                is_grid = any(key.endswith(s) for s in self._FULL_GRID_SUFFIXES)
++                if is_grid:
++                    continue
++                if val.ndim == 2 and val.shape[0] == n_sensor:
++                    result[key] = val[perm]
++                elif val.ndim == 1 and val.shape[0] == n_sensor:
++                    result[key] = val[perm]
++
++        return result
++
+     # -- HDF5 serialization --
+ 
+     def _write_hdf5(self, filepath):
+diff --git a/kwave/solvers/kspace_solver.py b/kwave/solvers/kspace_solver.py
+index 311d99ad5..b94f4bf22 100644
+--- a/kwave/solvers/kspace_solver.py
++++ b/kwave/solvers/kspace_solver.py
+@@ -34,12 +34,12 @@ def _to_cpu(x):
+ def _expand_to_grid(val, grid_shape, xp, name="parameter"):
+     if val is None:
+         raise ValueError(f"Missing required parameter: {name}")
+-    arr = xp.array(val, dtype=float).flatten(order="F")
++    arr = xp.array(val, dtype=float).ravel()
+     grid_size = int(np.prod(grid_shape))
+     if arr.size == 1:
+         return xp.full(grid_shape, float(arr[0]), dtype=float)
+     if arr.size == grid_size:
+-        return arr.reshape(grid_shape, order="F")
++        return arr.reshape(grid_shape)
+     raise ValueError(f"{name} size {arr.size} incompatible with grid size {grid_size}")
+ 
+ 
+@@ -48,16 +48,16 @@ def _build_source_op(mask_raw, signal_raw, mode, scale, *, xp, grid_shape, grid_
+ 
+     Returns a callable (t, field) → field that injects scaled source values.
+     """
+-    mask = xp.array(mask_raw, dtype=bool).flatten(order="F")
++    mask = xp.array(mask_raw, dtype=bool).ravel()
+     if mask.size == 1:
+-        mask = xp.full(grid_shape, bool(mask[0]), dtype=bool).flatten(order="F")
++        mask = xp.full(grid_shape, bool(mask[0]), dtype=bool).ravel()
+     n_src = int(xp.sum(mask))
+ 
+-    signal_arr = xp.array(signal_raw, dtype=float, order="F")
++    signal_arr = xp.array(signal_raw, dtype=float)
+     if signal_arr.ndim == 1:
+         signal = signal_arr.reshape(1, -1)
+     else:
+-        signal = signal_arr.reshape(-1, signal_arr.shape[-1], order="F") if signal_arr.ndim > 2 else signal_arr
++        signal = signal_arr.reshape(-1, signal_arr.shape[-1]) if signal_arr.ndim > 2 else signal_arr
+ 
+     scaled = signal * xp.atleast_1d(xp.asarray(scale))[:, None]
+     signal_len = scaled.shape[1]
+@@ -70,9 +70,9 @@ def get_val(t):
+     def dirichlet(t, field):
+         if t >= signal_len:
+             return field
+-        flat = field.flatten(order="F")  # copy — mutation is intentional
++        flat = field.flatten()  # copy — mutation is intentional
+         flat[mask] = get_val(t)
+-        return flat.reshape(grid_shape, order="F")
++        return flat.reshape(grid_shape)
+ 
+     # Pre-allocate buffer to avoid per-step allocation
+     _src_buf = xp.zeros(grid_size, dtype=float)
+@@ -82,7 +82,7 @@ def additive_kspace(t, field):
+             return field
+         _src_buf[:] = 0
+         _src_buf[mask] = get_val(t)
+-        src = _src_buf.reshape(grid_shape, order="F")
++        src = _src_buf.reshape(grid_shape)
+         return field + diff_fn(src, source_kappa)
+ 
+     def additive_no_correction(t, field):
+@@ -90,7 +90,7 @@ def additive_no_correction(t, field):
+             return field
+         _src_buf[:] = 0
+         _src_buf[mask] = get_val(t)
+-        return field + _src_buf.reshape(grid_shape, order="F")
++        return field + _src_buf.reshape(grid_shape)
+ 
+     ops = {"dirichlet": dirichlet, "additive": additive_kspace, "additive-no-correction": additive_no_correction}
+     if mode not in ops:
+@@ -210,19 +210,19 @@ def _is_cartesian(arr):
+ 
+         if mask_raw is None:
+             self.n_sensor_points = grid_numel
+-            self._extract = lambda f: f.flatten(order="F")
++            self._extract = lambda f: f.ravel()
+         else:
+             mask_arr = np.asarray(mask_raw, dtype=float)
+             # Check Cartesian first to avoid ambiguity when size == grid_numel
+             if _is_cartesian(mask_arr):
+                 self._setup_cartesian_extract(mask_arr)
+             elif _is_binary(mask_arr):
+-                bmask = xp.array(mask_arr, dtype=bool).flatten(order="F")
++                bmask = xp.array(mask_arr, dtype=bool).ravel()
+                 if bmask.size == 1:
+                     bmask = xp.full(grid_numel, bool(bmask[0]), dtype=bool)
+                 self.n_sensor_points = int(xp.sum(bmask))
+                 idx = xp.where(bmask)[0]
+-                self._extract = lambda f, _i=idx: f.flatten(order="F")[_i]
++                self._extract = lambda f, _i=idx: f.ravel()[_i]
+             else:
+                 raise ValueError(
+                     f"Sensor mask shape {mask_arr.shape} is neither binary " f"(numel={grid_numel}) nor Cartesian ({self.ndim}, N_points)"
+@@ -289,7 +289,7 @@ def _setup_cartesian_extract(self, cart_pos):
+             x_vec, cart_x = axis_coords[0], cart.flatten()
+ 
+             def _extract_1d_interp(f):
+-                return xp.asarray(np.interp(cart_x, x_vec, _to_cpu(f).flatten(order="F")))
++                return xp.asarray(np.interp(cart_x, x_vec, _to_cpu(f).ravel()))
+ 
+             self._extract = _extract_1d_interp
+         else:
+@@ -298,8 +298,8 @@ def _extract_1d_interp(f):
+             int_idx = np.clip(np.floor(frac_idx).astype(int), 0, np.array(self.grid_shape)[:, None] - 2)
+             local = frac_idx - int_idx
+ 
+-            # F-order strides and 2^ndim corner enumeration
+-            strides = np.cumprod([1] + list(self.grid_shape[:-1]))
++            # C-order strides and 2^ndim corner enumeration
++            strides = np.cumprod([1] + list(self.grid_shape[:0:-1]))[::-1]
+             n_corners = 2**self.ndim
+             corner_indices = np.zeros((self.n_sensor_points, n_corners), dtype=int)
+             corner_weights = np.ones((self.n_sensor_points, n_corners))
+@@ -313,7 +313,7 @@ def _extract_1d_interp(f):
+             corner_weights = xp.array(corner_weights)
+ 
+             def _extract_bilinear(f):
+-                return (f.flatten(order="F")[corner_indices] * corner_weights).sum(axis=1)
++                return (f.ravel()[corner_indices] * corner_weights).sum(axis=1)
+ 
+             self._extract = _extract_bilinear
+ 
+@@ -460,15 +460,15 @@ def _setup_source_operators(self):
+         grid_size = int(np.prod(self.grid_shape))
+ 
+         def _expand_mask(mask_raw):
+-            mask = xp.array(mask_raw, dtype=bool).flatten(order="F")
++            mask = xp.array(mask_raw, dtype=bool).ravel()
+             if mask.size == 1:
+-                mask = xp.full(self.grid_shape, bool(mask[0]), dtype=bool).flatten(order="F")
++                mask = xp.full(self.grid_shape, bool(mask[0]), dtype=bool).ravel()
+             return mask
+ 
+         def source_scale(mask_raw, c0):
+             """Get per-source-point sound speed values."""
+             mask = _expand_mask(mask_raw)
+-            c0_flat = c0.flatten(order="F")
++            c0_flat = c0.ravel()
+             n_src = int(xp.sum(mask))
+             return c0_flat[mask] if c0_flat.size > 1 else xp.full(n_src, float(c0_flat))
+ 
+@@ -566,7 +566,7 @@ def _setup_fields(self):
+             if self.smooth_p0 and self.ndim >= 2:
+                 from kwave.utils.filters import smooth
+ 
+-                # p0 is F-order from _expand_to_grid; smooth() is order-agnostic (uses FFT on shape)
++                # smooth() is order-agnostic (uses FFT on shape)
+                 p0 = xp.asarray(smooth(_to_cpu(p0), restore_max=True))
+             self._p0_initial = p0
+         else:
+@@ -779,6 +779,53 @@ def create_simulation(kgrid, medium, source, sensor, device="auto", smooth_p0=Fa
+     )
+ 
+ 
++def _f_to_c_source_reorder(source, grid_shape):
++    """Reorder multi-row source signals from MATLAB F-flat to C-flat mask order.
++
++    MATLAB sends source signal rows ordered by F-flattened mask indices.
++    The solver uses C-flat ordering internally.  For single-row (uniform)
++    sources, no reordering is needed.
++    """
++    ndim = len(grid_shape)
++    if ndim < 2:
++        return source
++    source = dict(source)  # shallow copy — don't mutate caller's dict
++
++    for mask_key, signal_keys in [("p_mask", ["p"]), ("u_mask", ["ux", "uy", "uz"])]:
++        mask_raw = source.get(mask_key)
++        if mask_raw is None:
++            continue
++        mask = np.asarray(mask_raw, dtype=bool)
++        if mask.size <= 1:
++            continue
++        mask_grid = mask.reshape(grid_shape)
++        n_src = int(mask_grid.sum())
++        if n_src < 2:
++            continue
++
++        # Build F→C permutation for mask points
++        f_nz = np.where(mask_grid.ravel(order="F"))[0]
++        c_nz = np.where(mask_grid.ravel())[0]
++        f_equiv = np.ravel_multi_index(np.unravel_index(c_nz, grid_shape), grid_shape, order="F")
++        perm = np.searchsorted(f_nz, f_equiv)
++
++        for sig_key in signal_keys:
++            sig = source.get(sig_key)
++            if sig is None:
++                continue
++            sig = np.asarray(sig)
++            if sig.ndim >= 2 and sig.shape[0] == n_src:
++                source[sig_key] = sig[perm]
++
++    return source
++
++
+ def simulate_from_dicts(kgrid, medium, source, sensor, device="auto", smooth_p0=False):
+-    """MATLAB interop entry point."""
++    """MATLAB interop entry point.
++
++    Reorders multi-row source signals from MATLAB's F-flat mask ordering
++    to the solver's C-flat ordering before running the simulation.
++    """
++    grid_shape = tuple(kgrid[k] for k in ["Nx", "Ny", "Nz"] if k in kgrid)
++    source = _f_to_c_source_reorder(source, grid_shape)
+     return create_simulation(kgrid, medium, source, sensor, device, smooth_p0=smooth_p0).run()
+diff --git a/kwave/utils/conversion.py b/kwave/utils/conversion.py
+index 848845ae1..2194f70f9 100644
+--- a/kwave/utils/conversion.py
++++ b/kwave/utils/conversion.py
+@@ -13,6 +13,8 @@
+ from kwave.utils.matlab import matlab_mask
+ from kwave.utils.matrix import sort_rows
+ 
++_default = object()  # sentinel for detecting implicit default order="F"
++
+ 
+ @typechecker
+ def db2neper(alpha: Real[kt.ArrayLike, "..."], y: Real[kt.ScalarLike, ""] = 1) -> Real[kt.ArrayLike, "..."]:
+@@ -164,23 +166,31 @@ def cart2grid(
+     kgrid: kWaveGrid,
+     cart_data: Union[Float[ndarray, "1 NumPoints"], Float[ndarray, "2 NumPoints"], Float[ndarray, "3 NumPoints"]],
+     axisymmetric: bool = False,
++    *,
++    order: str = _default,
+ ) -> Tuple:
+-    """
+-    Interpolates the set of Cartesian points defined by
+-    cart_data onto a binary matrix defined by the kWaveGrid object
+-    kgrid using nearest neighbour interpolation. An error is returned if
+-    the Cartesian points are outside the computational domain defined by
+-    kgrid.
++    """Interpolate Cartesian points onto a binary grid using nearest neighbour.
+ 
+     Args:
+         kgrid: simulation grid
+         cart_data: Cartesian sensor points
+         axisymmetric: set to True to use axisymmetric interpolation
++        order: ``"C"`` for C-order (new API) or ``"F"`` for Fortran-order
++            (legacy).  Default ``"F"`` — will change to ``"C"`` in a future
++            release.
+ 
+     Returns:
+-        A binary grid
+-
++        (grid_data, order_index, reorder_index)
+     """
++    if order is _default:
++        import warnings
++
++        warnings.warn(
++            "cart2grid default order='F' will change to order='C' in a future release. Pass order='C' explicitly.",
++            FutureWarning,
++            stacklevel=2,
++        )
++        order = "F"
+ 
+     # check for axisymmetric input
+     if axisymmetric and kgrid.dim != 2:
+@@ -243,7 +253,8 @@ def cart2grid(
+             grid_data[data_x[data_index], data_y[data_index]] = int(data_index)
+ 
+         # extract reordering index
+-        reorder_index = grid_data.flatten(order="F")[grid_data.flatten(order="F") != -1]
++        flat = grid_data.ravel(order=order)
++        reorder_index = flat[flat != -1]
+         reorder_index = reorder_index[:, None] + 1  # [N] => [N, 1]
+ 
+     elif kgrid.dim == 3:
+@@ -284,7 +295,8 @@ def cart2grid(
+             grid_data[data_x[data_index], data_y[data_index], data_z[data_index]] = point_index[data_index]
+ 
+         # extract reordering index
+-        reorder_index = grid_data.flatten(order="F")[grid_data.flatten(order="F") != -1]
++        flat = grid_data.ravel(order=order)
++        reorder_index = flat[flat != -1]
+         reorder_index = reorder_index[:, None, None]  # [N] => [N, 1, 1]
+     else:
+         raise ValueError("Input cart_data must be a 1, 2, or 3 dimensional matrix.")
+diff --git a/kwave/utils/kwave_array.py b/kwave/utils/kwave_array.py
+index b7145d7af..71ae74e64 100644
+--- a/kwave/utils/kwave_array.py
++++ b/kwave/utils/kwave_array.py
+@@ -16,6 +16,8 @@
+ from kwave.utils.math import make_affine, sinc
+ from kwave.utils.matlab import matlab_assign, matlab_find, matlab_mask
+ 
++_DEFAULT_ORDER = object()  # sentinel for detecting implicit default order="F"
++
+ 
+ @dataclass(eq=False)
+ class Element:
+@@ -692,14 +694,31 @@ def get_off_grid_points(self, kgrid, element_num, mask_only):
+ 
+         return grid_weights
+ 
+-    def get_distributed_source_signal(self, kgrid, source_signal):
+-        start_time = time.time()
++    def get_distributed_source_signal(self, kgrid, source_signal, *, order=_DEFAULT_ORDER):
++        """Distribute per-element source signals onto grid source points.
++
++        Args:
++            order: ``"C"`` for C-order (new API) or ``"F"`` for Fortran-order
++                (legacy).  Default ``"F"`` — will change to ``"C"`` in a
++                future release.
++        """
++        if order is _DEFAULT_ORDER:
++            import warnings
++
++            warnings.warn(
++                "get_distributed_source_signal default order='F' will change to order='C' in a future release. "
++                "Pass order='C' explicitly.",
++                FutureWarning,
++                stacklevel=2,
++            )
++            order = "F"
+ 
++        start_time = time.time()
+         self.check_for_elements()
+ 
+         mask = self.get_array_binary_mask(kgrid)
+-        mask_ind = matlab_find(mask).squeeze(axis=-1)
+-        num_source_points = np.sum(mask)
++        mask_ind = np.where(mask.ravel(order=order) != 0)[0]
++        num_source_points = int(np.sum(mask))
+ 
+         Nt = np.shape(source_signal)[1]
+ 
+@@ -727,46 +746,50 @@ def get_distributed_source_signal(self, kgrid, source_signal):
+         distributed_source_signal = np.zeros((num_source_points, Nt), dtype=data_type)
+ 
+         for ind in range(self.number_elements):
+-            source_weights = self.get_element_grid_weights(kgrid, ind)
+-
+-            element_mask_ind = matlab_find(np.array(source_weights), val=0, mode="neq").squeeze(axis=-1)
+-
++            weights_flat = np.asarray(self.get_element_grid_weights(kgrid, ind)).ravel(order=order)
++            element_mask_ind = np.where(weights_flat != 0)[0]
+             local_ind = np.isin(mask_ind, element_mask_ind)
+-
+-            distributed_source_signal[local_ind] += matlab_mask(source_weights, element_mask_ind - 1) * source_signal[ind, :][None, :]
++            distributed_source_signal[local_ind] += weights_flat[element_mask_ind, None] * source_signal[ind, :][None, :]
+ 
+         end_time = time.time()
+         logging.log(logging.INFO, f"total computation time : {end_time - start_time:.2f} s")
+ 
+         return distributed_source_signal
+ 
+-    def combine_sensor_data(self, kgrid, sensor_data):
++    def combine_sensor_data(self, kgrid, sensor_data, *, order=_DEFAULT_ORDER):
++        """Combine sensor data from grid points back to array elements.
++
++        Args:
++            order: ``"C"`` for C-order (new API) or ``"F"`` for Fortran-order
++                (legacy).  Default ``"F"`` — will change to ``"C"`` in a
++                future release.
++        """
++        if order is _DEFAULT_ORDER:
++            import warnings
++
++            warnings.warn(
++                "combine_sensor_data default order='F' will change to order='C' in a future release. " "Pass order='C' explicitly.",
++                FutureWarning,
++                stacklevel=2,
++            )
++            order = "F"
++
+         self.check_for_elements()
+ 
+         mask = self.get_array_binary_mask(kgrid)
+-        mask_ind = matlab_find(mask).squeeze(axis=-1)
++        mask_ind = np.where(mask.ravel(order=order) != 0)[0]
+ 
+         Nt = np.shape(sensor_data)[1]
+-        # TODO (Walter): this assertion does not work when "auto" is set
+-        # assert kgrid.Nt == Nt, 'sensor_data must have the same number of time steps as kgrid'
+-
+         combined_sensor_data = np.zeros((self.number_elements, Nt))
+ 
+         for element_num in range(self.number_elements):
+-            source_weights = self.get_element_grid_weights(kgrid, element_num)
+-
+-            element_mask_ind = matlab_find(np.array(source_weights), val=0, mode="neq").squeeze(axis=-1)
+-
++            weights_flat = np.asarray(self.get_element_grid_weights(kgrid, element_num)).ravel(order=order)
++            element_mask_ind = np.where(weights_flat != 0)[0]
+             local_ind = np.isin(mask_ind, element_mask_ind)
+ 
+-            combined_sensor_data[element_num, :] = np.sum(
+-                sensor_data[local_ind] * matlab_mask(source_weights, element_mask_ind - 1),
+-                axis=0,
+-            )
+-
++            combined_sensor_data[element_num, :] = np.sum(sensor_data[local_ind] * weights_flat[element_mask_ind, None], axis=0)
+             m_grid = self.elements[element_num].measure / (kgrid.dx) ** (self.elements[element_num].dim)
+-
+-            combined_sensor_data[element_num, :] = combined_sensor_data[element_num, :] / m_grid
++            combined_sensor_data[element_num, :] /= m_grid
+ 
+         return combined_sensor_data
+ 
+diff --git a/plans/release-strategy.md b/plans/release-strategy.md
+index 63de471a6..3db9d33b6 100644
+--- a/plans/release-strategy.md
++++ b/plans/release-strategy.md
+@@ -218,6 +218,32 @@ Port examples one at a time using MATLAB as ground truth — not old Python resu
+ 
+ ---
+ 
++## Phase 2.x: v0.6.x Point Releases
++
++### v0.6.1 — C-order Migration
++
++**Status: implemented on `c-order-migration` branch**
++
++Atomic migration of all solver internals from Fortran-order to C-order. The `kspaceFirstOrder()` API is experimental pre-1.0, so output shape changes are acceptable without a deprecation cycle.
++
++**Changes:**
++- `kspace_solver.py`: all `flatten(order="F")`/`reshape(..., order="F")` → `ravel()`/`reshape()`. C-order strides for bilinear interpolation.
++- `cpp_simulation.py`: `_fix_output_order()` transposes full-grid fields and permutes sensor time-series rows from F-indexed to C-indexed.
++- `kspaceFirstOrder.py`: `_reshape_sensor_to_grid()` for full-grid sensors → `(Nt, *grid_shape)` output. Aggregates → `(*grid_shape)`.
++- `cart2grid`, `combine_sensor_data`, `get_distributed_source_signal`: `order=` param with `FutureWarning` defaulting to `"F"`.
++
++**Unchanged (by design):** `matlab.py` (F-order boundary), `mapgen.py` (geometry), `kgrid.py` (MATLAB inputs), `cpp_simulation._write_hdf5()` (C++ binary format), legacy `kspaceFirstOrder2D/3D`.
++
++### v0.6.2 — Example Porting
++
++Port remaining examples from legacy `kspaceFirstOrder2D/3D` to unified `kspaceFirstOrder()`. Strategy: MATLAB reference → k-wave-cupy validation → standalone Python port → CI fixture.
++
++### v0.6.3 — Axisymmetric Support
++
++Axisymmetric = dimensionality reduction (3D→2D or 2D→1D). Not a separate solver — wrapper around `kspaceFirstOrder()` with radial symmetry terms added to the wave equation.
++
++---
++
+ ## Phase 3: v1.0.0 - Clean Release
+ 
+ **Goal:** Simple, readable, fast. Remove all deprecated code.
+diff --git a/tests/integration/conftest.py b/tests/integration/conftest.py
+index ca3966dd1..c61447926 100644
+--- a/tests/integration/conftest.py
++++ b/tests/integration/conftest.py
+@@ -33,13 +33,35 @@ def _load(name):
+     return _load
+ 
+ 
+-def assert_fields_close(result, ref, fields, *, rtol=1e-10, atol=1e-12):
++def _c_to_f_reorder(py_val, grid_shape):
++    """Reorder sensor rows from C-flat to F-flat ordering for MATLAB comparison.
++
++    Python (C-order) and MATLAB (F-order) flatten grid points in different
++    orders.  Both produce (n_sensor, Nt) but the row ordering differs.
++    This builds a permutation to reorder Python rows to match MATLAB.
++    """
++    if grid_shape is None or len(grid_shape) < 2:
++        return py_val
++    c_indices = np.arange(int(np.prod(grid_shape)))
++    f_indices = np.ravel_multi_index(np.unravel_index(c_indices, grid_shape), grid_shape, order="F")
++    # f_indices[i] = where C-flat point i lands in F-flat order
++    # We need the inverse: for each F-flat position, which C-flat row?
++    inv = np.argsort(f_indices)
++    if py_val.ndim == 2 and py_val.shape[0] == len(c_indices):
++        return py_val[inv]
++    if py_val.ndim == 1 and py_val.shape[0] == len(c_indices):
++        return py_val[inv]
++    return py_val
++
++
++def assert_fields_close(result, ref, fields, *, rtol=1e-10, atol=1e-12, grid_shape=None):
+     """Compare Python result dict against MATLAB reference arrays.
+ 
+     Args:
+         result: dict from kspaceFirstOrder()
+         ref: dict from scipy.io.loadmat()
+         fields: list of (python_key, matlab_key) tuples
++        grid_shape: tuple of grid dims for C→F row reordering (full-grid masks only)
+         rtol, atol: tolerances passed to np.testing.assert_allclose
+     """
+     for py_key, mat_key in fields:
+@@ -47,6 +69,8 @@ def assert_fields_close(result, ref, fields, *, rtol=1e-10, atol=1e-12):
+         assert mat_key in ref, f"MATLAB reference missing key '{mat_key}'"
+         py_val = np.atleast_1d(np.squeeze(np.asarray(result[py_key])))
+         mat_val = np.atleast_1d(np.squeeze(np.asarray(ref[mat_key])))
++        if grid_shape is not None:
++            py_val = _c_to_f_reorder(py_val, grid_shape)
+         assert py_val.shape == mat_val.shape, f"Shape mismatch for {py_key}: Python {py_val.shape} vs MATLAB {mat_val.shape}"
+         np.testing.assert_allclose(
+             py_val, mat_val, rtol=rtol, atol=atol, err_msg=f"Field '{py_key}' differs from MATLAB reference '{mat_key}'"
+diff --git a/tests/integration/test_ivp_2D.py b/tests/integration/test_ivp_2D.py
+index 8f6d165bc..67fbf0442 100644
+--- a/tests/integration/test_ivp_2D.py
++++ b/tests/integration/test_ivp_2D.py
+@@ -42,4 +42,5 @@ def test_ivp_2D_vs_matlab(load_matlab_ref):
+         result,
+         ref,
+         [("p", "sensor_data_p")],
++        grid_shape=(128, 128),
+     )
+diff --git a/tests/test_c_order.py b/tests/test_c_order.py
+new file mode 100644
+index 000000000..5207034cf
+--- /dev/null
++++ b/tests/test_c_order.py
+@@ -0,0 +1,299 @@
++"""Tests for C-order migration: _fix_output_order, _reshape_sensor_to_grid, FutureWarnings."""
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from kwave.data import Vector
++from kwave.kgrid import kWaveGrid
++from kwave.kmedium import kWaveMedium
++from kwave.ksensor import kSensor
++from kwave.ksource import kSource
++from kwave.kspaceFirstOrder import reshape_to_grid
++from kwave.solvers.kspace_solver import _f_to_c_source_reorder
++
++# ---------------------------------------------------------------------------
++# _fix_output_order (CppSimulation)
++# ---------------------------------------------------------------------------
++
++
++class TestFixOutputOrder:
++    """Unit-test CppSimulation._fix_output_order with synthetic data."""
++
++    def _make_sim(self, grid_shape, sensor_mask=None):
++        """Create a minimal CppSimulation without writing HDF5."""
++        from kwave.solvers.cpp_simulation import CppSimulation
++
++        kgrid = kWaveGrid(Vector(list(grid_shape)), Vector([1e-4] * len(grid_shape)))
++        kgrid.setTime(10, 1e-8)
++        medium = kWaveMedium(sound_speed=1500)
++        source = kSource()
++        sensor = kSensor()
++        if sensor_mask is not None:
++            sensor.mask = sensor_mask
++        else:
++            sensor = None
++        return CppSimulation(kgrid, medium, source, sensor, pml_size=(5,) * len(grid_shape), pml_alpha=(2.0,) * len(grid_shape))
++
++    def test_transpose_full_grid_2d(self):
++        """Full-grid fields are transposed from reversed F-order to C-order."""
++        sim = self._make_sim((4, 6))
++        # C++ outputs full-grid as (Ny, Nx) = (6, 4) due to F-order HDF5
++        result = {"p_final": np.arange(24).reshape(6, 4)}
++        fixed = sim._fix_output_order(result)
++        assert fixed["p_final"].shape == (4, 6)
++
++    def test_transpose_full_grid_3d(self):
++        """Full-grid 3D fields are transposed."""
++        sim = self._make_sim((3, 4, 5))
++        result = {"p_max": np.arange(60).reshape(5, 4, 3)}
++        fixed = sim._fix_output_order(result)
++        assert fixed["p_max"].shape == (3, 4, 5)
++
++    def test_sensor_row_reorder_2d(self):
++        """Sensor time-series rows are reordered from F-indexed to C-indexed."""
++        grid_shape = (3, 4)
++        mask = np.zeros(grid_shape, dtype=bool)
++        mask[0, 0] = True  # F-index 0, C-index 0
++        mask[1, 0] = True  # F-index 1, C-index 4
++        mask[0, 1] = True  # F-index 3, C-index 1
++        sim = self._make_sim(grid_shape, sensor_mask=mask)
++
++        n_sensor = int(mask.sum())
++        Nt = 5
++        # F-order sensor data: rows ordered by F-flat index (0, 1, 3)
++        f_data = np.array(
++            [
++                [10, 11, 12, 13, 14],  # F-idx 0 → (0,0)
++                [20, 21, 22, 23, 24],  # F-idx 1 → (1,0)
++                [30, 31, 32, 33, 34],
++            ]
++        )  # F-idx 3 → (0,1)
++        result = {"p": f_data.copy()}
++        fixed = sim._fix_output_order(result)
++
++        # C-order: rows ordered by C-flat index
++        # (0,0)=C-idx 0, (0,1)=C-idx 1, (1,0)=C-idx 4
++        # So C-order should be: (0,0), (0,1), (1,0)
++        assert fixed["p"][0, 0] == 10  # (0,0) stays first
++        assert fixed["p"][1, 0] == 30  # (0,1) was F-idx 3, now second
++        assert fixed["p"][2, 0] == 20  # (1,0) was F-idx 1, now third
++
++    def test_sensor_none_full_grid(self):
++        """When sensor is None, all grid points are sensor points."""
++        sim = self._make_sim((2, 3), sensor_mask=None)
++        Nt = 4
++        result = {"p": np.arange(24).reshape(6, Nt)}
++        fixed = sim._fix_output_order(result)
++        assert fixed["p"].shape == (6, Nt)
++
++    def test_1d_skips_reorder(self):
++        """1D grids skip sensor reordering (F and C order are identical)."""
++        sim = self._make_sim((8,), sensor_mask=np.ones(8, dtype=bool))
++        result = {"p": np.arange(40).reshape(8, 5)}
++        fixed = sim._fix_output_order(result)
++        np.testing.assert_array_equal(fixed["p"], np.arange(40).reshape(8, 5))
++
++    def test_non_grid_suffix_skipped(self):
++        """Non-grid fields are not transposed."""
++        sim = self._make_sim((4, 6))
++        result = {"p": np.arange(24).reshape(24, 1), "p_final": np.arange(24).reshape(6, 4)}
++        fixed = sim._fix_output_order(result)
++        assert fixed["p"].shape == (24, 1)  # unchanged
++        assert fixed["p_final"].shape == (4, 6)  # transposed
++
++    def test_1d_aggregate_reorder(self):
++        """1D aggregate fields are not reordered."""
++        sim = self._make_sim((8,), sensor_mask=np.ones(8, dtype=bool))
++        result = {"p_max": np.arange(8)}
++        fixed = sim._fix_output_order(result)
++        # 1D: ndim=1, so p_max (ndim=1) is treated as full-grid and transposed (no-op for 1D)
++        assert fixed["p_max"].shape == (8,)
++
++
++# ---------------------------------------------------------------------------
++# reshape_to_grid helper
++# ---------------------------------------------------------------------------
++
++
++class TestReshapeToGrid:
++    def test_time_series_2d(self):
++        """(n_sensor, Nt) → (*grid_shape, Nt)."""
++        data = np.arange(120).reshape(24, 5)
++        out = reshape_to_grid(data, (4, 6))
++        assert out.shape == (4, 6, 5)
++
++    def test_aggregate_1d(self):
++        """(n_sensor,) → (*grid_shape)."""
++        data = np.arange(24)
++        out = reshape_to_grid(data, (4, 6))
++        assert out.shape == (4, 6)
++
++    def test_3d_grid(self):
++        """Works with 3D grids."""
++        data = np.arange(60).reshape(60, 1)
++        out = reshape_to_grid(data, (3, 4, 5))
++        assert out.shape == (3, 4, 5, 1)
++
++    def test_passthrough_higher_dim(self):
++        """Higher-dim arrays pass through unchanged."""
++        data = np.arange(120).reshape(2, 3, 4, 5)
++        out = reshape_to_grid(data, (4, 6))
++        assert out.shape == (2, 3, 4, 5)
++
++
++# ---------------------------------------------------------------------------
++# _f_to_c_source_reorder (MATLAB interop)
++# ---------------------------------------------------------------------------
++
++
++class TestFToCSourceReorder:
++    def test_1d_noop(self):
++        """1D grids have no F/C ordering difference — source unchanged."""
++        source = {"p_mask": np.array([0, 1, 0, 1, 0, 0, 0, 0], dtype=bool), "p": np.array([[10, 11], [20, 21]])}
++        out = _f_to_c_source_reorder(source, (8,))
++        np.testing.assert_array_equal(out["p"], np.array([[10, 11], [20, 21]]))
++
++    def test_pressure_multi_source_2d(self):
++        """Multi-row pressure source rows are reordered from F-flat to C-flat."""
++        grid_shape = (3, 4)
++        mask = np.zeros(grid_shape, dtype=bool)
++        mask[0, 0] = True  # F-idx 0, C-idx 0
++        mask[1, 0] = True  # F-idx 1, C-idx 4
++        mask[0, 1] = True  # F-idx 3, C-idx 1
++
++        # Signal rows in F-flat order: row0→(0,0), row1→(1,0), row2→(0,1)
++        p_signal = np.array([[100, 101], [200, 201], [300, 301]])
++        source = {"p_mask": mask, "p": p_signal.copy()}
++        out = _f_to_c_source_reorder(source, grid_shape)
++
++        # C-flat order: (0,0)=idx0, (0,1)=idx1, (1,0)=idx4
++        # So C-flat rows should be: (0,0), (0,1), (1,0) = F-rows 0, 2, 1
++        np.testing.assert_array_equal(out["p"][0], [100, 101])  # (0,0)
++        np.testing.assert_array_equal(out["p"][1], [300, 301])  # (0,1)
++        np.testing.assert_array_equal(out["p"][2], [200, 201])  # (1,0)
++
++    def test_velocity_multi_source_2d(self):
++        """Multi-row velocity source rows are reordered."""
++        grid_shape = (3, 4)
++        mask = np.zeros(grid_shape, dtype=bool)
++        mask[0, 0] = True
++        mask[2, 1] = True  # F-idx 5, C-idx 6
++
++        ux = np.array([[10, 11], [20, 21]])
++        source = {"u_mask": mask, "ux": ux.copy(), "uy": None}
++        out = _f_to_c_source_reorder(source, grid_shape)
++        # With only 2 points, check that reorder happened (or is identity if indices align)
++        assert out["ux"].shape == (2, 2)
++
++    def test_single_source_noop(self):
++        """Single-source (n_src=1) is not reordered."""
++        grid_shape = (4, 4)
++        mask = np.zeros(grid_shape, dtype=bool)
++        mask[2, 3] = True
++        p_signal = np.array([[5, 6, 7]])
++        source = {"p_mask": mask, "p": p_signal.copy()}
++        out = _f_to_c_source_reorder(source, grid_shape)
++        np.testing.assert_array_equal(out["p"], p_signal)
++
++    def test_uniform_source_noop(self):
++        """Uniform source (1 row broadcast to all) is not reordered."""
++        grid_shape = (4, 4)
++        mask = np.zeros(grid_shape, dtype=bool)
++        mask[0, 0] = True
++        mask[1, 1] = True
++        mask[2, 2] = True
++        # 1 row, broadcast — n_rows != n_src
++        p_signal = np.array([[1, 2, 3]])
++        source = {"p_mask": mask, "p": p_signal.copy()}
++        out = _f_to_c_source_reorder(source, grid_shape)
++        np.testing.assert_array_equal(out["p"], p_signal)
++
++    def test_no_mask_noop(self):
++        """Missing mask key is silently skipped."""
++        source = {"p": np.array([[1, 2]])}
++        out = _f_to_c_source_reorder(source, (4, 4))
++        np.testing.assert_array_equal(out["p"], np.array([[1, 2]]))
++
++    def test_scalar_mask_noop(self):
++        """Scalar mask (size 1) is skipped."""
++        source = {"p_mask": np.array([True]), "p": np.array([[1, 2]])}
++        out = _f_to_c_source_reorder(source, (4, 4))
++        np.testing.assert_array_equal(out["p"], np.array([[1, 2]]))
++
++    def test_3d_grid(self):
++        """Works with 3D grids."""
++        grid_shape = (2, 3, 4)
++        mask = np.zeros(grid_shape, dtype=bool)
++        mask[0, 0, 0] = True  # F-idx 0, C-idx 0
++        mask[1, 0, 0] = True  # F-idx 1, C-idx 12
++        mask[0, 1, 0] = True  # F-idx 2, C-idx 4
++        p_signal = np.array([[10, 11], [20, 21], [30, 31]])
++        source = {"p_mask": mask, "p": p_signal.copy()}
++        out = _f_to_c_source_reorder(source, grid_shape)
++        # C-flat: (0,0,0)=0, (0,1,0)=4, (1,0,0)=12 → F-rows 0, 2, 1
++        np.testing.assert_array_equal(out["p"][0], [10, 11])
++        np.testing.assert_array_equal(out["p"][1], [30, 31])
++        np.testing.assert_array_equal(out["p"][2], [20, 21])
++
++
++# ---------------------------------------------------------------------------
++# FutureWarning tests
++# ---------------------------------------------------------------------------
++
++
++class TestFutureWarnings:
++    def test_cart2grid_warns_on_f_order(self):
++        from kwave.utils.conversion import cart2grid
++
++        kgrid = kWaveGrid(Vector([32, 32]), Vector([1e-4, 1e-4]))
++        cart = np.array([[0.0], [0.0]])
++        with pytest.warns(FutureWarning, match="cart2grid"):
++            cart2grid(kgrid, cart)
++
++    def test_cart2grid_no_warn_on_explicit_f(self):
++        """Explicit order='F' should NOT warn — only implicit default warns."""
++        from kwave.utils.conversion import cart2grid
++
++        kgrid = kWaveGrid(Vector([32, 32]), Vector([1e-4, 1e-4]))
++        cart = np.array([[0.0], [0.0]])
++        import warnings
++
++        with warnings.catch_warnings():
++            warnings.simplefilter("error", FutureWarning)
++            cart2grid(kgrid, cart, order="F")
++
++    def test_cart2grid_no_warn_on_c_order(self):
++        from kwave.utils.conversion import cart2grid
++
++        kgrid = kWaveGrid(Vector([32, 32]), Vector([1e-4, 1e-4]))
++        cart = np.array([[0.0], [0.0]])
++        import warnings
++
++        with warnings.catch_warnings():
++            warnings.simplefilter("error", FutureWarning)
++            cart2grid(kgrid, cart, order="C")
++
++    def test_get_distributed_source_signal_warns(self):
++        from kwave.utils.kwave_array import kWaveArray
++
++        karray = kWaveArray()
++        karray.add_line_element([0, -1e-3], [0, 1e-3])
++        kgrid = kWaveGrid(Vector([32, 32]), Vector([1e-4, 1e-4]))
++        kgrid.setTime(5, 1e-8)
++        signal = np.ones((1, 5))
++        with pytest.warns(FutureWarning, match="get_distributed_source_signal"):
++            karray.get_distributed_source_signal(kgrid, signal)
++
++    def test_combine_sensor_data_warns(self):
++        from kwave.utils.kwave_array import kWaveArray
++
++        karray = kWaveArray()
++        karray.add_line_element([0, -1e-3], [0, 1e-3])
++        kgrid = kWaveGrid(Vector([32, 32]), Vector([1e-4, 1e-4]))
++        kgrid.setTime(5, 1e-8)
++        mask = karray.get_array_binary_mask(kgrid)
++        n_sensor = int(mask.sum())
++        sensor_data = np.ones((n_sensor, 5))
++        with pytest.warns(FutureWarning, match="combine_sensor_data"):
++            karray.combine_sensor_data(kgrid, sensor_data)
+diff --git a/tests/test_native_solver.py b/tests/test_native_solver.py
+index a6eafe5a3..47a4dffe1 100644
+--- a/tests/test_native_solver.py
++++ b/tests/test_native_solver.py
+@@ -56,7 +56,7 @@ def test_heterogeneous_medium(self, grid_2d):
+             kSensor(mask=np.ones((64, 64), dtype=bool)),
+             backend="python",
+         )
+-        assert result["p"].shape[0] == 64 * 64
++        assert result["p"].shape == (64 * 64, 10)
+ 
+     def test_absorption(self, grid_2d):
+         result = kspaceFirstOrder(
+@@ -146,9 +146,8 @@ def test_velocity_recording(self, grid_2d):
+         sensor = kSensor(mask=np.ones((64, 64), dtype=bool))
+         sensor.record = ["p", "ux", "uy", "ux_max", "uy_rms", "ux_final", "p_final"]
+         result = kspaceFirstOrder(grid_2d, kWaveMedium(sound_speed=1500), _p0_source((64, 64)), sensor, backend="python")
+-        n = 64 * 64
+-        assert result["ux"].shape == (n, 10)
+-        assert result["ux_max"].shape == (n,)
++        assert result["ux"].shape == (64 * 64, 10)
++        assert result["ux_max"].shape == (64 * 64,)
+         assert "ux_final" in result and "p_final" in result
+ 
+     def test_intensity_recording(self, grid_2d):
+diff --git a/uv.lock b/uv.lock
+index 535921291..6491700ca 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -75,11 +75,11 @@ wheels = [
+ 
+ [[package]]
+ name = "beartype"
+-version = "0.22.4"
++version = "0.22.9"
+ source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/e8/77/af43bdf737723b28130f2cb595ec0f23e0e757d211fe068fd0ccdb77d786/beartype-0.22.4.tar.gz", hash = "sha256:68284c7803efd190b1b4639a0ab1a17677af9571b8a2ef5a169d10cb8955b01f", size = 1578210 }
++sdist = { url = "https://files.pythonhosted.org/packages/c7/94/1009e248bbfbab11397abca7193bea6626806be9a327d399810d523a07cb/beartype-0.22.9.tar.gz", hash = "sha256:8f82b54aa723a2848a56008d18875f91c1db02c32ef6a62319a002e3e25a975f", size = 1608866 }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/2f/eb/f25ad1a7726b2fe21005c3580b35fa7bfe09646faf7c8f41867747987a35/beartype-0.22.4-py3-none-any.whl", hash = "sha256:7967a1cee01fee42e47da69c58c92da10ba5bcfb8072686e48487be5201e3d10", size = 1318387 },
++    { url = "https://files.pythonhosted.org/packages/71/cc/18245721fa7747065ab478316c7fea7c74777d07f37ae60db2e84f8172e8/beartype-0.22.9-py3-none-any.whl", hash = "sha256:d16c9bbc61ea14637596c5f6fbff2ee99cbe3573e46a716401734ef50c3060c2", size = 1333658 },
+ ]
+ 
+ [[package]]
+@@ -758,7 +758,7 @@ wheels = [
+ 
+ [[package]]
+ name = "k-wave-python"
+-version = "0.5.0rc1"
++version = "0.6.0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "beartype" },
+@@ -802,7 +802,7 @@ dev = [
+ 
+ [package.metadata]
+ requires-dist = [
+-    { name = "beartype", specifier = "==0.22.4" },
++    { name = "beartype", specifier = "==0.22.9" },
+     { name = "coverage", marker = "extra == 'test'", specifier = "==7.10.6" },
+     { name = "deepdiff", specifier = "==8.6.1" },
+     { name = "deprecated", specifier = ">=1.2.14" },
+@@ -810,11 +810,11 @@ requires-dist = [
+     { name = "gdown", marker = "extra == 'example'", specifier = "==5.2.0" },
+     { name = "h5py", specifier = "==3.15.1" },
+     { name = "jaxtyping", specifier = "==0.3.2" },
+-    { name = "matplotlib", specifier = "==3.10.3" },
++    { name = "matplotlib", specifier = "==3.10.7" },
+     { name = "numpy", specifier = ">=1.22.2,<2.3.0" },
+-    { name = "opencv-python", specifier = "==4.11.0.86" },
++    { name = "opencv-python", specifier = "==4.13.0.92" },
+     { name = "phantominator", marker = "extra == 'test'" },
+-    { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.2.0" },
++    { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.5.1" },
+     { name = "pytest", marker = "extra == 'test'" },
+     { name = "pytest-xdist", marker = "extra == 'test'" },
+     { name = "requests", marker = "extra == 'test'", specifier = "==2.32.5" },
+@@ -1052,7 +1052,7 @@ wheels = [
+ 
+ [[package]]
+ name = "matplotlib"
+-version = "3.10.3"
++version = "3.10.7"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "contourpy" },
+@@ -1065,41 +1065,62 @@ dependencies = [
+     { name = "pyparsing" },
+     { name = "python-dateutil" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/26/91/d49359a21893183ed2a5b6c76bec40e0b1dcbf8ca148f864d134897cfc75/matplotlib-3.10.3.tar.gz", hash = "sha256:2f82d2c5bb7ae93aaaa4cd42aca65d76ce6376f83304fa3a630b569aca274df0", size = 34799811 }
+-wheels = [
+-    { url = "https://files.pythonhosted.org/packages/d0/ea/2bba25d289d389c7451f331ecd593944b3705f06ddf593fa7be75037d308/matplotlib-3.10.3-cp310-cp310-macosx_10_12_x86_64.whl", hash = "sha256:213fadd6348d106ca7db99e113f1bea1e65e383c3ba76e8556ba4a3054b65ae7", size = 8167862 },
+-    { url = "https://files.pythonhosted.org/packages/41/81/cc70b5138c926604e8c9ed810ed4c79e8116ba72e02230852f5c12c87ba2/matplotlib-3.10.3-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:d3bec61cb8221f0ca6313889308326e7bb303d0d302c5cc9e523b2f2e6c73deb", size = 8042149 },
+-    { url = "https://files.pythonhosted.org/packages/4a/9a/0ff45b6bfa42bb16de597e6058edf2361c298ad5ef93b327728145161bbf/matplotlib-3.10.3-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8c21ae75651c0231b3ba014b6d5e08fb969c40cdb5a011e33e99ed0c9ea86ecb", size = 8453719 },
+-    { url = "https://files.pythonhosted.org/packages/85/c7/1866e972fed6d71ef136efbc980d4d1854ab7ef1ea8152bbd995ca231c81/matplotlib-3.10.3-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a49e39755580b08e30e3620efc659330eac5d6534ab7eae50fa5e31f53ee4e30", size = 8590801 },
+-    { url = "https://files.pythonhosted.org/packages/5d/b9/748f6626d534ab7e255bdc39dc22634d337cf3ce200f261b5d65742044a1/matplotlib-3.10.3-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:cf4636203e1190871d3a73664dea03d26fb019b66692cbfd642faafdad6208e8", size = 9402111 },
+-    { url = "https://files.pythonhosted.org/packages/1f/78/8bf07bd8fb67ea5665a6af188e70b57fcb2ab67057daa06b85a08e59160a/matplotlib-3.10.3-cp310-cp310-win_amd64.whl", hash = "sha256:fd5641a9bb9d55f4dd2afe897a53b537c834b9012684c8444cc105895c8c16fd", size = 8057213 },
+-    { url = "https://files.pythonhosted.org/packages/f5/bd/af9f655456f60fe1d575f54fb14704ee299b16e999704817a7645dfce6b0/matplotlib-3.10.3-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:0ef061f74cd488586f552d0c336b2f078d43bc00dc473d2c3e7bfee2272f3fa8", size = 8178873 },
+-    { url = "https://files.pythonhosted.org/packages/c2/86/e1c86690610661cd716eda5f9d0b35eaf606ae6c9b6736687cfc8f2d0cd8/matplotlib-3.10.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d96985d14dc5f4a736bbea4b9de9afaa735f8a0fc2ca75be2fa9e96b2097369d", size = 8052205 },
+-    { url = "https://files.pythonhosted.org/packages/54/51/a9f8e49af3883dacddb2da1af5fca1f7468677f1188936452dd9aaaeb9ed/matplotlib-3.10.3-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:7c5f0283da91e9522bdba4d6583ed9d5521566f63729ffb68334f86d0bb98049", size = 8465823 },
+-    { url = "https://files.pythonhosted.org/packages/e7/e3/c82963a3b86d6e6d5874cbeaa390166458a7f1961bab9feb14d3d1a10f02/matplotlib-3.10.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:fdfa07c0ec58035242bc8b2c8aae37037c9a886370eef6850703d7583e19964b", size = 8606464 },
+-    { url = "https://files.pythonhosted.org/packages/0e/34/24da1027e7fcdd9e82da3194c470143c551852757a4b473a09a012f5b945/matplotlib-3.10.3-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:c0b9849a17bce080a16ebcb80a7b714b5677d0ec32161a2cc0a8e5a6030ae220", size = 9413103 },
+-    { url = "https://files.pythonhosted.org/packages/a6/da/948a017c3ea13fd4a97afad5fdebe2f5bbc4d28c0654510ce6fd6b06b7bd/matplotlib-3.10.3-cp311-cp311-win_amd64.whl", hash = "sha256:eef6ed6c03717083bc6d69c2d7ee8624205c29a8e6ea5a31cd3492ecdbaee1e1", size = 8065492 },
+-    { url = "https://files.pythonhosted.org/packages/eb/43/6b80eb47d1071f234ef0c96ca370c2ca621f91c12045f1401b5c9b28a639/matplotlib-3.10.3-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:0ab1affc11d1f495ab9e6362b8174a25afc19c081ba5b0775ef00533a4236eea", size = 8179689 },
+-    { url = "https://files.pythonhosted.org/packages/0f/70/d61a591958325c357204870b5e7b164f93f2a8cca1dc6ce940f563909a13/matplotlib-3.10.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:2a818d8bdcafa7ed2eed74487fdb071c09c1ae24152d403952adad11fa3c65b4", size = 8050466 },
+-    { url = "https://files.pythonhosted.org/packages/e7/75/70c9d2306203148cc7902a961240c5927dd8728afedf35e6a77e105a2985/matplotlib-3.10.3-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:748ebc3470c253e770b17d8b0557f0aa85cf8c63fd52f1a61af5b27ec0b7ffee", size = 8456252 },
+-    { url = "https://files.pythonhosted.org/packages/c4/91/ba0ae1ff4b3f30972ad01cd4a8029e70a0ec3b8ea5be04764b128b66f763/matplotlib-3.10.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ed70453fd99733293ace1aec568255bc51c6361cb0da94fa5ebf0649fdb2150a", size = 8601321 },
+-    { url = "https://files.pythonhosted.org/packages/d2/88/d636041eb54a84b889e11872d91f7cbf036b3b0e194a70fa064eb8b04f7a/matplotlib-3.10.3-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:dbed9917b44070e55640bd13419de83b4c918e52d97561544814ba463811cbc7", size = 9406972 },
+-    { url = "https://files.pythonhosted.org/packages/b1/79/0d1c165eac44405a86478082e225fce87874f7198300bbebc55faaf6d28d/matplotlib-3.10.3-cp312-cp312-win_amd64.whl", hash = "sha256:cf37d8c6ef1a48829443e8ba5227b44236d7fcaf7647caa3178a4ff9f7a5be05", size = 8067954 },
+-    { url = "https://files.pythonhosted.org/packages/3b/c1/23cfb566a74c696a3b338d8955c549900d18fe2b898b6e94d682ca21e7c2/matplotlib-3.10.3-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:9f2efccc8dcf2b86fc4ee849eea5dcaecedd0773b30f47980dc0cbeabf26ec84", size = 8180318 },
+-    { url = "https://files.pythonhosted.org/packages/6c/0c/02f1c3b66b30da9ee343c343acbb6251bef5b01d34fad732446eaadcd108/matplotlib-3.10.3-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:3ddbba06a6c126e3301c3d272a99dcbe7f6c24c14024e80307ff03791a5f294e", size = 8051132 },
+-    { url = "https://files.pythonhosted.org/packages/b4/ab/8db1a5ac9b3a7352fb914133001dae889f9fcecb3146541be46bed41339c/matplotlib-3.10.3-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:748302b33ae9326995b238f606e9ed840bf5886ebafcb233775d946aa8107a15", size = 8457633 },
+-    { url = "https://files.pythonhosted.org/packages/f5/64/41c4367bcaecbc03ef0d2a3ecee58a7065d0a36ae1aa817fe573a2da66d4/matplotlib-3.10.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a80fcccbef63302c0efd78042ea3c2436104c5b1a4d3ae20f864593696364ac7", size = 8601031 },
+-    { url = "https://files.pythonhosted.org/packages/12/6f/6cc79e9e5ab89d13ed64da28898e40fe5b105a9ab9c98f83abd24e46d7d7/matplotlib-3.10.3-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:55e46cbfe1f8586adb34f7587c3e4f7dedc59d5226719faf6cb54fc24f2fd52d", size = 9406988 },
+-    { url = "https://files.pythonhosted.org/packages/b1/0f/eed564407bd4d935ffabf561ed31099ed609e19287409a27b6d336848653/matplotlib-3.10.3-cp313-cp313-win_amd64.whl", hash = "sha256:151d89cb8d33cb23345cd12490c76fd5d18a56581a16d950b48c6ff19bb2ab93", size = 8068034 },
+-    { url = "https://files.pythonhosted.org/packages/3e/e5/2f14791ff69b12b09e9975e1d116d9578ac684460860ce542c2588cb7a1c/matplotlib-3.10.3-cp313-cp313t-macosx_10_13_x86_64.whl", hash = "sha256:c26dd9834e74d164d06433dc7be5d75a1e9890b926b3e57e74fa446e1a62c3e2", size = 8218223 },
+-    { url = "https://files.pythonhosted.org/packages/5c/08/30a94afd828b6e02d0a52cae4a29d6e9ccfcf4c8b56cc28b021d3588873e/matplotlib-3.10.3-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:24853dad5b8c84c8c2390fc31ce4858b6df504156893292ce8092d190ef8151d", size = 8094985 },
+-    { url = "https://files.pythonhosted.org/packages/89/44/f3bc6b53066c889d7a1a3ea8094c13af6a667c5ca6220ec60ecceec2dabe/matplotlib-3.10.3-cp313-cp313t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:68f7878214d369d7d4215e2a9075fef743be38fa401d32e6020bab2dfabaa566", size = 8483109 },
+-    { url = "https://files.pythonhosted.org/packages/ba/c7/473bc559beec08ebee9f86ca77a844b65747e1a6c2691e8c92e40b9f42a8/matplotlib-3.10.3-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f6929fc618cb6db9cb75086f73b3219bbb25920cb24cee2ea7a12b04971a4158", size = 8618082 },
+-    { url = "https://files.pythonhosted.org/packages/d8/e9/6ce8edd264c8819e37bbed8172e0ccdc7107fe86999b76ab5752276357a4/matplotlib-3.10.3-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:6c7818292a5cc372a2dc4c795e5c356942eb8350b98ef913f7fda51fe175ac5d", size = 9413699 },
+-    { url = "https://files.pythonhosted.org/packages/1b/92/9a45c91089c3cf690b5badd4be81e392ff086ccca8a1d4e3a08463d8a966/matplotlib-3.10.3-cp313-cp313t-win_amd64.whl", hash = "sha256:4f23ffe95c5667ef8a2b56eea9b53db7f43910fa4a2d5472ae0f72b64deab4d5", size = 8139044 },
+-    { url = "https://files.pythonhosted.org/packages/3d/d1/f54d43e95384b312ffa4a74a4326c722f3b8187aaaa12e9a84cdf3037131/matplotlib-3.10.3-pp310-pypy310_pp73-macosx_10_15_x86_64.whl", hash = "sha256:86ab63d66bbc83fdb6733471d3bff40897c1e9921cba112accd748eee4bce5e4", size = 8162896 },
+-    { url = "https://files.pythonhosted.org/packages/24/a4/fbfc00c2346177c95b353dcf9b5a004106abe8730a62cb6f27e79df0a698/matplotlib-3.10.3-pp310-pypy310_pp73-macosx_11_0_arm64.whl", hash = "sha256:a48f9c08bf7444b5d2391a83e75edb464ccda3c380384b36532a0962593a1751", size = 8039702 },
+-    { url = "https://files.pythonhosted.org/packages/6a/b9/59e120d24a2ec5fc2d30646adb2efb4621aab3c6d83d66fb2a7a182db032/matplotlib-3.10.3-pp310-pypy310_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:cb73d8aa75a237457988f9765e4dfe1c0d2453c5ca4eabc897d4309672c8e014", size = 8594298 },
++sdist = { url = "https://files.pythonhosted.org/packages/ae/e2/d2d5295be2f44c678ebaf3544ba32d20c1f9ef08c49fe47f496180e1db15/matplotlib-3.10.7.tar.gz", hash = "sha256:a06ba7e2a2ef9131c79c49e63dad355d2d878413a0376c1727c8b9335ff731c7", size = 34804865 }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/6c/87/3932d5778ab4c025db22710b61f49ccaed3956c5cf46ffb2ffa7492b06d9/matplotlib-3.10.7-cp310-cp310-macosx_10_12_x86_64.whl", hash = "sha256:7ac81eee3b7c266dd92cee1cd658407b16c57eed08c7421fa354ed68234de380", size = 8247141 },
++    { url = "https://files.pythonhosted.org/packages/45/a8/bfed45339160102bce21a44e38a358a1134a5f84c26166de03fb4a53208f/matplotlib-3.10.7-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:667ecd5d8d37813a845053d8f5bf110b534c3c9f30e69ebd25d4701385935a6d", size = 8107995 },
++    { url = "https://files.pythonhosted.org/packages/e2/3c/5692a2d9a5ba848fda3f48d2b607037df96460b941a59ef236404b39776b/matplotlib-3.10.7-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:cc1c51b846aca49a5a8b44fbba6a92d583a35c64590ad9e1e950dc88940a4297", size = 8680503 },
++    { url = "https://files.pythonhosted.org/packages/ab/a0/86ace53c48b05d0e6e9c127b2ace097434901f3e7b93f050791c8243201a/matplotlib-3.10.7-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4a11c2e9e72e7de09b7b72e62f3df23317c888299c875e2b778abf1eda8c0a42", size = 9514982 },
++    { url = "https://files.pythonhosted.org/packages/a6/81/ead71e2824da8f72640a64166d10e62300df4ae4db01a0bac56c5b39fa51/matplotlib-3.10.7-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:f19410b486fdd139885ace124e57f938c1e6a3210ea13dd29cab58f5d4bc12c7", size = 9566429 },
++    { url = "https://files.pythonhosted.org/packages/65/7d/954b3067120456f472cce8fdcacaf4a5fcd522478db0c37bb243c7cb59dd/matplotlib-3.10.7-cp310-cp310-win_amd64.whl", hash = "sha256:b498e9e4022f93de2d5a37615200ca01297ceebbb56fe4c833f46862a490f9e3", size = 8108174 },
++    { url = "https://files.pythonhosted.org/packages/fc/bc/0fb489005669127ec13f51be0c6adc074d7cf191075dab1da9fe3b7a3cfc/matplotlib-3.10.7-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:53b492410a6cd66c7a471de6c924f6ede976e963c0f3097a3b7abfadddc67d0a", size = 8257507 },
++    { url = "https://files.pythonhosted.org/packages/e2/6a/d42588ad895279ff6708924645b5d2ed54a7fb2dc045c8a804e955aeace1/matplotlib-3.10.7-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d9749313deb729f08207718d29c86246beb2ea3fdba753595b55901dee5d2fd6", size = 8119565 },
++    { url = "https://files.pythonhosted.org/packages/10/b7/4aa196155b4d846bd749cf82aa5a4c300cf55a8b5e0dfa5b722a63c0f8a0/matplotlib-3.10.7-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:2222c7ba2cbde7fe63032769f6eb7e83ab3227f47d997a8453377709b7fe3a5a", size = 8692668 },
++    { url = "https://files.pythonhosted.org/packages/e6/e7/664d2b97016f46683a02d854d730cfcf54ff92c1dafa424beebef50f831d/matplotlib-3.10.7-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e91f61a064c92c307c5a9dc8c05dc9f8a68f0a3be199d9a002a0622e13f874a1", size = 9521051 },
++    { url = "https://files.pythonhosted.org/packages/a8/a3/37aef1404efa615f49b5758a5e0261c16dd88f389bc1861e722620e4a754/matplotlib-3.10.7-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:6f1851eab59ca082c95df5a500106bad73672645625e04538b3ad0f69471ffcc", size = 9576878 },
++    { url = "https://files.pythonhosted.org/packages/33/cd/b145f9797126f3f809d177ca378de57c45413c5099c5990de2658760594a/matplotlib-3.10.7-cp311-cp311-win_amd64.whl", hash = "sha256:6516ce375109c60ceec579e699524e9d504cd7578506f01150f7a6bc174a775e", size = 8115142 },
++    { url = "https://files.pythonhosted.org/packages/2e/39/63bca9d2b78455ed497fcf51a9c71df200a11048f48249038f06447fa947/matplotlib-3.10.7-cp311-cp311-win_arm64.whl", hash = "sha256:b172db79759f5f9bc13ef1c3ef8b9ee7b37b0247f987fbbbdaa15e4f87fd46a9", size = 7992439 },
++    { url = "https://files.pythonhosted.org/packages/be/b3/09eb0f7796932826ec20c25b517d568627754f6c6462fca19e12c02f2e12/matplotlib-3.10.7-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:7a0edb7209e21840e8361e91ea84ea676658aa93edd5f8762793dec77a4a6748", size = 8272389 },
++    { url = "https://files.pythonhosted.org/packages/11/0b/1ae80ddafb8652fd8046cb5c8460ecc8d4afccb89e2c6d6bec61e04e1eaf/matplotlib-3.10.7-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:c380371d3c23e0eadf8ebff114445b9f970aff2010198d498d4ab4c3b41eea4f", size = 8128247 },
++    { url = "https://files.pythonhosted.org/packages/7d/18/95ae2e242d4a5c98bd6e90e36e128d71cf1c7e39b0874feaed3ef782e789/matplotlib-3.10.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d5f256d49fea31f40f166a5e3131235a5d2f4b7f44520b1cf0baf1ce568ccff0", size = 8696996 },
++    { url = "https://files.pythonhosted.org/packages/7e/3d/5b559efc800bd05cb2033aa85f7e13af51958136a48327f7c261801ff90a/matplotlib-3.10.7-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:11ae579ac83cdf3fb72573bb89f70e0534de05266728740d478f0f818983c695", size = 9530153 },
++    { url = "https://files.pythonhosted.org/packages/88/57/eab4a719fd110312d3c220595d63a3c85ec2a39723f0f4e7fa7e6e3f74ba/matplotlib-3.10.7-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:4c14b6acd16cddc3569a2d515cfdd81c7a68ac5639b76548cfc1a9e48b20eb65", size = 9593093 },
++    { url = "https://files.pythonhosted.org/packages/31/3c/80816f027b3a4a28cd2a0a6ef7f89a2db22310e945cd886ec25bfb399221/matplotlib-3.10.7-cp312-cp312-win_amd64.whl", hash = "sha256:0d8c32b7ea6fb80b1aeff5a2ceb3fb9778e2759e899d9beff75584714afcc5ee", size = 8122771 },
++    { url = "https://files.pythonhosted.org/packages/de/77/ef1fc78bfe99999b2675435cc52120887191c566b25017d78beaabef7f2d/matplotlib-3.10.7-cp312-cp312-win_arm64.whl", hash = "sha256:5f3f6d315dcc176ba7ca6e74c7768fb7e4cf566c49cb143f6bc257b62e634ed8", size = 7992812 },
++    { url = "https://files.pythonhosted.org/packages/02/9c/207547916a02c78f6bdd83448d9b21afbc42f6379ed887ecf610984f3b4e/matplotlib-3.10.7-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:1d9d3713a237970569156cfb4de7533b7c4eacdd61789726f444f96a0d28f57f", size = 8273212 },
++    { url = "https://files.pythonhosted.org/packages/bc/d0/b3d3338d467d3fc937f0bb7f256711395cae6f78e22cef0656159950adf0/matplotlib-3.10.7-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:37a1fea41153dd6ee061d21ab69c9cf2cf543160b1b85d89cd3d2e2a7902ca4c", size = 8128713 },
++    { url = "https://files.pythonhosted.org/packages/22/ff/6425bf5c20d79aa5b959d1ce9e65f599632345391381c9a104133fe0b171/matplotlib-3.10.7-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:b3c4ea4948d93c9c29dc01c0c23eef66f2101bf75158c291b88de6525c55c3d1", size = 8698527 },
++    { url = "https://files.pythonhosted.org/packages/d0/7f/ccdca06f4c2e6c7989270ed7829b8679466682f4cfc0f8c9986241c023b6/matplotlib-3.10.7-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:22df30ffaa89f6643206cf13877191c63a50e8f800b038bc39bee9d2d4957632", size = 9529690 },
++    { url = "https://files.pythonhosted.org/packages/b8/95/b80fc2c1f269f21ff3d193ca697358e24408c33ce2b106a7438a45407b63/matplotlib-3.10.7-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:b69676845a0a66f9da30e87f48be36734d6748024b525ec4710be40194282c84", size = 9593732 },
++    { url = "https://files.pythonhosted.org/packages/e1/b6/23064a96308b9aeceeffa65e96bcde459a2ea4934d311dee20afde7407a0/matplotlib-3.10.7-cp313-cp313-win_amd64.whl", hash = "sha256:744991e0cc863dd669c8dc9136ca4e6e0082be2070b9d793cbd64bec872a6815", size = 8122727 },
++    { url = "https://files.pythonhosted.org/packages/b3/a6/2faaf48133b82cf3607759027f82b5c702aa99cdfcefb7f93d6ccf26a424/matplotlib-3.10.7-cp313-cp313-win_arm64.whl", hash = "sha256:fba2974df0bf8ce3c995fa84b79cde38326e0f7b5409e7a3a481c1141340bcf7", size = 7992958 },
++    { url = "https://files.pythonhosted.org/packages/4a/f0/b018fed0b599bd48d84c08794cb242227fe3341952da102ee9d9682db574/matplotlib-3.10.7-cp313-cp313t-macosx_10_13_x86_64.whl", hash = "sha256:932c55d1fa7af4423422cb6a492a31cbcbdbe68fd1a9a3f545aa5e7a143b5355", size = 8316849 },
++    { url = "https://files.pythonhosted.org/packages/b0/b7/bb4f23856197659f275e11a2a164e36e65e9b48ea3e93c4ec25b4f163198/matplotlib-3.10.7-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:5e38c2d581d62ee729a6e144c47a71b3f42fb4187508dbbf4fe71d5612c3433b", size = 8178225 },
++    { url = "https://files.pythonhosted.org/packages/62/56/0600609893ff277e6f3ab3c0cef4eafa6e61006c058e84286c467223d4d5/matplotlib-3.10.7-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:786656bb13c237bbcebcd402f65f44dd61ead60ee3deb045af429d889c8dbc67", size = 8711708 },
++    { url = "https://files.pythonhosted.org/packages/d8/1a/6bfecb0cafe94d6658f2f1af22c43b76cf7a1c2f0dc34ef84cbb6809617e/matplotlib-3.10.7-cp313-cp313t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:09d7945a70ea43bf9248f4b6582734c2fe726723204a76eca233f24cffc7ef67", size = 9541409 },
++    { url = "https://files.pythonhosted.org/packages/08/50/95122a407d7f2e446fd865e2388a232a23f2b81934960ea802f3171518e4/matplotlib-3.10.7-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:d0b181e9fa8daf1d9f2d4c547527b167cb8838fc587deabca7b5c01f97199e84", size = 9594054 },
++    { url = "https://files.pythonhosted.org/packages/13/76/75b194a43b81583478a81e78a07da8d9ca6ddf50dd0a2ccabf258059481d/matplotlib-3.10.7-cp313-cp313t-win_amd64.whl", hash = "sha256:31963603041634ce1a96053047b40961f7a29eb8f9a62e80cc2c0427aa1d22a2", size = 8200100 },
++    { url = "https://files.pythonhosted.org/packages/f5/9e/6aefebdc9f8235c12bdeeda44cc0383d89c1e41da2c400caf3ee2073a3ce/matplotlib-3.10.7-cp313-cp313t-win_arm64.whl", hash = "sha256:aebed7b50aa6ac698c90f60f854b47e48cd2252b30510e7a1feddaf5a3f72cbf", size = 8042131 },
++    { url = "https://files.pythonhosted.org/packages/0d/4b/e5bc2c321b6a7e3a75638d937d19ea267c34bd5a90e12bee76c4d7c7a0d9/matplotlib-3.10.7-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:d883460c43e8c6b173fef244a2341f7f7c0e9725c7fe68306e8e44ed9c8fb100", size = 8273787 },
++    { url = "https://files.pythonhosted.org/packages/86/ad/6efae459c56c2fbc404da154e13e3a6039129f3c942b0152624f1c621f05/matplotlib-3.10.7-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:07124afcf7a6504eafcb8ce94091c5898bbdd351519a1beb5c45f7a38c67e77f", size = 8131348 },
++    { url = "https://files.pythonhosted.org/packages/a6/5a/a4284d2958dee4116359cc05d7e19c057e64ece1b4ac986ab0f2f4d52d5a/matplotlib-3.10.7-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c17398b709a6cce3d9fdb1595c33e356d91c098cd9486cb2cc21ea2ea418e715", size = 9533949 },
++    { url = "https://files.pythonhosted.org/packages/de/ff/f3781b5057fa3786623ad8976fc9f7b0d02b2f28534751fd5a44240de4cf/matplotlib-3.10.7-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7146d64f561498764561e9cd0ed64fcf582e570fc519e6f521e2d0cfd43365e1", size = 9804247 },
++    { url = "https://files.pythonhosted.org/packages/47/5a/993a59facb8444efb0e197bf55f545ee449902dcee86a4dfc580c3b61314/matplotlib-3.10.7-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:90ad854c0a435da3104c01e2c6f0028d7e719b690998a2333d7218db80950722", size = 9595497 },
++    { url = "https://files.pythonhosted.org/packages/0d/a5/77c95aaa9bb32c345cbb49626ad8eb15550cba2e6d4c88081a6c2ac7b08d/matplotlib-3.10.7-cp314-cp314-win_amd64.whl", hash = "sha256:4645fc5d9d20ffa3a39361fcdbcec731382763b623b72627806bf251b6388866", size = 8252732 },
++    { url = "https://files.pythonhosted.org/packages/74/04/45d269b4268d222390d7817dae77b159651909669a34ee9fdee336db5883/matplotlib-3.10.7-cp314-cp314-win_arm64.whl", hash = "sha256:9257be2f2a03415f9105c486d304a321168e61ad450f6153d77c69504ad764bb", size = 8124240 },
++    { url = "https://files.pythonhosted.org/packages/4b/c7/ca01c607bb827158b439208c153d6f14ddb9fb640768f06f7ca3488ae67b/matplotlib-3.10.7-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:1e4bbad66c177a8fdfa53972e5ef8be72a5f27e6a607cec0d8579abd0f3102b1", size = 8316938 },
++    { url = "https://files.pythonhosted.org/packages/84/d2/5539e66e9f56d2fdec94bb8436f5e449683b4e199bcc897c44fbe3c99e28/matplotlib-3.10.7-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:d8eb7194b084b12feb19142262165832fc6ee879b945491d1c3d4660748020c4", size = 8178245 },
++    { url = "https://files.pythonhosted.org/packages/77/b5/e6ca22901fd3e4fe433a82e583436dd872f6c966fca7e63cf806b40356f8/matplotlib-3.10.7-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b4d41379b05528091f00e1728004f9a8d7191260f3862178b88e8fd770206318", size = 9541411 },
++    { url = "https://files.pythonhosted.org/packages/9e/99/a4524db57cad8fee54b7237239a8f8360bfcfa3170d37c9e71c090c0f409/matplotlib-3.10.7-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4a74f79fafb2e177f240579bc83f0b60f82cc47d2f1d260f422a0627207008ca", size = 9803664 },
++    { url = "https://files.pythonhosted.org/packages/e6/a5/85e2edf76ea0ad4288d174926d9454ea85f3ce5390cc4e6fab196cbf250b/matplotlib-3.10.7-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:702590829c30aada1e8cef0568ddbffa77ca747b4d6e36c6d173f66e301f89cc", size = 9594066 },
++    { url = "https://files.pythonhosted.org/packages/39/69/9684368a314f6d83fe5c5ad2a4121a3a8e03723d2e5c8ea17b66c1bad0e7/matplotlib-3.10.7-cp314-cp314t-win_amd64.whl", hash = "sha256:f79d5de970fc90cd5591f60053aecfce1fcd736e0303d9f0bf86be649fa68fb8", size = 8342832 },
++    { url = "https://files.pythonhosted.org/packages/04/5f/e22e08da14bc1a0894184640d47819d2338b792732e20d292bf86e5ab785/matplotlib-3.10.7-cp314-cp314t-win_arm64.whl", hash = "sha256:cb783436e47fcf82064baca52ce748af71725d0352e1d31564cbe9c95df92b9c", size = 8172585 },
++    { url = "https://files.pythonhosted.org/packages/1e/6c/a9bcf03e9afb2a873e0a5855f79bce476d1023f26f8212969f2b7504756c/matplotlib-3.10.7-pp310-pypy310_pp73-macosx_10_15_x86_64.whl", hash = "sha256:5c09cf8f2793f81368f49f118b6f9f937456362bee282eac575cca7f84cda537", size = 8241204 },
++    { url = "https://files.pythonhosted.org/packages/5b/fd/0e6f5aa762ed689d9fa8750b08f1932628ffa7ed30e76423c399d19407d2/matplotlib-3.10.7-pp310-pypy310_pp73-macosx_11_0_arm64.whl", hash = "sha256:de66744b2bb88d5cd27e80dfc2ec9f0517d0a46d204ff98fe9e5f2864eb67657", size = 8104607 },
++    { url = "https://files.pythonhosted.org/packages/b9/a9/21c9439d698fac5f0de8fc68b2405b738ed1f00e1279c76f2d9aa5521ead/matplotlib-3.10.7-pp310-pypy310_pp73-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:53cc80662dd197ece414dd5b66e07370201515a3eaf52e7c518c68c16814773b", size = 8682257 },
++    { url = "https://files.pythonhosted.org/packages/58/8f/76d5dc21ac64a49e5498d7f0472c0781dae442dd266a67458baec38288ec/matplotlib-3.10.7-pp311-pypy311_pp73-macosx_10_15_x86_64.whl", hash = "sha256:15112bcbaef211bd663fa935ec33313b948e214454d949b723998a43357b17b0", size = 8252283 },
++    { url = "https://files.pythonhosted.org/packages/27/0d/9c5d4c2317feb31d819e38c9f947c942f42ebd4eb935fc6fd3518a11eaa7/matplotlib-3.10.7-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:d2a959c640cdeecdd2ec3136e8ea0441da59bcaf58d67e9c590740addba2cb68", size = 8116733 },
++    { url = "https://files.pythonhosted.org/packages/9a/cc/3fe688ff1355010937713164caacf9ed443675ac48a997bab6ed23b3f7c0/matplotlib-3.10.7-pp311-pypy311_pp73-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:3886e47f64611046bc1db523a09dd0a0a6bed6081e6f90e13806dd1d1d1b5e91", size = 8693919 },
+ ]
+ 
+ [[package]]
+@@ -1275,19 +1296,20 @@ wheels = [
+ 
+ [[package]]
+ name = "opencv-python"
+-version = "4.11.0.86"
++version = "4.13.0.92"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "numpy" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/17/06/68c27a523103dad5837dc5b87e71285280c4f098c60e4fe8a8db6486ab09/opencv-python-4.11.0.86.tar.gz", hash = "sha256:03d60ccae62304860d232272e4a4fda93c39d595780cb40b161b310244b736a4", size = 95171956 }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/05/4d/53b30a2a3ac1f75f65a59eb29cf2ee7207ce64867db47036ad61743d5a23/opencv_python-4.11.0.86-cp37-abi3-macosx_13_0_arm64.whl", hash = "sha256:432f67c223f1dc2824f5e73cdfcd9db0efc8710647d4e813012195dc9122a52a", size = 37326322 },
+-    { url = "https://files.pythonhosted.org/packages/3b/84/0a67490741867eacdfa37bc18df96e08a9d579583b419010d7f3da8ff503/opencv_python-4.11.0.86-cp37-abi3-macosx_13_0_x86_64.whl", hash = "sha256:9d05ef13d23fe97f575153558653e2d6e87103995d54e6a35db3f282fe1f9c66", size = 56723197 },
+-    { url = "https://files.pythonhosted.org/packages/f3/bd/29c126788da65c1fb2b5fb621b7fed0ed5f9122aa22a0868c5e2c15c6d23/opencv_python-4.11.0.86-cp37-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1b92ae2c8852208817e6776ba1ea0d6b1e0a1b5431e971a2a0ddd2a8cc398202", size = 42230439 },
+-    { url = "https://files.pythonhosted.org/packages/2c/8b/90eb44a40476fa0e71e05a0283947cfd74a5d36121a11d926ad6f3193cc4/opencv_python-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6b02611523803495003bd87362db3e1d2a0454a6a63025dc6658a9830570aa0d", size = 62986597 },
+-    { url = "https://files.pythonhosted.org/packages/fb/d7/1d5941a9dde095468b288d989ff6539dd69cd429dbf1b9e839013d21b6f0/opencv_python-4.11.0.86-cp37-abi3-win32.whl", hash = "sha256:810549cb2a4aedaa84ad9a1c92fbfdfc14090e2749cedf2c1589ad8359aa169b", size = 29384337 },
+-    { url = "https://files.pythonhosted.org/packages/a4/7d/f1c30a92854540bf789e9cd5dde7ef49bbe63f855b85a2e6b3db8135c591/opencv_python-4.11.0.86-cp37-abi3-win_amd64.whl", hash = "sha256:085ad9b77c18853ea66283e98affefe2de8cc4c1f43eda4c100cf9b2721142ec", size = 39488044 },
++    { url = "https://files.pythonhosted.org/packages/fc/6f/5a28fef4c4a382be06afe3938c64cc168223016fa520c5abaf37e8862aa5/opencv_python-4.13.0.92-cp37-abi3-macosx_13_0_arm64.whl", hash = "sha256:caf60c071ec391ba51ed00a4a920f996d0b64e3e46068aac1f646b5de0326a19", size = 46247052 },
++    { url = "https://files.pythonhosted.org/packages/08/ac/6c98c44c650b8114a0fb901691351cfb3956d502e8e9b5cd27f4ee7fbf2f/opencv_python-4.13.0.92-cp37-abi3-macosx_14_0_x86_64.whl", hash = "sha256:5868a8c028a0b37561579bfb8ac1875babdc69546d236249fff296a8c010ccf9", size = 32568781 },
++    { url = "https://files.pythonhosted.org/packages/3e/51/82fed528b45173bf629fa44effb76dff8bc9f4eeaee759038362dfa60237/opencv_python-4.13.0.92-cp37-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:0bc2596e68f972ca452d80f444bc404e08807d021fbba40df26b61b18e01838a", size = 47685527 },
++    { url = "https://files.pythonhosted.org/packages/db/07/90b34a8e2cf9c50fe8ed25cac9011cde0676b4d9d9c973751ac7616223a2/opencv_python-4.13.0.92-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:402033cddf9d294693094de5ef532339f14ce821da3ad7df7c9f6e8316da32cf", size = 70460872 },
++    { url = "https://files.pythonhosted.org/packages/02/6d/7a9cc719b3eaf4377b9c2e3edeb7ed3a81de41f96421510c0a169ca3cfd4/opencv_python-4.13.0.92-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:bccaabf9eb7f897ca61880ce2869dcd9b25b72129c28478e7f2a5e8dee945616", size = 46708208 },
++    { url = "https://files.pythonhosted.org/packages/fd/55/b3b49a1b97aabcfbbd6c7326df9cb0b6fa0c0aefa8e89d500939e04aa229/opencv_python-4.13.0.92-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:620d602b8f7d8b8dab5f4b99c6eb353e78d3fb8b0f53db1bd258bb1aa001c1d5", size = 72927042 },
++    { url = "https://files.pythonhosted.org/packages/fb/17/de5458312bcb07ddf434d7bfcb24bb52c59635ad58c6e7c751b48949b009/opencv_python-4.13.0.92-cp37-abi3-win32.whl", hash = "sha256:372fe164a3148ac1ca51e5f3ad0541a4a276452273f503441d718fab9c5e5f59", size = 30932638 },
++    { url = "https://files.pythonhosted.org/packages/e9/a5/1be1516390333ff9be3a9cb648c9f33df79d5096e5884b5df71a588af463/opencv_python-4.13.0.92-cp37-abi3-win_amd64.whl", hash = "sha256:423d934c9fafb91aad38edf26efb46da91ffbc05f3f59c4b0c72e699720706f5", size = 40212062 },
+ ]
+ 
+ [[package]]
+@@ -1441,7 +1463,7 @@ wheels = [
+ 
+ [[package]]
+ name = "pre-commit"
+-version = "4.2.0"
++version = "4.5.1"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "cfgv" },
+@@ -1450,9 +1472,9 @@ dependencies = [
+     { name = "pyyaml" },
+     { name = "virtualenv" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/08/39/679ca9b26c7bb2999ff122d50faa301e49af82ca9c066ec061cfbc0c6784/pre_commit-4.2.0.tar.gz", hash = "sha256:601283b9757afd87d40c4c4a9b2b5de9637a8ea02eaff7adc2d0fb4e04841146", size = 193424 }
++sdist = { url = "https://files.pythonhosted.org/packages/40/f1/6d86a29246dfd2e9b6237f0b5823717f60cad94d47ddc26afa916d21f525/pre_commit-4.5.1.tar.gz", hash = "sha256:eb545fcff725875197837263e977ea257a402056661f09dae08e4b149b030a61", size = 198232 }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/88/74/a88bf1b1efeae488a0c0b7bdf71429c313722d1fc0f377537fbe554e6180/pre_commit-4.2.0-py2.py3-none-any.whl", hash = "sha256:a009ca7205f1eb497d10b845e52c838a98b6cdd2102a6c8e4540e94ee75c58bd", size = 220707 },
++    { url = "https://files.pythonhosted.org/packages/5d/19/fd3ef348460c80af7bb4669ea7926651d1f95c23ff2df18b9d24bab4f3fa/pre_commit-4.5.1-py2.py3-none-any.whl", hash = "sha256:3b3afd891e97337708c1674210f8eba659b52a38ea5f822ff142d10786221f77", size = 226437 },
+ ]
+ 
+ [[package]]

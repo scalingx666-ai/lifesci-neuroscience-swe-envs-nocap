@@ -1,0 +1,237 @@
+diff --git a/docs/source/whats_new.rst b/docs/source/whats_new.rst
+index f7f391a1bd..227fe3b548 100644
+--- a/docs/source/whats_new.rst
++++ b/docs/source/whats_new.rst
+@@ -39,6 +39,17 @@ Requirements
+ 
+ Bugs
+ ~~~~
++- Fix :func:`moabb.datasets.Dataset.convert_to_bids` producing files the official
++  bids-validator (``@bids/validator`` v2) rejects. ``_build_sidecar_enrichment``
++  now wraps string or flat-dict ``acq.filters`` so every top-level value of
++  ``HardwareFilters`` is an object (schema requires objects, or the exact string
++  ``"n/a"``), fixing ``JSON_SCHEMA_VALIDATION_ERROR``. ``run_moabb_to_bids`` now
++  stores the MOABB run-label description (e.g. the ``feedback1`` in ``"1feedback1"``)
++  in the ``acquisition`` (``acq-``) entity instead of ``recording`` (``rec-``),
++  which is not valid for ``_eeg``/``_events``/``_channels`` files and raised
++  ``ALL_FILENAME_RULES_HAVE_ISSUES``. ``run_bids_to_moabb`` still accepts the
++  legacy ``rec-`` entity so existing MOABB caches keep reading back to the same
++  run label (:gh:`1217` by `Bruno Aristimunha`_).
+ - Keep :class:`moabb.evaluations.CrossSessionEvaluation` result provenance
+   session-specific when a custom cross-validator holds out more than one recording
+   session in the same fold. The estimator is still fitted once per fold, but each
+diff --git a/moabb/datasets/bids_interface.py b/moabb/datasets/bids_interface.py
+index dd84174c0e..f41183da94 100644
+--- a/moabb/datasets/bids_interface.py
++++ b/moabb/datasets/bids_interface.py
+@@ -631,17 +631,28 @@ def _build_sidecar_enrichment(metadata):
+         if hw_filters:
+             entries["HardwareFilters"] = hw_filters
+ 
+-    # HardwareFilters fallback: use acq.filters when prep filters are absent
++    # HardwareFilters fallback: use acq.filters when prep filters are absent.
++    # The @bids/validator v2 schema requires every top-level value of
++    # HardwareFilters to be an object (or the whole field to be the string
++    # "n/a"), so free-text or flat dicts must be nested.
+     if "HardwareFilters" not in entries and acq and acq.filters:
+         if isinstance(acq.filters, dict):
+-            # BIDS requires nested structure: {"FilterName": {"key": "value"}}
+-            # If the dict is flat (no nested dicts), wrap it under a filter name.
+-            if acq.filters and not any(isinstance(v, dict) for v in acq.filters.values()):
+-                entries["HardwareFilters"] = {"HardwareFilter": acq.filters}
+-            else:
++            if acq.filters and all(isinstance(v, dict) for v in acq.filters.values()):
++                # Already nested ({"Bandpass": {...}, "Notch": {...}}): keep as-is.
+                 entries["HardwareFilters"] = acq.filters
++            else:
++                # Flat dict with non-dict values: wrap under a single
++                # ``HardwareFilter`` key whose value is itself an object.
++                # Values are stringified to keep the sub-object JSON-friendly.
++                entries["HardwareFilters"] = {
++                    "HardwareFilter": {k: str(v) for k, v in acq.filters.items()}
++                }
+         else:
+-            entries["HardwareFilters"] = {"HardwareFilter": str(acq.filters)}
++            # Free-text description: wrap under Description so the
++            # ``HardwareFilter`` value is an object as the schema requires.
++            entries["HardwareFilters"] = {
++                "HardwareFilter": {"Description": str(acq.filters)}
++            }
+ 
+     # HardwareFilters (RECOMMENDED) — "n/a" when not described
+     entries.setdefault("HardwareFilters", "n/a")
+@@ -2144,20 +2155,36 @@ def subject_bids_to_moabb(subject: str):
+ 
+ 
+ def run_moabb_to_bids(run: str):
+-    """Convert the run to run index plus eventually description."""
++    """Convert the run to run index plus eventually description.
++
++    MOABB run labels can carry a non-numeric suffix (e.g. ``"1feedback1"``,
++    ``"3A"``). That suffix is stored in the BIDS ``acquisition`` (``acq-``)
++    entity, which is valid for ``_eeg``/``_events``/``_channels`` files.
++
++    Older MOABB versions used the ``recording`` (``rec-``) entity, which
++    the official bids-validator rejects for EEG core files
++    (``ALL_FILENAME_RULES_HAVE_ISSUES``). ``run_bids_to_moabb`` still
++    accepts caches written with ``recording-`` for backwards compatibility.
++    """
+     p = r"([0-9]+)(|[a-zA-Z]+[a-zA-Z0-9]*)"
+     idx, desc = re.fullmatch(p, run).groups()
+     out = {"run": idx}
+     if desc:
+-        out["recording"] = desc
++        out["acquisition"] = desc
+     return out
+ 
+ 
+ def run_bids_to_moabb(path: mne_bids.BIDSPath):
+-    """Extracts the run index plus eventually description from a path."""
+-    if path.recording is None:
++    """Extracts the run index plus eventually description from a path.
++
++    Accepts both the new ``acq-`` entity (written by current MOABB) and the
++    legacy ``rec-`` entity (written by older MOABB versions) so pre-existing
++    caches keep reading back to the same MOABB run label.
++    """
++    desc = path.acquisition if path.acquisition is not None else path.recording
++    if desc is None:
+         return path.run
+-    return f"{path.run}{path.recording}"
++    return f"{path.run}{desc}"
+ 
+ 
+ @dataclass
+diff --git a/moabb/tests/test_bids_enrichment.py b/moabb/tests/test_bids_enrichment.py
+index bcbda2b090..8365775197 100644
+--- a/moabb/tests/test_bids_enrichment.py
++++ b/moabb/tests/test_bids_enrichment.py
+@@ -23,6 +23,8 @@
+     _update_electrodes_tsv,
+     _update_events_json_sidecar,
+     _update_participants_tsv,
++    run_bids_to_moabb,
++    run_moabb_to_bids,
+ )
+ from moabb.datasets.metadata.schema import (
+     AcquisitionMetadata,
+@@ -443,7 +445,7 @@ def test_cap_manufacturer_overrides_sensor_type(self):
+         assert entries["CapManufacturer"] == "EasyCap"
+ 
+     def test_acq_filters_fallback_string(self):
+-        """acq.filters used as HardwareFilters when prep filters are absent."""
++        """acq.filters string wrapped so HardwareFilter value is an object (BIDS schema)."""
+         metadata = DatasetMetadata(
+             acquisition=AcquisitionMetadata(
+                 sampling_rate=256,
+@@ -454,10 +456,17 @@ def test_acq_filters_fallback_string(self):
+             experiment=ExperimentMetadata(paradigm="imagery"),
+         )
+         entries = _build_sidecar_enrichment(metadata)
+-        assert entries["HardwareFilters"] == {"HardwareFilter": "0.1-100 Hz bandpass"}
++        # BIDS validator (@bids/validator v2) requires HardwareFilters values
++        # to be objects (or the whole field to be the string "n/a"). Wrap the
++        # free-text filter description inside a ``Description`` sub-object.
++        assert entries["HardwareFilters"] == {
++            "HardwareFilter": {"Description": "0.1-100 Hz bandpass"}
++        }
++        # Top-level values must all be dicts.
++        assert all(isinstance(v, dict) for v in entries["HardwareFilters"].values())
+ 
+-    def test_acq_filters_fallback_dict(self):
+-        """acq.filters dict used as HardwareFilters when prep filters are absent."""
++    def test_acq_filters_fallback_flat_dict(self):
++        """Flat dict acq.filters is wrapped so every top-level value is an object."""
+         metadata = DatasetMetadata(
+             acquisition=AcquisitionMetadata(
+                 sampling_rate=256,
+@@ -468,7 +477,29 @@ def test_acq_filters_fallback_dict(self):
+             experiment=ExperimentMetadata(paradigm="imagery"),
+         )
+         entries = _build_sidecar_enrichment(metadata)
+-        assert entries["HardwareFilters"] == {"HardwareFilter": {"bandpass": [0.1, 100]}}
++        # ``bandpass: [0.1, 100]`` has a non-dict value, so wrap under a single
++        # ``HardwareFilter`` key whose value is an object.
++        assert entries["HardwareFilters"] == {
++            "HardwareFilter": {"bandpass": "[0.1, 100]"}
++        }
++        assert all(isinstance(v, dict) for v in entries["HardwareFilters"].values())
++
++    def test_acq_filters_fallback_nested_dict_passthrough(self):
++        """Already-nested dict (values are dicts) is kept as-is."""
++        nested = {
++            "Bandpass": {"LowCutoffFrequency": 0.1, "HighCutoffFrequency": 100},
++            "Notch": {"CutoffFrequency": [50]},
++        }
++        metadata = DatasetMetadata(
++            acquisition=AcquisitionMetadata(
++                sampling_rate=256, channel_types={"eeg": 22}, filters=nested
++            ),
++            participants=ParticipantMetadata(n_subjects=9),
++            experiment=ExperimentMetadata(paradigm="imagery"),
++        )
++        entries = _build_sidecar_enrichment(metadata)
++        assert entries["HardwareFilters"] == nested
++        assert all(isinstance(v, dict) for v in entries["HardwareFilters"].values())
+ 
+     def test_acq_filters_not_used_when_prep_filters_present(self):
+         """prep filters take priority over acq.filters."""
+@@ -654,6 +685,58 @@ def test_country_not_used_when_address_present(self):
+ # ============================================================
+ 
+ 
++class TestRunMoabbBidsRoundTrip:
++    """Round-trip and BIDS-validity for run_moabb_to_bids / run_bids_to_moabb.
++
++    The ``recording-`` entity is only valid for ``_physio``/``_stim`` BIDS
++    files, not for ``_eeg``/``_events``/``_channels``. The MOABB run label
++    description (e.g. the ``feedback1`` part of ``"1feedback1"``) must be
++    stored in a BIDS entity that is valid for EEG core files; we use
++    ``acquisition`` (``acq-``). On read we still accept ``recording`` for
++    backwards compatibility with caches written by older MOABB versions.
++    """
++
++    def test_run_moabb_to_bids_pure_numeric(self):
++        assert run_moabb_to_bids("0") == {"run": "0"}
++        assert run_moabb_to_bids("12") == {"run": "12"}
++
++    def test_run_moabb_to_bids_description_uses_acquisition_not_recording(self):
++        kwargs = run_moabb_to_bids("1feedback1")
++        assert "recording" not in kwargs, (
++            "The 'recording-' entity is not valid for EEG files; use 'acq-'."
++        )
++        assert kwargs == {"run": "1", "acquisition": "feedback1"}
++
++    def test_run_moabb_to_bids_alpha_only_suffix(self):
++        kwargs = run_moabb_to_bids("3A")
++        assert "recording" not in kwargs
++        assert kwargs == {"run": "3", "acquisition": "A"}
++
++    @pytest.mark.parametrize("label", ["0", "1", "12", "1feedback1", "3A", "2run2"])
++    def test_round_trip(self, label):
++        import mne_bids
++
++        kwargs = run_moabb_to_bids(label)
++        path = mne_bids.BIDSPath(
++            subject="01", task="imagery", datatype="eeg", check=False, **kwargs
++        )
++        assert run_bids_to_moabb(path) == label
++
++    def test_run_bids_to_moabb_legacy_recording_fallback(self):
++        """A cache written with recording- (older MOABB) must still read back."""
++        import mne_bids
++
++        path = mne_bids.BIDSPath(
++            subject="01",
++            task="imagery",
++            run="1",
++            recording="feedback1",
++            datatype="eeg",
++            check=False,
++        )
++        assert run_bids_to_moabb(path) == "1feedback1"
++
++
+ class TestBuildDatasetDescriptionKwargs:
+     def _make_dataset(self, metadata=None):
+         ds = MagicMock()

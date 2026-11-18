@@ -1,0 +1,704 @@
+diff --git a/docs/source/dev.md b/docs/source/dev.md
+index 4bcd5ca70..6fe588d94 100644
+--- a/docs/source/dev.md
++++ b/docs/source/dev.md
+@@ -9,6 +9,7 @@
+ - Added a "Pipeline flow" section to the reports with an auto-generated diagram of the steps that ran for a subject and the files they passed to one another (#1291 by @larsoner)
+ - Added [`report_image_format`][mne_bids_pipeline._config.report_image_format] config option to control the encoding of images embedded in reports, e.g. `dict(raster="png")` to trade larger reports for faster processing (#1300 by @larsoner)
+ - Report HDF5 and HTML files are no longer rewritten when a step did not modify the report (requires MNE-Python ≥ 1.13; older versions keep the previous always-save behavior) (#1300 by @larsoner)
++- [`report_image_format`][mne_bids_pipeline._config.report_image_format] now accepts `dict(raster="webp-lossy")`, which encodes about as fast as PNG while producing reports roughly 3× smaller (requires MNE-Python ≥ 1.13) (#1304 by @larsoner)
+ 
+ ### :warning: Behavior changes
+ 
+@@ -38,3 +39,5 @@
+ 
+ - Pinned Python version for development to 3.13. (#1243 by @hoechenberger)
+ - Improved the accounting of options used in each step (#1268 by @larsoner)
++- The CSP decoding step now band-pass filters the epochs once per passband instead of once per table row, cutting its runtime roughly in half with identical results (#1304 by @larsoner)
++- The pipeline flow recordings are now read and written with the standard-library `json` module rather than `json_tricks` (about 8× faster for their plain-JSON schema) and memoized per process, so a step no longer re-parses the whole recording on each of its calls (#1305 by @larsoner)
+diff --git a/mne_bids_pipeline/_config.py b/mne_bids_pipeline/_config.py
+index 83db92e65..989ee9575 100644
+--- a/mne_bids_pipeline/_config.py
++++ b/mne_bids_pipeline/_config.py
+@@ -2532,15 +2532,16 @@ def noise_cov(bids_path):
+ """
+ 
+ report_image_format: dict[
+-    Literal["raster", "vector"], Literal["webp", "png", "svg"]
++    Literal["raster", "vector"], Literal["webp", "webp-lossy", "png", "svg"]
+ ] = dict(raster="webp", vector="svg")
+ """
+ The formats used to store images embedded in the reports. The `"raster"` entry applies
+ to inherently pixel-based content (topographic map sliders, ICA properties, epochs
+-images, and similar) and can be `"webp"` or `"png"` — WebP produces the smallest
+-reports, but is considerably slower to encode than PNG, which can make a difference on
+-report-heavy runs. The `"vector"` entry applies to line-art figures and can
+-additionally be `"svg"`. Missing keys keep their default values.
++images, and similar) and can be `"webp"`, `"webp-lossy"`, or `"png"` — WebP produces the
++smallest reports, but lossless WebP is considerably slower to encode than PNG, which can
++make a difference on report-heavy runs; lossy WebP encodes about as fast as PNG and
++still yields much smaller reports. The `"vector"` entry applies to line-art figures and
++can additionally be `"svg"`. Missing keys keep their default values.
+ 
+ ???+ example "Example"
+     Trade larger reports for faster processing:
+diff --git a/mne_bids_pipeline/_config_import.py b/mne_bids_pipeline/_config_import.py
+index 7d9c706ed..ea09756a4 100644
+--- a/mne_bids_pipeline/_config_import.py
++++ b/mne_bids_pipeline/_config_import.py
+@@ -303,8 +303,17 @@ def _check_config(config: SimpleNamespace, config_path: PathLike | None) -> None
+     if config.report_image_format["raster"] == "svg":
+         raise ConfigError(
+             'report_image_format["raster"] cannot be "svg"; pixel-based report '
+-            'content (sliders, topographic maps, ...) requires "webp" or "png".'
++            'content (sliders, topographic maps, ...) requires "webp", '
++            '"webp-lossy", or "png".'
+         )
++    if "webp-lossy" in config.report_image_format.values():
++        from mne.report.report import _ALLOWED_IMAGE_FORMATS  # slow import, defer
++
++        # fail here rather than partway through the first report-writing step
++        if "webp-lossy" not in _ALLOWED_IMAGE_FORMATS:
++            raise ConfigError(
++                'report_image_format value "webp-lossy" requires MNE-Python >= 1.13.'
++            )
+ 
+     config.bids_root.resolve(strict=True)
+     if config.bids_root == config.deriv_root:
+diff --git a/mne_bids_pipeline/_flow.py b/mne_bids_pipeline/_flow.py
+index ae542b454..c6f41dd02 100644
+--- a/mne_bids_pipeline/_flow.py
++++ b/mne_bids_pipeline/_flow.py
+@@ -5,6 +5,7 @@
+ SVG rendering live in ``_graph.py``.
+ """
+ 
++import json
+ import pathlib
+ import re
+ from collections.abc import Sequence
+@@ -14,7 +15,7 @@
+ from mne_bids import get_entities_from_fname
+ 
+ from ._graph import _ID_PREFIX, _Edge, _Graph, _graph_html, _layout_graph, _Node
+-from ._io import _LOCK_TIMEOUT, _read_json, _write_json
++from ._io import _LOCK_TIMEOUT
+ from ._logging import _collapse_runs, _shorten_paths
+ from .typing import TypedDict
+ 
+@@ -60,15 +61,36 @@ def _flow_entry_key(entry: FlowEntryT) -> str:
+     return "|".join(str(entry[key] or "") for key in keys)  # type: ignore[literal-required]
+ 
+ 
++# The schema above is plain JSON, so stdlib json (~8x faster than json_tricks here,
++# and json_tricks' output for it is plain JSON too, so old files still parse) plus a
++# per-process memo of the last parse. The memo is safe across workers: every read and
++# write happens under the file's lock, each process has its own memo, and any write
++# moves (st_mtime_ns, st_size).
++_FLOW_MEMO: dict[pathlib.Path, tuple[tuple[int, int], dict[str, Any]]] = dict()
++
++
++def _flow_key(fname: pathlib.Path) -> tuple[int, int]:
++    stat = fname.stat()
++    return (stat.st_mtime_ns, stat.st_size)
++
++
+ def _parse_flow_file(fname: pathlib.Path) -> dict[str, Any]:
+     """Parse one recording file; the caller holds the lock when it matters."""
+     if not fname.is_file():
+         return dict()
++    key = _flow_key(fname)
++    memo = _FLOW_MEMO.get(fname, None)
++    if memo is not None and memo[0] == key:
++        return memo[1]
+     try:
+-        content = _read_json(fname)
++        with open(fname, encoding="utf-8") as fid:
++            content = json.load(fid)
+     except ValueError:  # includes JSONDecodeError
+         return dict()
+-    return content if content.get("version", None) == _FLOW_VERSION else dict()
++    if content.get("version", None) != _FLOW_VERSION:
++        return dict()
++    _FLOW_MEMO[fname] = (key, content)
++    return content
+ 
+ 
+ def _write_flow_entry(
+@@ -85,8 +107,9 @@ def _write_flow_entry(
+     # read-modify-write the same file; the lock prevents lost/torn updates
+     with FileLock(f"{fname}.lock", timeout=_LOCK_TIMEOUT):
+         content = _parse_flow_file(fname)
+-        entries: dict[str, FlowEntryT] = content.get("entries", dict())
+-        have_roots: dict[str, str] = content.get("roots", dict())
++        # copies: the parse can hand back the memoized content, don't mutate it
++        entries: dict[str, FlowEntryT] = dict(content.get("entries", dict()))
++        have_roots: dict[str, str] = dict(content.get("roots", dict()))
+         key = _flow_entry_key(entry)
+         old = entries.get(key, None)
+         if only_if_new and old is not None:
+@@ -107,7 +130,9 @@ def _write_flow_entry(
+         entries[key] = entry
+         have_roots.update(roots or dict())
+         content = dict(version=_FLOW_VERSION, roots=have_roots, entries=entries)
+-        _write_json(fname, content, indent=1)
++        with open(fname, "w", encoding="utf-8") as fid:
++            json.dump(content, fid, indent=1)
++        _FLOW_MEMO[fname] = (_flow_key(fname), content)  # what the next read will see
+     return entry
+ 
+ 
+diff --git a/mne_bids_pipeline/_report.py b/mne_bids_pipeline/_report.py
+index 8c82896b4..10163b980 100644
+--- a/mne_bids_pipeline/_report.py
++++ b/mne_bids_pipeline/_report.py
+@@ -5,30 +5,32 @@
+ from io import StringIO
+ from textwrap import indent
+ from types import SimpleNamespace
+-from typing import Any, Literal
++from typing import TYPE_CHECKING, Any, Literal
+ 
+-import matplotlib.axes
+-import matplotlib.figure
+-import matplotlib.image
+-import matplotlib.transforms
+ import mne
+ import numpy as np
+-import pandas as pd
+ from filelock import FileLock
+-from mne.io import BaseRaw
+-from mne.report.report import _df_bootstrap_table
+ from mne.utils import _pl
+ from mne_bids import BIDSPath
+ from mne_bids.stats import count_events
+-from scipy.io import loadmat
+ 
+ from ._config_utils import _get_task_contrasts
+-from ._decoding import _handle_csp_args
+ from ._flow import _report_flow_html
+ from ._io import _LOCK_TIMEOUT
+ from ._logging import _linkfile, gen_log_kwargs, logger
+ from .typing import FloatArrayT
+ 
++# This module is imported by every run (via steps/init), but matplotlib, pandas,
++# sklearn (._decoding) and mne.report.report only matter once a step actually adds
++# something to a report, so keep them out of module scope -- including out of the
++# annotations, which are evaluated eagerly
++if TYPE_CHECKING:
++    import matplotlib.axes
++    import matplotlib.figure
++    import matplotlib.image
++    import pandas as pd
++    from mne.io import BaseRaw
++
+ 
+ def _report_path(
+     *, cfg: SimpleNamespace, subject: str, session: str | None = None
+@@ -62,7 +64,7 @@ def _open_report(
+     task: str | None = None,
+     fname_report: BIDSPath | None = None,
+     name: str = "report",
+-) -> Generator[mne.Report, None, None]:
++) -> "Generator[mne.Report, None, None]":
+     if fname_report is None:
+         fname_report = _report_path(cfg=cfg, subject=subject, session=session)
+     fname_report = fname_report.fpath
+@@ -155,9 +157,10 @@ def _plot_full_epochs_decoding_scores(
+     scores: list[FloatArrayT],
+     metric: str,
+     kind: Literal["single-subject", "grand-average"] = "single-subject",
+-) -> tuple[matplotlib.figure.Figure, str, pd.DataFrame]:
++) -> "tuple[matplotlib.figure.Figure, str, pd.DataFrame]":
+     """Plot cross-validation results from full-epochs decoding."""
+     import matplotlib.pyplot as plt  # nested import to help joblib
++    import pandas as pd
+     import seaborn as sns
+ 
+     if metric == "roc_auc":
+@@ -283,7 +286,7 @@ def _plot_time_by_time_decoding_scores(
+     metric: str,
+     time_generalization: bool,
+     decim: int,
+-) -> matplotlib.figure.Figure:
++) -> "matplotlib.figure.Figure":
+     """Plot cross-validation results from time-by-time decoding."""
+     import matplotlib.pyplot as plt  # nested import to help joblib
+ 
+@@ -323,7 +326,7 @@ def _plot_time_by_time_decoding_scores(
+ 
+ 
+ def _label_time_by_time(
+-    ax: matplotlib.axes.Axes,
++    ax: "matplotlib.axes.Axes",
+     *,
+     decim: int,
+     xlabel: str | None = None,
+@@ -340,7 +343,7 @@ def _label_time_by_time(
+ 
+ def _plot_time_by_time_decoding_scores_gavg(
+     *, cfg: SimpleNamespace, decoding_data: dict[str, Any]
+-) -> matplotlib.figure.Figure:
++) -> "matplotlib.figure.Figure":
+     """Plot the grand-averaged decoding scores."""
+     import matplotlib.pyplot as plt  # nested import to help joblib
+ 
+@@ -431,7 +434,7 @@ def _plot_time_by_time_decoding_scores_gavg(
+ 
+ def plot_time_by_time_decoding_t_values(
+     decoding_data: dict[str, Any],
+-) -> matplotlib.figure.Figure:
++) -> "matplotlib.figure.Figure":
+     """Plot the t-values used to form clusters for the permutation test."""
+     import matplotlib.pyplot as plt  # nested import to help joblib
+ 
+@@ -477,7 +480,7 @@ def _plot_decoding_time_generalization(
+     decoding_data: dict[str, Any],
+     metric: str,
+     kind: Literal["single-subject", "grand-average"],
+-) -> matplotlib.figure.Figure:
++) -> "matplotlib.figure.Figure":
+     """Plot time generalization matrix."""
+     import matplotlib.pyplot as plt  # nested import to help joblib
+ 
+@@ -528,7 +531,7 @@ def _plot_decoding_time_generalization(
+ 
+ def _gen_empty_report(
+     *, cfg: SimpleNamespace, subject: str, session: str | None
+-) -> mne.Report:
++) -> "mne.Report":
+     title = f"sub-{subject}"
+     if session is not None:
+         title += f", ses-{session}"
+@@ -552,8 +555,10 @@ def add_event_counts(
+     subject: str | None,
+     session: str | None,
+     task: str | None,
+-    report: mne.Report,
++    report: "mne.Report",
+ ) -> None:
++    from mne.report.report import _df_bootstrap_table
++
+     try:
+         df_events = count_events(BIDSPath(root=cfg.bids_root, session=session))
+     except ValueError:
+@@ -574,7 +579,7 @@ def add_event_counts(
+ 
+ def _finalize(
+     *,
+-    report: mne.Report,
++    report: "mne.Report",
+     exec_params: SimpleNamespace,
+     # passed so logging magic can occur:
+     cfg: SimpleNamespace,
+@@ -629,7 +634,7 @@ def _run_sort_key(run: str) -> tuple[int, int | str]:
+         return (1, run)
+ 
+ 
+-def _sort_run_sections(report: mne.Report) -> None:
++def _sort_run_sections(report: "mne.Report") -> None:
+     """Order run-specific sections by run within each section group.
+ 
+     Sections that differ only by their ``run-*`` tag gather at the position the
+@@ -660,7 +665,7 @@ def _sort_run_sections(report: mne.Report) -> None:
+ 
+ def _add_flow_diagram(
+     *,
+-    report: mne.Report,
++    report: "mne.Report",
+     exec_params: SimpleNamespace,
+     subject: str,
+     session: str | None,
+@@ -752,7 +757,7 @@ def _get_prefix_tags(
+ 
+ def _imshow_tf(
+     vals: FloatArrayT,
+-    ax: matplotlib.axes.Axes,
++    ax: "matplotlib.axes.Axes",
+     *,
+     tmin: FloatArrayT,
+     tmax: FloatArrayT,
+@@ -763,7 +768,7 @@ def _imshow_tf(
+     cmap: str = "RdBu_r",
+     mask: FloatArrayT | None = None,
+     cmap_masked: Any | None = None,
+-) -> matplotlib.image.AxesImage:
++) -> "matplotlib.image.AxesImage":
+     """Plot CSP TF decoding scores."""
+     # XXX Add support for more metrics
+     assert len(vals) == len(tmin) == len(tmax) == len(fmin) == len(fmax)
+@@ -792,14 +797,19 @@ def add_csp_grand_average(
+     subject: str,
+     session: str | None,
+     task: str | None,
+-    report: mne.Report,
++    report: "mne.Report",
+     cond_1: str,
+     cond_2: str,
+     fname_csp_freq_results: BIDSPath,
+-    fname_csp_cluster_results: pd.DataFrame | None,
++    fname_csp_cluster_results: "pd.DataFrame | None",
+ ) -> None:
+     """Add CSP decoding results to the grand average report."""
+     import matplotlib.pyplot as plt  # nested import to help joblib
++    import matplotlib.transforms
++    import pandas as pd
++    from scipy.io import loadmat
++
++    from ._decoding import _handle_csp_args
+ 
+     # First, plot decoding scores across frequency bins (entire epochs).
+     section = f"Decoding: CSP, N = {len(cfg.subjects)}"
+@@ -1046,9 +1056,9 @@ def _agg_backend() -> Generator[None, None, None]:
+ def _add_raw(
+     *,
+     cfg: SimpleNamespace,
+-    report: mne.report.Report,
++    report: "mne.report.Report",
+     bids_path_in: BIDSPath,
+-    raw: BaseRaw,
++    raw: "BaseRaw",
+     title_prefix: str,
+     tags: tuple[str, ...] = (),
+     extra_html: str | None = None,
+@@ -1084,7 +1094,7 @@ def _add_raw(
+ def _render_bem(
+     *,
+     cfg: SimpleNamespace,
+-    report: mne.report.Report,
++    report: "mne.report.Report",
+     subject: str,
+     session: str | None,
+ ) -> None:
+diff --git a/mne_bids_pipeline/_run.py b/mne_bids_pipeline/_run.py
+index 873f7e40e..b3a855717 100644
+--- a/mne_bids_pipeline/_run.py
++++ b/mne_bids_pipeline/_run.py
+@@ -137,6 +137,19 @@ def hash_file_path(path: pathlib.Path) -> str:
+     return md5_hashed
+ 
+ 
++# A step is decorated once but called once per (subject, session, run), and rebuilding
++# these per call costs ~0.2 ms and re-does joblib's func_code introspection every time
++@functools.cache
++def _get_memory(location: pathlib.Path, verbose: int) -> Memory:
++    return Memory(location, verbose=verbose)
++
++
++@functools.cache
++def _get_memorized_func(memory: Memory, func: Callable[..., Any]) -> Any:
++    # exec_params has no effect on the output, so it must not affect the hash
++    return memory.cache(func, ignore=["exec_params"])
++
++
+ class ConditionalStepMemory:
+     def __init__(
+         self,
+@@ -157,11 +170,9 @@ def __init__(
+             use_location = pathlib.Path(memory_location)
+         # Actually make the Memory object only if necessary
+         if use_location is not None and get_input_fnames is not None:
+-            self.memory = Memory(use_location, verbose=exec_params.memory_verbose)
++            self.memory = _get_memory(use_location, exec_params.memory_verbose)
+         else:
+             self.memory = None
+-        # Ignore these as they have no effect on the output
+-        self.ignore = ["exec_params"]
+         self.get_input_fnames = get_input_fnames
+         self.get_output_fnames = get_output_fnames
+         self.memory_file_method = exec_params.memory_file_method
+@@ -261,10 +272,10 @@ def __mbp_cached_func_wrapper__(
+             kwargs["cfg"].hashes = hashes
+             del in_files  # will be modified by func call
+ 
+-            # Someday we could modify the joblib API to combine this with the
+-            # call (https://github.com/joblib/joblib/issues/1342), but our hash
+-            # should be plenty fast so let's not bother for now.
+-            memorized_func = self.memory.cache(func, ignore=self.ignore)
++            # The cache-hit path below reuses the result of the one call it makes, so
++            # only check_call_in_cache still hashes the arguments a second time; folding
++            # that in needs https://github.com/joblib/joblib/issues/1342.
++            memorized_func = _get_memorized_func(self.memory, func)
+             msg: str | None = None
+             emoji: str | None = None
+             short_circuit = False
+@@ -274,6 +285,7 @@ def __mbp_cached_func_wrapper__(
+             run = kwargs.get("run", None)  # noqa
+             task = kwargs.get("task", None)  # noqa
+             bad_out_files = False
++            cached_out_files = None  # the loaded cache entry, when it checks out
+             logger_call = logger.info
+             try:
+                 done = memorized_func.check_call_in_cache(*args, **kwargs)
+@@ -313,6 +325,7 @@ def __mbp_cached_func_wrapper__(
+                             bad_out_files = True
+                             break
+                     else:
++                        cached_out_files = out_files_hashes
+                         msg = (
+                             f"Computation unnecessary (cached "
+                             f"{func.__name__}(…){_ran_when(prior)}) …"
+@@ -361,6 +374,8 @@ def __mbp_cached_func_wrapper__(
+                 done = False
+                 with _ignore_warnings(self.ignore_warnings):
+                     out_files, _ = memorized_func.call(*args, **kwargs)
++            elif cached_out_files is not None:
++                out_files = cached_out_files  # same call, already hashed and loaded
+             else:
+                 with _ignore_warnings(self.ignore_warnings):
+                     out_files = memorized_func(*args, **kwargs)
+diff --git a/mne_bids_pipeline/steps/preprocessing/_04_frequency_filter.py b/mne_bids_pipeline/steps/preprocessing/_04_frequency_filter.py
+index 292689215..377621a98 100644
+--- a/mne_bids_pipeline/steps/preprocessing/_04_frequency_filter.py
++++ b/mne_bids_pipeline/steps/preprocessing/_04_frequency_filter.py
+@@ -20,7 +20,6 @@
+ 
+ import mne
+ import numpy as np
+-from meegkit import dss
+ from mne.io.pick import _picks_to_idx
+ from mne.preprocessing import EOGRegression
+ 
+@@ -81,6 +80,7 @@ def zapline(
+     """Use Zapline to remove line frequencies."""
+     if fline is None:
+         return
++    from meegkit import dss  # nested: pulls pyriemann and pyplot, Zapline-only
+ 
+     msg = f"Zapline filtering data at with {fline=} Hz."
+     logger.info(**gen_log_kwargs(message=msg))
+diff --git a/mne_bids_pipeline/steps/preprocessing/_06a2_find_ica_artifacts.py b/mne_bids_pipeline/steps/preprocessing/_06a2_find_ica_artifacts.py
+index a53e5a6ee..9c6262673 100644
+--- a/mne_bids_pipeline/steps/preprocessing/_06a2_find_ica_artifacts.py
++++ b/mne_bids_pipeline/steps/preprocessing/_06a2_find_ica_artifacts.py
+@@ -40,7 +40,7 @@ def detect_bad_components(
+     cfg: SimpleNamespace,
+     which: Literal["eog", "ecg"],
+     epochs: mne.BaseEpochs | None,
+-    ica: mne.preprocessing.ICA,
++    ica: "mne.preprocessing.ICA",
+     ch_names: list[str] | None,
+     subject: str,
+     session: str | None,
+@@ -416,7 +416,7 @@ def find_ica_artifacts(
+ def _run_icalabel(
+     *,
+     cfg: SimpleNamespace,
+-    ica: mne.preprocessing.ICA,
++    ica: "mne.preprocessing.ICA",
+     epochs: mne.BaseEpochs,
+     mne_exclude: list[int],
+     subject: str,
+@@ -492,8 +492,8 @@ def _run_icalabel(
+ 
+ def _add_report_icalabel(
+     *,
+-    report: mne.Report,
+-    ica: mne.preprocessing.ICA,
++    report: "mne.Report",
++    ica: "mne.preprocessing.ICA",
+     icalabel_report: list[tuple[str, float, bool]],
+     icalabel_df: pd.DataFrame,
+     tags: tuple[str, ...],
+diff --git a/mne_bids_pipeline/steps/sensor/_05_decoding_csp.py b/mne_bids_pipeline/steps/sensor/_05_decoding_csp.py
+index 9c32a0ff3..f872ac82d 100644
+--- a/mne_bids_pipeline/steps/sensor/_05_decoding_csp.py
++++ b/mne_bids_pipeline/steps/sensor/_05_decoding_csp.py
+@@ -92,8 +92,15 @@ def prepare_epochs_and_y(
+     cfg: SimpleNamespace,
+     fmin: float,
+     fmax: float,
++    cache: dict[tuple[float, float], tuple[mne.BaseEpochs, IntArrayT]],
+ ) -> tuple[mne.BaseEpochs, IntArrayT]:
+-    """Band-pass between, sub-select the desired epochs, and prepare y."""
++    """Band-pass between, sub-select the desired epochs, and prepare y.
++
++    Results are cached per passband, so callers must not modify what they get back.
++    """
++    if (fmin, fmax) in cache:
++        return cache[(fmin, fmax)]
++
+     # filtering out the conditions we are not interested in, to ensure here we
+     # have a valid partition between the condition of the contrast.
+ 
+@@ -110,6 +117,7 @@ def prepare_epochs_and_y(
+     epochs_filt = epochs_filt.filter(fmin, fmax, n_jobs=1, verbose="error")
+     y = _prepare_labels(epochs=epochs_filt, contrast=contrast)
+ 
++    cache[(fmin, fmax)] = (epochs_filt, y)
+     return epochs_filt, y
+ 
+ 
+@@ -254,6 +262,10 @@ def _fmt_contrast(
+         msg += f": {cfg.decoding_metric}={score:0.3f}"
+         return msg
+ 
++    # Only a handful of distinct passbands are used by the two tables below, and
++    # filtering dominates the runtime, so filter each one once (cropping comes after)
++    filt_cache: dict[tuple[float, float], tuple[mne.BaseEpochs, IntArrayT]] = dict()
++
+     for idx, row in freq_decoding_table.iterrows():
+         assert isinstance(row, pd.Series)
+         fmin = row["f_min"]
+@@ -262,10 +274,13 @@ def _fmt_contrast(
+         cond2 = row["cond_2"]
+         freq_range_name = row["freq_range_name"]
+ 
+-        # XXX We're filtering here again in each iteration. This should be
+-        # XXX optimized.
+         epochs_filt, y = prepare_epochs_and_y(
+-            epochs=epochs, contrast=contrast, fmin=fmin, fmax=fmax, cfg=cfg
++            epochs=epochs,
++            contrast=contrast,
++            fmin=fmin,
++            fmax=fmax,
++            cfg=cfg,
++            cache=filt_cache,
+         )
+         # Get the data for all time points
+         X = epochs_filt.get_data()
+@@ -335,12 +350,17 @@ def _fmt_contrast(
+         freq_range_name = row["freq_range_name"]
+ 
+         epochs_filt, y = prepare_epochs_and_y(
+-            epochs=epochs, contrast=contrast, fmin=fmin, fmax=fmax, cfg=cfg
++            epochs=epochs,
++            contrast=contrast,
++            fmin=fmin,
++            fmax=fmax,
++            cfg=cfg,
++            cache=filt_cache,
+         )
+         # Crop data to the time window of interest
+         if tmax is not None:  # avoid warnings about outside the interval
+             tmax = min(tmax, epochs_filt.times[-1])
+-        X = epochs_filt.crop(tmin, tmax).get_data()
++        X = epochs_filt.copy().crop(tmin, tmax).get_data()  # cached, so don't crop it
+         del epochs_filt
+         cv_scores = cross_val_score(
+             estimator=clf,
+@@ -367,6 +387,8 @@ def _fmt_contrast(
+         logger.info(**gen_log_kwargs(msg))
+         del tmin, tmax, fmin, fmax, cond1, cond2, freq_range_name
+ 
++    del filt_cache  # free the filtered copies before building the report
++
+     # Write each DataFrame to a different Excel worksheet.
+     a_vs_b = f"{condition1}+{condition2}".replace(op.sep, "")
+     processing = f"{a_vs_b}+CSP+{cfg.decoding_metric}"
+diff --git a/mne_bids_pipeline/tests/configs/config_ds000248_FLASH_BEM.py b/mne_bids_pipeline/tests/configs/config_ds000248_FLASH_BEM.py
+index 977e87b9e..6383e8950 100644
+--- a/mne_bids_pipeline/tests/configs/config_ds000248_FLASH_BEM.py
++++ b/mne_bids_pipeline/tests/configs/config_ds000248_FLASH_BEM.py
+@@ -12,4 +12,4 @@
+ bem_mri_images = "FLASH"
+ recreate_bem = True
+ 
+-report_image_format = dict(raster="png")
++report_image_format = dict(raster="webp-lossy")
+diff --git a/mne_bids_pipeline/tests/configs/config_ds000248_T1_BEM.py b/mne_bids_pipeline/tests/configs/config_ds000248_T1_BEM.py
+index 759762fce..ec77a377a 100644
+--- a/mne_bids_pipeline/tests/configs/config_ds000248_T1_BEM.py
++++ b/mne_bids_pipeline/tests/configs/config_ds000248_T1_BEM.py
+@@ -13,4 +13,4 @@
+ recreate_bem = True
+ freesurfer_verbose = True  # Prevent the CI from canceling the job prematurely
+ 
+-report_image_format = dict(raster="png")
++report_image_format = dict(raster="webp-lossy")
+diff --git a/mne_bids_pipeline/tests/configs/config_ds000248_no_mri.py b/mne_bids_pipeline/tests/configs/config_ds000248_no_mri.py
+index b73e25323..63c862e44 100644
+--- a/mne_bids_pipeline/tests/configs/config_ds000248_no_mri.py
++++ b/mne_bids_pipeline/tests/configs/config_ds000248_no_mri.py
+@@ -17,4 +17,4 @@
+ use_template_mri = "fsaverage"
+ adjust_coreg = True
+ 
+-report_image_format = dict(raster="png")
++report_image_format = dict(raster="webp-lossy")
+diff --git a/mne_bids_pipeline/tests/test_flow.py b/mne_bids_pipeline/tests/test_flow.py
+index fc344fd48..2bcc537e0 100644
+--- a/mne_bids_pipeline/tests/test_flow.py
++++ b/mne_bids_pipeline/tests/test_flow.py
+@@ -1,11 +1,13 @@
+ """Test the pipeline flow diagram."""
+ 
++import json
+ import pathlib
+ import shutil
+ import xml.etree.ElementTree as ET
+ from types import SimpleNamespace
+ from typing import Any
+ 
++import json_tricks
+ import pytest
+ from mne_bids import BIDSPath
+ 
+@@ -181,6 +183,13 @@ def test_flow_storage(tmp_path: pathlib.Path) -> None:
+         dict(roots, deriv_root=str(tmp_path)),
+     ) == ["<bids_root>/sub-01_meg.fif", "<deriv_root>/a.fif", "/elsewhere/b.fif"]
+ 
++    # Recordings written by the old json_tricks writer are plain JSON, so a deriv
++    # tree from before the switch to stdlib json still reads back unchanged
++    fname = flow_dir / "sub-01.json"
++    want = _read01(tmp_path)
++    fname.write_text(json_tricks.dumps(json.loads(fname.read_text()), indent=1))
++    assert _read01(tmp_path) == want
++
+     # A corrupt per-subject file is skipped rather than fatal
+     (flow_dir / "sub-01.json").write_text("not json")
+     assert _read01(tmp_path) == dataset_only
+diff --git a/mne_bids_pipeline/typing.py b/mne_bids_pipeline/typing.py
+index 43f2026ea..0f8ea57db 100644
+--- a/mne_bids_pipeline/typing.py
++++ b/mne_bids_pipeline/typing.py
+@@ -3,20 +3,27 @@
+ import pathlib
+ import sys
+ from collections.abc import Hashable, Sequence
+-from typing import Annotated, Any, Literal, TypeAlias, TypeVar
++from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, TypeVar
+ 
+ if sys.version_info < (3, 12):
+     from typing_extensions import TypedDict
+ else:
+     from typing import TypedDict
+ 
+-import mne
+ import numpy as np
+ from mne_bids import BIDSPath
+ from numpy.typing import ArrayLike
+ from pydantic import AfterValidator, Field, PlainValidator
+ from pydantic_core import PydanticCustomError
+ 
++# mne.channels costs ~120 ms to import (it pulls mne.transforms), and pydantic never
++# looks at the annotated type of DigMontageType below: PlainValidator replaces its
++# schema outright, so `Any` at runtime validates identically
++if TYPE_CHECKING:
++    from mne.channels import DigMontage
++else:
++    DigMontage = Any
++
+ PathLike = str | pathlib.Path
+ 
+ __all__ = [
+@@ -80,14 +87,16 @@ def assert_float_array_like(val: Any) -> FloatArrayT:
+ ]
+ 
+ 
+-def assert_dig_montage(val: mne.channels.DigMontage) -> mne.channels.DigMontage:
++def assert_dig_montage(val: "DigMontage") -> "DigMontage":
+     """Assert that the input is a DigMontage."""
+-    assert isinstance(val, mne.channels.DigMontage)
++    from mne.channels import DigMontage
++
++    assert isinstance(val, DigMontage)
+     return val
+ 
+ 
+ DigMontageType = Annotated[
+-    mne.channels.DigMontage,
++    DigMontage,
+     PlainValidator(assert_dig_montage),
+ ]
+ 

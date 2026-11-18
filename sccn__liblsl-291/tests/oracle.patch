@@ -1,0 +1,274 @@
+diff --git a/src/send_buffer.cpp b/src/send_buffer.cpp
+index 33f4dc0b..dfa228e7 100644
+--- a/src/send_buffer.cpp
++++ b/src/send_buffer.cpp
+@@ -23,6 +23,16 @@ void send_buffer::push_sample(const sample_p &s) {
+ }
+ 
+ 
++/**
++ * Wake a single consumer without enqueueing real data.
++ * Shares consumers_mut_ with push_sample() so the queue keeps its single producer.
++ */
++void send_buffer::wake_consumer(const std::shared_ptr<consumer_queue> &q) {
++	std::lock_guard<std::mutex> lock(consumers_mut_);
++	q->push_sample(sample_p());
++}
++
++
+ /// Registered a new consumer.
+ void send_buffer::register_consumer(consumer_queue *q) {
+ 	{
+diff --git a/src/send_buffer.h b/src/send_buffer.h
+index cfbbb259..6e4be98d 100644
+--- a/src/send_buffer.h
++++ b/src/send_buffer.h
+@@ -45,6 +45,15 @@ class send_buffer : public std::enable_shared_from_this<send_buffer> {
+ 	/// Push a sample onto the send buffer that will subsequently be received by all consumers.
+ 	void push_sample(const sample_p &s);
+ 
++	/**
++	 * Wake a single consumer's queue with the empty-sample convention.
++	 *
++	 * Takes the same lock as push_sample() so that callers on other threads (e.g. an IO handler
++	 * reacting to a peer close) do not become a second producer on a single-producer queue.
++	 * @param q The consumer to wake; held by the caller for the duration of the call.
++	 */
++	void wake_consumer(const std::shared_ptr<consumer_queue> &q);
++
+ 	/// Wait until some consumers are present.
+ 	bool wait_for_consumers(double timeout = FOREVER);
+ 
+diff --git a/src/tcp_server.cpp b/src/tcp_server.cpp
+index c835ed0b..95c6bf26 100644
+--- a/src/tcp_server.cpp
++++ b/src/tcp_server.cpp
+@@ -16,6 +16,7 @@
+ #include <asio/streambuf.hpp>
+ #include <asio/write.hpp>
+ #include <algorithm>
++#include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <cstring>
+@@ -268,8 +269,11 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ 	void handle_send_feedheader_outcome(
+ 		err_t err, std::size_t n, std::shared_ptr<consumer_queue> queue);
+ 
++	/// Detect peer close on the feed socket so idle consumers get unregistered (see #267).
++	void abort_on_peer_close(const std::shared_ptr<consumer_queue> &queue);
++
+ 	/// Transfers samples from the server's send buffer into the async send queues of IO threads
+-	void transfer_samples_thread(std::shared_ptr<client_session> /*keepalive*/,
++	void transfer_samples_thread(std::shared_ptr<client_session> keepalive,
+ 		std::shared_ptr<consumer_queue> &&queue, int max_samples_per_chunk);
+ 
+ 	/// Handler that gets called when a sample transfer has been completed.
+@@ -302,6 +306,10 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ 	int chunk_granularity_{0};
+ 	/// maximum number of samples buffered
+ 	int max_buffered_{0};
++	/// set when the consumer closes the feed connection (or sends unexpected data)
++	std::atomic<bool> abort_transfer_{false};
++	/// dummy byte for the peer-close detector's pending read
++	char peer_close_byte_{0};
+ 
+ 	// data exchanged between the transfer completion handler and the transfer thread
+ 	/// whether the current transfer has finished (possibly with an error)
+@@ -761,6 +769,8 @@ void client_session::handle_send_feedheader_outcome(
+ 		// convenient for unit tests
+ 		if (max_buffered_ <= 0) return;
+ 
++		abort_on_peer_close(queue);
++
+ 		// determine the maximum chunk size
+ 		int max_samples_per_chunk = std::numeric_limits<int>::max();
+ 		if (chunk_granularity_)
+@@ -777,13 +787,31 @@ void client_session::handle_send_feedheader_outcome(
+ 	}
+ }
+ 
+-void client_session::transfer_samples_thread(std::shared_ptr<client_session> /* keepalive */,
++void client_session::abort_on_peer_close(const std::shared_ptr<consumer_queue> &queue) {
++	// The feed is one-way after the handshake; a completed read means EOF or unexpected data.
++	// Either way the consumer is gone. A weak_ptr keeps the queue from staying registered if the
++	// transfer thread has already exited (e.g. after a failed write).
++	std::weak_ptr<consumer_queue> weak_queue = queue;
++	sock_.async_read_some(asio::buffer(&peer_close_byte_, 1),
++		[shared_this = shared_from_this(), weak_queue](err_t err, std::size_t /*n*/) {
++			if (err == asio::error::operation_aborted) return;
++			shared_this->abort_transfer_.store(true, std::memory_order_release);
++			// Wake through the send buffer rather than pushing here: this runs on an IO thread
++			// and would otherwise be a second producer on the outlet thread's queue.
++			auto q = weak_queue.lock();
++			auto serv = shared_this->serv_.lock();
++			if (q && serv) serv->send_buffer_->wake_consumer(q);
++		});
++}
++
++void client_session::transfer_samples_thread(std::shared_ptr<client_session> keepalive,
+ 	std::shared_ptr<consumer_queue> &&queue, int max_samples_per_chunk) {
+ 	int samples_in_current_chunk = 0;
+-	while (!serv_.expired()) {
++	while (!serv_.expired() && !abort_transfer_.load(std::memory_order_relaxed)) {
+ 		try {
+ 			// get next sample from the sample queue (blocking)
+ 			sample_p samp(queue->pop_sample());
++			if (abort_transfer_.load(std::memory_order_acquire)) break;
+ 
+ 			// ignore blank samples (they are basically wakeup notifiers from someone's
+ 			// end_serving())
+@@ -816,6 +844,12 @@ void client_session::transfer_samples_thread(std::shared_ptr<client_session> /*
+ 			LOG_F(WARNING, "Unexpected glitch in transfer_samples_thread: %s", e.what());
+ 		}
+ 	}
++	// Unregister immediately; cancel the peer-close read so the session can be destroyed.
++	queue.reset();
++	post(*io_, [keepalive]() {
++		asio::error_code ec;
++		keepalive->sock_.cancel(ec);
++	});
+ }
+ 
+ void client_session::handle_chunk_transfer_outcome(err_t err, std::size_t len) {
+diff --git a/testing/CMakeLists.txt b/testing/CMakeLists.txt
+index ae23ed87..c8d58240 100644
+--- a/testing/CMakeLists.txt
++++ b/testing/CMakeLists.txt
+@@ -72,6 +72,7 @@ add_executable(lsl_test_exported
+ 	ext/inlet_open.cpp
+ 	ext/inlet_reopen.cpp
+ 	ext/move.cpp
++	ext/outlet.cpp
+ 	ext/streaminfo.cpp
+ 	ext/sync_outlet.cpp
+ 	ext/time.cpp
+diff --git a/testing/ext/outlet.cpp b/testing/ext/outlet.cpp
+new file mode 100644
+index 00000000..7fb8f2e4
+--- /dev/null
++++ b/testing/ext/outlet.cpp
+@@ -0,0 +1,123 @@
++#include <atomic>
++#include <catch2/catch_all.hpp>
++#include <chrono>
++#include <lsl_cpp.h>
++#include <thread>
++
++// clazy:excludeall=non-pod-global-static
++
++namespace {
++
++bool wait_until_no_consumers(lsl::stream_outlet &outlet, double timeout_sec) {
++	auto deadline =
++		std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_sec);
++	while (outlet.have_consumers() && std::chrono::steady_clock::now() < deadline)
++		std::this_thread::sleep_for(std::chrono::milliseconds(10));
++	return !outlet.have_consumers();
++}
++
++TEST_CASE("have_consumers becomes false after idle inlet disconnects", "[outlet][basic]") {
++	lsl::stream_info info("have_consumers_idle", "Markers", 1, lsl::IRREGULAR_RATE, lsl::cf_int32,
++		"have_consumers_idle");
++	lsl::stream_outlet outlet(info);
++	auto found = lsl::resolve_stream("name", info.name(), 1, 2.0);
++	REQUIRE(found.size() == 1);
++
++	{
++		lsl::stream_inlet inlet(found[0]);
++		inlet.open_stream(2);
++		REQUIRE(outlet.wait_for_consumers(2));
++		REQUIRE(outlet.have_consumers());
++		// Intentionally do not push samples; disconnect must still be detected (#267).
++	}
++
++	CHECK(wait_until_no_consumers(outlet, 2.0));
++}
++
++TEST_CASE("have_consumers becomes false after disconnect during push", "[outlet][basic]") {
++	lsl::stream_info info("have_consumers_busy", "Markers", 1, lsl::IRREGULAR_RATE, lsl::cf_int32,
++		"have_consumers_busy");
++	lsl::stream_outlet outlet(info);
++	auto found = lsl::resolve_stream("name", info.name(), 1, 2.0);
++	REQUIRE(found.size() == 1);
++
++	std::atomic<bool> keep_pushing{true};
++	std::thread pusher([&outlet, &keep_pushing]() {
++		int32_t value = 0;
++		while (keep_pushing.load(std::memory_order_relaxed)) {
++			outlet.push_sample(&value);
++			++value;
++		}
++	});
++	// Stop and join even if open_stream() throws or a REQUIRE aborts the test.
++	struct stop_and_join {
++		std::atomic<bool> &keep_pushing;
++		std::thread &pusher;
++		~stop_and_join() {
++			keep_pushing.store(false, std::memory_order_relaxed);
++			pusher.join();
++		}
++	} pusher_cleanup{keep_pushing, pusher};
++
++	{
++		lsl::stream_inlet inlet(found[0]);
++		inlet.open_stream(2);
++		REQUIRE(outlet.wait_for_consumers(2));
++		REQUIRE(outlet.have_consumers());
++		int32_t received = 0;
++		CHECK(inlet.pull_sample(&received, 1, 1.0) != 0.0);
++		// Destroy the inlet while the outlet thread is still producing.
++		std::this_thread::sleep_for(std::chrono::milliseconds(20));
++	}
++
++	CHECK(wait_until_no_consumers(outlet, 2.0));
++}
++
++TEST_CASE("have_consumers tracks explicit close and reopen", "[outlet][basic]") {
++	lsl::stream_info info("have_consumers_reopen", "Markers", 1, lsl::IRREGULAR_RATE,
++		lsl::cf_int32, "have_consumers_reopen");
++	lsl::stream_outlet outlet(info);
++	auto found = lsl::resolve_stream("name", info.name(), 1, 2.0);
++	REQUIRE(found.size() == 1);
++
++	lsl::stream_inlet inlet(found[0]);
++	for (int cycle = 0; cycle < 3; ++cycle) {
++		CAPTURE(cycle);
++		inlet.open_stream(2);
++		REQUIRE(outlet.wait_for_consumers(2));
++		// close_stream() instead of destroying the inlet; the outlet must notice either way.
++		inlet.close_stream();
++		REQUIRE(wait_until_no_consumers(outlet, 2.0));
++	}
++}
++
++TEST_CASE("have_consumers stays true when one of two inlets disconnects", "[outlet][basic]") {
++	lsl::stream_info info("have_consumers_two", "Markers", 1, lsl::IRREGULAR_RATE, lsl::cf_int32,
++		"have_consumers_two");
++	lsl::stream_outlet outlet(info);
++	auto found = lsl::resolve_stream("name", info.name(), 1, 2.0);
++	REQUIRE(found.size() == 1);
++
++	lsl::stream_inlet keeper(found[0]);
++	keeper.open_stream(2);
++	REQUIRE(outlet.wait_for_consumers(2));
++
++	{
++		lsl::stream_inlet leaver(found[0]);
++		leaver.open_stream(2);
++		REQUIRE(outlet.have_consumers());
++	}
++	std::this_thread::sleep_for(std::chrono::milliseconds(500));
++
++	// Unregistering one consumer must leave the other registered and still fed.
++	CHECK(outlet.have_consumers());
++	int32_t sent = 42, received = 0;
++	outlet.push_sample(&sent);
++	CHECK(keeper.pull_sample(&received, 1, 2.0) != 0.0);
++	CHECK(received == sent);
++
++	keeper.close_stream();
++	CHECK(wait_until_no_consumers(outlet, 2.0));
++}
++
++} // namespace

@@ -1,0 +1,752 @@
+diff --git a/connectomics/decoding/graph.py b/connectomics/decoding/graph.py
+index 5913b6d00..034abbcdf 100644
+--- a/connectomics/decoding/graph.py
++++ b/connectomics/decoding/graph.py
+@@ -234,6 +234,11 @@ def _resolve_inputs(
+ 
+ def _resolve_decoder_kwargs(node: DecodeNode, inputs: Sequence[np.ndarray]) -> dict[str, Any]:
+     kwargs = dict(node.kwargs)
++    # `tag` is reserved for output naming (runtime.output_naming reads it to
++    # replace the auto-generated kwargs slug) and is never a decoder argument.
++    # Without this pop the naming feature is unusable: passing it would reach
++    # the decoder as an unexpected keyword.
++    kwargs.pop("tag", None)
+     for key, value in list(kwargs.items()):
+         if not key.endswith("_channels"):
+             continue
+diff --git a/scripts/prepare_liconn.py b/scripts/prepare_liconn.py
+index c03fc5673..b3975e0e0 100644
+--- a/scripts/prepare_liconn.py
++++ b/scripts/prepare_liconn.py
+@@ -14,6 +14,12 @@
+ 
+ The 270/145 split deliberately leaves at least 138 validation slices, which is
+ the BANIS+ 128-voxel patch plus its 10-voxel trailing target context.
++
++Image and segmentation may live at different scales. ``--segmentation-resolution-xyz``
++selects a coarser segmentation scale, which is then nearest-upsampled by the exact
++integer factor implied by the two resolutions. This exports the 9x9x12 nm image with
++the 18x18x24 nm proofread segmentation as GT (the proofread segmentation has no 9 nm
++scale), at the cost of a label whose boundaries stay quantized to the coarse grid.
+ """
+ 
+ from __future__ import annotations
+@@ -58,6 +64,43 @@ def _exact_scale_index(info: dict, resolution_xyz: Sequence[float]) -> int:
+     return matches[0]
+ 
+ 
++def _upsample_factor_xyz(
++    image_resolution_xyz: Sequence[float],
++    segmentation_resolution_xyz: Sequence[float],
++    image_size_xyz: Sequence[int],
++    segmentation_size_xyz: Sequence[int],
++) -> tuple[int, ...]:
++    """Per-axis integer factor mapping the segmentation grid onto the image grid.
++
++    Requires the resolution ratio to be a whole number on every axis and the source
++    shapes to agree with it under Neuroglancer's ceil-halving convention, so a fine
++    voxel never reads outside the coarse array.
++    """
++    factors = []
++    for axis, (fine_res, coarse_res) in enumerate(
++        zip(image_resolution_xyz, segmentation_resolution_xyz)
++    ):
++        ratio = float(coarse_res) / float(fine_res)
++        factor = int(round(ratio))
++        if factor < 1 or abs(ratio - factor) > 1.0e-6:
++            raise ValueError(
++                f"Segmentation/image resolution ratio on axis {axis} is {ratio}, "
++                "which is not a positive integer; nearest upsampling needs a whole factor."
++            )
++        factors.append(factor)
++
++    for axis, (fine_size, coarse_size, factor) in enumerate(
++        zip(image_size_xyz, segmentation_size_xyz, factors)
++    ):
++        expected = -(-int(fine_size) // factor)
++        if expected != int(coarse_size):
++            raise ValueError(
++                f"Axis {axis}: image size {fine_size} at factor {factor} implies a "
++                f"segmentation size of {expected}, but the source reports {coarse_size}."
++            )
++    return tuple(factors)
++
++
+ def _iter_blocks(
+     shape: Sequence[int], block_shape: Sequence[int]
+ ) -> Iterator[tuple[slice, slice, slice]]:
+@@ -129,6 +172,41 @@ def _read_zyx_block(
+     return np.asarray(array_xyz).transpose(2, 1, 0)
+ 
+ 
++def _read_zyx_block_upsampled(
++    store,
++    block_zyx: tuple[slice, slice, slice],
++    source_offset_zyx: Sequence[int],
++    factor_zyx: Sequence[int],
++) -> np.ndarray:
++    """Read a fine-grid block out of a coarser store by integer nearest upsampling.
++
++    Fine index ``f`` maps to coarse index ``f // factor``. The covering coarse range is
++    read once, repeated ``factor`` times per axis, then trimmed back to the requested
++    fine block, so block boundaries need not align to the coarse grid.
++    """
++    coarse_slices = []
++    trims = []
++    for block, offset, factor in zip(block_zyx, source_offset_zyx, factor_zyx):
++        fine_start = int(block.start) + int(offset)
++        fine_stop = int(block.stop) + int(offset)
++        coarse_start = fine_start // int(factor)
++        coarse_stop = -(-fine_stop // int(factor))
++        coarse_slices.append(slice(coarse_start, coarse_stop))
++        trims.append((fine_start - coarse_start * int(factor), fine_stop - fine_start))
++
++    z_slice, y_slice, x_slice = coarse_slices
++    array_xyz = store[x_slice, y_slice, z_slice, 0].read().result()
++    block_array = np.asarray(array_xyz).transpose(2, 1, 0)
++    for axis, factor in enumerate(factor_zyx):
++        if int(factor) != 1:
++            block_array = np.repeat(block_array, int(factor), axis=axis)
++    return block_array[
++        trims[0][0] : trims[0][0] + trims[0][1],
++        trims[1][0] : trims[1][0] + trims[1][1],
++        trims[2][0] : trims[2][0] + trims[2][1],
++    ]
++
++
+ def _describe_plan(
+     image_path: Path,
+     segmentation_path: Path,
+@@ -139,10 +217,17 @@ def _describe_plan(
+     crop_stop_zyx: Sequence[int],
+     crop_shape_zyx: Sequence[int],
+     split_z: int,
++    segmentation_resolution_xyz: Sequence[float] | None = None,
++    factor_zyx: Sequence[int] | None = None,
+ ) -> None:
+     print(f"Image source:       {image_path}")
+     print(f"Segmentation source:{segmentation_path}")
+     print(f"Resolution XYZ:     {list(resolution_xyz)} nm")
++    if segmentation_resolution_xyz is not None:
++        print(
++            f"Segmentation XYZ:   {list(segmentation_resolution_xyz)} nm "
++            f"(nearest-upsampled by {list(factor_zyx)} ZYX)"
++        )
+     print(f"Source shape ZYX:   {tuple(source_shape_zyx)}")
+     print(
+         "Crop ZYX:           "
+@@ -208,15 +293,18 @@ def prepare(args: argparse.Namespace) -> None:
+ 
+     image_info = _read_info(image_path)
+     segmentation_info = _read_info(segmentation_path)
++    segmentation_resolution_xyz = args.segmentation_resolution_xyz or args.resolution_xyz
+     image_scale_index = _exact_scale_index(image_info, args.resolution_xyz)
+-    segmentation_scale_index = _exact_scale_index(segmentation_info, args.resolution_xyz)
++    segmentation_scale_index = _exact_scale_index(segmentation_info, segmentation_resolution_xyz)
+     image_scale = image_info["scales"][image_scale_index]
+     segmentation_scale = segmentation_info["scales"][segmentation_scale_index]
+-    if image_scale["size"] != segmentation_scale["size"]:
+-        raise ValueError(
+-            "Image/segmentation source shapes differ: "
+-            f"{image_scale['size']} vs {segmentation_scale['size']}."
+-        )
++    factor_xyz = _upsample_factor_xyz(
++        args.resolution_xyz,
++        segmentation_resolution_xyz,
++        image_scale["size"],
++        segmentation_scale["size"],
++    )
++    factor_zyx = tuple(reversed(factor_xyz))
+ 
+     source_shape_zyx = tuple(reversed([int(value) for value in image_scale["size"]]))
+     crop_shape_zyx = _validate_crop(
+@@ -235,6 +323,8 @@ def prepare(args: argparse.Namespace) -> None:
+         args.crop_stop_zyx,
+         crop_shape_zyx,
+         args.split_z,
++        segmentation_resolution_xyz,
++        factor_zyx,
+     )
+     if args.dry_run:
+         return
+@@ -268,6 +358,10 @@ def prepare(args: argparse.Namespace) -> None:
+         "source_crop_start_zyx": [int(value) for value in args.crop_start_zyx],
+         "source_crop_stop_zyx": [int(value) for value in args.crop_stop_zyx],
+         "split_z_in_crop": int(args.split_z),
++        "segmentation_source_resolution_nm_xyz": [
++            float(value) for value in segmentation_resolution_xyz
++        ],
++        "segmentation_upsample_factor_zyx": [int(value) for value in factor_zyx],
+     }
+ 
+     # PyTC currently targets Zarr v2 stores. Explicitly select v2 so the
+@@ -315,7 +409,12 @@ def prepare(args: argparse.Namespace) -> None:
+         )
+         for block in _iter_blocks(local_shape, args.block_shape):
+             image_block = _read_zyx_block(image_store, block, source_offset)
+-            segmentation_block = _read_zyx_block(segmentation_store, block, source_offset)
++            if factor_zyx == (1, 1, 1):
++                segmentation_block = _read_zyx_block(segmentation_store, block, source_offset)
++            else:
++                segmentation_block = _read_zyx_block_upsampled(
++                    segmentation_store, block, source_offset, factor_zyx
++                )
+             image_output[block] = image_block
+             segmentation_output[block] = segmentation_block
+             if args.verify_writes:
+@@ -348,6 +447,17 @@ def parse_args() -> argparse.Namespace:
+         nargs=3,
+         default=[18.0, 18.0, 24.0],
+     )
++    parser.add_argument(
++        "--segmentation-resolution-xyz",
++        type=float,
++        nargs=3,
++        default=None,
++        help=(
++            "Segmentation scale to read, when it differs from --resolution-xyz. "
++            "Must be a whole-number multiple of it; the labels are nearest-upsampled "
++            "onto the image grid. Defaults to --resolution-xyz."
++        ),
++    )
+     parser.add_argument(
+         "--crop-start-zyx",
+         type=int,
+diff --git a/tutorials/neuron_liconn_ist/1_affinity.yaml b/tutorials/neuron_liconn_ist/1_affinity.yaml
+new file mode 100644
+index 000000000..1105a92e4
+--- /dev/null
++++ b/tutorials/neuron_liconn_ist/1_affinity.yaml
+@@ -0,0 +1,64 @@
++# IST LICONN step 1 of 2: EM -> voxel affinity.
++#
++# Train (200k steps, ~2 GPU-days):
++#   python scripts/main.py --config tutorials/neuron_liconn_ist/1_affinity.yaml --mode train
++#
++# Infer the held-out val region:
++#   python scripts/main.py --config tutorials/neuron_liconn_ist/1_affinity.yaml \
++#     --mode test --checkpoint ${params.artifacts.checkpoint}
++#
++# ALREADY DONE. The reference run is
++#   outputs/liconn_final_banis_plus_tube/20260728_032436
++# (200k, exit clean 2026-07-30, val_loss 1.2863 -> 1.0601) and its val affinity
++# already exists at ${params.artifacts.val_affinity_h5} --
++# (3, 145, 4290, 3345) float16, verified non-degenerate. Step 2 consumes that
++# artifact directly; you do not need to re-run this step to reproduce the decode.
++#
++# OUTPUT CONVENTION, and the one thing step 2 depends on:
++#   * arrays are ZYX, so affinity channel c is the edge along array axis c:
++#     ch0 = Z, ch1 = Y, ch2 = X. (Channel c == axis c, NOT 2-ax.)
++#   * `inference.model.channel_activations` is `scale_sigmoid`, i.e. the stored
++#     value is sigmoid(0.2 * logit), NOT the model's probability. The saved array
++#     therefore spans about [0.03, 0.81] and never reaches 0 or 1. Any threshold
++#     read off another dataset's tutorial will be wrong here -- see 2_abiss.yaml.
++
++_base_:
++  - params.yaml
++  - ../neuron_nisb/base_banis+.yaml
++
++experiment_name: liconn_ist_affinity
++description: >-
++  BANIS+ (MedNeXt-L/k3, 6-ch r1+r10 affinity, per-channel BCE, EMA, erosion=2)
++  trained from scratch on the IST LICONN final-proofread volume at
++  18x18x24 nm XYZ. Held-out val is the trailing 145 z-slices.
++
++save_path: ${params.paths.output_root}/affinity
++
++default:
++  data:
++    dataloader:
++      batch_size: 2
++
++train:
++  data:
++    train:
++      path: ${params.data.train}
++      image: data.zarr/img
++      label: data.zarr/seg
++      resolution: ${params.data.resolution_zyx}
++    val:
++      path: ${params.data.val}
++      image: data.zarr/img
++      label: data.zarr/seg
++      resolution: ${params.data.resolution_zyx}
++
++test:
++  data:
++    test:
++      name: liconn_ist_val
++      path: ${params.data.val}
++      image: data.zarr/img
++      # GT is read by step 2's evaluation, not by inference.
++      label: null
++      skeleton: null
++      resolution: ${params.data.resolution_zyx}
+diff --git a/tutorials/neuron_liconn_ist/2_abiss.yaml b/tutorials/neuron_liconn_ist/2_abiss.yaml
+new file mode 100644
+index 000000000..d79aab83f
+--- /dev/null
++++ b/tutorials/neuron_liconn_ist/2_abiss.yaml
+@@ -0,0 +1,134 @@
++# IST LICONN step 2 of 2: affinity -> instance segmentation with ABISS.
++#
++#   python scripts/main.py --config tutorials/neuron_liconn_ist/2_abiss.yaml \
++#     --mode test --checkpoint ${params.artifacts.checkpoint}
++#
++# Input   ${params.artifacts.val_affinity_h5}   step 1's (3,145,4290,3345) float16
++# Output  ${params.paths.output_root}/abiss/    segmentation + metrics
++#
++# The affinity is loaded from disk via `decoding.load_prediction_path`, so this
++# step re-runs the decode without re-running the model.
++#
++# WHY ABISS AND NOT AFFINITY-CC. Measured on MICrONS Pinky, each decoder given its
++# own leave-one-out best threshold: affinity CC 2.03 VOI vs ABISS 1.02, and CC's
++# oracle-merge ceiling (1.94) sat at its own base score -- its errors are false
++# merges baked into the fragments, which no agglomeration can undo. ABISS's
++# watershed produces near-merge-free fragments instead. That is the same failure
++# mode reported for this tissue, so ABISS is the right default here.
++#
++# ############################################################################
++# THRESHOLDS DO NOT TRANSFER FROM THE OTHER ABISS TUTORIALS. READ THIS.
++# ############################################################################
++# Step 1 saves with `inference.model.channel_activations: scale_sigmoid`, i.e.
++# the stored value is sigmoid(0.2 * logit), not the model's probability. Measured
++# on the actual artifact, this val affinity spans about [0.03, 0.81] and NEVER
++# reaches 0.88. Copying `neuron_microns_pinky_abiss.yaml`'s ws_high_threshold of
++# 0.88 would put the seeding threshold ABOVE the data maximum and seed nothing.
++#
++# Two consequences:
++#   * ws_high / ws_low are given as PERCENTILES here, which is invariant to the
++#     compression and to any future change of activation.
++#   * ws_merge_threshold is an ABSOLUTE value in the COMPRESSED space and must be
++#     swept per volume. Mapping Pinky's plain-sigmoid optimum through the same
++#     compression (p -> sigmoid(0.2*logit(p))) suggested 0.50-0.60; the actual
++#     measured optimum on this volume is 0.47, so the mapping was a useful
++#     starting bracket but not a substitute for sweeping.
++#   * `ws_merge_function: max` is invariant under any monotone remap, so the
++#     sweep explores exactly the same family of segmentations as it would on
++#     uncompressed probabilities. `mean` would NOT be -- do not switch it without
++#     first uncompressing.
++
++_base_:
++  - params.yaml
++  - 1_affinity.yaml
++
++experiment_name: liconn_ist_abiss
++description: >-
++  IST LICONN held-out val decoded with the ABISS watershed and max-affinity
++  agglomeration, scored against the proofread FFN segmentation.
++
++save_path: ${params.paths.output_root}/abiss
++
++default:
++  decoding:
++    # Consume the affinity already on disk instead of re-running the model.
++    load_prediction_path: ${params.artifacts.val_affinity_h5}
++    steps:
++      - name: decode_abiss
++        kwargs:
++          # Output-filename tag. WITHOUT THIS the namer slugifies every kwarg
++          # value into the filename -- including the full command string and the
++          # two absolute scratch paths below -- producing a >255-char name and
++          # `OSError: [Errno 36] File name too long` AFTER the decode has already
++          # run (43 min wasted). `tag` replaces the auto-slug entirely.
++          tag: abiss_max047
++          command: >-
++            {python_exe} scripts/run_abiss_volume.py
++            --input {input_h5}
++            --output {output_h5}
++            --abiss-home ${params.paths.repository}/lib/abiss
++            --abiss-workdir ${params.paths.output_root}/abiss/ws_scratch
++          input_dataset: main
++          output_dataset: main
++          # Both scratch paths must live on /projects. ABISS `ws` and the h5
++          # exchange default to tempfile.gettempdir() == node-local /tmp, which
++          # on this cluster is far too small for a 2.08 G-voxel volume (~25 GB
++          # affinity + ~8-16 GB per seg, ~40-50 GB total).
++          workdir: ${params.paths.output_root}/abiss/exchange
++          # This repo stores channel c as the edge along array axis c (z, y, x).
++          # ABISS `ws` reads an (X, Y, Z, C) volume whose channel 0 is the X
++          # edge, so the triplet is reversed.
++          channels: [2, 1, 0]
++          timeout_sec: 21600
++          cli_args:
++            # The `banis` affinity target stores edge (i, i+1) at voxel i; `ws`
++            # reads the value at i as edge (i-1, i). Without this the whole
++            # boundary map lands one voxel off along every axis.
++            edge_storage: source
++            # Percentiles, not absolutes -- see the header block.
++            ws_high_threshold: "94%"
++            ws_low_threshold: "20%"
++            # merge_segments only merges regions under this size, so the stock
++            # 400 would stop agglomeration dead. Raised out of the way so the
++            # affinity criterion is what decides.
++            ws_size_threshold: 10000000
++            ws_dust_threshold: 200
++            # `max` is monotone-invariant; see the header block.
++            ws_merge_function: max
++            # MEASURED on this volume: sweep_merge_threshold.py over 3
++            # disjoint full-Z 1024^2 val slabs. Mean VOI 0.7367 here; the
++            # optimum is FLAT (0.45 -> 0.7388, 0.47 -> 0.7367, 0.49 -> 0.7484,
++            # a 0.012 spread) so anything in 0.45-0.49 is equivalent, but the
++            # cliff below is steep: 0.38 gives merge-VOI 1.19 (catastrophic
++            # over-merge) and 0.41 is already 0.90. Prefer erring high.
++            ws_merge_threshold: 0.47
++
++  evaluation:
++    enabled: true
++    # Dense GT, no skeletons: VOI is the primary threshold-free readout,
++    # adapted_rand a second view, and nerl_oracle_merge gives the merge-only
++    # ceiling that says whether the remaining error is splits or merges.
++    metrics: [voi, adapted_rand, nerl_oracle_merge]
++
++test:
++  data:
++    test:
++      name: liconn_ist_val
++      path: ${params.data.val}
++      image: data.zarr/img
++      # Step 2 DOES read GT -- this is the scoring step.
++      label: data.zarr/seg
++      skeleton: null
++      resolution: ${params.data.resolution_zyx}
++
++# NOTES
++# - Nothing here is fitted to a test skeleton: the val region is held out of
++#   training, and the sweep is scored on it explicitly rather than frozen from
++#   another dataset.
++# - Single-volume ABISS holds the whole affinity in memory
++#   (3 x 145 x 4290 x 3345 float32 ~= 25 GB before ws internals). Validate on a
++#   z-full slab first (README), and use a big-memory node or the chunked runner
++#   scripts/run_abiss_chunk.py for the full volume.
++# - `notes:` cannot be a top-level YAML key here: unlike neuron_j0126/2_abiss.yaml
++#   (consumed by run_abiss_chunk.py), this file is parsed by the strict Config
++#   schema via scripts/main.py, which raises on unknown top-level keys.
+diff --git a/tutorials/neuron_liconn_ist/README.md b/tutorials/neuron_liconn_ist/README.md
+new file mode 100644
+index 000000000..bdb28d405
+--- /dev/null
++++ b/tutorials/neuron_liconn_ist/README.md
+@@ -0,0 +1,159 @@
++# IST LICONN: affinity + conservative ABISS decode
++
++This tutorial turns the IST LICONN `ExPID82_1` volume into a neuron segmentation:
++
++1. Predict voxel affinities.
++2. Decode them with ABISS (conservative watershed + max-affinity agglomeration),
++   scored against the proofread FFN segmentation.
++
++## Which LICONN this is
++
++**The real IST LICONN volume**, FFN-proofread — *not* the simulated NISB liconn
++under `/projects/weilab/dataset/nisb/liconn` that `tutorials/neuron_nisb/liconn_*.yaml`
++uses. None of that volume's numbers (the 0.211 NERL, the erosion ablations, the
++decode-lever retraction) were measured here. Details:
++`pytc-agent/projects/2026_ist_liconn/lessons/lesson_mip0_resolution_gate.md` §0.
++
++| | value |
++|---|---|
++| source | `liconn/ffn/ExPID82_1/image_230130b` + `segmentation/231030_agg_240123` |
++| resolution | **18×18×24 nm XYZ** = `[24, 18, 18]` nm ZYX, image **and** GT |
++| crop ZYX | `[140,240,240] → [555,4530,3585]`, split at z=270 |
++| train / val | `270×4290×3345` / `145×4290×3345` |
++
++The source image has a finer 9×9×12 nm mip0, but the proofread segmentation's
++finest scale *is* 18×18×24, so 18 nm is the ceiling for paired image+GT. A
++higher-resolution variant exists (`tutorials/neuron_nisb/liconn_final_banis+_mip0.yaml`,
++image from mip0 + nearest-upsampled GT) but is not part of this pipeline and has
++not been trained.
++
++## Before running
++
++Edit **only** [params.yaml](params.yaml): repository checkout, dataset root,
++output root, and the existing checkpoint/affinity artifacts. Both step YAMLs
++inherit it, so paths are never duplicated.
++
++`params.paths.repository` must point at the **main checkout**, not a worktree —
++worktrees do not carry `lib/`, and step 2 needs `lib/abiss/build/ws`.
++
++## Step 1 — affinity
++
++```bash
++python scripts/main.py --config tutorials/neuron_liconn_ist/1_affinity.yaml --mode train
++
++python scripts/main.py --config tutorials/neuron_liconn_ist/1_affinity.yaml \
++  --mode test --checkpoint <run>/checkpoints/step=00200000.ckpt
++```
++
++**Already done.** `outputs/liconn_final_banis_plus_tube/20260728_032436` is a
++clean 200k run (val_loss 1.2863 → 1.0601, 2026-07-30) and its val affinity —
++`(3, 145, 4290, 3345)` float16, verified non-degenerate — is what step 2 reads.
++You do not need to re-run step 1 to reproduce the decode.
++
++Two output conventions step 2 depends on:
++
++- Arrays are ZYX, so **channel `c` is the edge along array axis `c`**: ch0=Z, ch1=Y, ch2=X.
++- `channel_activations: scale_sigmoid`, so the stored value is `sigmoid(0.2·logit)`, **not** a probability.
++
++## Step 2 — ABISS decode
++
++```bash
++python scripts/main.py --config tutorials/neuron_liconn_ist/2_abiss.yaml \
++  --mode test --checkpoint <ckpt>
++```
++
++ABISS rather than affinity-CC because CC's errors are false merges baked into
++its fragments, which no agglomeration can undo. On MICrONS Pinky, each decoder
++at its own leave-one-out optimum: CC 2.03 VOI (oracle-merge ceiling 1.94 — i.e.
++nothing recoverable) vs ABISS 1.02 (ceiling 0.90).
++
++### Thresholds do not transfer from the other ABISS tutorials
++
++Because of `scale_sigmoid`, this affinity spans about **[0.03, 0.81]** and never
++reaches 0.88. Copying `neuron_microns_pinky_abiss.yaml`'s `ws_high_threshold: 0.88`
++puts the seeding threshold **above the data maximum** and seeds nothing.
++
++So `ws_high`/`ws_low` are given as **percentiles** (invariant to the compression),
++and `ws_merge_threshold` is absolute in the compressed space and **must be swept
++per volume**. `ws_merge_function: max` is monotone-invariant, so the sweep covers
++exactly the family of segmentations it would on uncompressed probabilities —
++`mean` would not, so do not switch it without uncompressing first.
++
++### Sweeping the merge threshold
++
++```bash
++python tutorials/neuron_liconn_ist/sweep_merge_threshold.py --slabs 3
++```
++
++One watershed per slab, then the merge step repeated per threshold (ABISS batch
++mode), so the sweep costs little more than a single decode. Slabs are **full-Z**
++so GT is truncated only in XY, and GT ids are used as-is — deliberately avoiding
++the re-cc3d-inside-a-small-crop harness that inverted merge-vs-coverage
++comparisons on the NISB liconn volume.
++
++Then set the winning value as `ws_merge_threshold` in
++[2_abiss.yaml](2_abiss.yaml). **Until that sweep has been run the value in the
++YAML is a placeholder, and any number produced with it should not be quoted as
++tuned.**
++
++### Memory
++
++Single-volume ABISS holds the whole affinity in memory: `3 × 145 × 4290 × 3345`
++float32 ≈ 25 GB before `ws` internals. Validate on a slab first; for the full
++val volume use a big-memory node, or the chunked runner
++`scripts/run_abiss_chunk.py` (see `tutorials/neuron_j0126/2_abiss.yaml` for a
++chunked-hierarchy example).
++
++## Results
++
++### Whole val (the real number)
++
++Job 2947912 (ABISS decode, 43 min, peak RSS 147 GB) + 2947953 (scoring, 7 min),
++all 145×4290×3345 = 2.08 G voxels, mt=0.47:
++
++| | VOI ↓ | split | merge | Adapted-Rand err ↓ | pred segs | GT segs |
++|---|---:|---:|---:|---:|---:|---:|
++| **ABISS max, mt 0.47** | **0.9129** | 0.6732 | 0.2397 | 0.3195 | 79,056 | 35,815 |
++
++**The threshold above was tuned on slabs and is probably biased high.** Slabs
++truncate GT in XY, so cross-slab splits go unpenalised: going slab → volume costs
+++0.176 VOI, and **0.149 of that is the split term** (0.524 → 0.673) while merge
++barely moves (0.213 → 0.240). A slab objective therefore under-prices splitting
++and prefers a higher merge threshold than the volume would. Expect the true
++volume optimum at or below 0.45; confirm with a whole-volume batch sweep
++(one watershed, several merge thresholds) before treating 0.47 as final.
++
++### Slab sweep (threshold selection only)
++
++Mean over **3 disjoint full-Z 1024² val slabs**, ABISS max-affinity, `ws_high`/`ws_low`
++at the 94th/20th percentile (resolving to ≈0.72 / ≈0.20, stable across slabs):
++
++| merge thr | VOI ↓ | split | merge | Adapted-Rand err ↓ |
++|---:|---:|---:|---:|---:|
++| 0.38 | 1.5563 | 0.3692 | 1.1872 | 0.7128 |
++| 0.41 | 0.9036 | 0.4298 | 0.4739 | 0.3424 |
++| 0.43 | 0.7842 | 0.4579 | 0.3263 | 0.2582 |
++| 0.45 | 0.7388 | 0.4879 | 0.2508 | 0.2003 |
++| **0.47** | **0.7367** | 0.5238 | 0.2129 | 0.1799 |
++| 0.49 | 0.7484 | 0.5628 | 0.1856 | **0.1731** |
++| 0.52 | 0.8368 | 0.6721 | 0.1647 | 0.2176 |
++
++**Read this before quoting 0.7367 — it is not the volume score; 0.9129 above is.**
++
++- **The optimum is flat, the cliff is not.** 0.45–0.49 spans 0.012 of VOI, so the
++  exact value barely matters; but 0.41 is already 0.90 and 0.38 collapses to 1.56
++  with merge-VOI 1.19. Err high, never low.
++- **Slab VOI ≠ volume VOI.** GT objects are truncated in XY, so cross-slab splits
++  go unpenalised, and the absolute number is slab-size dependent (one 512² slab
++  gave 0.620 at mt=0.45). This is a valid basis for choosing a threshold and for
++  comparing decoders at matched settings — it is *not* the volume score. The
++  full-val number still needs a big-memory node or the chunked runner.
++- **`ws_high`/`ws_low` were not swept**, only mapped through the `scale_sigmoid`
++  compression from Pinky's values. Pinky found that band insensitive on its own
++  data; that has not been verified here.
++- ABISS is **split-dominated at its optimum** (split 0.524 vs merge 0.213), i.e.
++  behaving as the conservative decoder it is configured to be. That is the regime
++  a downstream error-correction step would target.
++
++Neither of the two 200k runs on this volume had ever been decoded or scored
++before this tutorial, so there is no prior number to compare against.
+diff --git a/tutorials/neuron_liconn_ist/params.yaml b/tutorials/neuron_liconn_ist/params.yaml
+new file mode 100644
+index 000000000..72ac31c94
+--- /dev/null
++++ b/tutorials/neuron_liconn_ist/params.yaml
+@@ -0,0 +1,34 @@
++# IST LICONN (final_proofread) local settings ---------------------------------
++#
++# This is the only file that should need editing for a new machine or storage
++# layout. Every step YAML inherits it and uses ${params...} references, so paths
++# are never duplicated across the workflow.
++#
++# NOTE ON WHICH LICONN THIS IS. This tutorial is the REAL IST LICONN volume
++# (ExPID82_1, FFN-proofread). It is NOT the simulated NISB liconn under
++# /projects/weilab/dataset/nisb/liconn that tutorials/neuron_nisb/liconn_*.yaml
++# and the 0.211 NERL number refer to. See
++# pytc-agent/projects/2026_ist_liconn/lessons/lesson_mip0_resolution_gate.md §0.
++
++params:
++  paths:
++    # Repository checkout that contains this tutorial AND the vendored ABISS
++    # build (lib/abiss/build/ws). Worktrees do not carry lib/, so this must
++    # point at the main checkout even when running from a worktree.
++    repository: /projects/weilab/weidf/lib/pytorch_connectomics
++    output_root: ${params.paths.repository}/outputs/neuron_liconn_ist
++    dataset_root: /projects/weilab/dataset/liconn/pytc
++
++  data:
++    # 18x18x24 nm XYZ = [24, 18, 18] nm ZYX. Both img and seg. This is the
++    # finest scale at which the proofread FFN segmentation exists.
++    train: ${params.paths.dataset_root}/final_proofread/train
++    val: ${params.paths.dataset_root}/final_proofread/val
++    resolution_zyx: [24, 18, 18]
++
++  artifacts:
++    # Existing 200k banis+ checkpoint trained on this volume at 18 nm.
++    checkpoint: ${params.paths.repository}/outputs/liconn_final_banis_plus_tube/20260728_032436/checkpoints/step=00200000.ckpt
++    # Its val affinity, already computed: (3, 145, 4290, 3345) float16, ZYX
++    # channel order, scale_sigmoid-compressed (see 2_abiss.yaml).
++    val_affinity_h5: ${params.paths.repository}/outputs/liconn_final_banis_plus_tube/20260728_032436/test_step=00200000/val/raw_x1_ch0-1-2.h5
+diff --git a/tutorials/neuron_liconn_ist/sweep_merge_threshold.py b/tutorials/neuron_liconn_ist/sweep_merge_threshold.py
+new file mode 100644
+index 000000000..f1b8a0fb9
+--- /dev/null
++++ b/tutorials/neuron_liconn_ist/sweep_merge_threshold.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""ABISS merge-threshold sweep on IST LICONN val slabs, scored with VOI.
++
++One watershed per slab, then the merge step repeated per threshold (ABISS batch
++mode), so the sweep costs barely more than a single decode.
++
++Slabs are FULL-Z (145) so GT objects are only truncated in XY; the crop-eval
++trap that inverted merge-vs-coverage comparisons on the NISB liconn volume came
++from re-cc3d'ing GT inside a small 3D crop, which is not done here -- GT ids are
++taken as-is from the proofread volume.
++
++    python tutorials/neuron_liconn_ist/sweep_merge_threshold.py --slabs 3
++"""
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import sys
++from pathlib import Path
++
++import numpy as np
++
++REPO = Path(__file__).resolve().parents[2]  # repo root (tutorials/<name>/<file>)
++MAIN_REPO = Path("/projects/weilab/weidf/lib/pytorch_connectomics")
++sys.path.insert(0, str(REPO))
++
++AFF = MAIN_REPO / "outputs/liconn_final_banis_plus_tube/20260728_032436/test_step=00200000/val/raw_x1_ch0-1-2.h5"
++GT = "/projects/weilab/dataset/liconn/pytc/final_proofread/val/data.zarr/seg"
++WS = MAIN_REPO / "lib/abiss/build/ws"
++
++
++def _load_runner():
++    spec = importlib.util.spec_from_file_location("rav", REPO / "scripts/run_abiss_volume.py")
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--slabs", type=int, default=3)
++    ap.add_argument("--size", type=int, default=1024)
++    ap.add_argument("--ws-high", default="94%")
++    ap.add_argument("--ws-low", default="20%")
++    ap.add_argument(
++        "--merge-thresholds",
++        default="0.40,0.45,0.50,0.53,0.56,0.59,0.62,0.66,0.70",
++    )
++    args = ap.parse_args()
++
++    import h5py
++    import zarr
++    from connectomics.metrics.segmentation_numpy import adapted_rand, voi
++
++    rav = _load_runner()
++    mts = [float(v) for v in args.merge_thresholds.split(",")]
++    S = args.size
++
++    # Disjoint full-z slabs spread across the val face.
++    origins = [(600, 600), (2000, 1600), (3200, 800), (1200, 2200), (2600, 2400)][: args.slabs]
++
++    gt_store = zarr.open(GT, mode="r")
++    rows = []
++    for si, (y0, x0) in enumerate(origins):
++        with h5py.File(AFF, "r") as f:
++            aff = np.asarray(f["main"][:, :, y0 : y0 + S, x0 : x0 + S]).astype(np.float32)
++        gt = np.asarray(gt_store[:, y0 : y0 + S, x0 : x0 + S])
++        hi = rav._resolve_threshold(args.ws_high, aff, "ws_high")
++        lo = rav._resolve_threshold(args.ws_low, aff, "ws_low")
++        print(
++            f"[slab {si}] y0={y0} x0={x0} aff{aff.shape} "
++            f"range=[{aff.min():.3f},{aff.max():.3f}] ws_high={hi:.4f} ws_low={lo:.4f} "
++            f"gt_ids={len(np.unique(gt))}",
++            flush=True,
++        )
++        segs = rav._run_abiss_ws(
++            aff,
++            ws_binary=WS,
++            ws_high_threshold=hi,
++            ws_low_threshold=lo,
++            ws_size_threshold=10_000_000,
++            ws_dust_threshold=200,
++            boundary_flags=[1, 1, 1, 1, 1, 1],
++            offset=0,
++            channels=[2, 1, 0],
++            ws_merge_thresholds=mts,
++            ws_merge_function="max",
++            edge_storage="source",
++        )
++        for mt in mts:
++            seg = segs[round(mt, 10)]
++            vs, vm = voi(seg, gt)
++            ar = adapted_rand(seg, gt)
++            rows.append((si, mt, vs, vm, vs + vm, ar, int(seg.max())))
++            print(
++                f"   mt={mt:.2f}  VOI={vs + vm:.4f} (split {vs:.4f} / merge {vm:.4f})  "
++                f"ARerr={ar:.4f}  nseg={int(seg.max())}",
++                flush=True,
++            )
++
++    print("\n=== mean over slabs ===")
++    print(f"{'mt':>6} {'VOI':>8} {'split':>8} {'merge':>8} {'ARerr':>8}")
++    best = None
++    for mt in mts:
++        sel = [r for r in rows if r[1] == mt]
++        v = float(np.mean([r[4] for r in sel]))
++        s = float(np.mean([r[2] for r in sel]))
++        m = float(np.mean([r[3] for r in sel]))
++        a = float(np.mean([r[5] for r in sel]))
++        print(f"{mt:6.2f} {v:8.4f} {s:8.4f} {m:8.4f} {a:8.4f}")
++        if best is None or v < best[1]:
++            best = (mt, v)
++    print(f"\nbest mean VOI: mt={best[0]:.2f} -> {best[1]:.4f}")
++
++
++if __name__ == "__main__":
++    main()

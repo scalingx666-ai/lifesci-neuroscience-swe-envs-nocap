@@ -1,0 +1,41 @@
+# Issue
+
+**Title:** Use SWC GIN with http fallback
+
+## Description
+
+Before submitting a pull request (PR), please read the [contributing guide](https://github.com/brainglobe/.github/blob/main/CONTRIBUTING.md).
+
+Please fill out as much of this template as you can, but if you have any problems or questions, just leave a comment and we will help out :)
+
+## Description
+
+**What is this PR**
+
+- [ ] Bug fix
+- [ ] Addition of a new feature
+- [x] Other
+
+**Why is this PR needed?**
+GIN has become quite unreliable when queried from CI.
+
+**What does this PR do?**
+Use SWC GIN to host the data. Adds a try/except to switch between http and https (only on URLs that point to GIN, otherwise, fail loudly).
+
+## How has this PR been tested?
+Tested locally
+
+## Is this a breaking change?
+No
+
+## Does this PR require an update to the documentation?
+No
+
+## Checklist:
+
+- [x] The code has been tested locally
+- [x] The code has been formatted with [pre-commit](https://pre-commit.com/)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `5aa244a59f96`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

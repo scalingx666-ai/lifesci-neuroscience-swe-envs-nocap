@@ -1,0 +1,271 @@
+diff --git a/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.cu.cc b/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.cu.cc
+index 7fad5b32..a9dcbdfd 100644
+--- a/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.cu.cc
++++ b/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.cu.cc
+@@ -448,12 +448,6 @@ __global__ void CsrSpikeForwardFixed4Kernel(
+     const int post = static_cast<int>(
+         index - static_cast<int64_t>(batch) * n_post);
+     float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+-    if (initial != nullptr) {
+-#pragma unroll
+-      for (int receptor = 0; receptor < 4; ++receptor) {
+-        sums[receptor] = ToFloat(initial[index * 4 + receptor]);
+-      }
+-    }
+ #pragma unroll
+     for (int offset = 0; offset < 4; ++offset) {
+       const int64_t incoming = static_cast<int64_t>(post) * 4 + offset;
+@@ -479,11 +473,23 @@ __global__ void CsrSpikeForwardFixed4Kernel(
+     }
+ #pragma unroll
+     for (int receptor = 0; receptor < 4; ++receptor) {
+-      currents[index * 4 + receptor] = FromFloat<T>(sums[receptor]);
++      const int64_t output = index * 4 + receptor;
++      const T projected = FromFloat<T>(sums[receptor]);
++      currents[output] = initial == nullptr ? projected :
++          FromFloat<T>(ToFloat(initial[output]) + ToFloat(projected));
+     }
+   }
+ }
+ 
++template <typename T>
++__global__ void AddInitialCurrentsKernel(
++    int64_t count, const T* initial, T* currents) {
++  for (int64_t index : GpuGridRangeX(count)) {
++    currents[index] = FromFloat<T>(
++        ToFloat(initial[index]) + ToFloat(currents[index]));
++  }
++}
++
+ template <typename T, typename Index>
+ __global__ void CsrSpikeGradKernel(
+     int count, int n_pre, int n_post, int n_basis, const T* spikes,
+@@ -1556,10 +1562,14 @@ class DpointnetCsrSpikeForwardOp : public OpKernel {
+     const Index* synapse_types = metadata_values + n_edges_;
+     const Index* row_splits = metadata_values + 2 * n_edges_;
+     Tensor* currents = nullptr;
+-    OP_REQUIRES_OK(
+-        context,
+-      context->forward_input_or_allocate_output(
+-        {10}, 0, output_shape, &currents));
++    if (use_fixed4_forward_) {
++      OP_REQUIRES_OK(
++          context,
++          context->forward_input_or_allocate_output(
++              {10}, 0, output_shape, &currents));
++    } else {
++      OP_REQUIRES_OK(context, context->allocate_output(0, output_shape, &currents));
++    }
+     const GPUDevice& device = context->eigen_device<GPUDevice>();
+     const int64_t output_count = currents->NumElements();
+     if (vjp_only_) {
+@@ -1589,17 +1599,7 @@ class DpointnetCsrSpikeForwardOp : public OpKernel {
+               currents->flat<T>().data()));
+       return;
+     }
+-    if (initial.NumElements() > 0 &&
+-        currents->flat<T>().data() != initial.flat<T>().data()) {
+-      OP_REQUIRES(
+-        context,
+-        cudaMemcpyAsync(
+-          currents->flat<T>().data(), initial.flat<T>().data(),
+-          output_count * sizeof(T), cudaMemcpyDeviceToDevice,
+-          device.stream()) == cudaSuccess,
+-        errors::Internal("Failed to copy initial current buffer."));
+-    }
+-    if (initial.NumElements() == 0) {
++    {
+       constexpr int zero_threads = 256;
+       OP_REQUIRES_OK(
+         context,
+@@ -1707,6 +1707,16 @@ class DpointnetCsrSpikeForwardOp : public OpKernel {
+               weights.flat<T>().data(), synapse_types, basis.flat<T>().data(),
+               row_splits, currents->flat<T>().data()));
+     }
++    if (initial.NumElements() > 0) {
++      constexpr int threads = 256;
++      OP_REQUIRES_OK(
++          context,
++          GpuLaunchKernel(
++              AddInitialCurrentsKernel<T>,
++              BlockCountFor(output_count, threads, device), threads, 0,
++              device.stream(), output_count, initial.flat<T>().data(),
++              currents->flat<T>().data()));
++    }
+   }
+ 
+  private:
+diff --git a/docs/autodocs/source/dpointnet_development.rst b/docs/autodocs/source/dpointnet_development.rst
+index e0ba38e5..81aaa40c 100644
+--- a/docs/autodocs/source/dpointnet_development.rst
++++ b/docs/autodocs/source/dpointnet_development.rst
+@@ -86,6 +86,29 @@ External custom runners must wire their input and recurrent carrier surfaces.
+ Explicit packed/small-batch FP16 backward requests are incompatible with the
+ FP32 temporal route.
+ 
++Current accumulation and numerical boundaries
++---------------------------------------------
++
++``fused_spike_currents(initial_currents=...)`` rounds the standalone projection
++to the compute dtype before adding the initial current once. Do not seed the
++projection's atomic accumulator or fixed-four reduction with the initial
++current: that reassociates every synaptic addition with the baseline, can
++absorb small contributions, and changes threshold crossings even in FP32.
++The fixed-four route may forward its initial buffer because each thread reads
++and writes only its own output elements. Atomic projection routes retain a
++separate output until projection completes, then add the initial current on
++the same TensorFlow device stream. The initial-current VJP is the identity;
++spike and canonical weight VJPs are unchanged.
++
++This rounding boundary does not make atomic projection deterministic or
++make differently grouped sums of multiple projections bitwise equivalent.
++Tiny current differences can amplify through recurrent spike thresholds.
++Validate per-neuron counts and states, not only aggregate spike totals;
++capture forward results before backward/update when diagnosing divergence.
++For checkpoint replay requirements, retain the recorded-primal guidance above.
++``use_fused_current_accumulation`` concerns forward currents and is independent
++of ``use_fused_recurrent_accumulation``, the recurrent weight-gradient carrier.
++
+ Online loss channels
+ --------------------
+ 
+diff --git a/tests/simulator/dpointnet/test_current_accumulation_rounding.py b/tests/simulator/dpointnet/test_current_accumulation_rounding.py
+new file mode 100644
+index 00000000..667bf9b4
+--- /dev/null
++++ b/tests/simulator/dpointnet/test_current_accumulation_rounding.py
+@@ -0,0 +1,134 @@
++import numpy as np
++import pytest
++import tensorflow as tf
++
++from bmtk.simulator.dpointnet.custom_ops.csr_spike_ops import (
++    build_csr_connectivity,
++    fused_cuda_available,
++    fused_spike_currents,
++    reorder_csr_values,
++)
++
++
++@pytest.mark.skipif(not fused_cuda_available(), reason="Fused CUDA op is unavailable.")
++@pytest.mark.parametrize("batch", [1, 4, 16, 32])
++@pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
++@pytest.mark.parametrize("route", ["ordinary", "fixed4", "active", "queue", "queue_runs"])
++@pytest.mark.parametrize("compiled", [False, True])
++def test_accumulation_rounds_projection_before_adding_initial(batch, dtype, route, compiled):
++    indices = np.array([[post, pre] for pre in range(4) for post in range(3)])
++    types = np.zeros(len(indices), np.int64)
++    connectivity = build_csr_connectivity(
++        indices, types, 4, 3, 1, build_fixed4_incoming=True, sort_by_target=True)
++    master = tf.Variable(np.ones(len(indices)), dtype=tf.float32)
++    weights = reorder_csr_values(tf.cast(master, dtype), connectivity)
++    basis = tf.constant([[1., .5, .25, .125]], dtype)
++    scale = 2048. if dtype == tf.float16 else 16777216.
++    initial = tf.Variable(tf.fill((batch * 3, 4), tf.cast(scale, dtype)))
++    activity = tf.Variable(
++        np.repeat([[1., 1., 1., 1.]], batch, axis=0), dtype=dtype)
++    options = dict(
++        use_fixed4_forward=route == "fixed4",
++        use_active_row_forward=route == "active",
++        use_device_active_queue_forward=route in ("queue", "queue_runs"),
++        use_forward_run_aggregation=route == "queue_runs",
++    )
++
++    def evaluate(spikes, baseline):
++        with tf.GradientTape() as tape:
++            tape.watch((spikes, baseline))
++            projected = fused_spike_currents(
++                spikes, master, weights, connectivity, basis, 3,
++                compute_spike_gradient=True, **options)
++            accumulated = fused_spike_currents(
++                spikes, master, weights, connectivity, basis, 3,
++                compute_spike_gradient=True, initial_currents=baseline, **options)
++            loss = tf.reduce_sum(tf.cast(accumulated, tf.float32))
++        gradients = tape.gradient(loss, (spikes, master, baseline))
++        return accumulated, baseline + projected, gradients
++
++    run = tf.function(evaluate) if compiled else evaluate
++    for _ in range(3):
++        accumulated, reference, gradients = run(activity, initial)
++        np.testing.assert_array_equal(accumulated, reference)
++        np.testing.assert_array_equal(initial, np.full((batch * 3, 4), scale))
++        np.testing.assert_array_equal(gradients[0], np.full((batch, 4), 3 * 1.875))
++        np.testing.assert_array_equal(gradients[1], np.full(len(indices), batch * 1.875))
++        np.testing.assert_array_equal(gradients[2], np.ones((batch * 3, 4)))
++
++
++@pytest.mark.skipif(not fused_cuda_available(), reason="Fused CUDA op is unavailable.")
++@pytest.mark.parametrize("batch", [1, 4, 16, 32])
++@pytest.mark.parametrize("compiled", [False, True])
++def test_fixed4_fp16_cancellation_rounds_projection_first(batch, compiled):
++    indices = np.array([[post, pre] for pre in range(4) for post in range(3)])
++    connectivity = build_csr_connectivity(
++        indices, np.zeros(len(indices), np.int64), 4, 3, 1,
++        build_fixed4_incoming=True, sort_by_target=True)
++    master = tf.constant(np.repeat([1., 2.**-11, 0., 0.], 3), tf.float32)
++    weights = reorder_csr_values(tf.cast(master, tf.float16), connectivity)
++    basis = tf.ones((1, 4), tf.float16)
++    activity = tf.ones((batch, 4), tf.float16)
++    initial = tf.Variable(-tf.ones((batch * 3, 4), tf.float16))
++
++    # The FP16 tie rounds to 1; cancelling in FP32 before that cast leaves 2**-11.
++    projection = np.float32(1.) + np.float32(2.**-11)
++    assert np.float16(projection) == np.float16(1.)
++    assert np.float16(projection - np.float32(1.)) == np.float16(2.**-11)
++
++    def evaluate(spikes, baseline):
++        projected = fused_spike_currents(
++            spikes, master, weights, connectivity, basis, 3,
++            compute_spike_gradient=True, use_fixed4_forward=True)
++        accumulated = fused_spike_currents(
++            spikes, master, weights, connectivity, basis, 3,
++            compute_spike_gradient=True, use_fixed4_forward=True, initial_currents=baseline)
++        return projected, accumulated
++
++    run = tf.function(evaluate) if compiled else evaluate
++    for _ in range(3):
++        projected, accumulated = run(activity, initial)
++        np.testing.assert_array_equal(projected, np.ones((batch * 3, 4), np.float16))
++        np.testing.assert_array_equal(
++            accumulated, np.zeros((batch * 3, 4), np.float16),
++            err_msg="FP16 projection must round before baseline cancellation")
++        np.testing.assert_array_equal(initial, -np.ones((batch * 3, 4), np.float16))
++
++
++@pytest.mark.skipif(not fused_cuda_available(), reason="Fused CUDA op is unavailable.")
++@pytest.mark.parametrize("batch", [1, 4, 16, 32])
++@pytest.mark.parametrize("route", ["ordinary", "fixed4", "queue"])
++def test_distinct_counted_inputs_accumulation_and_checkpoint_vjp(batch, route):
++    indices = np.array([[post, pre] for pre in range(4) for post in range(3)])
++    connectivity = build_csr_connectivity(
++        indices, np.zeros(len(indices), np.int64), 4, 3, 1,
++        build_fixed4_incoming=True, sort_by_target=True)
++    master = tf.Variable(np.arange(1, len(indices) + 1), dtype=tf.float32)
++    weights = reorder_csr_values(master, connectivity)
++    basis = tf.constant([[1., .5, .25, .125]], tf.float32)
++    spikes = tf.constant(np.arange(batch * 4).reshape(batch, 4) % 5, tf.float32)
++    initial = tf.constant(np.arange(batch * 3 * 4).reshape(batch * 3, 4), tf.float32)
++    options = dict(use_fixed4_forward=route == "fixed4",
++                   use_device_active_queue_forward=route == "queue")
++
++    def operation(x, baseline):
++        return fused_spike_currents(
++            x, master, weights, connectivity, basis, 3,
++            compute_spike_gradient=True, initial_currents=baseline, **options)
++
++    @tf.function
++    def evaluate(recompute):
++        with tf.GradientTape() as tape:
++            tape.watch((spikes, initial))
++            result = tf.recompute_grad(operation)(spikes, initial) if recompute else operation(spikes, initial)
++            loss = tf.reduce_sum(result)
++        return result, tape.gradient(loss, (spikes, master, initial))
++
++    expected = initial.numpy().reshape(batch, 3, 4).astype(np.float64)
++    for edge, (post, pre) in enumerate(indices):
++        expected[:, post] += spikes.numpy()[:, pre, None] * master.numpy()[edge] * basis.numpy()[0]
++    ordinary = evaluate(False)
++    replay = evaluate(True)
++    np.testing.assert_array_equal(ordinary[0], expected.reshape(batch * 3, 4))
++    for actual, reference in zip(tf.nest.flatten(replay), tf.nest.flatten(ordinary)):
++        np.testing.assert_array_equal(actual, reference)

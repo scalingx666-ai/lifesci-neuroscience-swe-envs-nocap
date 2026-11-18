@@ -1,0 +1,13 @@
+# Issue
+
+**Title:** refactor: remove vert loops
+
+## Description
+
+Possible speedup but mainly cleaner code. Removes multiple
+complicated loops in favor of a single expression. Luckily,
+this expression is now lazily executed as well.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `62ec9e7f832e`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

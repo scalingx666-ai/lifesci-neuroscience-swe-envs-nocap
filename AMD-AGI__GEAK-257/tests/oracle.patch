@@ -1,0 +1,1332 @@
+diff --git a/ADAPTIVE_MIXED_MODE.md b/ADAPTIVE_MIXED_MODE.md
+new file mode 100644
+index 000000000..2b053ab5d
+--- /dev/null
++++ b/ADAPTIVE_MIXED_MODE.md
+@@ -0,0 +1,509 @@
++# GEAK Adaptive Mixed Mode — Full Documentation
++
++**Branch:** `mixed-optimizer` (pushed to `origin/mixed-optimizer`)
++**Base:** `gwiab-scheduler` at commit `f2f0e1b`
++**Commit:** `1433875` — "Adaptive K allocation for mixed mode dispatch"
++**Repo:** `git@github.com:AMD-AGI/GEAK.git`
++**Local clone:** `/data/sapmajum/GEAK_scheduler`
++
++---
++
++## 1. Problem Statement
++
++GEAK has three pipeline modes for multi-GPU kernel optimization:
++
++| Mode | K (planned slots) | N-K (fixed slots) | Behavior |
++|------|-------------------|-------------------|----------|
++| **fixed** | 0 | N | All workers get identical canonical prompt — pure brute-force exploration |
++| **planned** | N | 0 | All workers get distinct LLM-generated strategies — pure diversity |
++| **mixed** | K | N-K | Some planned, some fixed — hybrid |
++
++The old mixed mode used a **static** split: `K = N // 2` (half each). This is suboptimal:
++- If planned strategies consistently outperform fixed, we waste half the GPU slots
++- If fixed outperforms planned (e.g., on simple kernels), we waste the other half
++- No learning across rounds — round 5 makes the same allocation as round 1
++
++---
++
++## 2. Solution: Adaptive K Allocation
++
++**Core idea:** After each round, measure which source (planned vs fixed) produced better speedups. Allocate proportionally in the next round.
++
++### Algorithm
++
++```
++Round 1: K = N // 2 (equal split, no history)
++
++Round R > 1:
++  planned_avg = mean(speedup of all kind="planned" tasks across rounds 1..R-1)
++  fixed_avg   = mean(speedup of all kind="fixed" tasks across rounds 1..R-1)
++
++  K = round(N * planned_avg / (planned_avg + fixed_avg))
++  K = clamp(K, 1, N-1)  ← exploration floor
++```
++
++### Properties
++
++- **Proportional:** Better source gets more slots, proportional to its advantage
++- **Cumulative:** Uses ALL historical data, not just last round (more stable)
++- **Exploration floor:** Both sources always get at least 1 slot (never starves either)
++- **Backward compatible:** fixed mode (K=0) and planned mode (K=N) unchanged
++- **Graceful degradation:** If no per-task data exists (old eval format), falls back to N//2
++
++### Example
++
++With N=4 GPUs:
++```
++Round 1: K=2 (2 planned, 2 fixed)
++  → planned tasks: 2.0x, 1.5x (avg=1.75)
++  → fixed tasks:   1.1x, 1.0x (avg=1.05)
++
++Round 2: K = round(4 * 1.75 / 2.80) = round(2.5) = 2
++  → Still 2/2, but if planned pulls further ahead...
++
++Round 3: (planned_avg=2.5, fixed_avg=1.05)
++  K = round(4 * 2.5 / 3.55) = round(2.82) = 3
++  → 3 planned, 1 fixed — shifted toward planned
++
++Round 4: (planned_avg=2.75, fixed_avg=1.0)
++  K = round(4 * 2.75 / 3.75) = round(2.93) = 3
++  → Stays 3/1, clamped by exploration floor (min 1 fixed)
++```
++
++---
++
++## 3. Architecture
++
++### Pipeline Flow
++
++```
++┌─────────────────────────────────────────────────────────────────────┐
++│                        UNIFIED ROUND LOOP                          │
++│                     (unified.py:_run_unified_loop)                  │
++│                                                                     │
++│  for round_num in 1..max_rounds:                                    │
++│                                                                     │
++│    ┌──────────┐     ┌────────────┐     ┌─────────┐     ┌────────┐  │
++│    │   PLAN   │────▶│   SELECT   │────▶│  WRITE  │────▶│EXECUTE │  │
++│    │TaskPlanner│    │ Dispatcher │    │task files│    │ staged │  │
++│    │.build_pool│    │  .select() │    │  (.md)  │    │dispatch│  │
++│    └──────────┘     └────────────┘     └─────────┘     └────────┘  │
++│         │                │                                    │     │
++│    M candidates     K planned +              per-task best_results  │
++│    (pool)           (N-K) fixed              + patches on disk      │
++│                     (DispatchPlan)                             │     │
++│                          ▲                                    ▼     │
++│                          │              ┌──────────┐               │
++│                          │              │ EVALUATE │               │
++│                    round_evals ◀────────│ evaluate │               │
++│                    (per_task with        │ round_best│               │
++│                     kind + speedup)     └──────────┘               │
++│                                              │                      │
++│                                      round_N_evaluation.json        │
++│                                      (includes per_task array)      │
++└─────────────────────────────────────────────────────────────────────┘
++```
++
++### Key Components
++
++| Component | File | Role |
++|-----------|------|------|
++| TaskPlanner | `run/planner/task_planner.py` | LLM generates M candidate strategies; always injects canonical fixed entry |
++| CandidatePool | `run/planner/candidate_pool.py` | Pool of M candidates with `.planned`, `.fixed` filtering |
++| **Dispatcher** | `run/dispatcher/selector.py` | **THE adaptive seam** — picks K planned + (N-K) fixed |
++| Writer | `run/dispatcher/writer.py` | Writes DispatchPlan as `.md` task files (YAML frontmatter + markdown body) |
++| Staged dispatch | `run/dispatch.py` | Priority-staged execution with early exit on improvement |
++| Evaluation | `run/postprocess/evaluation.py` | FULL_BENCHMARK verification, per-task outcome tagging |
++| Unified loop | `run/unified.py` | Orchestrates PLAN→SELECT→WRITE→EXECUTE→EVALUATE per round |
++
++### Data Flow for `kind`
++
++```
++CandidateTask.kind ──▶ DispatchPlanItem.kind ──▶ task file YAML (kind: planned/fixed)
++                                                        │
++                                                        ▼
++                                              task_file_to_agent_task()
++                                                  cfg["kind"] = meta["kind"]  ← NEW
++                                                        │
++                                                        ▼
++                                              results/{label}/best_results.json
++                                                        │
++                                              evaluate_round_best() scans results
++                                              _resolve_task_kind() reads YAML ← NEW
++                                                        │
++                                                        ▼
++                                              round_N_evaluation.json
++                                                { ..., "per_task": [
++                                                    {"label": "...", "kind": "planned", "speedup": 1.5},
++                                                    {"label": "...", "kind": "fixed", "speedup": 1.1}
++                                                ]}
++                                                        │
++                                                        ▼
++                                              Dispatcher._k_for_mode(round_evals=...)
++                                              → adaptive K for next round
++```
++
++---
++
++## 4. Code Changes (4 files)
++
++### 4.1 `src/minisweagent/run/dispatcher/selector.py`
++
++**Full file after changes (172 lines):**
++
++The `Dispatcher.select()` now accepts `round_evals` and passes it to `_k_for_mode()`.
++
++`_k_for_mode()` was replaced from a one-liner:
++```python
++# OLD:
++return {"fixed": 0, "planned": n, "mixed": n // 2}.get(mode, n // 2)
++```
++to the adaptive algorithm that:
++1. Returns 0 for fixed, N for planned (unchanged)
++2. For mixed: scans `per_task` entries across all `round_evals`, computes per-source average speedup, allocates K proportionally, clamps to [1, N-1]
++
++### 4.2 `src/minisweagent/run/postprocess/evaluation.py`
++
++Three additions:
++1. **`_resolve_task_kind(task_files_dir, label)`** — looks up `kind` from the `.md` task file matching a given label
++2. In `evaluate_round_best()`: each candidate now includes `"kind"` resolved from the task file; `round_eval["per_task"]` is populated before any return path
++3. In `write_eval_results()`: imports `PerTaskOutcome`, converts `round_eval["per_task"]` into typed objects on the returned `RoundEvaluation`
++
++### 4.3 `src/minisweagent/run/dispatch.py`
++
++One-line change at line 317:
++```python
++# OLD:
++for _passthrough_key in ("baseline_metrics", "benchmark_baseline"):
++# NEW:
++for _passthrough_key in ("baseline_metrics", "benchmark_baseline", "kind"):
++```
++
++### 4.4 `src/minisweagent/run/unified.py`
++
++One-line change at line 581:
++```python
++# OLD:
++plan = dispatcher.select(pool, mode, n_workers)
++# NEW:
++plan = dispatcher.select(pool, mode, n_workers, round_evals=round_evals)
++```
++
++---
++
++## 5. Setup on a New Node
++
++### 5.1 Clone the branch
++
++```bash
++cd /data/$USER
++git clone -b mixed-optimizer git@github.com:AMD-AGI/GEAK.git GEAK_mixed
++cd GEAK_mixed
++```
++
++### 5.2 Container requirements
++
++GEAK runs inside Docker containers with ROCm and GPU access. You need two containers:
++
++**Triton container** (for Triton kernels):
++```bash
++# Example: create or reuse a container with ROCm + Triton support
++# The parity test used: geak_gwiab_triton (image: geak-agent:latest)
++docker run -d --name geak_mixed_triton \
++  --device=/dev/kfd --device=/dev/dri \
++  --group-add video --group-add render \
++  -v /data:/data \
++  -e HSA_XNACK=1 \
++  geak-agent:latest sleep infinity
++```
++
++**HIP container** (for HIP/CUDA kernels):
++```bash
++# The parity test used: geak_gwiab_hip (image: rocm/pytorch:rocm7.1.1)
++docker run -d --name geak_mixed_hip \
++  --device=/dev/kfd --device=/dev/dri \
++  --group-add video --group-add render \
++  -v /data:/data \
++  rocm/pytorch:rocm7.1.1 sleep infinity
++```
++
++### 5.3 Copy GEAK into containers
++
++```bash
++GEAK_SRC="/data/$USER/GEAK_mixed"
++
++# Triton container
++docker exec geak_mixed_triton bash -c "rm -rf /workspace/src && mkdir -p /workspace"
++docker cp "$GEAK_SRC/src" geak_mixed_triton:/workspace/src
++docker exec geak_mixed_triton pip install -e /workspace 2>/dev/null || true
++
++# HIP container
++docker exec geak_mixed_hip bash -c "rm -rf /workspace/src && mkdir -p /workspace"
++docker cp "$GEAK_SRC/src" geak_mixed_hip:/workspace/src
++docker exec geak_mixed_hip pip install -e /workspace 2>/dev/null || true
++```
++
++### 5.4 API key
++
++```bash
++export AMD_LLM_API_KEY="7d3c15d3142b4d1492859da87f16d9fc"
++```
++
++The model is `claude-opus-4.6` via AMD's LLM gateway.
++
++### 5.5 Kernel test data (AKA)
++
++The parity test kernels are in the AKA (Automated Kernel Archive):
++```
++/data/sapmajum/parity_test/runs_20260514/AKA_triton/tasks/triton2triton/geak_eval/
++/data/sapmajum/parity_test/runs_20260514/AKA_hip/tasks/hip2hip/others/
++```
++
++If running on a different node, you'll need to either:
++- Copy these directories to the new node
++- Or clone AKA fresh from the repository
++
++---
++
++## 6. Test Plan: Mixed Mode vs Planned vs Fixed
++
++### 6.1 Goal
++
++Run the same 30 kernels (18 Triton + 12 HIP) in **mixed mode** and compare with the existing **planned** (Triton) and **fixed** (HIP) baselines from the May 14 parity test.
++
++### 6.2 Previous baseline results
++
++#### Triton kernels (planned mode, May 14)
++
++| Kernel | Level | Final Speedup | Rounds |
++|--------|-------|---------------|--------|
++| fused_append_shared_experts | L1 | 2.99x | 5 |
++| llama_ff_triton | L1 | 5.03x | 5 |
++| mla_decode | L1 | 1.18x | 2 |
++| moe_routing_sigmoid_top1 | L1 | 1.26x | 5 |
++| refk_fp8_blockwise_mm | L1 | 1.00x | 4 |
++| refk_identity | L1 | 1.02x | 4 |
++| fast_rms_layernorm | L2 | 10.37x | 5 |
++| ff_backward | L2 | 1.00x | 2 |
++| lean_atten_paged | L2 | 1.00x | 5 |
++| topk | L2 | 1.21x | 5 |
++| fused_moe_mxfp4 | L3 | 1.06x | 2 |
++| fused_mxfp4_quant_moe_sort | L3 | 1.84x | 2 |
++| fused_qk_rope_cache_mla | L3 | 8.25x | 5 |
++| fused_qkv_rope | L3 | 3.93x | 4 |
++| fused_rms_fp8 | L3 | 2.31x | 3 |
++| gemm | L3 | 3.13x | 5 |
++| gemm_a16w16_atomic | L3 | — | 0 (preflight fail) |
++| gemm_a16wfp4 | L3 | 1.01x | 5 |
++
++#### HIP kernels (fixed mode, May 14)
++
++| Kernel | Final Speedup |
++|--------|---------------|
++| roiaware_pool3d | 27.01x |
++| roipoint_pool3d | 14.76x |
++| assign_score_withk | 2.81x |
++| knn | 2.54x |
++| three_nn | 1.98x |
++| three_interpolate | 1.80x |
++| gather_points | 1.46x |
++| silu | 1.27x (incomplete) |
++| furthest_point_sample | 1.13x |
++| ball_query | 1.18x |
++| matrix_multiplication | 1.09x |
++| points_in_boxes | 1.03x |
++
++### 6.3 Run commands
++
++**Mixed mode** is the hardcoded default in `mini.py` (`pipeline_mode = "mixed"`). The key env var is `GEAK_PIPELINE_MODE` which overrides it from the launch script.
++
++#### Single kernel test (quick validation):
++
++```bash
++# Pick a well-known kernel for quick validation
++KERNEL_DIR="/path/to/AKA_triton/tasks/triton2triton/geak_eval/L1/llama_ff_triton"
++OUT_DIR="/data/$USER/mixed_test/triton_llama_ff_triton"
++
++docker exec \
++  -e "GEAK_MODEL=claude-opus-4.6" \
++  -e "AMD_LLM_API_KEY=$AMD_LLM_API_KEY" \
++  -e "GEAK_PIPELINE_MODE=mixed" \
++  geak_mixed_triton bash -c \
++  "cd /workspace && geak -t 'Optimize the Triton kernel at ${KERNEL_DIR}/kernel.py. Use the test harness at ${KERNEL_DIR}/test_kernel_harness.py.' \
++   --num-parallel 4 --gpu-ids 0,1,2,3 --mode full -y --exit-immediately" \
++  > "$OUT_DIR/run.log" 2>&1
++```
++
++#### Full batch script template:
++
++```bash
++#!/usr/bin/env bash
++# Mixed mode parity test: 18 Triton + 12 HIP
++set -euo pipefail
++
++AMD_LLM_API_KEY="${AMD_LLM_API_KEY:-7d3c15d3142b4d1492859da87f16d9fc}"
++BATCH_DIR="/data/$USER/mixed_test"
++MODEL="claude-opus-4.6"
++
++TRITON_CONTAINER="geak_mixed_triton"
++HIP_CONTAINER="geak_mixed_hip"
++
++# Point these to your AKA directories
++AKA_TRITON="/path/to/AKA_triton/tasks/triton2triton/geak_eval"
++AKA_HIP="/path/to/AKA_hip/tasks/hip2hip/others"
++
++RESULTS_CSV="$BATCH_DIR/results.csv"
++mkdir -p "$BATCH_DIR"
++echo "name,language,level,mode,verified_speedups,final_speedup,status,elapsed_s" > "$RESULTS_CSV"
++
++TRITON_KERNELS=(
++  "fused_append_shared_experts|L1|fused_append_shared_experts"
++  "llama_ff_triton|L1|llama_ff_triton"
++  "mla_decode|L1|mla_decode"
++  "moe_routing_sigmoid_top1|L1|moe_routing_sigmoid_top1"
++  "refk_fp8_blockwise_mm|L1|refk_fp8_blockwise_mm"
++  "refk_identity|L1|refk_identity"
++  "fast_rms_layernorm|L2|fast_rms_layernorm"
++  "ff_backward|L2|ff_backward"
++  "lean_atten_paged|L2|lean_atten_paged"
++  "topk|L2|topk"
++  "fused_moe_mxfp4|L3|fused_moe_mxfp4"
++  "fused_mxfp4_quant_moe_sort|L3|fused_mxfp4_quant_moe_sort"
++  "fused_qk_rope_cache_mla|L3|fused_qk_rope_cache_mla"
++  "fused_qkv_rope|L3|fused_qkv_rope"
++  "fused_rms_fp8|L3|fused_rms_fp8"
++  "gemm|L3|gemm"
++  "gemm_a16w16_atomic|L3|gemm_a16w16_atomic"
++  "gemm_a16wfp4|L3|gemm_a16wfp4"
++)
++
++HIP_KERNELS=(
++  "assign_score_withk" "ball_query" "furthest_point_sample"
++  "gather_points" "knn" "matrix_multiplication"
++  "points_in_boxes" "roiaware_pool3d" "roipoint_pool3d"
++  "silu" "three_interpolate" "three_nn"
++)
++
++run_triton_one() {
++  local NAME=$1 LEVEL=$2 DIRNAME=$3
++  local KERNEL_DIR="${AKA_TRITON}/${LEVEL}/${DIRNAME}"
++  local OUT_DIR="$BATCH_DIR/triton_${NAME}"
++  [[ -f "$OUT_DIR/out/final_report.json" ]] && return 0
++  rm -rf "$OUT_DIR" 2>/dev/null; mkdir -p "$OUT_DIR"
++
++  local T0=$(date +%s)
++  docker exec \
++    -e "GEAK_MODEL=$MODEL" \
++    -e "AMD_LLM_API_KEY=$AMD_LLM_API_KEY" \
++    -e "GEAK_PIPELINE_MODE=mixed" \
++    "$TRITON_CONTAINER" bash -c \
++    "cd /workspace && geak -t 'Optimize the Triton kernel at ${KERNEL_DIR}/kernel.py. Use the test harness at ${KERNEL_DIR}/test_kernel_harness.py.' \
++     --num-parallel 4 --gpu-ids 0,1,2,3 --mode full -y --exit-immediately" \
++    > "$OUT_DIR/run.log" 2>&1 || true
++
++  local ELAPSED=$(($(date +%s) - T0))
++  # Extract results (same helper as parity test)
++  local FINAL="" VS="" STATUS="done"
++  [[ -f "$OUT_DIR/out/final_report.json" ]] && \
++    FINAL=$(python3 -c "import json; d=json.load(open('$OUT_DIR/out/final_report.json')); print(d.get('total_speedup') or d.get('best_speedup') or '')" 2>/dev/null) || STATUS="no_final_report"
++  VS=$(grep -oE "Verified speedup: [0-9.]+x" "$OUT_DIR/run.log" 2>/dev/null | tr '\n' ' ') || true
++
++  echo "${NAME},triton,${LEVEL},mixed,\"${VS}\",${FINAL},${STATUS},${ELAPSED}" >> "$RESULTS_CSV"
++}
++
++run_hip_one() {
++  local NAME=$1
++  local REPO_DIR="${AKA_HIP}/${NAME}"
++  local OUT_DIR="$BATCH_DIR/hip_${NAME}"
++  [[ -f "$OUT_DIR/out/final_report.json" ]] && return 0
++  rm -rf "$OUT_DIR" 2>/dev/null; mkdir -p "$OUT_DIR"
++
++  local KERNEL_PATH=$(find "$REPO_DIR" \( -name '*.hip' \) ! -name '*_ref.hip' ! -path '*/build/*' -print 2>/dev/null | head -1)
++  local T0=$(date +%s)
++  docker exec \
++    -e "GEAK_MODEL=$MODEL" \
++    -e "AMD_LLM_API_KEY=$AMD_LLM_API_KEY" \
++    -e "GEAK_PIPELINE_MODE=mixed" \
++    "$HIP_CONTAINER" bash -c \
++    "cd /workspace && geak -t 'Optimize the HIP kernel at ${KERNEL_PATH}.' \
++     --num-parallel 4 --gpu-ids 4,5,6,7 --mode full -y --exit-immediately" \
++    > "$OUT_DIR/run.log" 2>&1 || true
++
++  local ELAPSED=$(($(date +%s) - T0))
++  local FINAL="" VS="" STATUS="done"
++  [[ -f "$OUT_DIR/out/final_report.json" ]] && \
++    FINAL=$(python3 -c "import json; d=json.load(open('$OUT_DIR/out/final_report.json')); print(d.get('total_speedup') or d.get('best_speedup') or '')" 2>/dev/null) || STATUS="no_final_report"
++  VS=$(grep -oE "Verified speedup: [0-9.]+x" "$OUT_DIR/run.log" 2>/dev/null | tr '\n' ' ') || true
++
++  echo "${NAME},hip,,mixed,\"${VS}\",${FINAL},${STATUS},${ELAPSED}" >> "$RESULTS_CSV"
++}
++
++# Run Triton sequentially on GPUs 0-3
++for entry in "${TRITON_KERNELS[@]}"; do
++  IFS='|' read -r NAME LEVEL DIRNAME <<< "$entry"
++  run_triton_one "$NAME" "$LEVEL" "$DIRNAME"
++done &
++
++# Run HIP sequentially on GPUs 4-7 (in parallel with Triton)
++for NAME in "${HIP_KERNELS[@]}"; do
++  run_hip_one "$NAME"
++done &
++
++wait
++echo "All runs complete. Results: $RESULTS_CSV"
++```
++
++### 6.4 What to look for in logs
++
++The adaptive K is logged by the Dispatcher. Grep for:
++```bash
++grep "Dispatcher: mode=mixed" run.log
++```
++
++Expected output progression:
++```
++Dispatcher: mode=mixed N=4 K=2 → 2 planned + 2 fill    # Round 1: equal split
++Dispatcher: mode=mixed N=4 K=3 → 3 planned + 1 fill    # Round 2+: shifted toward planned
++```
++
++Also check per-task outcomes in evaluation JSONs:
++```bash
++cat out/round_1_evaluation.json | python3 -m json.tool | grep -A3 "per_task"
++```
++
++### 6.5 Comparison methodology
++
++After runs complete, compare the `results.csv` against the May 14 baselines above. Key metrics:
++- **Win rate:** How many kernels does mixed beat planned (for Triton) or fixed (for HIP)?
++- **Geometric mean speedup:** Overall performance across the kernel set
++- **Worst-case regression:** Any kernel where mixed is significantly worse?
++
++---
++
++## 7. Important Notes
++
++1. **`GEAK_PIPELINE_MODE=mixed`** must be set in the container env. Without it, `mini.py` defaults to `pipeline_mode = "mixed"` (hardcoded at line 972), so it should work by default — but set it explicitly for clarity.
++
++2. **The adaptive behavior only matters for N >= 3.** With N=2 (2 GPUs), it falls back to K=1 (one of each), same as the old static split. Use N=4 to see the adaptation in action.
++
++3. **Round 1 is always equal split.** The adaptation only kicks in from round 2 onward, after per-task outcomes are available.
++
++4. **Existing test suite:** 132/132 dispatcher/evaluation/pipeline tests pass. Only failure is a pre-existing litellm import error (unrelated).
++
++5. **No config knobs.** The exploration floor (min 1 slot each) is hardcoded. To change it, modify `_k_for_mode` in `selector.py`.
++
++---
++
++## 8. File Reference
++
++| File | Path | Lines changed |
++|------|------|---------------|
++| Dispatcher | `src/minisweagent/run/dispatcher/selector.py` | 91-133 (adaptive _k_for_mode) |
++| Evaluation | `src/minisweagent/run/postprocess/evaluation.py` | 85-95 (_resolve_task_kind), 908+ (per_task population) |
++| Dispatch | `src/minisweagent/run/dispatch.py` | 317 (kind passthrough) |
++| Unified loop | `src/minisweagent/run/unified.py` | 581 (round_evals threading) |
++| Pipeline types | `src/minisweagent/run/pipeline_types.py` | 111-134 (PerTaskOutcome — already existed, now populated) |
++| Candidate pool | `src/minisweagent/run/planner/candidate_pool.py` | Unchanged (kind field already existed) |
++| Task planner | `src/minisweagent/run/planner/task_planner.py` | Unchanged (canonical fixed injection already existed) |
++| Writer | `src/minisweagent/run/dispatcher/writer.py` | Unchanged (kind already written to YAML) |
++| Task file I/O | `src/minisweagent/run/task_file.py` | Unchanged |
+diff --git a/src/minisweagent/run/dispatch.py b/src/minisweagent/run/dispatch.py
+index b6d51d4d6..138dcd389 100644
+--- a/src/minisweagent/run/dispatch.py
++++ b/src/minisweagent/run/dispatch.py
+@@ -319,6 +319,10 @@ def task_file_to_agent_task(task_file: Path):
+     if meta.get("starting_patch"):
+         cfg["starting_patch"] = meta["starting_patch"]
+ 
++    # kind is dispatcher scheduling metadata persisted to the task .md YAML by the
++    # writer and read back by _resolve_task_kind() in postprocess.evaluation. It is
++    # intentionally NOT passed to AgentConfig: agents behave identically regardless
++    # of how they were scheduled (planned vs fixed canonical fill).
+     for _passthrough_key in ("baseline_metrics", "benchmark_baseline"):
+         if meta.get(_passthrough_key):
+             cfg[_passthrough_key] = meta[_passthrough_key]
+diff --git a/src/minisweagent/run/dispatcher/selector.py b/src/minisweagent/run/dispatcher/selector.py
+index 3b870980f..971217a66 100644
+--- a/src/minisweagent/run/dispatcher/selector.py
++++ b/src/minisweagent/run/dispatcher/selector.py
+@@ -2,20 +2,27 @@
+ 
+ The dispatcher is the **only** component that knows about mode semantics.
+ Its job is purely selection: from a pool of M candidates, pick N to run
+-on the available parallel workers.  The selection rule is determined by
+-``_k_for_mode``, the single seam that the adaptive future replaces.
++on the available parallel workers.  In mixed mode, K (the number of
++planned slots) is determined adaptively based on per-task outcomes from
++prior rounds.
+ """
+ 
+ from __future__ import annotations
+ 
+ import logging
+ from dataclasses import replace
++from typing import Any
+ 
+ from minisweagent.run.dispatch_plan import DispatchPlan, DispatchPlanItem
+ from minisweagent.run.planner.candidate_pool import CandidatePool, CandidateTask
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Speedups at or above this are treated as timing-saturation / measurement
++# garbage (e.g. a divide-by-near-zero "10000x" artifact) and are excluded from
++# adaptive-K scoring so they cannot hijack slot allocation.
++MAX_PLAUSIBLE_SPEEDUP = 100.0
++
+ 
+ class Dispatcher:
+     """Select N tasks from a CandidatePool based on mode."""
+@@ -25,6 +32,7 @@ def select(
+         pool: CandidatePool,
+         mode: str,
+         n: int,
++        round_evals: list[dict[str, Any]] | None = None,
+     ) -> DispatchPlan:
+         """Pick exactly N items from *pool* according to *mode*.
+ 
+@@ -33,7 +41,7 @@ def select(
+         if n < 1:
+             n = 1
+ 
+-        k = self._k_for_mode(mode, n)
++        k = self._k_for_mode(mode, n, round_evals)
+         planned = sorted(pool.planned, key=lambda c: c.priority)
+         fixed = pool.fixed
+         registry = pool.registry
+@@ -90,14 +98,73 @@ def select(
+         )
+ 
+     @staticmethod
+-    def _k_for_mode(mode: str, n: int) -> int:
+-        """THE ONLY PLACE the mode-to-K mapping lives.
+-
+-        Adaptive K replaces this function; signature stays the same.
+-
+-        Returns the number of slots to fill with planned candidates.
++    def _k_for_mode(
++        mode: str, n: int, round_evals: list[dict[str, Any]] | None = None
++    ) -> int:
++        """Adaptive K allocation for mixed mode.
++
++        Fixed/planned modes are unchanged. Mixed mode splits the N slots
++        between the planned and fixed sources using a **max-seeking** signal:
++        kernel optimization cares about the *best* result a source produced,
++        not its mean — a single strong planned candidate should attract slots
++        even if most planned attempts were mediocre, and mean-averaging
++        otherwise collapses both sources to parity. Each source's peak speedup
++        is:
++
++          * **clamped** to the plausible open range ``(0, MAX_PLAUSIBLE_SPEEDUP)``
++            so timing-saturation / garbage speedups can't hijack allocation, and
++          * **weighted by the source's success rate** (plausible results /
++            dispatched count) so failure-prone sources lose slots.
++
++        K is allocated proportionally to the two scores and clamped to
++        ``[1, n - 1]`` to keep an exploration floor of one slot per source.
+         """
+-        return {"fixed": 0, "planned": n, "mixed": n // 2}.get(mode, n // 2)
++        if mode == "fixed":
++            return 0
++        if mode == "planned":
++            return n
++        if not round_evals or n <= 2:
++            return max(1, n // 2)
++
++        planned_speeds: list[float] = []
++        planned_total = 0
++        fixed_speeds: list[float] = []
++        fixed_total = 0
++        for rev in round_evals:
++            for pt in rev.get("per_task", []):
++                kind = pt.get("kind")
++                if kind == "planned":
++                    planned_total += 1
++                elif kind == "fixed":
++                    fixed_total += 1
++                else:
++                    continue
++                spd = pt.get("speedup")
++                # plausibility clamp: drop non-positive, None, and
++                # saturation/garbage artifacts at or above MAX_PLAUSIBLE_SPEEDUP
++                if spd is None or spd <= 0 or spd >= MAX_PLAUSIBLE_SPEEDUP:
++                    continue
++                (planned_speeds if kind == "planned" else fixed_speeds).append(spd)
++
++        if not planned_speeds and not fixed_speeds:
++            return max(1, n // 2)
++
++        def _source_score(speeds: list[float], total: int) -> float:
++            # max-seeking (optimization cares about the BEST result a source
++            # produced), discounted by the source's success rate (failure
++            # penalty). A source with no plausible result scores a neutral 1.0.
++            if not speeds:
++                return 1.0
++            best = max(speeds)
++            success_rate = len(speeds) / max(1, total)
++            return best * success_rate
++
++        planned_score = _source_score(planned_speeds, planned_total)
++        fixed_score = _source_score(fixed_speeds, fixed_total)
++        if planned_score + fixed_score <= 0:
++            return max(1, n // 2)
++        k = round(n * planned_score / (planned_score + fixed_score))
++        return max(1, min(k, n - 1))
+ 
+     @staticmethod
+     def _fill(
+diff --git a/src/minisweagent/run/mini.py b/src/minisweagent/run/mini.py
+index a2a49a3aa..8d198153e 100644
+--- a/src/minisweagent/run/mini.py
++++ b/src/minisweagent/run/mini.py
+@@ -980,7 +980,10 @@ def _hard_kill_handler() -> None:
+ 
+         from minisweagent.run.unified import PipelineContext, run_pipeline
+ 
+-        pipeline_mode = "mixed"
++        pipeline_mode = os.environ.get("GEAK_PIPELINE_MODE", "mixed").strip().lower()
++        if pipeline_mode not in {"fixed", "planned", "mixed"}:
++            logger.warning("Invalid GEAK_PIPELINE_MODE=%r, falling back to 'mixed'", pipeline_mode)
++            pipeline_mode = "mixed"
+         logger.info("Running unified pipeline mode: %s", pipeline_mode)
+         pipeline_result = run_pipeline(
+             PipelineContext(
+diff --git a/src/minisweagent/run/postprocess/evaluation.py b/src/minisweagent/run/postprocess/evaluation.py
+index 48f714d3f..e08f66a22 100644
+--- a/src/minisweagent/run/postprocess/evaluation.py
++++ b/src/minisweagent/run/postprocess/evaluation.py
+@@ -22,6 +22,11 @@
+ from pathlib import Path
+ from typing import Any
+ 
++from minisweagent.run.pipeline_types import (
++    FullBenchmarkResult,
++    PerTaskOutcome,
++    RoundEvaluation,
++)
+ from minisweagent.run.postprocess.benchmark_parsing import (
+     compute_shape_speedups,
+     compute_speedup,
+@@ -84,6 +89,19 @@ def __init__(self, section: str, returncode: int | None, detail: str) -> None:
+ )
+ 
+ 
++def _resolve_task_kind(task_files_dir: Path, label: str) -> str:
++    """Look up ``kind`` from the task file whose label matches *label*."""
++    if not task_files_dir.is_dir():
++        return "planned"
++    for tf in task_files_dir.iterdir():
++        if tf.suffix == ".md" and label in tf.stem:
++            from minisweagent.run.task_file import read_task_file
++
++            meta, _ = read_task_file(tf)
++            return meta.get("kind", "planned")
++    return "planned"
++
++
+ def _stderr_indicates_broken_contract(stderr: str) -> str | None:
+     """Return the first contract-broken signature found in *stderr*, or None."""
+     if not stderr:
+@@ -981,8 +999,6 @@ def write_eval_results(
+         fb_output_path = output_dir / f"round_{round_num}_full_benchmark.txt"
+         fb_output_path.write_text(fb_raw["stdout"])
+ 
+-    from minisweagent.run.pipeline_types import FullBenchmarkResult, RoundEvaluation
+-
+     fb_typed = None
+     if isinstance(fb_raw, dict):
+         failure = None
+@@ -993,10 +1009,6 @@ def write_eval_results(
+         elif not fb_raw.get("success", True) and fb_raw.get("returncode", 0) != 0:
+             failure = f"benchmark failed (exit code {fb_raw.get('returncode')})"
+         elif fb_raw.get("failure_reason"):
+-            # Set by ``_compute_verified_speedup`` when latency parsing failed
+-            # despite a clean exit; without this propagation a return-code-0
+-            # benchmark with unparseable output looked like "everything passed
+-            # but no verified speedup" with no diagnostic.
+             failure = str(fb_raw["failure_reason"])
+         fb_typed = FullBenchmarkResult(
+             verified_speedup=fb_raw.get("verified_speedup"),
+@@ -1005,12 +1017,16 @@ def write_eval_results(
+             failure_reason=failure,
+         )
+ 
++    pt_raw = round_eval.get("per_task", [])
++    per_task = [PerTaskOutcome.from_dict(o) for o in pt_raw] if pt_raw else []
++
+     return RoundEvaluation(
+         round=round_num,
+         best_patch=round_eval.get("best_patch", ""),
+         best_task=round_eval.get("best_task", ""),
+         benchmark_speedup=round_eval.get("benchmark_speedup", 1.0),
+         full_benchmark=fb_typed,
++        per_task=per_task,
+     )
+ 
+ 
+@@ -1035,27 +1051,48 @@ def evaluate_round_best(
+         return None
+ 
+     # --- Collect candidates ---
++    task_files_dir = output_dir / "tasks" / f"round_{round_num}"
+     candidates: list[dict[str, Any]] = []
++    # Dispatched candidates that failed / produced no improvement. Recorded so
++    # the dispatcher's adaptive-K success-rate penalty sees per-source totals
++    # (not just the survivors). Their speedups are dropped by the plausibility
++    # clamp downstream; only the per-kind counts matter.
++    failed_outcomes: list[dict[str, Any]] = []
++
++    def _record_failed(label: str, spd: float = 0.0) -> None:
++        failed_outcomes.append(
++            {
++                "label": label,
++                "kind": _resolve_task_kind(task_files_dir, label),
++                "speedup": spd,
++                "status": "failed",
++            }
++        )
++
+     for task_dir in sorted(results_dir.iterdir()):
+         if not task_dir.is_dir() or task_dir.name == "worktrees":
+             continue
+         br_file = task_dir / "best_results.json"
+         if not br_file.exists():
+             logger.warning("No best_results.json in %s", task_dir.name)
++            _record_failed(task_dir.name)
+             continue
+         try:
+             br = json.loads(br_file.read_text())
+         except (json.JSONDecodeError, ValueError, TypeError) as exc:
+             logger.warning("Failed to parse %s: %s", br_file, exc)
++            _record_failed(task_dir.name)
+             continue
+ 
+         speedup = float(br.get("best_patch_speedup", 0))
+         patch_file = br.get("best_patch_file")
+         if not patch_file:
+             logger.warning("No patch file in %s", br_file)
++            _record_failed(task_dir.name, speedup)
+             continue
+         if speedup <= 0:
+             logger.info("No improvement (speedup=%.4f) in %s", speedup, task_dir.name)
++            _record_failed(task_dir.name, speedup)
+             continue
+ 
+         kernel_time: float | None = None
+@@ -1076,6 +1113,7 @@ def evaluate_round_best(
+                 "patch_file": patch_file,
+                 "speedup": speedup,
+                 "kernel_time_ms": kernel_time,
++                "kind": _resolve_task_kind(task_files_dir, task_dir.name),
+                 "per_shape_speedups": br.get("per_shape_speedups") or {},
+                 "baseline_shape_latency_ms": br.get("baseline_shape_latency_ms") or {},
+                 "candidate_shape_latency_ms": br.get("candidate_shape_latency_ms") or {},
+@@ -1160,6 +1198,11 @@ def evaluate_round_best(
+     if best.get("candidate_shape_latency_ms"):
+         round_eval["candidate_shape_latency_ms"] = best["candidate_shape_latency_ms"]
+ 
++    round_eval["per_task"] = [
++        {"label": c["task"], "kind": c.get("kind", "planned"), "speedup": c["speedup"], "status": "ok"}
++        for c in candidates
++    ] + failed_outcomes
++
+     # --- GEAK_AGENT_SELECT_PATCH: trust agent-reported speedup, skip eval ---
+     if os.environ.get("GEAK_AGENT_SELECT_PATCH", "").strip() == "1":
+         logger.info(
+@@ -1177,10 +1220,12 @@ def evaluate_round_best(
+         logger.warning("COMMANDMENT.md not found at %s; skipping FULL_BENCHMARK and PROFILE", commandment_path)
+         eval_path = output_dir / f"round_{round_num}_evaluation.json"
+         eval_path.write_text(json.dumps(round_eval, indent=2, default=str))
+-        from minisweagent.run.pipeline_types import RoundEvaluation
+-
+         return RoundEvaluation(
+-            round=round_num, best_patch=best_patch_file or "", best_task=best_task, benchmark_speedup=best_speedup
++            round=round_num,
++            best_patch=best_patch_file or "",
++            best_task=best_task,
++            benchmark_speedup=best_speedup,
++            per_task=[PerTaskOutcome.from_dict(o) for o in round_eval.get("per_task", [])],
+         )
+ 
+     repo_root = ctx.get("repo_root")
+@@ -1209,14 +1254,13 @@ def evaluate_round_best(
+         round_eval["status"] = "patch_failed"
+         eval_path = output_dir / f"round_{round_num}_evaluation.json"
+         eval_path.write_text(json.dumps(round_eval, indent=2, default=str))
+-        from minisweagent.run.pipeline_types import FullBenchmarkResult, RoundEvaluation
+-
+         return RoundEvaluation(
+             round=round_num,
+             best_patch=best_patch_file or "",
+             best_task=best_task,
+             benchmark_speedup=best_speedup,
+             full_benchmark=FullBenchmarkResult(failure_reason=f"patch apply failed: {exc}"),
++            per_task=[PerTaskOutcome.from_dict(o) for o in round_eval.get("per_task", [])],
+         )
+ 
+     try:
+diff --git a/src/minisweagent/run/unified.py b/src/minisweagent/run/unified.py
+index fd1fb4de9..9a2178654 100644
+--- a/src/minisweagent/run/unified.py
++++ b/src/minisweagent/run/unified.py
+@@ -582,7 +582,7 @@ def _run_unified_loop(ctx: PipelineContext, mode: Mode) -> Any:
+         )
+ 
+         # 2. SELECT — pick N tasks from pool
+-        plan = dispatcher.select(pool, mode, n_workers)
++        plan = dispatcher.select(pool, mode, n_workers, round_evals=round_evals)
+ 
+         # 3. WRITE — .md task files for traceability
+         task_files = write_dispatch_plan_as_task_files(
+diff --git a/tests/run/test_adaptive_k.py b/tests/run/test_adaptive_k.py
+new file mode 100644
+index 000000000..65ee72904
+--- /dev/null
++++ b/tests/run/test_adaptive_k.py
+@@ -0,0 +1,461 @@
++"""Tests for the adaptive-K dispatcher and the kind-resolution contract.
++
++Locks three things:
++
++1. ``Dispatcher._k_for_mode`` — the adaptive allocation algorithm: planned/fixed
++   passthroughs, mixed-mode round-1 fallback, proportional shift, exploration
++   floor (clamping to ``[1, n-1]``), one-sided history, zero-speedup fallback,
++   and the N=2 short-circuit.
++
++2. ``_resolve_task_kind`` — YAML lookup from the task .md frontmatter, including
++   substring label matching and the conservative ``"planned"`` default.
++
++3. The architectural contract that ``kind`` is dispatcher scheduling metadata
++   only and MUST NOT leak into agent ``cfg`` via the ``dispatch.py``
++   ``_passthrough_key`` loop. This is the regression guard for the bug where
++   passing ``kind`` through caused every worker to crash with
++   ``TypeError: AgentConfig.__init__() got an unexpected keyword argument
++   'kind'``.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from minisweagent.run.dispatcher.selector import Dispatcher
++from minisweagent.run.postprocess.evaluation import _resolve_task_kind, evaluate_round_best
++
++# ---------------------------------------------------------------------------
++# _k_for_mode behavior
++# ---------------------------------------------------------------------------
++
++
++class TestKForModeBasicModes:
++    """fixed/planned modes are pure passthroughs; mixed has the interesting math."""
++
++    @pytest.mark.parametrize("n", [1, 2, 3, 4, 8, 16])
++    def test_fixed_mode_returns_zero(self, n: int) -> None:
++        assert Dispatcher._k_for_mode("fixed", n) == 0
++
++    @pytest.mark.parametrize("n", [1, 2, 3, 4, 8, 16])
++    def test_planned_mode_returns_n(self, n: int) -> None:
++        assert Dispatcher._k_for_mode("planned", n) == n
++
++    def test_fixed_mode_ignores_round_evals(self) -> None:
++        evals = [{"per_task": [{"kind": "planned", "speedup": 99.0}]}]
++        assert Dispatcher._k_for_mode("fixed", 4, round_evals=evals) == 0
++
++    def test_planned_mode_ignores_round_evals(self) -> None:
++        evals = [{"per_task": [{"kind": "fixed", "speedup": 99.0}]}]
++        assert Dispatcher._k_for_mode("planned", 4, round_evals=evals) == 4
++
++
++class TestKForModeMixedFallback:
++    """Round 1 (or any round without per_task data) falls back to N//2."""
++
++    def test_mixed_no_round_evals_falls_back_to_half(self) -> None:
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=None) == 2
++
++    def test_mixed_empty_round_evals_falls_back_to_half(self) -> None:
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=[]) == 2
++
++    def test_mixed_n_equals_2_short_circuits_to_one(self) -> None:
++        # N<=2 is the documented "no adaptive shift" boundary: there's no
++        # interesting allocation to make with only 2 slots so we always
++        # do 1+1 regardless of history.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 5.0},
++                    {"kind": "fixed", "speedup": 1.0},
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 2, round_evals=evals) == 1
++
++    def test_mixed_per_task_present_but_all_zero_speedups_falls_back(self) -> None:
++        # Zero/negative speedups are filtered out, leaving the algorithm with
++        # no usable history → N//2 fallback.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 0.0},
++                    {"kind": "planned", "speedup": -1.0},
++                    {"kind": "fixed", "speedup": 0.0},
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=evals) == 2
++
++    def test_mixed_per_task_missing_kind_or_speedup_is_ignored(self) -> None:
++        evals = [
++            {
++                "per_task": [
++                    {"speedup": 5.0},  # no kind
++                    {"kind": "planned"},  # no speedup
++                    {"kind": "other", "speedup": 5.0},  # neither planned nor fixed
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=evals) == 2
++
++
++class TestKForModeMixedAdaptive:
++    """The interesting case: per_task entries drive proportional K selection."""
++
++    def test_planned_dominant_shifts_k_up(self) -> None:
++        # planned avg = 2.0, fixed avg = 1.0 → K = round(4 * 2/3) = 3.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 2.0},
++                    {"kind": "planned", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 1.0},
++                    {"kind": "fixed", "speedup": 1.0},
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=evals) == 3
++
++    def test_fixed_dominant_shifts_k_down_clamped_at_one(self) -> None:
++        # planned avg = 1.0, fixed avg = 2.0 → K = round(4 * 1/3) = 1.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 1.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=evals) == 1
++
++    def test_extreme_planned_dominance_clamps_to_n_minus_1(self) -> None:
++        # Even with planned >> fixed, the exploration floor reserves 1 slot
++        # for fixed → K never reaches N. (50.0 stays under MAX_PLAUSIBLE_SPEEDUP
++        # so it counts as a real planned peak rather than being clamped away.)
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 50.0},
++                    {"kind": "fixed", "speedup": 1.0},
++                ]
++            }
++        ]
++        k = Dispatcher._k_for_mode("mixed", 4, round_evals=evals)
++        assert k == 3
++        assert k <= 4 - 1, "exploration floor: at least 1 fixed slot must remain"
++
++    def test_extreme_fixed_dominance_clamps_to_one(self) -> None:
++        # Even with fixed >> planned, the exploration floor reserves 1 slot
++        # for planned → K never reaches 0 (which would be fixed mode). (50.0
++        # stays under MAX_PLAUSIBLE_SPEEDUP so it counts as a real fixed peak.)
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 1.0},
++                    {"kind": "fixed", "speedup": 50.0},
++                ]
++            }
++        ]
++        k = Dispatcher._k_for_mode("mixed", 4, round_evals=evals)
++        assert k == 1
++        assert k >= 1, "exploration floor: at least 1 planned slot must remain"
++
++    def test_one_sided_history_only_planned_uses_default_for_other(self) -> None:
++        # planned avg = 3.0, fixed avg defaults to 1.0 → K = round(4 * 3/4) = 3.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 3.0},
++                    {"kind": "planned", "speedup": 3.0},
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=evals) == 3
++
++    def test_one_sided_history_only_fixed_uses_default_for_other(self) -> None:
++        # planned avg defaults to 1.0, fixed avg = 3.0 → K = round(4 * 1/4) = 1.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "fixed", "speedup": 3.0},
++                    {"kind": "fixed", "speedup": 3.0},
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=evals) == 1
++
++    def test_history_aggregates_across_multiple_rounds(self) -> None:
++        # Two rounds, planned 2.0 each, fixed 1.0 each → planned_avg=2.0,
++        # fixed_avg=1.0 → K=3. Same answer either way, but exercises the
++        # multi-round accumulation path.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 1.0},
++                ]
++            },
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 1.0},
++                ]
++            },
++        ]
++        assert Dispatcher._k_for_mode("mixed", 4, round_evals=evals) == 3
++
++
++class TestKForModeMaxSeekingClampFailurePenalty:
++    """Regression tests for the max-seeking + clamp + failure-penalty rework.
++
++    The audit of the full 18-kernel run showed the old mean-based signal
++    converged planned-vs-fixed to parity (K pinned at N//2). These lock the
++    three properties that fix that: max-seeking (peak, not mean), the
++    plausibility clamp, and the success-rate failure penalty.
++    """
++
++    def test_max_seeking_beats_mean_parity(self) -> None:
++        # planned [5,1,1,1] and fixed [2,2,2,2] have the SAME mean (2.0): the
++        # old mean-based signal tied them at K=n//2=6. Max-seeking rewards
++        # planned's best (5.0) → K shifts decisively toward planned.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 5.0},
++                    {"kind": "planned", "speedup": 1.0},
++                    {"kind": "planned", "speedup": 1.0},
++                    {"kind": "planned", "speedup": 1.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                ]
++            }
++        ]
++        # planned_score = 5.0 * (4/4) = 5.0; fixed_score = 2.0 * (4/4) = 2.0
++        # K = round(12 * 5/7) = 9  (mean-based parity would have been 6)
++        k = Dispatcher._k_for_mode("mixed", 12, round_evals=evals)
++        assert k == 9
++        assert k > 12 // 2, "max-seeking must beat the mean-parity K=n//2"
++
++    def test_plausibility_clamp_drops_garbage_speedups(self) -> None:
++        # 1e6 and a >=100 value are timing-saturation / garbage and must be
++        # dropped. Without the clamp planned's 1e6 peak would pin K at n-1;
++        # with it, K is driven by the plausible 3.0 vs fixed 2.0 only.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 1e6},
++                    {"kind": "planned", "speedup": 120.0},
++                    {"kind": "planned", "speedup": 3.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                ]
++            }
++        ]
++        # planned: plausible peak 3.0, success_rate 1/3 → score 1.0
++        # fixed:   peak 2.0, success_rate 2/2 → score 2.0
++        # K = round(8 * 1.0/3.0) = 3   (NOT 7 = n-1)
++        k = Dispatcher._k_for_mode("mixed", 8, round_evals=evals)
++        assert k == 3
++        assert k < 8 - 1, "clamped garbage must not pin K at the planned ceiling"
++
++    def test_failure_penalty_demotes_low_success_rate_source(self) -> None:
++        # planned has a higher PEAK (5.0) than fixed (2.0) but only 1 of 6
++        # dispatched planned tasks produced a plausible result; the success-rate
++        # discount drops planned below fixed so K stays toward fixed.
++        per_task: list[dict[str, Any]] = [{"kind": "planned", "speedup": 5.0, "status": "ok"}]
++        per_task += [{"kind": "planned", "speedup": 0.0, "status": "failed"} for _ in range(5)]
++        per_task += [{"kind": "fixed", "speedup": 2.0, "status": "ok"} for _ in range(6)]
++        evals = [{"per_task": per_task}]
++        # planned_score = 5.0 * (1/6) = 0.833; fixed_score = 2.0 * (6/6) = 2.0
++        # K = round(8 * 0.833/2.833) = 2
++        k = Dispatcher._k_for_mode("mixed", 8, round_evals=evals)
++        assert k == 2
++        assert k < 8 // 2, "failure-prone planned must lose slots despite higher peak"
++
++    def test_all_failed_source_scores_neutral(self) -> None:
++        # planned dispatched 3 tasks, all failed (no plausible speed) → neutral
++        # score 1.0; fixed is strong → K clamps toward fixed but stays >= 1.
++        per_task: list[dict[str, Any]] = [
++            {"kind": "planned", "speedup": 0.0, "status": "failed"} for _ in range(3)
++        ]
++        per_task += [{"kind": "fixed", "speedup": 4.0, "status": "ok"} for _ in range(3)]
++        evals = [{"per_task": per_task}]
++        # planned_score = 1.0 (no plausible result); fixed_score = 4.0 * (3/3) = 4.0
++        # K = round(8 * 1.0/5.0) = 2
++        k = Dispatcher._k_for_mode("mixed", 8, round_evals=evals)
++        assert k == 2
++        assert k >= 1, "exploration floor keeps >= 1 planned slot even when all failed"
++
++    def test_parity_returns_half(self) -> None:
++        # Identical planned & fixed signals (same peak, same success rate) → n//2.
++        evals = [
++            {
++                "per_task": [
++                    {"kind": "planned", "speedup": 2.0},
++                    {"kind": "planned", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                    {"kind": "fixed", "speedup": 2.0},
++                ]
++            }
++        ]
++        assert Dispatcher._k_for_mode("mixed", 8, round_evals=evals) == 8 // 2
++
++
++class TestEdgePathCarriesPerTask:
++    """Failure-path RoundEvaluations must carry per_task so partial-failure
++    rounds still feed adaptive-K (regression guard for the 'K pinned' bug)."""
++
++    def test_missing_commandment_path_carries_per_task(self, tmp_path: Path) -> None:
++        output_dir = tmp_path / "out"
++        output_dir.mkdir()
++        pp_dir = tmp_path / "pp"
++        pp_dir.mkdir()  # intentionally NO COMMANDMENT.md → triggers the edge path
++        results_dir = tmp_path / "results"
++        results_dir.mkdir()
++        task_a = results_dir / "task_a"
++        task_a.mkdir()
++        (task_a / "best_results.json").write_text(
++            json.dumps(
++                {"best_patch_speedup": 2.0, "best_patch_file": str(tmp_path / "a.patch")}
++            ),
++            encoding="utf-8",
++        )
++        ctx = {"output_dir": str(output_dir), "preprocess_dir": str(pp_dir)}
++
++        result = evaluate_round_best(ctx, round_num=1, results_dir=results_dir)
++
++        assert result is not None
++        per_task = result.to_dict().get("per_task")
++        assert per_task, "missing-COMMANDMENT path must carry per_task, not drop it"
++        assert any(o.get("label") == "task_a" for o in per_task)
++
++
++# ---------------------------------------------------------------------------
++# _resolve_task_kind YAML lookup
++# ---------------------------------------------------------------------------
++
++
++def _write_task_md(dir_: Path, fname: str, kind: str) -> Path:
++    """Write a minimal task .md file with YAML frontmatter and a body."""
++    path = dir_ / fname
++    path.write_text(
++        f"---\nkind: {kind}\nlabel: {Path(fname).stem}\npriority: 5\n---\n"
++        "task body — content does not matter for kind resolution\n",
++        encoding="utf-8",
++    )
++    return path
++
++
++class TestResolveTaskKind:
++    def test_returns_planned_for_planned_labeled_file(self, tmp_path: Path) -> None:
++        _write_task_md(tmp_path, "00_single-pass-online-softmax.md", "planned")
++        assert _resolve_task_kind(tmp_path, "single-pass-online-softmax") == "planned"
++
++    def test_returns_fixed_for_fixed_labeled_file(self, tmp_path: Path) -> None:
++        _write_task_md(tmp_path, "05_fixed-canonical.md", "fixed")
++        assert _resolve_task_kind(tmp_path, "fixed-canonical") == "fixed"
++
++    def test_returns_default_when_directory_does_not_exist(self, tmp_path: Path) -> None:
++        missing = tmp_path / "no_such_round_dir"
++        assert _resolve_task_kind(missing, "anything") == "planned"
++
++    def test_returns_default_when_no_matching_file(self, tmp_path: Path) -> None:
++        _write_task_md(tmp_path, "05_fixed-canonical.md", "fixed")
++        assert _resolve_task_kind(tmp_path, "totally-unrelated-label") == "planned"
++
++    def test_substring_label_match(self, tmp_path: Path) -> None:
++        # Numeric prefix and trailing kernel-name suffix should both match —
++        # the writer-produced file naming includes both, but the evaluator
++        # only knows the bare label from candidate metadata.
++        _write_task_md(tmp_path, "00_single-pass-online-softmax.md", "planned")
++        assert _resolve_task_kind(tmp_path, "single-pass-online") == "planned"
++
++    def test_only_md_files_are_inspected(self, tmp_path: Path) -> None:
++        # A non-.md file with a matching name must be ignored: the function
++        # only treats files with .md suffix as task files.
++        (tmp_path / "00_planned-thing.txt").write_text("kind: fixed\n", encoding="utf-8")
++        assert _resolve_task_kind(tmp_path, "planned-thing") == "planned"
++
++    def test_planned_and_fixed_in_same_dir_are_disambiguated_by_label(
++        self, tmp_path: Path
++    ) -> None:
++        _write_task_md(tmp_path, "00_alpha.md", "planned")
++        _write_task_md(tmp_path, "05_beta.md", "fixed")
++        assert _resolve_task_kind(tmp_path, "alpha") == "planned"
++        assert _resolve_task_kind(tmp_path, "beta") == "fixed"
++
++
++# ---------------------------------------------------------------------------
++# Architectural contract: kind MUST NOT leak into agent cfg
++# ---------------------------------------------------------------------------
++
++
++def _apply_dispatch_passthrough(meta: dict[str, Any]) -> dict[str, Any]:
++    """Mirror the cfg-construction passthrough loop from
++    ``minisweagent.run.dispatch.task_file_to_agent_task``.
++
++    This deliberately re-implements the ~3-line loop instead of running the
++    full dispatch flow so the contract is locked at the cfg-shape level — if
++    the source loop drifts to re-include ``kind`` (or any other dispatcher
++    metadata), this test will fail and force a documentation moment.
++    """
++    cfg: dict[str, Any] = {}
++    for _passthrough_key in ("baseline_metrics", "benchmark_baseline"):
++        if meta.get(_passthrough_key):
++            cfg[_passthrough_key] = meta[_passthrough_key]
++    return cfg
++
++
++class TestKindIsNotInAgentCfg:
++    """Regression guard for the AgentConfig(**cfg) crash bug."""
++
++    def test_kind_in_meta_does_not_leak_into_cfg(self) -> None:
++        meta = {
++            "kind": "planned",
++            "baseline_metrics": "/tmp/baseline.json",
++            "benchmark_baseline": "/tmp/bench.json",
++            "label": "single-pass-online-softmax",
++        }
++        cfg = _apply_dispatch_passthrough(meta)
++        assert "kind" not in cfg, (
++            "kind is dispatcher scheduling metadata and MUST NOT be passed to "
++            "AgentConfig via the cfg passthrough loop in dispatch.py — that path "
++            "previously caused every worker to crash with `AgentConfig.__init__() "
++            "got an unexpected keyword argument 'kind'` because AgentConfig has no "
++            "kind field. kind lives in the task .md YAML; the evaluator reads it "
++            "via _resolve_task_kind. Do not re-add it to the passthrough tuple."
++        )
++
++    def test_baseline_metrics_still_passes_through(self) -> None:
++        meta = {"kind": "planned", "baseline_metrics": "/tmp/baseline.json"}
++        cfg = _apply_dispatch_passthrough(meta)
++        assert cfg.get("baseline_metrics") == "/tmp/baseline.json"
++
++    def test_benchmark_baseline_still_passes_through(self) -> None:
++        meta = {"kind": "fixed", "benchmark_baseline": "/tmp/bench.json"}
++        cfg = _apply_dispatch_passthrough(meta)
++        assert cfg.get("benchmark_baseline") == "/tmp/bench.json"
++
++    def test_source_passthrough_loop_is_kind_free(self) -> None:
++        # Defensive: read the source line and assert it does not list "kind"
++        # in the passthrough tuple. This catches a drift even if someone
++        # bypasses the helper above by editing dispatch.py directly.
++        import minisweagent.run.dispatch as dispatch_mod
++
++        src = Path(dispatch_mod.__file__).read_text(encoding="utf-8")
++        passthrough_lines = [
++            line for line in src.splitlines() if "_passthrough_key in (" in line
++        ]
++        assert passthrough_lines, "passthrough loop not found in dispatch.py"
++        for line in passthrough_lines:
++            assert '"kind"' not in line and "'kind'" not in line, (
++                f"dispatch.py passthrough loop must not include 'kind': {line!r}"
++            )

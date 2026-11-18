@@ -1,0 +1,804 @@
+# Issue
+
+**Title:** chore(deps): update r-lib/actions action to v2
+
+## Description
+
+This PR contains the following updates:
+
+| Package | Type | Update | Change |
+|---|---|---|---|
+| [r-lib/actions](https://redirect.github.com/r-lib/actions) | action | major | `v1` → `v2` |
+
+---
+
+### Release Notes
+
+<details>
+<summary>r-lib/actions (r-lib/actions)</summary>
+
+### [`v2.12.1`](https://redirect.github.com/r-lib/actions/compare/v2.12.0...v2.12.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.12.0...v2.12.1)
+
+### [`v2.12.0`](https://redirect.github.com/r-lib/actions/compare/v2.11.4...v2.12.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.11.4...v2.12.0)
+
+### [`v2.11.4`](https://redirect.github.com/r-lib/actions/compare/v2.11.3...v2.11.4)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.11.3...v2.11.4)
+
+### [`v2.11.3`](https://redirect.github.com/r-lib/actions/compare/v2.11.2...v2.11.3)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.11.2...v2.11.3)
+
+### [`v2.11.2`](https://redirect.github.com/r-lib/actions/compare/v2.11.1...v2.11.2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.11.1...v2.11.2)
+
+### [`v2.11.1`](https://redirect.github.com/r-lib/actions/compare/v2.11.0...v2.11.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.11.0...v2.11.1)
+
+### [`v2.11.0`](https://redirect.github.com/r-lib/actions/compare/v2.10.1...v2.11.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.10.1...v2.11.0)
+
+### [`v2.10.1`](https://redirect.github.com/r-lib/actions/compare/v2.10.0...v2.10.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.10.0...v2.10.1)
+
+### [`v2.10.0`](https://redirect.github.com/r-lib/actions/compare/v2.9.0...v2.10.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.9.0...v2.10.0)
+
+### [`v2.9.0`](https://redirect.github.com/r-lib/actions/compare/v2.8.7...v2.9.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.7...v2.9.0)
+
+### [`v2.8.7`](https://redirect.github.com/r-lib/actions/compare/v2.8.6...v2.8.7)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.6...v2.8.7)
+
+### [`v2.8.6`](https://redirect.github.com/r-lib/actions/compare/v2.8.5...v2.8.6)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.5...v2.8.6)
+
+### [`v2.8.5`](https://redirect.github.com/r-lib/actions/compare/v2.8.4...v2.8.5)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.4...v2.8.5)
+
+### [`v2.8.4`](https://redirect.github.com/r-lib/actions/compare/v2.8.3...v2.8.4)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.3...v2.8.4)
+
+### [`v2.8.3`](https://redirect.github.com/r-lib/actions/compare/v2.8.2...v2.8.3)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.2...v2.8.3)
+
+### [`v2.8.2`](https://redirect.github.com/r-lib/actions/compare/v2.8.1...v2.8.2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.1...v2.8.2)
+
+### [`v2.8.1`](https://redirect.github.com/r-lib/actions/compare/v2.8.0...v2.8.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.8.0...v2.8.1)
+
+### [`v2.8.0`](https://redirect.github.com/r-lib/actions/compare/v2.7.2...v2.8.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.7.2...v2.8.0)
+
+### [`v2.7.2`](https://redirect.github.com/r-lib/actions/compare/v2.7.1...v2.7.2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.7.1...v2.7.2)
+
+### [`v2.7.1`](https://redirect.github.com/r-lib/actions/compare/v2.7.0...v2.7.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.7.0...v2.7.1)
+
+### [`v2.7.0`](https://redirect.github.com/r-lib/actions/compare/v2.6.5...v2.7.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.6.5...v2.7.0)
+
+### [`v2.6.5`](https://redirect.github.com/r-lib/actions/compare/v2.6.4...v2.6.5)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.6.4...v2.6.5)
+
+### [`v2.6.4`](https://redirect.github.com/r-lib/actions/compare/v2.6.3...v2.6.4)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.6.3...v2.6.4)
+
+### [`v2.6.3`](https://redirect.github.com/r-lib/actions/compare/v2.6.2...v2.6.3)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.6.2...v2.6.3)
+
+### [`v2.6.2`](https://redirect.github.com/r-lib/actions/compare/v2.6.1...v2.6.2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.6.1...v2.6.2)
+
+### [`v2.6.1`](https://redirect.github.com/r-lib/actions/compare/v2.6.0...v2.6.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.6.0...v2.6.1)
+
+### [`v2.6.0`](https://redirect.github.com/r-lib/actions/compare/v2.5.0...v2.6.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.5.0...v2.6.0)
+
+### [`v2.5.0`](https://redirect.github.com/r-lib/actions/compare/v2.4.0...v2.5.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.4.0...v2.5.0)
+
+### [`v2.4.0`](https://redirect.github.com/r-lib/actions/compare/v2.3.1...v2.4.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.3.1...v2.4.0)
+
+### [`v2.3.1`](https://redirect.github.com/r-lib/actions/compare/v2.3.0...v2.3.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.3.0...v2.3.1)
+
+### [`v2.3.0`](https://redirect.github.com/r-lib/actions/compare/v2.2.8...v2.3.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.8...v2.3.0)
+
+### [`v2.2.8`](https://redirect.github.com/r-lib/actions/compare/v2.2.7...v2.2.8)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.7...v2.2.8)
+
+### [`v2.2.7`](https://redirect.github.com/r-lib/actions/compare/v2.2.6...v2.2.7)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.6...v2.2.7)
+
+### [`v2.2.6`](https://redirect.github.com/r-lib/actions/compare/v2.2.5...v2.2.6)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.5...v2.2.6)
+
+### [`v2.2.5`](https://redirect.github.com/r-lib/actions/compare/v2.2.4...v2.2.5)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.4...v2.2.5)
+
+### [`v2.2.4`](https://redirect.github.com/r-lib/actions/compare/v2.2.3...v2.2.4)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.3...v2.2.4)
+
+### [`v2.2.3`](https://redirect.github.com/r-lib/actions/compare/v2.2.2...v2.2.3)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.2...v2.2.3)
+
+### [`v2.2.2`](https://redirect.github.com/r-lib/actions/compare/v2.2.1...v2.2.2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.1...v2.2.2)
+
+### [`v2.2.1`](https://redirect.github.com/r-lib/actions/compare/v2.2.0...v2.2.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.2.0...v2.2.1)
+
+### [`v2.2.0`](https://redirect.github.com/r-lib/actions/compare/v2.1.5...v2.2.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.1.5...v2.2.0)
+
+### [`v2.1.5`](https://redirect.github.com/r-lib/actions/compare/v2.1.4...v2.1.5)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.1.4...v2.1.5)
+
+### [`v2.1.4`](https://redirect.github.com/r-lib/actions/compare/v2.1.3...v2.1.4)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.1.3...v2.1.4)
+
+### [`v2.1.3`](https://redirect.github.com/r-lib/actions/compare/v2.1.2...v2.1.3)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.1.2...v2.1.3)
+
+### [`v2.1.2`](https://redirect.github.com/r-lib/actions/compare/v2.1.1...v2.1.2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.1.1...v2.1.2)
+
+### [`v2.1.1`](https://redirect.github.com/r-lib/actions/compare/v2.1.0...v2.1.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.1.0...v2.1.1)
+
+### [`v2.1.0`](https://redirect.github.com/r-lib/actions/compare/v2.0.11...v2.1.0)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.11...v2.1.0)
+
+### [`v2.0.11`](https://redirect.github.com/r-lib/actions/compare/v2.0.10...v2.0.11)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.10...v2.0.11)
+
+### [`v2.0.10`](https://redirect.github.com/r-lib/actions/compare/v2.0.9...v2.0.10)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.9...v2.0.10)
+
+### [`v2.0.9`](https://redirect.github.com/r-lib/actions/compare/v2.0.8...v2.0.9)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.8...v2.0.9)
+
+### [`v2.0.8`](https://redirect.github.com/r-lib/actions/compare/v2.0.7...v2.0.8)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.7...v2.0.8)
+
+### [`v2.0.7`](https://redirect.github.com/r-lib/actions/compare/v2.0.6...v2.0.7)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.6...v2.0.7)
+
+### [`v2.0.6`](https://redirect.github.com/r-lib/actions/compare/v2.0.5...v2.0.6)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.5...v2.0.6)
+
+### [`v2.0.5`](https://redirect.github.com/r-lib/actions/compare/v2.0.4...v2.0.5)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.4...v2.0.5)
+
+### [`v2.0.4`](https://redirect.github.com/r-lib/actions/compare/v2.0.3...v2.0.4)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.3...v2.0.4)
+
+### [`v2.0.3`](https://redirect.github.com/r-lib/actions/compare/v2.0.2...v2.0.3)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.2...v2.0.3)
+
+### [`v2.0.2`](https://redirect.github.com/r-lib/actions/compare/v2.0.1...v2.0.2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2.0.1...v2.0.2)
+
+### [`v2.0.1`](https://redirect.github.com/r-lib/actions/compare/v2...v2.0.1)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2...v2.0.1)
+
+### [`v2.0.0`](https://redirect.github.com/r-lib/actions/compare/v2...v2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v2...v2)
+
+### [`v2`](https://redirect.github.com/r-lib/actions/releases/tag/v2)
+
+[Compare Source](https://redirect.github.com/r-lib/actions/compare/v1.0.2...v2)
+
+Note that `v2` is a sliding tag, and we introduce non-breaking changes to it.
+
+### `v2.12.1` (2026-06-23)
+
+- `[setup-r]` now avoids a warning about an `url.parse()` deprecation
+  ().
+
+- `[setup-r-dependencies]` now uses `quarto-dev/quarto-actions` `v2.2.0`
+  ([@&#8203;jdblischak](https://redirect.github.com/jdblischak), ).
+
+- Examples: `test-coverage.yaml` now uses `codecov/codecov-action` `v7`
+  ([@&#8203;shikokuchuo](https://redirect.github.com/shikokuchuo), ).
+
+- New example `claude-investigate.yaml` workflow ([@&#8203;DavisVaughan](https://redirect.github.com/DavisVaughan), ).
+
+### `v2.12.0` (2026-04-30)
+
+- All node.js actions use node 24 now. Relatedly, all example workflows
+  use recent versions of actions that use node 24.
+
+- `[setup-r]` now uses `use-public-rspm: true` by default on Linux and
+  Windows. macOS binaries require further opt-in with
+  `use-public-rspm: always`.
+
+- It is now possible to require actions to be pinned to a full-length
+  commit SHA in repositories using `r-lib/actions` ().
+
+- `[setup-pandoc][setup-r-dependencies]` now default to Pandoc
+  version 3.8.3.
+
+- `[setup-r-dependencies]` now includes the R architecture in the
+  cache key, so caches for `macos-15` (Apple Silicon) and
+  `macos-15-intel` (Rosetta/x86\_64) no longer collide ().
+
+- `[setup-r]` run `apt-get update` without `-qq` on Linux, to make
+  debugging update failures easier ().
+
+### `v2.11.4` (2025-10-08)
+
+- `[setup-r]` correctly installs Rtools again on aarch64 Windows,
+  as needed.
+
+### `v2.11.3` (2025-03-24)
+
+- `[setup-r]` now supports Rtools45, and installs it by default
+  for R >= 4.5.0.
+
+### `v2.11.2` (2025-02-19)
+
+- `[setup-r]` now installs gfortran 14.2 for R 4.5.0 and later ().
+
+- `[setup-r]` now does not use PPM on aarch64 Linux, because PPM
+  does not have binary packages for aarch64 Linux, and it would send
+  x86\_64 binarires for aarch64 systems as well.
+
+- `[setup-r]` now unlinks `pkg-config@0.29.2` on macOS silently,
+  to avoid an error from the problem matchers ().
+
+- `[setup-r-dependencies]` now supports `dependencies: FALSE`
+  ([@&#8203;eitsupi](https://redirect.github.com/eitsupi), ).
+
+- `[setup-r-dependencies]` now creates the `R_LIBS_USER` and
+  `R_LIBS_SITE` library directories ().
+
+- `[setup-r-dependencies]` now prints the R repo status ().
+
+- Example workflows that use renv now call `setup-r` with
+  `r-version: renv`, to install the R version declared in the
+  `renv.lock` file.
+
+### `v2.11.1` (2024-11-25)
+
+- `[setup-r]` now unlinks the pre-installed pkg-config brew package
+  to fix a clash with the new pkgconf package ().
+
+### `v2.11.0` (2024-11-09)
+
+- `[setup-r-dependencies]` parameter `pak-version` can now be `repo` or
+  `none` as well. `repo` means that the action will install pak from
+  the configured repositories, using `install.packages()`. `repo` is
+  appropriate on systems that do not have access to our pak reporitory
+  on GitHUb. `none` means that the action does not install pak at all.
+  Use this if you want to install pak yourself manually. Set the
+  `R_LIB_FOR_PAK` environment variable to point to the library where pak
+  is installed.
+
+- `[setup-r]` now has a `working-directory` parameter, to be able to
+  specify the location of the `renv.lock` file (, [@&#8203;calderonsamuel](https://redirect.github.com/calderonsamuel)).
+
+- Example check-like workflows now run on all pull requests, not only
+  on pull requests against the `main` branch.
+
+- `[setup-r-dependencies]` and `[setup-renv]` now do not use the
+  deprecated `save-always` parameter of `actions/cache`.
+
+- `[setup-renv]` now correctly accepts `bypass-cache: never`, as stated
+  in the documentation.
+
+- `[setup-r-dependencies]` now saves the package cache correctly on
+  Windows with older R ().
+
+### `v2.10.1` (2024-08-08)
+
+- `[setup-r-dependencies]` now pins `quarto-dev/quarto-actions/setup`
+  version to a constant sha, to be compatible with organizations where
+  this is a requirement ().
+
+- `[setup-renv]` now also caches R packages in `renv/library`, used when
+  `RENV_CONFIG_PAK_ENABLED: true` ().
+
+- `[setup-manifest]`: new action to set up an R project with a Posit
+  Connect `manifest.json` file ().
+
+### `v2.10.0` (2024-08-02)
+
+- `[setup-r]`: on R 3.6.x we now use the P3M snapshot from 2024-06-01 by
+  default. This is because many newer CRAN packages do not work on R 3.6.x
+  any more. The default CRAN mirror is still added, so newer packages may
+  be used if they are required, but `setup-r-dependencies@v2` will prefer
+  the binary packages from P3M.
+
+  Note that this only happens if you opt in to use P3M with the
+  `use-public-rspm: true` input parameter. This is the default in all
+  example workflows.
+
+  If the `RSPM` environment variable is already set, then it is used
+  unchanged, on all R versions. To avoid using a P3M snapshot on R 3.6.x,
+  set the `RSPM_PIN_3_6` environment variable to `false`.
+
+- `[setup-r]` now installs the x86\_64 build of R on arm64 macOS, if there
+  is no arm64 build available for this R version ().
+
+- Example blogdown, bookdown, document, pr-commands and render-markdown
+  workflows now correctly have write permission to repository contents
+  (, [@&#8203;remlapmot](https://redirect.github.com/remlapmot)).
+
+- `[check-r-package]`: you can now set`upload-snapshots` to `always`, to
+  upload snapshots even after failures ().
+
+- `[setup-r-dependencies]` now always sets the `R_LIBS_USER` GitHub
+  environment variable, so it can be used without `[setup-r]` or without
+  setting it manually ().
+
+- The example workflows now use their file names as workflow names.
+  This is to make it easier to match worflow runs to workflow files.
+  Most of the the `check-*` workflows use `R-CMD-check.yaml`, however,
+  to anticipate the usethis package renaming them by default ().
+
+- `[setup-renv]`: you can now set `bypass-cache` to `never`, to save the
+  cache even if the workflow fails (, [@&#8203;jaradkohl-mfj](https://redirect.github.com/jaradkohl-mfj)).
+
+- `[setup-pandoc]`: installing nightly Pandoc works again now ().
+
+- `[setup-r-dependencies]` now automatically installs Quarto if the repo
+  has a qmd file, and it isn't installed. See the `install-quarto` and
+  `quarto-version` input parameters ().
+
+- `[setup-r]` now avoids spurious warnings from Homebrew ().
+
+- `[setup-r-dependencies]` now accepts `pak-version: none` to skip pak
+  installation. pak should be already installed on the system in this
+  case, otherwise the dependencies resolution and installation will fail.
+  You probably also need to set the `R_LIB_FOR_PAK` env var to the library
+  where it is installed.
+
+### `v2.9.0` (2024-05-09)
+
+- The `test-coverage.yaml` example workflow now handles global Codecov
+  tokens for test coverage uploads to codecov.io
+  ([@&#8203;ALanguillaume](https://redirect.github.com/ALanguillaume), [@&#8203;gaborcsardi](https://redirect.github.com/gaborcsardi), ).
+
+- The `check-full.yaml` example does not test on R 3.6.x any more.
+
+- All example workflows set the default permissions now to read-only.
+
+- We deleted the (long broken) `run-rchk` action.
+  [R-hub](https://r-hub.github.io/rhub/) will have an `rchk` container and builder soon: .
+
+- \[setup-r-dependencies]: new option to save the R package cache for
+  unsuccessful workflow runs as well ([@&#8203;schloerke](https://redirect.github.com/schloerke), ).
+
+- New example workflows `bookdown-gh-pages` and `blogdown-gh-pages` to
+  deploy bookdown books and blogdown sites to GH Pages without commiting
+  them into the repository ().
+
+### `v2.8.7` (2024-04-05)
+
+- `[setup-r-dependencies]` now has a `lockfile-create-lib` input parameter, that is
+  passed to `pak::lockfile_create(lib = ...)` ().
+
+### `v2.8.6` (2024-03-30)
+
+- `[setup-r]` now does not install qpdf on Windows, because it is part of all Rtools
+  versions that we use. Also, it installs Ghostscript from a `.zip` file instead of a
+  `choco` package, because `choco install` can sometimes freeze ().
+
+### `v2.8.5` (2024-03-26)
+
+- `[setup-r]` uses a different tag name to download system packages from on
+  Windows. This is to fix .
+
+### `v2.8.4` (2024-03-25)
+
+- `[setup-r]`: Ghostscript and QPDF installation is now more robust on Windows.
+  We download and install manually, instead of installing from the Chocolatey
+  repository ().
+
+### `v2.8.3` (2024-03-20)
+
+- `[setup-r]` now sets the `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=true`
+  environment variable when installation associated tools on macOS. Without this `brew`
+  often fails on outdated Homebrew installations ().
+- `[setup-r-dependencies]` now works on aarch64 Linux.
+
+### `v2.8.2` (2024-03-18)
+
+- `[setup-r]` now supports Rtools44, and installs Rtools44 for R 4.4.x (currently R-devel).
+- `[check-r-package]` now supports `upload-results: never` to never upload
+  check results as artifacts. This is useful if you want to handle artifact uploads
+  yourself.
+
+### `v2.8.1` (2024-02-29)
+
+- `[setup-r-dependencies]`: fix Pandoc auto-installation ().
+
+### `v2.8.0` (2024-02-27)
+
+- `[setup-r]` now allows `rtools-version: none` to skip installing Rtools ().
+- `[setup-pandoc]`: The default version is 3.1.11 now.
+- `[setup-pandoc]` can now install the latest pandoc version, or the pandoc nightly build.
+- `[setup-pandoc]` now supports arm64 macOS and any amd64 or arm64 Linux distribution.
+- `[setup-r-dependencies]` now installs pandoc if the R package depends on the rmarkdown package.
+- `[check-r-package]` now has inputs `artifact-name` and `snapshot-artifact-name` to specify artifact names explicitly ().
+- The styler example now sets permissions correctly (, [@&#8203;thisisnic](https://redirect.github.com/thisisnic)).
+- The test coverage example now handles paths with spaces or special characters (, [@&#8203;Felixmil](https://redirect.github.com/Felixmil)).
+- The check example workflows now use a better `build_args` parameter ().
+
+### `v2.7.2` (2024-02-01)
+
+- `[check-r-package]` now uses better artifact names. It includes `matrix.config.id` from the job matrix in the artifact name. If that's not defined then the zero-based job index in the matrix is used. For non-matrix jobs, this is `0`.
+
+### `v2.7.1` (2024-01-31)
+
+- `[check-r-package]` now includes the runner architecture in the name of the test output artifact, to avoid a name clash between `macos-14` and other macOS runners.
+
+### `v2.7.0` (2024-01-31)
+
+- `[setup-r]` now removes Homebrew R from the PATH on macOS. With this `setup-r` works on the new arm64 `macos-14` platform.
+- All actions and examples now use Node 20 actions.
+
+### `v2.6.5` (2023-10-27)
+
+- `[setup-r]` now tries to avoid `*.r-project.org` URLs, to work around a DNS issue.
+- `[check-r-package]` now only sets `_R_CHECK_CRAN_INCOMING_=false` if it is not set already ([@&#8203;krlmlr](https://redirect.github.com/krlmlr), ).
+- `[setup-renv]` now has a `working-directory` parameter ([@&#8203;milanmlft](https://redirect.github.com/milanmlft), ).
+- The example `test-coverage.yaml` workflow now works on Windows.
+
+### `v2.6.4` (2023-07-14)
+
+- `[setup-r-dependencies]` now works without `sudo` on Linux.
+- `[setup-renv]` now only installs renv if not installed already, e.g. the installation of the correct renv version
+  is typically triggered from the `.Rprofile` ().
+
+### `v2.6.3` (2023-04-26)
+
+- `[setup-r]` now installs gfortran 12.2 only for R 4.3.0 and newer, as it is not compatible with the
+  R 4.1.x (and possibly other) R builds ().
+
+### `v2.6.2` (2023-04-24)
+
+- `[setup-r]` sets its `installed-r-version` output correctly again, to the actual R version number.
+- `[setup-r]` now installs gfortran 12.2 for R 4.0.0 and newer. This fixes fortran compilation for
+  R 4.3.0 and newer.
+
+### `v2.6.1` (2023-04-21)
+
+- `[setup-r]` observes the `rtools-version` input parameter again ().
+- The pkgdown example now sets the permissions of the automatic `GITHUB_TOKEN`
+  to allow deployment (, [@&#8203;jennybc](https://redirect.github.com/jennybc)).
+
+### `v2.6.0` (2023-04-21)
+
+- `[setup-r]` now does a better job resolving R version specifications.
+- The example workflow for styler now commits all styled files (, [@&#8203;dpprdan](https://redirect.github.com/dpprdan)).
+
+### `v2.5.0` (2023-04-01)
+
+- `[setup-r]`: better cache key for R-devel: now the graphics engine API id and t	he internal R id are also included
+  in the cache key (, [@&#8203;schloerke](https://redirect.github.com/schloerke)).
+- `[setup-r]`: the `r-version` parameter can now be set to `renv`, to read the R version to install from the
+  `renv.lock` file (, [@&#8203;iqis](https://redirect.github.com/iqis)).
+- `[setup-r]`: now installs Rtools43 for R 4.3.0 (current R-next) and later ().
+- `[setup-r-dependencies]`: new input parameter: `upgrade`, whether to install the latest available package
+  versions. Defaults to `FALSE`.
+- `[setup-tinytex]`: handle tinytex 2023 change about windows directory (, [@&#8203;cderv](https://redirect.github.com/cderv)).
+- `[setup-pandoc]`: fix installation of Pandoc 3.1.2 (and possibly later) on macOS (, [@&#8203;IndrajeetPatil](https://redirect.github.com/IndrajeetPatil)).
+- The example `document.yaml` workflow now also saves the `DESCRIPTION` file (, [@&#8203;dpprdan](https://redirect.github.com/dpprdan)).
+
+### `v2.4.0` (2023-01-16)
+
+- `[setup-r]`: supports Rtools43 now. On R-devel Windows Rtools43 is installed by default ().
+- `[setup-renv]`: new input parameter: `bypass-cache` to skip the GitHub cache completely (, [@&#8203;davidski](https://redirect.github.com/davidski)).
+- The `style.yaml` example workflow now installs roxygen2 as well (, [@&#8203;dpprdan](https://redirect.github.com/dpprdan)).
+- The `document.yaml` and `style.yaml` example workflows now do not run for pull requests (, [@&#8203;arisp99](https://redirect.github.com/arisp99)).
+
+### `v2.3.1` (2022-11-04)
+
+- `[setup-r-dependencies]` is now compatible with renv again ().
+- `[check-r-package]` now sets the `LOGNAME` environment variable, which is needed for an `R CMD check` test to work ().
+
+### `v2.3.0` (2022-10-26)
+
+- All node.js actions use node 16 now.
+
+- `[check-r-package]` uploading artifacts works now when `working-directory` is set (, [@&#8203;riccardoporreca](https://redirect.github.com/riccardoporreca)).
+
+- `[setup-pandoc]` uses now pandoc version 2.19.2 by default.
+
+- `[setup-r]` now sets `RENV_CONFIG_REPOS_OVERRIDE` to RSPM, if RSPM is requrested ().
+
+- `[setup-r]` has a new `windows-path-include-rtools` parameter ().
+
+- `[setup-r]` now installs ghostscript on all platforms, as it is sometimes needed for `R CMD check` ().
+
+- `[setup-r-dependencies]` now installs pak into the site library. This helps checking packages that depend on pak ().
+
+- `[setup-renv]` has a new `profile` parameter for the renv profile to use in `renv::activate()` (, [@&#8203;Bisaloo](https://redirect.github.com/Bisaloo)).
+
+- All example workflows use actions relying on node 16 now.
+
+- Example workflows using lintr now fail on lint errors now ().
+
+- The `check-full` workflow now includes a check on Windows 4.1.x ().
+
+- The `style` example how also supports Quarto `.qmd` files (, [@&#8203;IndrajeetPatil](https://redirect.github.com/IndrajeetPatil)).
+
+- New example workflow, `lint-changed-files`, to lint only the changed files (, [@&#8203;IndrajeetPatil](https://redirect.github.com/IndrajeetPatil)).
+
+- New example workflow, `check-no-suggests`, to run `R CMD check` with only the suggested packages ().
+
+- The `test-coverage` workflow now prints the test results and on test failures it also uploads them as an artifact ().
+
+### `v2.2.8` (2022-08-31)
+
+- Examples now use `ubuntu-latest` instead of `ubuntu-20.04`. This avoid having to update your workflows every two years.
+  It does not change anything right now, however, as `ubuntu-latest` is the same as `ubuntu-20.04` currently.
+
+### `v2.2.7` (2022-08-23)
+
+- HTML 5 check example now works for packages with vignettes (by ignoring them), .
+- \[setup-r] now adds Rtools40 to the PATH for Windows ucrt R versions, so R can compile packages again, .
+
+### `v2.2.6` (2022-08-22)
+
+- Examples now use Ubuntu 22.04, because 18.04 is deprecated on GHA.
+- New example for HTML 5 checks: [examples/html-5-check.yaml](examples/html-5-check.yaml).
+
+### `v2.2.5` (2002-08-05)
+
+- `[check-r-package]` now correctly uploads artifacts after a check error (, ).
+- `shiny-deploy` example now works correctly.
+
+### `v2.2.4` (2022-07-27)
+
+- `[setup-r]` does not fix `release` to 4.2.0 any more.
+
+### `v2.2.3` (2002-06-23)
+
+- `[setup-r]` `release` is now fixed to R 4.2.0 on Linux, until we have the Linux binaries ready for R 4.2.1.
+- The lintr example workflow now installs the local package as well (,[@&#8203;dpprdan](https://redirect.github.com/dpprdan)).
+- Artifact upload now works properly if `check-dir` is specified (, [@&#8203;riccardoporreca](https://redirect.github.com/riccardoporreca))
+
+### `v2.2.2` (2022-04-25)
+
+- `[setup-r]` `release` is not fixed to R 4.1.3 any more, on Linux.
+
+### `v2.2.1` (2022-04-21)
+
+- `[setup-r]` `release` is now fixed to R 4.1.3 on Linux, until we have the Linux binaries and RSPM binary packages
+  ready for R 4.2.0.
+
+### `v2.2.0` (2022-04-01)
+
+- `[setup-r]` now supports `next` as an R version. It installs the next version of R. This is R-patched if there is no
+  active release process. Otherwise it can be R-alpha, R-beta, R-rc or R-prerelease ().
+- `[setup-r-dependencies]` has a new `cache` input parameter, which you can set to `false` to disable the cache
+  ([@&#8203;Bisaloo](https://redirect.github.com/Bisaloo), ).
+- `[setup-r-dependencies]` now removed the temporary `.github/pkg.lock` file after the package installation,
+  to avoid a dirty git tree ([@&#8203;schloerke](https://redirect.github.com/schloerke), ).
+- `[setup-pandoc]` now fails if it fails to install pandoc ([@&#8203;nikeee](https://redirect.github.com/nikeee), ).
+
+### `v2.1.5` (2022-03-11)
+
+- `[setup-r]`: remove workaround for R 4.1.3. `release` is R 4.1.3 now on Linux.
+
+### `v2.1.4` (2022-03-10)
+
+- `[check-r-package`: new `upload-results` parameter to be able to upload the result artifact for successful checks.
+- `[setup-r]`: fix R installation for R `release`.
+
+### `v2.1.3` (2022-02-18)
+
+- `[setup-r-dependencies]`: the `pak-version` parameter defaults to "stable" now.
+- `[setup-tinynex]` now fails if it fails to download or install TinyTeX ().
+
+### `v2.1.2` (2022-02-16)
+
+- `[setup-r]` now again adds Rtools40 to the path (, [@&#8203;nealrichardson](https://redirect.github.com/nealrichardson)).
+- `[setup-r]` Rtools42 version updated to latest.
+
+### `v2.1.1` (2022-02-14)
+
+- `[setup-r-dependencies]` uses the correct cache key now, previously it was truncated.
+
+### `v2.1.0` (2022-02-12)
+
+- `[setup-r-dependencies]` now has a `packages` parameter, to override which package(s) to install ().
+- `[setup-r]` now supports Rtools42. Pass `'42'` as the `rtools-version` parameter ().
+- `[setup-r]`: the `windows-path-include-mingw` parameter is now defunct with Rtools40 and later, as it is not needed and possibly causes confusion.
+- `[check-r-package]` has a new parameter: `upload-snapshots`, to upload testthat snapshots as artifacts ().
+- The pkgdown, bookdown and blogdown examples now use concurrency groups to avoid race conditions when deploying the site ().
+- The test-coverage example now keeps the output from covr, to make debugging easier ().
+- Two new examples are included, to run `roxygen2::roxygenise()` and `styler::style_pkg()` on a repo and commit the results ().
+
+### `v2.0.11` (2022-01-16)
+
+- `[setup-r]` forces HTTP/1.1 for pak/pkgcache.
+- `[setup-r-dependencies]` does the same. This *seems* to fix crashes during package installation ().
+
+### `v2.0.10` (2022-01-11)
+
+- The pkgdown example now uses `clean: false` to allow a production and a dev site.
+
+### `v2.0.9` (2022-01-11)
+
+- `[setup-r]` now does not download qpdf on Windows, because it is already
+  included in Rtools ().
+
+### `v2.0.8` (2022-01-11)
+
+- `[check-r-package]` does not print the environment now, because there is a slight chance that printing
+  exposes processed secrets that GitHub's reduction mechanism misses.
+
+### `v2.0.7` (2022-01-06)
+
+- Simplified GitHub Pages deployment in the pkgdown example ().
+
+### `v2.0.6` (2022-01-05)
+
+- `[setup-r]` does not add the `ppa:cran/travis` PPA on Ubuntu, as it is not needed any more. ([@&#8203;jeroen](https://redirect.github.com/jeroen), )
+- `[setup-r]` macOS R-devel builds use a more robust R download URL now ([@&#8203;s-u](https://redirect.github.com/s-u), ).
+- `[setup-r-dependencies]` now uses the correct cache key if `working-directory` is specified ([@&#8203;harupy](https://redirect.github.com/harupy), )
+
+### `v2.0.5` (2021-12-17)
+
+- `[setup-r-dependencies]` now works with older versions of the sessioninfo package.
+  (This typically happens on older R versions and Windows or macOS, where pak prefers
+  to install an older binary package to a newer source package, unless the newer package
+  is needed.)
+
+### `v2.0.4` (2021-12-16)
+
+- `[setup-r]` and `[setup-r-dependencies]` now have better organized output
+- `[check-r-package]` now prints all environment variables before the check.
+
+### `v2.0.3` (2021-12-15)
+
+- `[setup-r]` and `[setup-r-dependencies]` do not treat R version `devel-ucrt` specially any more,
+  and it is equivalent to `devel`.
+
+### `v2.0.2` (2021-12-14)
+
+- `[check-r-package]` now sets the `_R_CHECK_FORCE_SUGGESTS_=false`  environment variable,
+  unless it was already set before to a non-empty value.
+
+### `v2.0.1` (2021-12-13)
+
+- `[setup-r-dependencies]` is now better at ignoring soft package dependencies that
+  cannot be installed on the current R version. See more in the README here:
+  <https://github.com/r-lib/actions/tree/v2/setup-r-dependencies#ignoring-optional-dependencies-that-need-a-newer-r-version>
+
+### `v2.0.0` (2021-12-12)
+
+#### Breaking changes from `v1`
+
+- `[check-r-package]`: many parameters have a new format now, and they need
+  to be legal R expressions.
+- `[setup-r]` does not have a `crayon.enabled` parameter now. You can update
+  `.Rprofile` manually to set options if you like, see example in the README.
+
+#### New compared to `v1`
+
+- `[check-r-package]` has a `working-direcytory` parameter now ().
+- `[check-r-package]` prints the testthat output, and uploads artifacts on failure
+  now, no need to do these in the workflow file.
+- `[run-rchk]` is now a more flexible composite action ([@&#8203;randy3k](https://redirect.github.com/randy3k), , ).
+- `[setup-pandoc]` now defaults to Pandoc version 2.14.2.
+- `[setup-r]` more robust installation in macOS, hopefully the hangs are solved.
+- `[setup-r]` now works on macOS Big Sur for older R versions ().
+- `[setup-r-dependencies]` has more robust dependency and system dependency lookup
+  and installation (, , , , , , , ).
+- `[setup-r-dependencies]` automatically uses the UCRT versions of packages on UCRT R.
+- `[setup-r-dependencies]` has a `working-directory` parameter now (, ).
+- `[setup-r-dependencies]` has a less conservative cache key now for R-devel ().
+- `[setup-r-dependencies]` now has a `dependencies` parameter to finetune which
+  dependencies are installed ().
+
+#### Changes in example workflows from `v1`
+
+- New example workflows, that work with the `v2` tag.
+- Example pkgdown workflow builds releases now ().
+- bookdown, blogdown and pkgdown examples now have workflow triggers to
+  trigger a build manually.
+- bookdown, blogdown and pkgdown examples now build on pull requests as
+  well, without deploying ().
+- Check examples omit showing the testtat output and the artifact upload
+  on error, these are done in the `check-r-package` action now.
+
+</details>
+
+---
+
+### Configuration
+
+📅 **Schedule**: (UTC)
+
+- Branch creation
+  - At any time (no schedule defined)
+- Automerge
+  - At any time (no schedule defined)
+
+🚦 **Automerge**: Disabled by config. Please merge this manually once you are satisfied.
+
+♻ **Rebasing**: Whenever PR becomes conflicted, or you tick the rebase/retry checkbox.
+
+🔕 **Ignore**: Close this PR and you won't be reminded about this update again.
+
+---
+
+ - [ ] <!-- rebase-check -->If you want to rebase/retry this PR, check this box
+
+---
+
+This PR was generated by [Mend Renovate](https://mend.io/renovate/). View the [repository job log](https://developer.mend.io/github/dfsp-spirit/fsbrain).
+<!--renovate-debug:eyJjcmVhdGVkSW5WZXIiOiI0NC4zOS4wIiwidXBkYXRlZEluVmVyIjoiNDQuMzkuMCIsInRhcmdldEJyYW5jaCI6Im1hc3RlciIsImxhYmVscyI6W119-->
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `57f308ff30a5`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

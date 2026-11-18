@@ -1,0 +1,1119 @@
+diff --git a/docs/source/community/contributing.md b/docs/source/community/contributing.md
+index 507a69f9b5..034f0f8746 100644
+--- a/docs/source/community/contributing.md
++++ b/docs/source/community/contributing.md
+@@ -633,12 +633,54 @@ and is structured as follows:
+   - `movement.napari.regions_widget`: a Qt table widget for managing named
+     regions of interest drawn as `napari` shapes layers.
+     See the next section for more details on this widget's architecture.
++- {mod}`movement.napari.layer_wiring`: callbacks that operate on `napari`
++  layers and the viewer. These callbacks are defined outside the widgets because
++  they must remain active for as long as the viewer or the layer exists (rather than
++  sharing lifetime with a widget that can be closed). The module also defines
++  relevant metadata keys for `movement` layers (e.g. `POINTS_LAYER_KEY`,
++  `TRACKS_LAYER_KEY`).
+ - {mod}`movement.napari.layer_styles`: dataclasses that encapsulate visual
+   properties for each layer type.
+ - {mod}`movement.napari.convert`: functions for converting `movement`
+   datasets into the NumPy arrays and properties DataFrames
+   that `napari` layer constructors expect.
+ 
++#### Where should a layer callback live?
++
++The layers created by a widget stay in the viewer even after closing the widget.
++If it makes sense to keep callbacks alive after closing a widget, those
++callbacks should be defined in {mod}`movement.napari.layer_wiring`, rather
++than as methods of a widget. A callback connected as a method of a widget is
++only guaranteed to run while that widget is alive
++
++Use this rule of thumb:
++
++- If the callback **mutates layer or viewer state** (layer data,
++  properties, symbols, `editable`, the frame slider range), put it in
++  `layer_wiring`. That state is part of the user's work and may be saved
++  to a file later, so it must outlive the widget.
++- If the callback **only refreshes a widget's own UI** (a dropdown, a
++  table, a button), keep it as a method on that widget. Once the widget
++  is gone there is nothing left to update.
++
++Callbacks in `layer_wiring` are wired in one of two ways, depending on
++the lifetime they need:
++
++- **Viewer lifetime**: `connect_viewer_callbacks(viewer)` is called once
++  per viewer (it keeps a `WeakSet` of already-wired viewers, so repeated
++  calls are a no-op). It connects callbacks that react to viewer-level
++  events, such as layers being inserted or removed, or the displayed
++  dimensions changing.
++- **Layer lifetime**: connected directly to a layer's events when the
++  layer is created (e.g.
++  `points_layer.events.data.connect(on_points_data_changed)` in
++  `loader_widgets`), so the callback lives and dies with that layer.
++
++Because these callbacks are not tied to a widget, they can be tested
++against a bare viewer and layers, without instantiating a widget —
++see `tests/test_unit/test_napari_plugin/test_layer_wiring.py`.
++
++
+ #### Qt Model/View architecture
+ 
+ `movement.napari.regions_widget` follows
+diff --git a/movement/napari/layer_wiring.py b/movement/napari/layer_wiring.py
+new file mode 100644
+index 0000000000..49015d247c
+--- /dev/null
++++ b/movement/napari/layer_wiring.py
+@@ -0,0 +1,258 @@
++"""Layer callbacks that must outlive the widget connecting them.
++
++Put a callback here if it should be active as long as the viewer
++or a layer exists (rather than sharing lifetime with a widget that
++can be closed).
++
++- Typical candidates are callbacks that mutate layer state (data, properties,
++  symbols, ``editable``): that state is part of the user's work and may be
++  saved to a file later, so it must survive the widget being closed.
++- A callback that only refreshes a widget's own UI (a dropdown, a table, a
++  button) can stay a method on that widget: once the widget is gone there is
++  nothing left to update, which is fine.
++
++"""
++
++import warnings
++from functools import partial
++from weakref import WeakSet
++
++import numpy as np
++from napari.components.dims import RangeTuple
++from napari.layers import Image, Points, Shapes, Tracks
++from napari.layers.base import ActionType
++
++from movement.napari.layer_styles import EDITED_POINT_SYMBOL
++
++# Metadata keys stored on the movement Points layer.
++# - POINTS_LAYER_KEY marks the layer as movement-created.
++# - POINTS_PROPERTIES_KEY holds the full properties df, incl. the NaN rows
++#   dropped from the live layer, needed to reconstruct the dataset.
++# - DATASET_ATTRS_KEY holds the source dataset's attrs (source_software, fps…).
++# - TRACKS_LAYER_KEY holds a reference to the companion Tracks layer.
++POINTS_LAYER_KEY: str = "movement_points_layer"
++POINTS_PROPERTIES_KEY: str = "movement_points_properties"
++DATASET_ATTRS_KEY: str = "movement_dataset_attrs"
++TRACKS_LAYER_KEY: str = "movement_tracks_layer"
++
++# Keep a set of viewers already wired by connect_viewer_callbacks,
++# so we don't wire them twice. We use a WeakSet so tracking a viewer here
++# does not prevent it from being garbage-collected when it is no longer used.
++_WIRED_VIEWERS: WeakSet = WeakSet()
++
++
++# ---- Callbacks with viewer lifetime --------------------
++def connect_viewer_callbacks(viewer) -> None:
++    """Wire the layer callbacks to a viewer, skipping if already wired.
++
++    These wirings last as long as the viewer, no matter which widget requested
++    them.
++    """
++    # Check if viewer has been wired by this function
++    viewer = getattr(viewer, "__wrapped__", viewer)
++    if viewer in _WIRED_VIEWERS:
++        return
++
++    # Connect relevant layer callbacks to the viewer.
++    # Connect frame slider range update to layer events
++    for action in (
++        "inserted",
++        "removed",
++    ):
++        getattr(viewer.layers.events, action).connect(
++            partial(update_frame_slider_range, viewer)
++        )
++
++    # Point drags are only guaranteed to stay within their own frame
++    # when frame is the sliced (non-displayed) axis in a 2D view. If
++    # axes are rolled or a 3D view is used in the viewer, disable editing
++    # rather than risk a drag moving a point onto a different frame.
++    for event in (
++        viewer.dims.events.order,
++        viewer.dims.events.ndisplay,
++    ):
++        event.connect(partial(update_points_layers_editable, viewer))
++
++    # Update set
++    _WIRED_VIEWERS.add(viewer)
++
++
++def update_frame_slider_range(viewer, event=None):
++    """Check the frame slider range and update it if necessary.
++
++    This is required because if the data loaded starts or ends
++    with all NaN values, the frame slider range will not reflect
++    the full range of frames.
++    """
++
++    def _layer_has_data(layer):
++        if isinstance(layer, Shapes):
++            return len(layer.data) > 0
++        return layer.data.shape[0] > 0
++
++    # Only update the frame slider range if there are layers
++    # that are Points, Tracks, Image or Shapes with data
++    list_layers = [
++        ly
++        for ly in viewer.layers
++        if isinstance(ly, Points | Tracks | Image | Shapes)
++        and _layer_has_data(ly)
++    ]
++    if len(list_layers) > 0:
++        # Get the maximum frame index from all candidate layers
++        max_frame_idx = max(
++            # For every layer, get max_frame_idx metadata if it exists,
++            # else deduce it from the data shape
++            [
++                getattr(ly, "metadata", {}).get(
++                    "max_frame_idx", ly.data.shape[0] - 1
++                )
++                if not isinstance(ly, Shapes)
++                # Napari stores shapes layer data as a list of 2D arrays
++                # instead of a 3D array, so we can't use data.shape here
++                else getattr(ly, "metadata", {}).get(
++                    "max_frame_idx", len(ly.data) - 1
++                )
++                for ly in list_layers
++            ]
++        )
++
++        # If the frame slider range is not set to the full range of frames,
++        # update it.
++        if (viewer.dims.range[0].stop != max_frame_idx) or (
++            int(viewer.dims.range[0].start) != 0
++        ):
++            viewer.dims.range = (
++                RangeTuple(start=0.0, stop=max_frame_idx, step=1.0),
++            ) + viewer.dims.range[1:]
++
++
++def frame_axis_is_sliced(viewer) -> bool:
++    """Determine whether the frame axis is the sliced axis in a 2D view."""
++    return viewer.dims.ndisplay == 2 and viewer.dims.order[0] == 0
++
++
++def update_points_layers_editable(viewer, event=None):
++    """Disable point editing while the frame axis isn't sliced.
++
++    Connected to ``viewer.dims.events.order``/``ndisplay``.
++    It disables editing on every movement Points layer if
++    the viewer axes are rolled or switched to 3D; napari greys
++    out the select/add/delete controls.
++    """
++    is_editable = frame_axis_is_sliced(viewer)
++    for layer in viewer.layers:
++        if isinstance(layer, Points) and layer.metadata.get(POINTS_LAYER_KEY):
++            layer.editable = is_editable
++
++
++# ---- Callbacks with layer lifetime --------------------
++def set_point_symbol_by_edited(layer: Points) -> None:
++    """Show points flagged as edited with a distinct marker symbol."""
++    edited = layer.properties.get("edited")
++    if edited is None or not edited.any():
++        return
++    symbols = np.asarray(layer.symbol).copy()
++    symbols[edited] = EDITED_POINT_SYMBOL
++    layer.symbol = symbols
++
++
++def on_points_data_changed(event):
++    """Keep the corresponding Tracks layer in sync with the Points layer.
++
++    Connected to ``points_layer.events.data``. Handles two actions:
++
++    - ``ActionType.CHANGED`` (a point was dragged): sets the
++      confidence score of moved points to NaN, marks them as
++      edited, and changes their marker symbol to
++      ``EDITED_POINT_SYMBOL`` so edited points are visually
++      distinguishable. The Tracks layer row is updated in place
++      via `sync_tracks_layer`.
++    - ``ActionType.REMOVED`` (one or more points were deleted):
++      removes the corresponding rows from
++      the Tracks layer via `remove_from_tracks_layer`.
++    """
++    layer = event.source
++    if not isinstance(layer, Points):
++        return
++
++    if event.action == ActionType.CHANGED:
++        moved_indices = list(event.data_indices)
++        props = layer.properties
++        props["confidence"] = props["confidence"].copy()
++        props["confidence"][moved_indices] = float("nan")
++        if "edited" in props:
++            props["edited"] = props["edited"].copy()
++        else:
++            props["edited"] = np.full(len(props["confidence"]), False)
++        props["edited"][moved_indices] = True
++        layer.properties = props
++        set_point_symbol_by_edited(layer)
++        sync_tracks_layer(layer, moved_indices)
++
++    elif event.action == ActionType.REMOVED:
++        removed_indices = list(event.data_indices)
++        remove_from_tracks_layer(layer, removed_indices)
++
++
++def sync_tracks_layer(points_layer, moved_indices):
++    """Update the corresponding Tracks layer to match an edited point.
++
++    A moved point's new (frame, y, x) is written to the same row
++    in the Tracks layer, so the track segment connecting the
++    previous frame to this one terminates at the dragged position.
++    """
++    tracks_layer = points_layer.metadata[TRACKS_LAYER_KEY]
++
++    # Points and Tracks layers are built from the same NaN-filtered
++    # array in the same row order (see _add_points_layer/
++    # _add_tracks_layer). The Tracks layer only has an extra
++    # leading track_id column.
++    tracks_data = tracks_layer.data
++    tracks_data[moved_indices, 1:] = points_layer.data[moved_indices]
++
++    set_tracks_layer_data(tracks_layer, tracks_data, tracks_layer.properties)
++
++
++def remove_from_tracks_layer(points_layer, removed_indices):
++    """Remove the rows corresponding to deleted points.
++
++    Users edit the Points layer directly, either dragging points
++    or removing inaccurate predictions. The Tracks layer has no
++    interactive editing of its own, so it must be kept in sync
++    with the Points layer instead.
++
++    ``removed_indices`` are indices in the Points layer which line
++    up with rows in the Tracks layer, the same way
++    :func:`sync_tracks_layer` relies on for edits.
++    """
++    tracks_layer = points_layer.metadata[TRACKS_LAYER_KEY]
++
++    tracks_data = np.delete(tracks_layer.data, removed_indices, axis=0)
++    tracks_properties = {
++        key: np.delete(np.asarray(values), removed_indices, axis=0)
++        for key, values in tracks_layer.properties.items()
++    }
++
++    set_tracks_layer_data(tracks_layer, tracks_data, tracks_properties)
++
++
++def set_tracks_layer_data(tracks_layer, data, properties):
++    """Set a Tracks layer's data and properties, preserving color_by.
++
++    Setting ``.data`` on a napari Tracks layer resets its internal
++    features to empty, which transiently invalidates ``color_by``
++    (napari warns and falls back to "track_id") even though we
++    restore the same properties and colour-by property right
++    after. Suppress that spurious warning around the sequence.
++    """
++    color_by = tracks_layer.color_by
++    with warnings.catch_warnings():
++        warnings.filterwarnings(
++            "ignore",
++            message=".*Previous color_by key.*",
++            category=UserWarning,
++        )
++        tracks_layer.data = data
++        tracks_layer.properties = properties
++        tracks_layer.color_by = color_by
+diff --git a/movement/napari/loader_widgets.py b/movement/napari/loader_widgets.py
+index 7a30af507e..0974f172f9 100644
+--- a/movement/napari/loader_widgets.py
++++ b/movement/napari/loader_widgets.py
+@@ -1,14 +1,12 @@
+ """Widgets for loading movement datasets from file."""
+ 
+-import warnings
++from functools import partial
+ from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
+ import xarray as xr
+-from napari.components.dims import RangeTuple
+-from napari.layers import Image, Points, Shapes, Tracks
+-from napari.layers.base import ActionType
++from napari.layers import Points
+ from napari.settings import get_settings
+ from napari.utils.notifications import show_error, show_warning
+ from napari.viewer import Viewer
+@@ -25,11 +23,17 @@
+ 
+ from movement.io.load import load_dataset, rename_legacy_dimensions
+ from movement.napari.convert import ds_to_napari_layers
+-from movement.napari.layer_styles import (
+-    EDITED_POINT_SYMBOL,
+-    BoxesStyle,
+-    PointsStyle,
+-    TracksStyle,
++from movement.napari.layer_styles import BoxesStyle, PointsStyle, TracksStyle
++from movement.napari.layer_wiring import (
++    DATASET_ATTRS_KEY,
++    POINTS_LAYER_KEY,
++    POINTS_PROPERTIES_KEY,
++    TRACKS_LAYER_KEY,
++    connect_viewer_callbacks,
++    frame_axis_is_sliced,
++    on_points_data_changed,
++    set_point_symbol_by_edited,
++    update_frame_slider_range,
+ )
+ from movement.utils.logging import logger
+ from movement.validators.datasets import DS_TYPE_VALIDATORS
+@@ -55,17 +59,6 @@
+     **SUPPORTED_NETCDF_FILES,
+ }
+ 
+-# Metadata keys stored on the movement Points layer.
+-# - POINTS_LAYER_KEY marks the layer as movement-created.
+-# - POINTS_PROPERTIES_KEY holds the full properties df, incl. the NaN rows
+-#   dropped from the live layer, needed to reconstruct the dataset.
+-# - DATASET_ATTRS_KEY holds the source dataset's attrs (source_software, fps…).
+-# - TRACKS_LAYER_KEY holds a reference to the companion Tracks layer.
+-POINTS_LAYER_KEY: str = "movement_points_layer"
+-POINTS_PROPERTIES_KEY: str = "movement_points_properties"
+-DATASET_ATTRS_KEY: str = "movement_dataset_attrs"
+-TRACKS_LAYER_KEY: str = "movement_tracks_layer"
+-
+ 
+ class DataLoader(QWidget):
+     """Widget for loading movement datasets from file."""
+@@ -82,23 +75,12 @@ def __init__(self, napari_viewer: Viewer, parent=None):
+         self._create_file_path_widget()
+         self._create_load_button()
+ 
+-        # Connect frame slider range update to layer events
+-        for action_str in ["inserted", "removed"]:
+-            getattr(self.viewer.layers.events, action_str).connect(
+-                self._update_frame_slider_range,
+-            )
+-        self._enable_layer_tooltips()
++        # Connect the viewer to the movement layer callbacks. These
++        # outlive this widget, so layers stay in sync if the movement
++        # meta-widget is closed
++        connect_viewer_callbacks(self.viewer)
+ 
+-        # Point drags are only guaranteed to stay within their own frame
+-        # when frame is the sliced (non-displayed) axis in a 2D view. If
+-        # axes are rolled or a 3D view is used, disable editing rather
+-        # than risk a drag moving a point onto a different frame.
+-        self.viewer.dims.events.order.connect(
+-            self._update_points_layers_editable
+-        )
+-        self.viewer.dims.events.ndisplay.connect(
+-            self._update_points_layers_editable
+-        )
++        self._enable_layer_tooltips()
+ 
+     def _create_source_software_widget(self):
+         """Create a combo box for selecting the source software."""
+@@ -375,158 +357,19 @@ def _add_points_layer(self):
+             },
+             **points_style.as_kwargs(),
+         )
+-        self.points_layer.events.data.connect(self._on_points_data_changed)
+-        self.points_layer.editable = self._frame_axis_is_sliced()
++        self.points_layer.events.data.connect(on_points_data_changed)
++        # Re-pad the frame slider range (if needed) after each point layer edit
++        self.points_layer.events.data.connect(
++            partial(update_frame_slider_range, self.viewer)
++        )
++        self.points_layer.editable = frame_axis_is_sliced(self.viewer)
+ 
+         # If the loaded dataset already has an `edited` property
+         # mark those points with the edited symbol.
+-        self._set_point_symbol_by_edited(self.points_layer)
++        set_point_symbol_by_edited(self.points_layer)
+ 
+         logger.info("Added tracked dataset as a napari Points layer.")
+ 
+-    def _frame_axis_is_sliced(self) -> bool:
+-        """Whether frame is the sliced axis in a 2D view.
+-
+-        A point drag only ever touches the currently *displayed* axes
+-        (see ``Points._move`` in napari). When frame is the sliced
+-        axis, that means x/y -- everything is safe to edit. If axes
+-        have been rolled so frame is displayed instead, or a 3D view
+-        is active, a drag could move a point onto a different frame.
+-        """
+-        return (
+-            self.viewer.dims.ndisplay == 2 and self.viewer.dims.order[0] == 0
+-        )
+-
+-    def _update_points_layers_editable(self, event=None):
+-        """Disable point editing while the frame axis isn't sliced.
+-
+-        Connected to ``viewer.dims.events.order``/``ndisplay``.
+-        In the default view, the frame axis is the slider, so
+-        dragging a point can only change its x/y position. Rolling
+-        the axes or switching to 3D makes frame draggable too, which
+-        would let a drag move a point to another frame. Disable
+-        editing on every movement Points layer while that is the
+-        case; napari greys out the select/add/delete controls.
+-        """
+-        frame_axis_is_sliced = self._frame_axis_is_sliced()
+-        for layer in self.viewer.layers:
+-            if isinstance(layer, Points) and layer.metadata.get(
+-                POINTS_LAYER_KEY
+-            ):
+-                layer.editable = frame_axis_is_sliced
+-
+-    @staticmethod
+-    def _set_point_symbol_by_edited(layer: Points) -> None:
+-        """Show points flagged as edited with a distinct marker symbol."""
+-        edited = layer.properties.get("edited")
+-        if edited is None or not edited.any():
+-            return
+-        symbols = np.asarray(layer.symbol).copy()
+-        symbols[edited] = EDITED_POINT_SYMBOL
+-        layer.symbol = symbols
+-
+-    def _on_points_data_changed(self, event):
+-        """Keep the corresponding Tracks layer in sync with the Points layer.
+-
+-        Connected to ``points_layer.events.data``. Handles two actions:
+-
+-        - ``ActionType.CHANGED`` (a point was dragged): sets the
+-          confidence score of moved points to NaN, marks them as
+-          edited, and changes their marker symbol to
+-          ``EDITED_POINT_SYMBOL`` so edited points are visually
+-          distinguishable. The Tracks layer row is updated in place
+-          via `_sync_tracks_layer`.
+-        - ``ActionType.REMOVED`` (one or more points were deleted):
+-          removes the corresponding rows from
+-          the Tracks layer via `_remove_from_tracks_layer`.
+-        """
+-        layer = event.source
+-        if not isinstance(layer, Points):
+-            return
+-
+-        if event.action == ActionType.CHANGED:
+-            moved_indices = list(event.data_indices)
+-            props = layer.properties
+-            props["confidence"] = props["confidence"].copy()
+-            props["confidence"][moved_indices] = float("nan")
+-            if "edited" in props:
+-                props["edited"] = props["edited"].copy()
+-            else:
+-                props["edited"] = np.full(len(props["confidence"]), False)
+-            props["edited"][moved_indices] = True
+-            layer.properties = props
+-            self._set_point_symbol_by_edited(layer)
+-            self._sync_tracks_layer(layer, moved_indices)
+-
+-        elif event.action == ActionType.REMOVED:
+-            removed_indices = list(event.data_indices)
+-            self._remove_from_tracks_layer(layer, removed_indices)
+-
+-    def _sync_tracks_layer(self, points_layer, moved_indices):
+-        """Update the corresponding Tracks layer to match an edited point.
+-
+-        A moved point's new (frame, y, x) is written to the same row
+-        in the Tracks layer, so the track segment connecting the
+-        previous frame to this one terminates at the dragged position.
+-        """
+-        tracks_layer = points_layer.metadata[TRACKS_LAYER_KEY]
+-
+-        # Points and Tracks layers are built from the same NaN-filtered
+-        # array in the same row order (see _add_points_layer/
+-        # _add_tracks_layer). The Tracks layer only has an extra
+-        # leading track_id column.
+-        tracks_data = tracks_layer.data
+-        tracks_data[moved_indices, 1:] = points_layer.data[moved_indices]
+-
+-        self._set_tracks_layer_data(
+-            tracks_layer, tracks_data, tracks_layer.properties
+-        )
+-
+-    def _remove_from_tracks_layer(self, points_layer, removed_indices):
+-        """Remove the rows corresponding to deleted points.
+-
+-        Users edit the Points layer directly, either dragging points
+-        or removing inaccurate predictions. The Tracks layer has no
+-        interactive editing of its own, so it must be kept in sync
+-        with the Points layer instead.
+-
+-        ``removed_indices`` are indices in the Points layer which line
+-        up with rows in the Tracks layer, the same way
+-        :meth:`_sync_tracks_layer` relies on for edits.
+-        """
+-        tracks_layer = points_layer.metadata[TRACKS_LAYER_KEY]
+-
+-        tracks_data = np.delete(tracks_layer.data, removed_indices, axis=0)
+-        tracks_properties = {
+-            key: np.delete(np.asarray(values), removed_indices, axis=0)
+-            for key, values in tracks_layer.properties.items()
+-        }
+-
+-        self._set_tracks_layer_data(
+-            tracks_layer, tracks_data, tracks_properties
+-        )
+-
+-    @staticmethod
+-    def _set_tracks_layer_data(tracks_layer, data, properties):
+-        """Set a Tracks layer's data and properties, preserving color_by.
+-
+-        Setting ``.data`` on a napari Tracks layer resets its internal
+-        features to empty, which transiently invalidates ``color_by``
+-        (napari warns and falls back to "track_id") even though we
+-        restore the same properties and colour-by property right
+-        after. Suppress that spurious warning around the sequence.
+-        """
+-        color_by = tracks_layer.color_by
+-        with warnings.catch_warnings():
+-            warnings.filterwarnings(
+-                "ignore",
+-                message=".*Previous color_by key.*",
+-                category=UserWarning,
+-            )
+-            tracks_layer.data = data
+-            tracks_layer.properties = properties
+-            tracks_layer.color_by = color_by
+-
+     def _add_tracks_layer(self):
+         """Add the tracked data to the viewer as a Tracks layer."""
+         # Define style for tracks layer
+@@ -573,55 +416,6 @@ def _add_boxes_layer(self):
+         )
+         logger.info("Added tracked dataset as a napari Shapes layer.")
+ 
+-    def _update_frame_slider_range(self):
+-        """Check the frame slider range and update it if necessary.
+-
+-        This is required because if the data loaded starts or ends
+-        with all NaN values, the frame slider range will not reflect
+-        the full range of frames.
+-        """
+-
+-        def _layer_has_data(layer):
+-            if isinstance(layer, Shapes):
+-                return len(layer.data) > 0
+-            return layer.data.shape[0] > 0
+-
+-        # Only update the frame slider range if there are layers
+-        # that are Points, Tracks, Image or Shapes with data
+-        list_layers = [
+-            ly
+-            for ly in self.viewer.layers
+-            if isinstance(ly, Points | Tracks | Image | Shapes)
+-            and _layer_has_data(ly)
+-        ]
+-        if len(list_layers) > 0:
+-            # Get the maximum frame index from all candidate layers
+-            max_frame_idx = max(
+-                # For every layer, get max_frame_idx metadata if it exists,
+-                # else deduce it from the data shape
+-                [
+-                    getattr(ly, "metadata", {}).get(
+-                        "max_frame_idx", ly.data.shape[0] - 1
+-                    )
+-                    if not isinstance(ly, Shapes)
+-                    # Napari stores shapes layer data as a list of 2D arrays
+-                    # instead of a 3D array, so we can't use data.shape here
+-                    else getattr(ly, "metadata", {}).get(
+-                        "max_frame_idx", len(ly.data) - 1
+-                    )
+-                    for ly in list_layers
+-                ]
+-            )
+-
+-            # If the frame slider range is not set to the full range of frames,
+-            # update it.
+-            if (self.viewer.dims.range[0].stop != max_frame_idx) or (
+-                int(self.viewer.dims.range[0].start) != 0
+-            ):
+-                self.viewer.dims.range = (
+-                    RangeTuple(start=0.0, stop=max_frame_idx, step=1.0),
+-                ) + self.viewer.dims.range[1:]
+-
+     @staticmethod
+     def _enable_layer_tooltips():
+         """Toggle on tooltip visibility for napari layers.
+diff --git a/tests/fixtures/napari.py b/tests/fixtures/napari.py
+index 95d5d2d452..6c3b16a156 100644
+--- a/tests/fixtures/napari.py
++++ b/tests/fixtures/napari.py
+@@ -7,6 +7,7 @@
+ from napari.layers.base import ActionType
+ 
+ from movement.io import save_poses
++from movement.napari.layer_wiring import on_points_data_changed
+ from movement.napari.loader_widgets import DataLoader
+ 
+ 
+@@ -221,7 +222,7 @@ def _move_point(loader, frame, keypoint, individual, new_y, new_x):
+         mock_event.source = loader.points_layer
+         mock_event.action = ActionType.CHANGED
+         mock_event.data_indices = (edit_idx,)
+-        loader._on_points_data_changed(mock_event)
++        on_points_data_changed(mock_event)
+ 
+     return _move_point
+ 
+@@ -254,11 +255,17 @@ def _remove_point(loader, frame, keypoint, individual):
+ 
+ @pytest.fixture
+ def loaded_data_loader(make_napari_viewer_proxy):
+-    """Return a factory of DataLoader widgets with loaded data."""
++    """Return a factory of DataLoader widgets with loaded data.
+ 
+-    def _loaded_data_loader(filepath, ds):
++    By default, a DataLoader object is instantiated from scratch,
++    but it also accepts an existing ``loader`` as an argument
++    (this can be useful e.g. when it is owned by a ``MovementMetaWidget``).
++    """
++
++    def _loaded_data_loader(filepath, ds, loader=None):
+         """Return a DataLoader widget with the input data loaded."""
+-        loader = DataLoader(make_napari_viewer_proxy())
++        if loader is None:
++            loader = DataLoader(make_napari_viewer_proxy())
+         loader.file_path_edit.setText(str(filepath))
+         loader.source_software_combo.setCurrentText(
+             ds.attrs["source_software"]
+diff --git a/tests/test_unit/test_napari_plugin/test_data_loader_widget.py b/tests/test_unit/test_napari_plugin/test_data_loader_widget.py
+index 59f0c56722..d5eaf519c1 100644
+--- a/tests/test_unit/test_napari_plugin/test_data_loader_widget.py
++++ b/tests/test_unit/test_napari_plugin/test_data_loader_widget.py
+@@ -6,6 +6,7 @@
+ """
+ 
+ from contextlib import nullcontext as does_not_raise
++from functools import partial
+ from pathlib import Path
+ from unittest.mock import Mock
+ 
+@@ -33,6 +34,11 @@
+     QPushButton,
+ )
+ 
++from movement.napari.layer_wiring import (
++    on_points_data_changed,
++    set_point_symbol_by_edited,
++    update_frame_slider_range,
++)
+ from movement.napari.loader_widgets import (
+     SUPPORTED_BBOXES_FILES,
+     DataLoader,
+@@ -64,19 +70,18 @@ def test_data_loader_widget_instantiation(make_napari_viewer_proxy):
+     # Make sure that layer tooltips are enabled
+     assert get_settings().appearance.layer_tooltip_visibility is True
+ 
+-    # Test methods are connected to layer events
++    # Test the frame slider update is connected to layer events as a
++    # partial (which napari holds as a strong reference and therefore
++    # outlives the widget).
+     assert all(
+-        [
+-            data_loader_widget._update_frame_slider_range.__name__
+-            in [
+-                cb[1]
+-                for cb in event.callbacks
+-                if not isinstance(cb, EmitterGroup)
+-            ]
+-            for event in [
+-                data_loader_widget.viewer.layers.events.inserted,
+-                data_loader_widget.viewer.layers.events.removed,
+-            ]
++        any(
++            isinstance(cb, partial) and cb.func is update_frame_slider_range
++            for cb in event.callbacks
++            if not isinstance(cb, EmitterGroup)
++        )
++        for event in [
++            data_loader_widget.viewer.layers.events.inserted,
++            data_loader_widget.viewer.layers.events.removed,
+         ]
+     )
+ 
+@@ -122,14 +127,18 @@ def test_on_layer_added_and_deleted(
+     layer_type, sample_layer_data, make_napari_viewer_proxy, mocker
+ ):
+     """Test the frame slider update is called when a layer is added/removed."""
+-    # Create a mock napari viewer
+-    data_loader_widget = DataLoader(make_napari_viewer_proxy())
+-
+-    # Mock the frame slider check method
++    # Mock the frame slider check function.
++    # We need to mock the function before the widget connects it. This is
++    # because the connection is a `partial`, which holds a
++    # direct reference to the function object, rather than looking it up
++    # by its name. Patching only swaps what the module attribute points to.
+     mock_frame_slider_check = mocker.patch(
+-        "movement.napari.loader_widgets.DataLoader._update_frame_slider_range"
++        "movement.napari.layer_wiring.update_frame_slider_range"
+     )
+ 
++    # Create a mock napari viewer and wire the mocked callback
++    data_loader_widget = DataLoader(make_napari_viewer_proxy())
++
+     # Add a sample layer to the viewer
+     mock_layer = layer_type(
+         data=sample_layer_data[layer_type.__name__],
+@@ -518,7 +527,13 @@ def test_dimension_slider_with_nans(
+     make_napari_viewer_proxy,
+ ):
+     """Test that the dimension slider is set to the total number of frames
+-    when data layers with NaNs are loaded.
++    when data layers with NaNs are loaded, and stays there after a point edit.
++
++    napari recomputes ``dims.range`` from the live (NaN-filtered) layer extent
++    on every data edit, which would drop the padding for leading/trailing
++    all-NaN frames. ``update_frame_slider_range`` is wired to the Points
++    layer's ``events.data`` to re-pad it, so the range (and the playhead) must
++    not shift when a point is dragged.
+     """
+     # Get data with nans at the expected locations
+     nan_location = {
+@@ -561,9 +576,16 @@ def test_dimension_slider_with_nans(
+     data_loader_widget._on_load_clicked()
+ 
+     # Check the frame slider is set to the full range of frames
+-    assert viewer.dims.range[0] == RangeTuple(
+-        start=0.0, stop=ds.position.shape[0] - 1, step=1.0
+-    )
++    full_range = RangeTuple(start=0.0, stop=ds.position.shape[0] - 1, step=1.0)
++    assert viewer.dims.range[0] == full_range
++
++    # Edit a point via the real .data setter (what a drag does under the
++    # hood): this makes napari recompute dims.range from the live extent.
++    # The range must still span the full frame count, NaN frames included.
++    new_data = data_loader_widget.points_layer.data.copy()
++    new_data[0, 1:] = [100, 200]
++    data_loader_widget.points_layer.data = new_data
++    assert viewer.dims.range[0] == full_range
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -802,7 +824,7 @@ def test_empty_layer_excluded_from_frame_slider_update(
+     add_layer(viewer)
+ 
+     with does_not_raise():
+-        loader._update_frame_slider_range()
++        update_frame_slider_range(loader.viewer)
+ 
+ 
+ # ------------------- tests for layers style ----------------------------#
+@@ -951,7 +973,7 @@ def test_set_point_symbol_by_edited_no_edited_property_is_noop(
+     loader = loaded_data_loader(filepath, ds)
+ 
+     original_symbol = loader.points_layer.symbol.copy()
+-    loader._set_point_symbol_by_edited(loader.points_layer)
++    set_point_symbol_by_edited(loader.points_layer)
+ 
+     np.testing.assert_array_equal(loader.points_layer.symbol, original_symbol)
+ 
+@@ -962,7 +984,7 @@ def test_on_points_data_changed_ignores_tracks_layer(
+     """Test that the callback does not modify a layer's properties
+     when the data change occurs on a non-Points layer.
+ 
+-    Verifies that `DataLoader._on_points_data_changed` returns early
++    Verifies that `on_points_data_changed` returns early
+     without modifying confidence when `event.source` is not a
+     `napari.layers.Points` instance.
+     """
+@@ -984,7 +1006,7 @@ def test_on_points_data_changed_ignores_tracks_layer(
+     mock_event.action = ActionType.CHANGED
+     mock_event.data_indices = (0,)
+ 
+-    loader._on_points_data_changed(mock_event)
++    on_points_data_changed(mock_event)
+ 
+     # Check tracks layer properties are unchanged
+     np.testing.assert_array_equal(
+@@ -1007,7 +1029,7 @@ def test_on_points_data_changed_ignores_unhandled_action_types(
+ ):
+     """Test that the callback leaves confidence untouched for other events.
+ 
+-    Verifies that :meth:`DataLoader._on_points_data_changed` leaves
++    Verifies that :func:`on_points_data_changed` leaves
+     ``confidence`` untouched for action types it does not act on:
+     ``ADDING``, ``ADDED``, ``REMOVING``, and ``CHANGING``
+     (in-progress drag). The two action types it does handle,
+@@ -1024,7 +1046,7 @@ def test_on_points_data_changed_ignores_unhandled_action_types(
+     mock_event.action = action_type
+     mock_event.data_indices = (0,)
+ 
+-    loader._on_points_data_changed(mock_event)
++    on_points_data_changed(mock_event)
+ 
+     pd.testing.assert_series_equal(
+         loader.points_layer.features["confidence"],
+@@ -1037,7 +1059,7 @@ def test_on_points_data_changed_syncs_tracks_layer(
+ ):
+     """Test that dragging a point updates the corresponding Tracks layer.
+ 
+-    Verifies that :meth:`DataLoader._on_points_data_changed` writes a
++    Verifies that :func:`on_points_data_changed` writes a
+     moved point's new (frame, y, x) to the same row in the Tracks
+     layer, and leaves every other row untouched.
+     """
+@@ -1078,7 +1100,7 @@ def test_on_points_data_changed_preserves_tracks_color_by(
+     Regression test for GH issue #573: setting ``Tracks.data`` resets
+     the layer's features to empty, which transiently invalidates
+     ``color_by`` and triggers a spurious "Previous color_by key ...
+-    not present in features" warning. ``DataLoader._set_tracks_layer_data``
++    not present in features" warning. ``set_tracks_layer_data``
+     restores ``color_by`` and the ``*_factorized`` property right after,
+     so both should be unchanged once a drag completes.
+     """
+@@ -1108,7 +1130,7 @@ def test_on_points_data_removes_tracks_layer_row(
+ ):
+     """Test that deleting a point removes the matching row from Tracks.
+ 
+-    Verifies that `DataLoader._on_points_data_changed` reacts to
++    Verifies that `on_points_data_changed` reacts to
+     the real ``ActionType.REMOVED`` event fired by napari's own
+     ``Points.remove`` by dropping the same row from the companion
+     Tracks layer, leaving every other row untouched.
+@@ -1199,7 +1221,7 @@ def test_update_points_layers_editable_toggles_with_axis_order(
+ 
+     Rolling the displayed axes, or switching to a 3D view, means a
+     point drag could touch a different frame (see
+-    ``DataLoader._frame_axis_is_sliced``), so the Points layer should
++    ``frame_axis_is_sliced``), so the Points layer should
+     become non-editable; restoring the default order/2D view should
+     make it editable again.
+     """
+@@ -1245,7 +1267,7 @@ def drag(indices):
+         mock_event.source = loader.points_layer
+         mock_event.action = ActionType.CHANGED
+         mock_event.data_indices = indices
+-        loader._on_points_data_changed(mock_event)
++        on_points_data_changed(mock_event)
+ 
+     # First drag: creates `edited` (the `else` branch), one point moved
+     drag((0,))
+diff --git a/tests/test_unit/test_napari_plugin/test_layer_wiring.py b/tests/test_unit/test_napari_plugin/test_layer_wiring.py
+new file mode 100644
+index 0000000000..874edc0862
+--- /dev/null
++++ b/tests/test_unit/test_napari_plugin/test_layer_wiring.py
+@@ -0,0 +1,222 @@
++"""Test that movement layer wiring outlives the meta-widget.
++
++Layer and viewer callbacks should remain active independently of the
++``DataLoader`` widget lifetime, keeping the Points and Tracks layers in
++sync after the movement panel is closed. These tests verify
++that expectation.
++"""
++
++import gc
++import weakref
++
++import numpy as np
++import pytest
++from napari.layers.base import ActionType
++
++from movement.napari.layer_wiring import connect_viewer_callbacks
++from movement.napari.loader_widgets import DataLoader
++from movement.napari.meta_widget import MovementMetaWidget
++
++
++@pytest.fixture
++def orphan_viewer_and_layers(valid_poses_path_and_ds, loaded_data_loader):
++    """Return viewer and layers of a loaded dataset whose widget is gc-ed."""
++    # Get loader widget
++    # (valid_poses_path_and_ds returns a 2-tuple
++    # (out_path, valid_poses_dataset))
++    loader = loaded_data_loader(*valid_poses_path_and_ds)
++
++    # Get weak reference to loader widget
++    loader_ref = weakref.ref(loader)
++
++    # Get associated viewer and layers
++    viewer, points_layer, tracks_layer = (
++        loader.viewer,
++        loader.points_layer,
++        loader.tracks_layer,
++    )
++
++    # Delete widget and run garbage collection, as the
++    # napari GUI eventually does after the movement panel is closed.
++    del loader
++    gc.collect()
++
++    # Check there are no strong references to the loader anymore
++    assert loader_ref() is None, "DataLoader was not garbage collected"
++
++    return viewer, points_layer, tracks_layer
++
++
++def simulate_point_drag(points_layer, edit_idx, new_position):
++    """Move a point and emit the event napari emits after a drag."""
++    points_layer.data[edit_idx, 1:] = new_position
++    points_layer.events.data(
++        value=points_layer.data,
++        action=ActionType.CHANGED,
++        data_indices=(edit_idx,),
++        vertex_indices=((),),
++    )
++
++
++def test_point_edit_syncs_tracks_layer_after_widget_closed(
++    orphan_viewer_and_layers,
++):
++    """Test that dragging a point updates the Tracks layer if widget gc-ed."""
++    # Get layers of a loader widget that has been garbage-collected
++    _, points_layer, tracks_layer = orphan_viewer_and_layers
++
++    # Simulate point dragging
++    edit_idx = 5
++    edit_array = [100, 200]
++    simulate_point_drag(points_layer, edit_idx, edit_array)
++
++    # Check the edited boolean for the dragged point
++    assert points_layer.properties["edited"][edit_idx]
++
++    # Check the tracks layer holds the edited coordinates
++    np.testing.assert_array_equal(tracks_layer.data[edit_idx, 2:], edit_array)
++
++
++def test_point_removal_syncs_tracks_layer_after_widget_closed(
++    orphan_viewer_and_layers,
++):
++    """Test that deleting a point removes Tracks layer row if widget gc-ed."""
++    # Get layers of a loader widget that has been garbage-collected
++    _, points_layer, tracks_layer = orphan_viewer_and_layers
++
++    # Get tracks layer prior state
++    removed_idx = 5
++    n_rows = tracks_layer.data.shape[0]
++    expected_next_row = tracks_layer.data[removed_idx + 1].copy()
++
++    # Simulate point deletion
++    points_layer.data = np.delete(points_layer.data, removed_idx, axis=0)
++    points_layer.events.data(
++        value=points_layer.data,
++        action=ActionType.REMOVED,
++        data_indices=(removed_idx,),
++        vertex_indices=((),),
++    )
++
++    # Check tracks layer data has one less row
++    assert tracks_layer.data.shape[0] == n_rows - 1
++
++    # Check the data at the removed index has moved one row
++    np.testing.assert_array_equal(
++        tracks_layer.data[removed_idx], expected_next_row
++    )
++
++
++def test_rolling_axes_disables_editing_after_widget_closed(
++    orphan_viewer_and_layers,
++):
++    """Test that rolling the axes still disables point editing."""
++    # Check points layer is editable after widget is gc-ed
++    viewer, points_layer, _ = orphan_viewer_and_layers
++    assert points_layer.editable
++
++    # Change order of dimensions in viewer
++    # and corresponding change in points layer
++    viewer.dims.order = (1, 0, 2)
++    assert not points_layer.editable
++
++    viewer.dims.order = (0, 1, 2)
++    assert points_layer.editable
++
++
++def test_3d_view_disables_editing_after_widget_closed(
++    orphan_viewer_and_layers,
++):
++    """Test that switching to a 3D view still disables point editing.
++
++    ``connect_viewer_callbacks`` wires ``update_points_layers_editable``
++    to the ``ndisplay`` event as well as to ``order``.
++    """
++    # Check points layer is editable after widget is gc-ed
++    viewer, points_layer, _ = orphan_viewer_and_layers
++    assert points_layer.editable
++
++    # Switch to a 3D view, where a drag could move a point to another frame
++    viewer.dims.ndisplay = 3
++    assert not points_layer.editable
++
++    # Back to the default 2D view
++    viewer.dims.ndisplay = 2
++    assert points_layer.editable
++
++
++def test_layer_wiring_survives_closing_metawidget(
++    make_napari_viewer_proxy,
++    valid_poses_path_and_ds,
++    loaded_data_loader,
++):
++    """Test the layer wiring survives closing the movement panel.
++
++    Unlike the tests above, which drop the ``DataLoader`` directly, this
++    exercises the teardown path the napari GUI actually takes: clicking
++    the panel's "x" calls ``QtViewerDockWidget.destroyOnClose``, which
++    calls ``viewer.window.remove_dock_widget``.
++    """
++    # Instantiate and dock meta-widget
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    dock_widget = viewer.window.add_dock_widget(meta_widget, name="movement")
++
++    # Get loader in meta_widget with data loaded
++    loader = loaded_data_loader(
++        *valid_poses_path_and_ds,
++        loader=meta_widget.findChild(DataLoader),
++    )
++
++    # Get weak reference to the loader widget
++    loader_ref = weakref.ref(loader)
++
++    # Get layers
++    points_layer, tracks_layer = loader.points_layer, loader.tracks_layer
++
++    # Close the movement panel, as clicking its "x" does
++    viewer.window.remove_dock_widget(dock_widget)
++    del meta_widget, dock_widget, loader
++
++    # Ensure the loader is gc-ed before asserting
++    # (`remove_dock_widget` re-parents the meta-widget to None,
++    # so the loader is reclaimed by ordinary Python gc once the
++    # last reference to it is dropped).
++    gc.collect()
++    assert loader_ref() is None, "DataLoader was not garbage collected"
++
++    # Check a point drag still syncs the Tracks layer
++    edit_idx = 5
++    edit_array = [100, 200]
++    simulate_point_drag(points_layer, edit_idx, edit_array)
++
++    assert points_layer.properties["edited"][edit_idx]
++    np.testing.assert_array_equal(tracks_layer.data[edit_idx, 2:], edit_array)
++
++
++def test_connect_viewer_callbacks_twice_does_not_duplicate(
++    make_napari_viewer_proxy,
++):
++    """Test that wiring a viewer twice does not duplicate the callbacks."""
++    # Wire the viewer callbacks once
++    viewer = make_napari_viewer_proxy()
++    connect_viewer_callbacks(viewer)
++
++    # Count callbacks linked to the viewer, for each of the four events
++    # `connect_viewer_callbacks` wires: layers "inserted" and "removed",
++    # and dimensions "order" and "ndisplay".
++    emitters = [
++        viewer.layers.events.inserted,
++        viewer.layers.events.removed,
++        viewer.dims.events.order,
++        viewer.dims.events.ndisplay,
++    ]
++    n_callbacks_per_emitter = [len(emitter.callbacks) for emitter in emitters]
++
++    # Connect the callbacks to the viewer again
++    connect_viewer_callbacks(viewer)
++
++    # The number of callbacks should not increase
++    assert [
++        len(emitter.callbacks) for emitter in emitters
++    ] == n_callbacks_per_emitter

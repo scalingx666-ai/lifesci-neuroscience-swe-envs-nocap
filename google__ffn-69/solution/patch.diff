@@ -1,0 +1,2071 @@
+diff --git a/ffn/inference/executor.py b/ffn/inference/executor.py
+index fa7642d..997ebc6 100644
+--- a/ffn/inference/executor.py
++++ b/ffn/inference/executor.py
+@@ -12,63 +12,174 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ # ==============================================================================
+-"""Support for FFN inference execution.
++"""FFN model execution.
+ 
+-Contains implementations of the `BatchExecutor` interface, which takes care
+-of actually evaluating the FFN predictions.
++FFN inference is performed via a client-server 'executor' interface,
++with the server owning the model and accelerator resources, and one
++or more clients maintaining the segmentation state and orchestrating
++inference calls.
++
++This permits batching in the server, which is generally necessary for
++good utilization of accelerator resources.
+ """
+ 
+-import _thread as thread
++import _thread
+ from concurrent import futures
+-import logging
+ import os
+ import queue
+ import threading
+ import time
++from typing import Callable, Optional, Sequence
++
++from absl import logging
++import jax
++import jax.numpy as jnp
+ import numpy as np
++import tensorflow.compat.v1 as tf
++from ..training import model as ffn_model
++from . import inference_utils
+ from .inference_utils import timer_counter
+ 
+ 
+-class BatchExecutor(object):
+-  """Base class for FFN executors."""
++class TerminationException(Exception):  # pylint: disable=g-bad-exception-name
++  """Indicates that the program has been requested to shut down."""
++  pass
++
++
++class ExecutorInterface:
++  """Provides a client/server interface.
++
++  Owns the communication channels and provides methods of communication
++  with the server.
++  """
++
++  def __init__(self):
++    self.lock = threading.Lock()
++    self.outputs = {}  # Will be populated by Queues as clients register.
++    # Used by clients to communiate with the executor. The protocol is
++    # as follows:
++    #  - 'exit': indicates a request to kill the executor
++    #  - N >= 0: registration of a new client with the specified ID
++    #  - N < 0: deregistration of an existing client with ID -N - 1
++    #  - (client_id, seed, image, fetches): request to perform inference
++    self._input_queue = queue.Queue()
++    self.exit_request = threading.Event()
++
++  def queue_put(self, x):
++    if self.exit_request.is_set():
++      raise TerminationException()
++
++    return self._input_queue.put(x)
++
++  def queue_get(self, **kwargs):
++    return self._input_queue.get(**kwargs)
++
++  def get_output(self,
++                 client_id: int,
++                 timeout: int = 0) -> dict[str, np.ndarray]:
++    while True:
++      try:
++        return self.outputs[client_id].get(timeout=timeout)
++      except queue.Empty:
++        if self.exit_request.is_set():
++          raise TerminationException()  # pylint:disable=raise-missing-from
++
++
++class ExecutorClient:
++  """Client interface for the FFN executor."""
++
++  def __init__(self, counters: inference_utils.Counters,
++               interface: ExecutorInterface):
++    self._client_id = None
++    self.counters = counters
++    self._interface = interface
++
++  def start(self) -> int:
++    """Registers as a new client.
++
++    Returns:
++      client ID
++    """
++    raise NotImplementedError()
++
++  def finish(self):
++    """Deregisters the client."""
++    raise NotImplementedError()
++
++  def predict(self, seed: np.ndarray, image: np.ndarray,
++              fetches: Sequence[str]) -> dict[str, np.ndarray]:
++    raise NotImplementedError()
++
++
++class ThreadingExecutorClient(ExecutorClient):
++  """Client interface for a same-process executor."""
++
++  def start(self) -> int:
++    with self._interface.lock:
++      if not self._interface.outputs:
++        client_id = 0
++      else:
++        client_id = max(self._interface.outputs.keys()) + 1
++
++      self._interface.outputs[client_id] = queue.Queue()
++
++    self._interface.queue_put(client_id)
++    self._client_id = client_id
++    return client_id
++
++  def finish(self):
++    if self._client_id is None:
++      return
++    with self._interface.lock:
++      del self._interface.outputs[self._client_id]
++    self._interface.queue_put(-1 - self._client_id)
++
++  def predict(self, seed: np.ndarray, image: np.ndarray,
++              fetches: Sequence[str]) -> dict[str, np.ndarray]:
++    assert self._client_id is not None
++    self._interface.queue_put((self._client_id, seed, image, fetches))
++    with timer_counter(self.counters, 'client-wait'):
++      return self._interface.get_output(self._client_id, timeout=1)
++
++
++class BatchExecutor:
++  """Base class for FFN executors.
++
++  Owns the FFN model and any accelerator resources.
++  """
+ 
+-  def __init__(self, model, session, counters, batch_size):
++  def __init__(self, interface: ExecutorInterface,
++               model: ffn_model.FFNModel,
++               model_info: ffn_model.ModelInfo, session: tf.Session,
++               counters: inference_utils.Counters, batch_size: int):
++    self._interface = interface
+     self.session = session
+     self.model = model
+     self.counters = counters
+ 
+     self.batch_size = batch_size
+     self.active_clients = 0
++    self.registered_clients = set()
+ 
+     # Cache input/output sizes.
+-    self._input_seed_size = np.array(model.info.input_seed_size[::-1]).tolist()
++    self._input_seed_size = np.array(model_info.input_seed_size[::-1]).tolist()
+     self._input_image_size = np.array(
+-        model.info.input_image_size[::-1]
+-    ).tolist()
+-    self._pred_size = np.array(model.info.pred_mask_size[::-1]).tolist()
++        model_info.input_image_size[::-1]).tolist()
++    self._pred_size = np.array(model_info.pred_mask_size[::-1]).tolist()
+ 
+     self._initialize_model()
+ 
++  def __del__(self):
++    self.stop_server()
++
+   def start_server(self):
+     raise NotImplementedError()
+ 
+   def stop_server(self):
+     raise NotImplementedError()
+ 
+-  def start_client(self):
+-    """Registers a new client.
+-
+-    Returns:
+-      client ID
+-    """
+-    raise NotImplementedError()
+-
+-  def finish_client(self, client_id):
+-    """Deregisters a client."""
+-    raise NotImplementedError()
+-
+-  def predict(self, client_id, seed, image, fetches):
+-    raise NotImplementedError()
++  def get_client(self, subvol_counters):
++    return ThreadingExecutorClient(subvol_counters, self._interface)
+ 
+   def _initialize_model(self):
+     self.model.define_tf_graph()
+@@ -87,7 +198,7 @@ def _run_executor_log_exceptions(self):
+       logging.exception(e)
+       # If the executor fails, the whole process becomes useless and we need
+       # to make sure it gets terminated.
+-      thread.interrupt_main()
++      _thread.interrupt_main()  # pytype: disable=module-attr
+       time.sleep(10)
+       os._exit(1)  # pylint:disable=protected-access
+ 
+@@ -97,12 +208,7 @@ def num_devices(self):
+ 
+ 
+ class ThreadingBatchExecutor(BatchExecutor):
+-  """Thread-based BatchExecutor.
+-
+-  The intended use is to have multiple threads sharing the same executor
+-  object with:
+-    - a server thread started with `start_server`
+-    - each client running in its own thread.
++  """Thread-based BatchExecutor for TF models.
+ 
+   It is recommended to start the client threads as daemons, so that failures
+   of the server thread will result in termination of the whole program.
+@@ -112,19 +218,16 @@ class ThreadingBatchExecutor(BatchExecutor):
+   if the batch size is 1.
+   """
+ 
+-  def __init__(self, model, session, counters, batch_size, expected_clients=1):
+-    super(ThreadingBatchExecutor, self).__init__(
+-        model, session, counters, batch_size
+-    )
+-    self._lock = threading.Lock()
+-    self.outputs = {}  # Will be populated by Queues as clients register.
+-    # Used by clients to communiate with the executor. The protocol is
+-    # as follows:
+-    #  - 'exit': indicates a request to kill the executor
+-    #  - N >= 0: registration of a new client with the specified ID
+-    #  - N < 0: deregistration of an existing client with ID -N - 1
+-    #  (client_id, seed, image, fetches): request to perform inference
+-    self.input_queue = queue.Queue()
++  def __init__(self,
++               interface: ExecutorInterface,
++               model: Optional[ffn_model.FFNModel],
++               model_info: ffn_model.ModelInfo,
++               session: Optional[tf.Session],
++               counters: inference_utils.Counters,
++               batch_size: int,
++               expected_clients: int = 1):
++    super(ThreadingBatchExecutor, self).__init__(interface, model, model_info,
++                                                 session, counters, batch_size)
+ 
+     # Total clients seen during the lifetime of the executor.
+     self.total_clients = 0
+@@ -135,11 +238,9 @@ def __init__(self, model, session, counters, batch_size, expected_clients=1):
+ 
+     # Arrays fed to TF.
+     self.input_seed = np.zeros(
+-        [batch_size] + self._input_seed_size + [1], dtype=np.float32
+-    )
++        [batch_size] + self._input_seed_size + [1], dtype=np.float32)
+     self.input_image = np.zeros(
+-        [batch_size] + self._input_image_size + [1], dtype=np.float32
+-    )
++        [batch_size] + self._input_image_size + [1], dtype=np.float32)
+     self.th_executor = None
+ 
+   def start_server(self):
+@@ -151,33 +252,34 @@ def start_server(self):
+     """
+     if self.th_executor is None:
+       self.th_executor = threading.Thread(
+-          target=self._run_executor_log_exceptions
+-      )
++          target=self._run_executor_log_exceptions)
++      self._interface.exit_request.clear()
+       self.th_executor.start()
+ 
+   def stop_server(self):
++    if self.th_executor is None:
++      return
+     logging.info('Requesting executor shutdown.')
+-    self.input_queue.put('exit')
+-    if self.th_executor is not None:
+-      self.th_executor.join()
++    self._interface.queue_put('exit')
++    self._interface.exit_request.set()
++    self.th_executor.join()
++    self.th_executor = None
+     logging.info('Executor shutdown complete.')
+ 
+   def _run_executor(self):
+     """Main loop of the server thread which runs TF code."""
+-    self._curr_infeed = 0
+-    logging.info('Executor starting.')
++    logging.info('Executor starting, batch_size=%d.', self.batch_size)
+ 
+     while self.active_clients or self.total_clients < self.expected_clients:
+-      self.counters['executor-clients'].Set(self.active_clients)
++      self.counters.get(
++          'executor-clients', cumulative=False).Set(self.active_clients)
+ 
+       with timer_counter(self.counters, 'executor-input'):
+         ready = []
+-        while (
+-            len(ready) < min(self.active_clients, self.batch_size)
+-            or not self.active_clients
+-        ):
++        while (len(ready) < min(self.active_clients, self.batch_size) or
++               not self.active_clients):
+           try:
+-            data = self.input_queue.get(timeout=5)
++            data = self._interface.queue_get(timeout=5)
+           except queue.Empty:
+             continue
+           if data == 'exit':
+@@ -186,10 +288,12 @@ def _run_executor(self):
+           elif isinstance(data, int):
+             client_id = data
+             if client_id >= 0:
++              self.registered_clients.add(client_id)
+               self.total_clients += 1
+               self.active_clients += 1
+               logging.info('client %d starting', client_id)
+             else:
++              self.registered_clients.remove(-client_id - 1)
+               logging.info('client %d terminating', -client_id - 1)
+               self.active_clients -= 1
+           else:
+@@ -204,55 +308,271 @@ def _run_executor(self):
+ 
+     logging.info('Executor terminating.')
+ 
+-  def _schedule_batch(self, client_ids, fetches):
++  def _schedule_batch(self, client_ids: Sequence[int], fetches: Sequence[str]):
+     """Schedules a single batch for execution."""
++
++    to_fetch = {f: getattr(self.model, f) for f in fetches}
+     with timer_counter(self.counters, 'executor-inference'):
+       try:
+         ret = self.session.run(
+-            fetches,
+-            {
++            to_fetch, {
+                 self.model.input_seed: self.input_seed,
+-                self.model.input_patches: self.input_image,
+-            },
+-        )
++                self.model.input_patches: self.input_image
++            })
+       except Exception as e:  # pylint:disable=broad-except
+         logging.exception(e)
+         # If calling TF didn't work (faulty hardware, misconfiguration, etc),
+         # we want to terminate the whole program.
+-        thread.interrupt_main()
++        _thread.interrupt_main()  # pytype: disable=module-attr
+         raise e
+ 
+     with timer_counter(self.counters, 'executor-output'):
+-      with self._lock:
++      with self._interface.lock:
+         for i, client_id in enumerate(client_ids):
+           try:
+-            self.outputs[client_id].put({k: v[i, ...] for k, v in ret.items()})
++            self._interface.outputs[client_id].put(
++                {k: v[i, ...] for k, v in ret.items()})
+           except KeyError:
+             # This could happen if a client unregistered itself
+             # while inference was running.
+             pass
+ 
+-  def start_client(self):
+-    with self._lock:
+-      if not self.outputs:
+-        client_id = 0
+-      else:
+-        client_id = max(self.outputs.keys()) + 1
+ 
+-      self.outputs[client_id] = queue.Queue()
++class TPUExecutor(ThreadingBatchExecutor):
++  """ThreadingBatchExecutor for TF models on TPUs."""
+ 
+-    self.input_queue.put(client_id)
+-    return client_id
++  CLIENT_ID_PAD = -1
++  CLIENT_ID_SHUTDOWN = -2
++
++  @property
++  def num_devices(self):
++    return self.num_tpus
+ 
+-  def finish_client(self, client_id):
+-    self.input_queue.put(-1 - client_id)
+-    with self._lock:
+-      del self.outputs[client_id]
++  def _tpu_loop(self, loop_op):
++    try:
++      self.session.run(loop_op)
++    except Exception as e:
++      logging.exception(e)
++      raise e
++    logging.info('TPU loop done.')
+ 
+-  def predict(self, client_id, seed, image, fetches):
+-    self.input_queue.put((client_id, seed, image, fetches))
++  def _dispatcher(self, results_op):
++    """Reads data from TPU and dispatches it to clients."""
++    try:
++      while True:
++        results = self.session.run(results_op)
++        ids, logits = results
++        if -2 in ids:
++          logging.info('Terminating dispatcher.')
++          return
++
++        logits = np.reshape(logits, self.model.logits.shape_as_list())
++        with self._interface.lock:
++          for i, client_id in enumerate(ids):
++            try:
++              self._interface.outputs[client_id].put({'logits': logits[i, ...]})
++            except KeyError:
++              # This could happen if a client unregistered itself
++              # while inference was running.
++              pass
++    except Exception as e:
++      logging.exception(e)
++      raise e
+ 
+-    with timer_counter(self.counters, 'client-wait'):
+-      ret = self.outputs[client_id].get()
++  def _run_executor(self):
++    fs_loop, fs_dispatch = set(), set()
++    self._curr_infeed = 0
++
++    with futures.ThreadPoolExecutor(max_workers=self.num_tpus * 2) as e:
++      # Runs the TPU main loop in separate threads.
++      for loop_op in self.tpu_loop_ops:
++        fs_loop.add(e.submit(self._tpu_loop, loop_op))
++      # Gets results from the TPU and distributes them to the clients.
++      for results_op in self.tpu_outfeed_results:
++        fs_dispatch.add(e.submit(self._dispatcher, results_op))
++
++      super(TPUExecutor, self)._run_executor()
++      logging.info('TPU executor done. Shutting down.')
++
++      # TODO(mjanusz): Fix this awkward shut down procedure.
++      # Experiments show that the following alternatives do not work:
++      #  - scheduling a single batch per TPU (no loops are actually terminated)
++      #  - not scheduling more work on infeeds corresponding to loops that have
++      #    terminated, assuming a 1:1 mapping between self.tpu_loop_ops and
++      #    self.tpu_infeed_enquee_ops
++      while fs_loop:
++        for _ in range(self.num_tpus):
++          # Terminate the main loop on the TPU.
++          self._schedule_batch([TPUExecutor.CLIENT_ID_SHUTDOWN] *
++                               self.batch_size, None)
++          logging.info('Scheduling termination request.')
++
++        fs_done, fs_loop = futures.wait(
++            fs_loop, timeout=1, return_when=futures.FIRST_COMPLETED)
++        for f in fs_done:
++          f.result()
++
++    # Check for exceptions.
++    for f in fs_dispatch:
++      f.result()
++    self.session.run(self.tpu_shutdown_system)
++    logging.info('TPU executor shutdown complete.')
++
++  def _schedule_batch_on_feed(self, client_ids, fetches, feed_id):
++    del fetches  # TODO(mjanusz): Support this.
++    self.session.run(
++        self.tpu_infeed_enqueue_ops[feed_id],
++        {
++            # Pad client IDs to full batch size.
++            self.client_ids:
++                np.array(
++                    client_ids + [TPUExecutor.CLIENT_ID_PAD] *
++                    (self.batch_size - len(client_ids)),
++                    dtype=np.int32),
++            self.plc_input_seed:
++                self.input_seed,
++            self.plc_input_patches:
++                self.input_image
++        })
++
++  def _schedule_batch(self, client_ids, fetches):
++    self._schedule_batch_on_feed(client_ids, fetches, self._curr_infeed)
++
++    # Distribute batches across available TPUs in a round-robin fashion.
++    self._curr_infeed += 1
++    self._curr_infeed %= len(self.tpu_infeed_enqueue_ops)
++
++  def _initialize_model(self):
++    self.tpu_initialize_system = tf.tpu.initialize_system()
++    self.tpu_shutdown_system = tf.tpu.shutdown_system()
++
++    # This returns the global_tpu_id, which we don't use yet.
++    self.session.run(self.tpu_initialize_system)
++    self.client_ids = tf.placeholder(dtype=tf.int32, shape=(self.batch_size,))
++
++    # Define infeeds.
++    infeed_placeholder_attrs = ('input_seed', 'input_patches')
++    infeed_placeholders = [self.client_ids] + [
++        getattr(self.model, attr) for attr in infeed_placeholder_attrs
++    ]
++    tpu_infeed_queue = tf.contrib.tpu.InfeedQueue(
++        tuple_types=[t.dtype for t in infeed_placeholders],
++        tuple_shapes=[t.shape for t in infeed_placeholders],
++    )
++    num_tpus = sum(
++        dev.device_type == 'TPU' for dev in self.session.list_devices())
++    tpu_infeed_queue.set_number_of_shards(num_tpus)
++    logging.info('Found %d TPU cores.', num_tpus)
++
++    self.num_tpus = num_tpus
++    self.tpu_infeed_enqueue_ops = tpu_infeed_queue.generate_enqueue_ops(
++        [infeed_placeholders] * num_tpus, lambda x: x)
++
++    # Save the placeholders that we will feed on the host. These will
++    # be replaced by infeed dequeue ops below.
++    self.plc_input_seed = self.model.input_seed
++    self.plc_input_patches = self.model.input_patches
++
++    def loop_body(not_done):
++      """Defines the graph that executes in a loop on the TPU."""
++      del not_done
++      inputs = tpu_infeed_queue.generate_dequeue_op()
++      client_ids = inputs[0]
++      inputs = inputs[1:]
++      for attr, iteration_input in zip(infeed_placeholder_attrs, inputs):
++        setattr(self.model, attr, iteration_input)
++
++      # Define the graph for the FFN model.
++      self.model.define_tf_graph()
++
++      # Flat shape (or at least removal of the channel dimension) is necessary
++      # for efficient outfeed as of Oct 2020).
++      self.flat_logits = tf.reshape(self.model.logits, [-1])
++      tpu_outfeed_enqueue_op = tf.contrib.tpu.outfeed_enqueue_tuple(
++          [client_ids, self.flat_logits])
++
++      with tf.control_dependencies([tpu_outfeed_enqueue_op]):
++        return tf.greater(client_ids[0:1], TPUExecutor.CLIENT_ID_SHUTDOWN)
++
++    def loop_condition(not_done):
++      return tf.identity(not_done[0], name='not_done_reduce')
++
++    # Note: this executes loop_body.
++    self.tpu_loop_ops = tf.tpu.replicate(
++        lambda: tf.while_loop(  # pylint:disable=g-long-lambda
++            cond=loop_condition,
++            body=loop_body,
++            loop_vars=[tf.constant(True, dtype=tf.bool, shape=(1,))],
++            parallel_iterations=1),
++        inputs=[[]] * num_tpus)
++
++    self.tpu_outfeed_results = []
++    for i in range(num_tpus):
++      with tf.device('/device:TPU:%d' % i):
++        self.tpu_outfeed_results.append(
++            tf.contrib.tpu.outfeed_dequeue_tuple(
++                dtypes=[tf.int32, self.model.logits.dtype],
++                shapes=[self.client_ids.shape, self.flat_logits.shape]))
++
++
++class JAXExecutor(ThreadingBatchExecutor):
++  """ThreadingBatchExecutor for JAX models."""
++
++  def __init__(self,
++               interface: ExecutorInterface,
++               model_info: ffn_model.ModelInfo,
++               apply_fn: Callable[[jnp.ndarray], jnp.ndarray],
++               counters: inference_utils.Counters,
++               batch_size: int,
++               expected_clients: int = 1):
++    super().__init__(
++        interface,
++        model=None,
++        model_info=model_info,
++        session=None,
++        counters=counters,
++        batch_size=batch_size,
++        expected_clients=expected_clients)
++    self._apply_fn = jax.jit(apply_fn)
++    self._curr_device = 0
++    self.tpe = futures.ThreadPoolExecutor(max_workers=jax.device_count())
++
++  @property
++  def num_devices(self) -> int:
++    return jax.device_count()
++
++  def _initialize_model(self):
++    # JAX models do not require initialization.
++    return
++
++  def _dispatcher(self, data: jnp.ndarray, client_ids: Sequence[int]):
++    """Dispatches results to clients."""
++    with timer_counter(self.counters, 'executor-inference'):
++      try:
++        ret = self._apply_fn(data)
++      except Exception as e:  # pylint:disable=broad-except
++        logging.exception(e)
++        # Terminate the whole program on failure.
++        _thread.interrupt_main()  # pytype: disable=module-attr
++        raise e
++
++      ret = np.array(ret)
++
++    with timer_counter(self.counters, 'executor-output'):
++      with self._interface.lock:
++        for i, client_id in enumerate(client_ids):
++          try:
++            self._interface.outputs[client_id].put({'logits': ret[i, ...]})
++          except KeyError:
++            # This could happen if a client unregistered itself
++            # while inference was running.
++            pass
++
++  def _schedule_batch(self, client_ids: Sequence[int], fetches: Sequence[str]):
++    del fetches
++
++    with jax.default_device(jax.devices()[self._curr_device]):
++      data = jnp.concatenate([self.input_image, self.input_seed], axis=-1)
+ 
+-    return ret
++    self.tpe.submit(self._dispatcher, data, client_ids)
++    self._curr_device = (self._curr_device + 1) % self.num_devices
+diff --git a/ffn/inference/inference.py b/ffn/inference/inference.py
+index e7708a2..05aa105 100644
+--- a/ffn/inference/inference.py
++++ b/ffn/inference/inference.py
+@@ -19,35 +19,43 @@
+ import os
+ import threading
+ import time
++from connectomics.segmentation import labels as label_utils
++import numpy as np
++from numpy.lib.stride_tricks import as_strided
++from scipy.special import expit
++from scipy.special import logit
++from tensorflow.io import gfile
++from ..training import model as ffn_model
++from ..utils import ortho_plane_visualization
++from . import executor
+ from . import inference_pb2
+ from . import movement
+ from . import seed
+ from . import storage
+-from connectomics.segmentation import labels as label_utils
+ from .inference_utils import Counters
+ from .inference_utils import TimedIter
+ from .inference_utils import timer_counter
+-import numpy as np
+ 
+-from numpy.lib.stride_tricks import as_strided
+-from ..utils import ortho_plane_visualization
+-from scipy.special import expit
+-from scipy.special import logit
+-from tensorflow.io import gfile
+-from ..training import model as ffn_model
+ 
+ MSEC_IN_SEC = 1000
+ MAX_SELF_CONSISTENT_ITERS = 32
+ 
++# pylint:disable=invalid-name
++Tuple3i = tuple[int, int, int]
++
++# pylint:enable=invalid-name
++
+ 
+ # Visualization.
+ # ---------------------------------------------------------------------------
+ 
+ 
+ class DynamicImage:
++
+   def UpdateFromPIL(self, new_img):
+     # pylint: disable=g-import-not-at-top
+-    from IPython import display   # pytype:disable=import-error
++    from IPython import display  # pytype:disable=import-error
++
+     display.clear_output(wait=True)
+     image = BytesIO()
+     new_img.save(image, format='png')
+@@ -63,20 +71,21 @@ def _cmap_rgb1(drw):
+   return (np.dstack([r, g, b]) * 250.0).astype(np.uint8)
+ 
+ 
+-def visualize_state(seed_logits, pos, movement_policy, dynimage):
++def visualize_state(seed_logits, pos: Tuple3i, movement_policy, dynimage):
+   """Visualizes the inference state.
+ 
+   Args:
+     seed_logits: ndarray (z, y, x) with the current predicted mask
+     pos: current FoV position within 'seed' as z, y, x
+     movement_policy: movement policy object
+-    dynimage: DynamicImage object which is to be updated with the
+-        state visualization
++    dynimage: DynamicImage object which is to be updated with the state
++      visualization
+   """
+   from PIL import Image
+ 
+   planes = ortho_plane_visualization.cut_ortho_planes(
+-      seed_logits, center=pos, cross_hair=True)
++      seed_logits, center=pos, cross_hair=True
++  )
+   to_vis = ortho_plane_visualization.concat_ortho_planes(planes)
+ 
+   if isinstance(movement_policy.scored_coords, np.ndarray):
+@@ -93,11 +102,14 @@ def visualize_state(seed_logits, pos, movement_policy, dynimage):
+     # The grid might be too large, cut it to be symmetrical
+     cut = (np.array(scores_up.shape) - np.array(seed_logits.shape)) // 2
+     sh = seed_logits.shape
+-    scores_up = scores_up[cut[0]:cut[0] + sh[0],
+-                          cut[1]:cut[1] + sh[1],
+-                          cut[2]:cut[2] + sh[2]]
++    scores_up = scores_up[
++        cut[0] : cut[0] + sh[0],
++        cut[1] : cut[1] + sh[1],
++        cut[2] : cut[2] + sh[2],
++    ]
+     grid_planes = ortho_plane_visualization.cut_ortho_planes(
+-        scores_up, center=pos, cross_hair=True)
++        scores_up, center=pos, cross_hair=True
++    )
+     grid_view = ortho_plane_visualization.concat_ortho_planes(grid_planes)
+     grid_view *= 4  # Looks better this way
+     to_vis = np.concatenate((to_vis, grid_view), axis=1)
+@@ -106,8 +118,8 @@ def visualize_state(seed_logits, pos, movement_policy, dynimage):
+   y, x = pos[1:]
+ 
+   # Mark seed in the xy plane.
+-  val[(y - 1):(y + 2), (x - 1):(x + 2), 0] = 255
+-  val[(y - 1):(y + 2), (x - 1):(x + 2), 1:] = 0
++  val[(y - 1) : (y + 2), (x - 1) : (x + 2), 0] = 255
++  val[(y - 1) : (y + 2), (x - 1) : (x + 2), 1:] = 0
+ 
+   vis = Image.fromarray(val)
+   dynimage.UpdateFromPIL(vis)
+@@ -117,51 +129,66 @@ def visualize_state(seed_logits, pos, movement_policy, dynimage):
+ class Canvas:
+   """Tracks state of the inference progress and results within a subvolume."""
+ 
+-  def __init__(self,
+-               model: ffn_model.FFNModel,
+-               tf_executor,
+-               image,
+-               options,
+-               counters=None,
+-               restrictor=None,
+-               movement_policy_fn=None,
+-               keep_history=False,
+-               checkpoint_path=None,
+-               checkpoint_interval_sec=0,
+-               corner_zyx=None):
++  # Saving compressed NPZ files involves temporary files in the local
++  # filesystem. In order to avoid running out of disk/RAM, we serialize
++  # these operations.
++  io_lock = threading.Lock()
++
++  def __init__(
++      self,
++      model_info: ffn_model.ModelInfo,
++      exec_client: executor.ExecutorClient,
++      image,
++      options,
++      counters=None,
++      restrictor=None,
++      movement_policy_fn=None,
++      keep_history=False,
++      checkpoint_path=None,
++      checkpoint_interval_sec=0,
++      corner_zyx=None,
++      storage_cls=storage.NumpyArray,
++      keep_probability_maps=False,
++  ):
+     """Initializes the canvas.
+ 
+     Args:
+-      model: FFNModel object
+-      tf_executor: Executor object to use for inference
++      model_info: ModelInfo for the FFN model
++      exec_client: client for the executor interface
+       image: 3d ndarray-like of shape (z, y, x)
+       options: InferenceOptions proto
+       counters: (optional) counter container, where __getitem__ returns a
+-          counter compatible with the MR Counter API
+-      restrictor: (optional) a MovementRestrictor object which can exclude
+-          some areas of the data from the segmentation process
+-      movement_policy_fn: callable taking the Canvas object as its
+-          only argument and returning a movement policy object
+-          (see movement.BaseMovementPolicy)
++        counter compatible with the MR Counter API
++      restrictor: (optional) a MovementRestrictor object which can exclude some
++        areas of the data from the segmentation process
++      movement_policy_fn: callable taking the Canvas object as its only argument
++        and returning a movement policy object (see movement.BaseMovementPolicy)
+       keep_history: whether to maintain a record of locations visited by the
+-          FFN, together with any associated metadata; note that this data is
+-          kept only for the object currently being segmented
++        FFN, together with any associated metadata; note that this data is kept
++        only for the object currently being segmented
+       checkpoint_path: (optional) path at which to save a checkpoint file
+-      checkpoint_interval_sec: how often to save a checkpoint file (in
+-          seconds); if <= 0, no checkpoint are going to be saved
++      checkpoint_interval_sec: how often to save a checkpoint file (in seconds);
++        if <= 0, no checkpoint are going to be saved
+       corner_zyx: 3 element array-like indicating the spatial corner of the
+-          image in (z, y, x)
++        image in (z, y, x)
++      storage_cls: class implementing the ndarray interface and a 'clear'
++        method. Used to create arrays for internal data.
++      keep_probability_maps: controls whether object probability maps are
++        tracked and saved.
+     """
+-    self.model = model
+     self.image = image
+-    self.executor = tf_executor
++    self._exec_client = exec_client
+     self._exec_client_id = None
+ 
+     self.options = inference_pb2.InferenceOptions()
+     self.options.CopyFrom(options)
+     # Convert thresholds, etc. to logit values for efficient inference.
+-    for attr in ('init_activation', 'pad_value', 'move_threshold',
+-                 'segment_threshold'):
++    for attr in (
++        'init_activation',
++        'pad_value',
++        'move_threshold',
++        'segment_threshold',
++    ):
+       setattr(self.options, attr, logit(getattr(self.options, attr)))
+ 
+     self.counters = counters if counters is not None else Counters()
+@@ -180,9 +207,9 @@ def __init__(self,
+ 
+     # Cast to array to ensure we can do elementwise expressions later.
+     # All of these are in zyx order.
+-    self._pred_size = np.array(model.info.pred_mask_size[::-1])
+-    self._input_seed_size = np.array(model.info.input_seed_size[::-1])
+-    self._input_image_size = np.array(model.info.input_image_size[::-1])
++    self._pred_size = np.array(model_info.pred_mask_size[::-1])
++    self._input_seed_size = np.array(model_info.input_seed_size[::-1])
++    self._input_image_size = np.array(model_info.input_image_size[::-1])
+     self.margin = self._input_image_size // 2
+ 
+     self._pred_delta = (self._input_seed_size - self._pred_size) // 2
+@@ -191,13 +218,20 @@ def __init__(self,
+     # Current working area. This represents an object probability map
+     # in logit form, and is fed directly as the mask input to the FFN
+     # model.
+-    self.seed = np.zeros(self.shape, dtype=np.float32)
+-    self.segmentation = np.zeros(self.shape, dtype=np.int32)
+-    self.seg_prob = np.zeros(self.shape, dtype=np.uint8)
++    self.seed = storage_cls(
++        shape=self.shape, dtype=np.float32, default_value=np.nan
++    )
++    self.segmentation = storage_cls(shape=self.shape, dtype=np.int32)
++    self.keep_probability_maps = keep_probability_maps
++    if keep_probability_maps:
++      self.seg_prob = storage_cls(shape=self.shape, dtype=np.uint8)
++    else:
++      self.seg_prob = None
+ 
+     # When an initial segmentation is provided, maps the global ID space
+     # to locally used IDs.
+     self.global_to_local_ids = {}
++    self.local_to_global_ids = {}
+ 
+     self.seed_policy = None
+     self._seed_policy_state = None
+@@ -215,23 +249,31 @@ def __init__(self,
+     if movement_policy_fn is None:
+       # The model.deltas are (for now) in xyz order and must be swapped to zyx.
+       self.movement_policy = movement.FaceMaxMovementPolicy(
+-          self, deltas=model.info.deltas[::-1],
+-          score_threshold=self.options.move_threshold)
++          self,
++          deltas=model_info.deltas[::-1],
++          score_threshold=self.options.move_threshold,
++      )
+     else:
+       self.movement_policy = movement_policy_fn(self)
+ 
++    self._hosts = []
+     self.reset_state((0, 0, 0))
+     self.t_last_predict = None
++    self.log_info(
++        'Constructed canvas with corner %s (zyx) and shape %s',
++        self.corner_zyx,
++        self.shape,
++    )
+ 
+   def _register_client(self):
+     if self._exec_client_id is None:
+-      self._exec_client_id = self.executor.start_client()
++      self._exec_client_id = self._exec_client.start()
+       logging.info('Registered as client %d.', self._exec_client_id)
+ 
+   def _deregister_client(self):
+     if self._exec_client_id is not None:
+       logging.info('Deregistering client %d', self._exec_client_id)
+-      self.executor.finish_client(self._exec_client_id)
++      self._exec_client.finish()
+       self._exec_client_id = None
+ 
+   def __del__(self):
+@@ -240,10 +282,16 @@ def __del__(self):
+     # where such cycles are really needed.
+     self._deregister_client()
+ 
+-  def local_id(self, segment_id):
++  def local_id(self, segment_id: int):
+     return self.global_to_local_ids.get(segment_id, segment_id)
+ 
+-  def reset_state(self, start_pos):
++  def reset_state(self, start_pos: Tuple3i, reset_extents=True):
++    """Resets the state of the Canvas to prepares it for a new inference run."""
++
++    # NOTE: Keep in mind that any settings reset in this function should
++    # likely be part of the checkpoint, so that they can be restored
++    # correctly when an in-flight segment is being resumed.
++
+     # Resetting the movement_policy is currently necessary to update the
+     # policy's bitmask for whether a position is already segmented (the
+     # canvas updates the segmented mask only between calls to segment_at
+@@ -252,17 +300,19 @@ def reset_state(self, start_pos):
+     self.history = []
+     self.history_deleted = []
+ 
+-    self._min_pos = np.array(start_pos)
+-    self._max_pos = np.array(start_pos)
++    if reset_extents:
++      self._min_pos = np.array(start_pos)
++      self._max_pos = np.array(start_pos)
++
+     self._register_client()
+ 
+-  def is_valid_pos(self, pos, ignore_move_threshold=False):
++  def is_valid_pos(self, pos: Tuple3i, ignore_move_threshold=False) -> bool:
+     """Returns True if segmentation should be attempted at the given position.
+ 
+     Args:
+       pos: position to check as (z, y, x)
+       ignore_move_threshold: (boolean) when starting a new segment at pos the
+-          move threshold can and must be ignored.
++        move threshold can and must be ignored.
+ 
+     Returns:
+       Boolean indicating whether to run FFN inference at the given position.
+@@ -292,7 +342,7 @@ def is_valid_pos(self, pos, ignore_move_threshold=False):
+ 
+     return True
+ 
+-  def _get_image(self, pos):
++  def _get_image(self, pos: Tuple3i) -> np.ndarray:
+     """Returns the image for the FOV centered at 'pos'."""
+     # Top-left corner of the FoV.
+     start = np.array(pos) - self.margin
+@@ -300,7 +350,7 @@ def _get_image(self, pos):
+     img = self.image[tuple(slice(s, e) for s, e in zip(start, end))]
+     return img
+ 
+-  def predict(self, pos, logit_seed):
++  def predict(self, pos: Tuple3i, logit_seed: np.ndarray) -> np.ndarray:
+     """Runs a single step of FFN prediction.
+ 
+     Args:
+@@ -318,19 +368,19 @@ def predict(self, pos, logit_seed):
+       if self.t_last_predict is not None:
+         delta_t = time.time() - self.t_last_predict
+         self.counters['inference-not-predict-ms'].IncrementBy(
+-            delta_t * MSEC_IN_SEC)
++            delta_t * MSEC_IN_SEC
++        )
++      extra_fetches = ['logits']
+ 
+-      fetches = {'logits': self.model.logits}
+       with timer_counter(self.counters, 'inference'):
+-        fetches = self.executor.predict(self._exec_client_id,
+-                                        logit_seed, img, fetches)
++        fetches = self._exec_client.predict(logit_seed, img, extra_fetches)
+ 
+       self.t_last_predict = time.time()
+ 
+     logits = fetches.pop('logits')
+     return logits[..., 0]
+ 
+-  def update_at(self, pos):
++  def update_at(self, pos: Tuple3i) -> np.ndarray:
+     """Updates object mask prediction at a specific position.
+ 
+     Note that depending on the settings of the canvas, the update might involve
+@@ -366,15 +416,18 @@ def update_at(self, pos):
+ 
+         if self._keep_history:
+           self.history_deleted.append(
+-              np.sum((old_seed >= logit(0.8)) & (logits < th_max)))
++              np.sum((old_seed >= logit(0.8)) & (logits < th_max))
++          )
+ 
+-        if (np.mean(logits >= self.options.move_threshold) >
+-            self.options.disco_seed_threshold):
++        if (
++            np.mean(logits >= self.options.move_threshold)
++            > self.options.disco_seed_threshold
++        ):
+           # Because (x > NaN) is always False, this mask excludes positions that
+           # were previously uninitialized (i.e. set to NaN in old_seed).
+           old_err = np.seterr(invalid='ignore')
+           try:
+-            mask = ((old_seed < th_max) & (logits > old_seed))
++            mask = (old_seed < th_max) & (logits > old_seed)
+           finally:
+             np.seterr(**old_err)
+           logits[mask] = old_seed[mask]
+@@ -384,46 +437,62 @@ def update_at(self, pos):
+ 
+     return logits
+ 
+-  def init_seed(self, pos):
++  def init_seed(self, pos: Tuple3i):
+     """Reinitiailizes the object mask with a seed.
+ 
+     Args:
+       pos: position at which to place the seed (z, y, x)
+     """
+-    self.seed[...] = np.nan
++    self.seed.clear()
+     self.seed[pos] = self.options.init_activation
+ 
+-  def segment_at(self, start_pos, dynamic_image=None,
+-                 vis_update_every=10,
+-                 vis_fixed_z=False):
++  def get_next_segment_id(self) -> int:
++    """Returns the next free segment ID to assign."""
++
++    self._max_id += 1
++    while self._max_id in self.origins:
++      self._max_id += 1
++    return self._max_id
++
++  def segment_at(
++      self,
++      start_pos: Tuple3i,
++      dynamic_image=None,
++      vis_update_every=10,
++      vis_fixed_z=False,
++      partial_segment_iters=0,
++  ):
+     """Runs FFN segmentation starting from a specific point.
+ 
+     Args:
+       start_pos: location at which to run segmentation as (z, y, x)
+-      dynamic_image: optional DynamicImage object which to update with
+-          a visualization of the segmentation state
+-      vis_update_every: number of FFN iterations between subsequent
+-          updates of the dynamic image
+-      vis_fixed_z: if True, the z position used for visualization is
+-          fixed at the starting value specified in `pos`. Otherwise,
+-          the current FoV of the FFN is used to determine what to
+-          visualize.
++      dynamic_image: optional DynamicImage object which to update with a
++        visualization of the segmentation state
++      vis_update_every: number of FFN iterations between subsequent updates of
++        the dynamic image
++      vis_fixed_z: if True, the z position used for visualization is fixed at
++        the starting value specified in `pos`. Otherwise, the current FoV of the
++        FFN is used to determine what to visualize.
++      partial_segment_iters: if an interrupted segmentation is being resumed,
++        the number of inference calls already performed; 0 otherwise.
+ 
+     Returns:
+       number of iterations performed
+     """
+-    if self.reset_seed_per_segment:
+-      self.init_seed(start_pos)
+-    # This includes a reset of the movement policy, see comment in method body.
+-    self.reset_state(start_pos)
++    if not partial_segment_iters:
++      if self.reset_seed_per_segment:
++        self.init_seed(start_pos)
++      # This includes a reset of the movement policy, see comment in method
++      # body.
++      self.reset_state(start_pos, reset_extents=self.reset_seed_per_segment)
+ 
+-    num_iters = 0
++      if not self.movement_policy:
++        # Add first element with arbitrary priority 1 (it will be consumed
++        # right away anyway).
++        item = (self.movement_policy.score_threshold * 2, start_pos)
++        self.movement_policy.append(item)
+ 
+-    if not self.movement_policy:
+-      # Add first element with arbitrary priority 1 (it will be consumed
+-      # right away anyway).
+-      item = (self.movement_policy.score_threshold * 2, start_pos)
+-      self.movement_policy.append(item)
++    num_iters = partial_segment_iters
+ 
+     with timer_counter(self.counters, 'segment_at-loop'):
+       for pos in self.movement_policy:
+@@ -449,22 +518,21 @@ def segment_at(self, start_pos, dynamic_image=None,
+             self.history.append(pos)
+ 
+           if dynamic_image is not None and num_iters % vis_update_every == 0:
+-            vis_pos = pos if not vis_fixed_z else (start_pos[0], pos[1],
+-                                                   pos[2])
+-            visualize_state(self.seed, vis_pos, self.movement_policy,
+-                            dynamic_image)
++            vis_pos = pos if not vis_fixed_z else (start_pos[0], pos[1], pos[2])
++            visualize_state(
++                self.seed, vis_pos, self.movement_policy, dynamic_image
++            )
+ 
+           assert np.all(pred.shape == self._pred_size)
+ 
+-          self._maybe_save_checkpoint()
++          self._maybe_save_checkpoint(partial_segment_iters=num_iters)
+ 
+     return num_iters
+ 
+-  def log_info(self, string, *args, **kwargs):
+-    logging.info('[cl %d] ' + string, self._exec_client_id,
+-                 *args, **kwargs)
++  def log_info(self, string: str, *args, **kwargs):
++    logging.info('[cl %d] ' + string, self._exec_client_id, *args, **kwargs)
+ 
+-  def segment_all(self, seed_policy=seed.PolicyPeaks):
++  def segment_all(self, seed_policy=seed.PolicyPeaks, partial_segment_iters=0):
+     """Segments the input image.
+ 
+     Segmentation is attempted from all valid starting points provided by
+@@ -472,7 +540,9 @@ def segment_all(self, seed_policy=seed.PolicyPeaks):
+ 
+     Args:
+       seed_policy: callable taking the image and the canvas object as arguments
+-          and returning an iterator over proposed seed point.
++        and returning an iterator over proposed seed point.
++      partial_segment_iters: number of iterations already done for an in-progres
++        segment in case one is being resumed
+     """
+     self.seed_policy = seed_policy(self)
+     if self._seed_policy_state is not None:
+@@ -486,12 +556,16 @@ def segment_all(self, seed_policy=seed.PolicyPeaks):
+       for pos in TimedIter(self.seed_policy, self.counters, 'seed-policy'):
+         # When starting a new segment the move_threshold on the probability
+         # should be ignored when determining if the position is valid.
+-        if not (self.is_valid_pos(pos, ignore_move_threshold=True)
+-                and self.restrictor.is_valid_pos(pos)
+-                and self.restrictor.is_valid_seed(pos)):
++        if not (
++            self.is_valid_pos(pos, ignore_move_threshold=True)
++            and self.restrictor.is_valid_pos(pos)
++            and self.restrictor.is_valid_seed(pos)
++        ):
++          assert not partial_segment_iters
+           continue
+ 
+-        self._maybe_save_checkpoint()
++        if not partial_segment_iters:
++          self._maybe_save_checkpoint(partial_segment_iters=0)
+ 
+         # Too close to an existing segment?
+         low = np.array(pos) - mbd
+@@ -500,19 +574,24 @@ def segment_all(self, seed_policy=seed.PolicyPeaks):
+         if np.any(self.segmentation[sel] > 0):
+           logging.debug('Too close to existing segment.')
+           self.segmentation[pos] = -1
++          assert not partial_segment_iters
+           continue
+ 
+         self.log_info('Starting segmentation at %r (zyx)', pos)
+ 
+         # Try segmentation.
+         seg_start = time.time()
+-        num_iters = self.segment_at(pos)
++        num_iters = self.segment_at(
++            pos, partial_segment_iters=partial_segment_iters
++        )
++        partial_segment_iters = 0
+         t_seg = time.time() - seg_start
+ 
+         # Check if segmentation was successful.
+         if num_iters <= 0:
+-          self.counters['invalid-other-time-ms'].IncrementBy(t_seg *
+-                                                             MSEC_IN_SEC)
++          self.counters['invalid-other-time-ms'].IncrementBy(
++              t_seg * MSEC_IN_SEC
++          )
+           self.log_info('Failed: num iters was %d', num_iters)
+           continue
+ 
+@@ -543,8 +622,9 @@ def segment_all(self, seed_policy=seed.PolicyPeaks):
+         raw_segmented_voxels = np.sum(mask)
+ 
+         # Record existing segment IDs overlapped by the newly added object.
+-        overlapped_ids, counts = np.unique(self.segmentation[sel][mask],
+-                                           return_counts=True)
++        overlapped_ids, counts = np.unique(
++            self.segmentation[sel][mask], return_counts=True
++        )
+         valid = overlapped_ids > 0
+         overlapped_ids = overlapped_ids[valid]
+         counts = counts[valid]
+@@ -557,26 +637,30 @@ def segment_all(self, seed_policy=seed.PolicyPeaks):
+           if self.segmentation[pos] == 0:
+             self.segmentation[pos] = -1
+           self.log_info('Failed: too small: %d', actual_segmented_voxels)
+-          self.counters['invalid-small-time-ms'].IncrementBy(t_seg *
+-                                                             MSEC_IN_SEC)
++          self.counters['invalid-small-time-ms'].IncrementBy(
++              t_seg * MSEC_IN_SEC
++          )
+           continue
+ 
+         self.counters['voxels-segmented'].IncrementBy(actual_segmented_voxels)
+         self.counters['voxels-overlapping'].IncrementBy(
+-            raw_segmented_voxels - actual_segmented_voxels)
+-
+-        # Find the next free ID to assign.
+-        self._max_id += 1
+-        while self._max_id in self.origins:
+-          self._max_id += 1
+-
+-        self.segmentation[sel][mask] = self._max_id
+-        self.seg_prob[sel][mask] = storage.quantize_probability(
+-            expit(self.seed[sel][mask]))
++            raw_segmented_voxels - actual_segmented_voxels
++        )
+ 
+-        self.log_info('Created supervoxel:%d  seed(zyx):%s  size:%d  iters:%d',
+-                      self._max_id, pos,
+-                      actual_segmented_voxels, num_iters)
++        sid = self.get_next_segment_id()
++        self.segmentation[sel][mask] = sid
++        if self.keep_probability_maps:
++          self.seg_prob[sel][mask] = storage.quantize_probability(
++              expit(self.seed[sel][mask])
++          )
++
++        self.log_info(
++            'Created supervoxel:%d  seed(zyx):%s  size:%d  iters:%d',
++            self._max_id,
++            pos,
++            actual_segmented_voxels,
++            num_iters,
++        )
+ 
+         self.overlaps[self._max_id] = np.array([overlapped_ids, counts])
+ 
+@@ -584,6 +668,8 @@ def segment_all(self, seed_policy=seed.PolicyPeaks):
+         self.origins[self._max_id] = storage.OriginInfo(pos, num_iters, t_seg)
+         self.counters['valid-time-ms'].IncrementBy(t_seg * MSEC_IN_SEC)
+ 
++        self._maybe_save_checkpoint(partial_segment_iters=0)
++
+     self.log_info('Segmentation done.')
+ 
+     # It is important to deregister ourselves when the segmentation is complete.
+@@ -593,8 +679,9 @@ def segment_all(self, seed_policy=seed.PolicyPeaks):
+     # inference.
+     self._deregister_client()
+ 
+-  def init_segmentation_from_volume(self, volume, corner, end,
+-                                    align_and_crop=None):
++  def init_segmentation_from_volume(
++      self, volume, corner, end, align_and_crop=None
++  ):
+     """Initializes segmentation from an existing VolumeStore.
+ 
+     This is useful to start inference with an existing segmentation.
+@@ -606,40 +693,55 @@ def init_segmentation_from_volume(self, volume, corner, end,
+       end: location at which to stop reading data as (z, y, x)
+       align_and_crop: callable to align & crop a 3d segmentation subvolume
+     """
+-    self.log_info('Loading initial segmentation from (zyx) %r:%r',
+-                  corner, end)
+-
+-    init_seg = volume[:,  #
+-                      corner[0]:end[0],  #
+-                      corner[1]:end[1],  #
+-                      corner[2]:end[2]]
+-
+-    init_seg, global_to_local = label_utils.make_contiguous(init_seg)
++    init_seg = volume[
++        :, corner[0] : end[0], corner[1] : end[1], corner[2] : end[2]  #  #  #
++    ]
+     init_seg = init_seg[0, ...]
++    self.log_info(
++        'Segmentation loaded, shape: %r. Canvas segmentation is %r',
++        init_seg.shape,
++        self.segmentation.shape,
++    )
+ 
++    init_seg, global_to_local = label_utils.make_contiguous(init_seg)
+     self.global_to_local_ids = dict(global_to_local)
++    self.local_to_global_ids = {
++        v: k for k, v in self.global_to_local_ids.items()
++    }
+ 
+-    self.log_info('Segmentation loaded, shape: %r. Canvas segmentation is %r',
+-                  init_seg.shape, self.segmentation.shape)
+     if align_and_crop is not None:
+       init_seg = align_and_crop(init_seg)
+       self.log_info('Segmentation cropped to: %r', init_seg.shape)
+ 
+     self.segmentation[:] = init_seg
+-    self.seg_prob[self.segmentation > 0] = storage.quantize_probability(
+-        np.array([1.0]))
+-    self._max_id = np.max(self.segmentation)
++    if self.keep_probability_maps:
++      assert self.seg_prob is not None
++      self.seg_prob[self.segmentation > 0] = storage.quantize_probability(
++          np.array([1.0])
++      )
++    self._max_id = int(np.max(self.segmentation))
+     self.log_info('Max restored ID is: %d.', self._max_id)
+ 
+-  def restore_checkpoint(self, path):
+-    """Restores state from the checkpoint at `path`."""
++  def restore_checkpoint(self, path: str) -> int:
++    """Restores state from the checkpoint at `path`.
++
++    Args:
++      path: path to the file from which to load the checkpoint
++
++    Returns:
++      an int indicating the number of inference iterations already done for
++      an in-progress segment, or 0 if the checkpoint does not contain an
++      in-progress segment
++    """
+     self.log_info('Restoring inference checkpoint: %s', path)
+     with gfile.GFile(path, 'rb') as f:
+-      data = np.load(f)
++      data = np.load(f, allow_pickle=True)
+ 
+       self.segmentation[:] = data['segmentation']
+       self.seed[:] = data['seed']
+-      self.seg_prob[:] = data['seg_qprob']
++      if self.keep_probability_maps:
++        assert self.seg_prob is not None
++        self.seg_prob[:] = data['seg_qprob']
+       self.history_deleted = list(data['history_deleted'])
+       self.history = list(data['history'])
+       self.origins = data['origins'].item()
+@@ -648,48 +750,82 @@ def restore_checkpoint(self, path):
+ 
+       segmented_voxels = np.sum(self.segmentation != 0)
+       self.counters['voxels-segmented'].Set(segmented_voxels)
+-      self._max_id = np.max(self.segmentation)
++      self._max_id = int(np.max(self.segmentation))
++      self._min_pos = data['min_pos']
++      self._max_pos = data['max_pos']
+ 
+       self.movement_policy.restore_state(data['movement_policy'])
+ 
+-      seed_policy_state = data['seed_policy_state']
+       # When restoring the state of a previously unused Canvas, the seed
+       # policy will not be defined. We just save the seed policy state here
+       # for future use in .segment_all().
+-      self._seed_policy_state = seed_policy_state
++      self._seed_policy_state = data['seed_policy_state']
+ 
+       self.counters.loads(data['counters'].item())
+ 
++      if 'partial_segment_iters' in data:
++        partial_segment_iters = data['partial_segment_iters']
++      else:
++        partial_segment_iters = 0
++
++      if 'hosts' in data:
++        self._hosts = list(data['hosts'])
++
+     self.log_info('Inference checkpoint restored.')
++    return partial_segment_iters
++
++  def save_checkpoint(self, path: str, partial_segment_iters: int):
++    """Saves an inference checkpoint to `path`.
+ 
+-  def save_checkpoint(self, path):
+-    """Saves a inference checkpoint to `path`."""
++    Args:
++      path: path at which the checkpoint should be saved
++      partial_segment_iters: if this checkpoint is for an in-flight segment,
++        number of inference iterations already executed; 0 otherwise
++    """
+     self.log_info('Saving inference checkpoint to %s.', path)
+     with timer_counter(self.counters, 'save_checkpoint'):
+       gfile.makedirs(os.path.dirname(path))
+       with storage.atomic_file(path) as fd:
+         seed_policy_state = None
+         if self.seed_policy is not None:
+-          seed_policy_state = self.seed_policy.get_state()
+-
+-        np.savez_compressed(fd,
+-                            movement_policy=self.movement_policy.get_state(),
+-                            segmentation=self.segmentation,
+-                            seg_qprob=self.seg_prob,
+-                            seed=self.seed,
+-                            origins=self.origins,
+-                            overlaps=self.overlaps,
+-                            history=np.array(self.history),
+-                            history_deleted=np.array(self.history_deleted),
+-                            seed_policy_state=seed_policy_state,
+-                            counters=self.counters.dumps())
++          seed_policy_state = self.seed_policy.get_state(
++              partial_segment_iters > 0
++          )
++
++        aux = {}
++        if self.keep_probability_maps:
++          aux['seg_qprob'] = self.seg_prob
++
++        np.savez_compressed(
++            fd,
++            movement_policy=np.asarray(
++                self.movement_policy.get_state(), dtype=object
++            ),
++            segmentation=self.segmentation,
++            seed=self.seed,
++            origins=self.origins,
++            overlaps=self.overlaps,
++            min_pos=self._min_pos,
++            max_pos=self._max_pos,
++            history=np.array(self.history),
++            history_deleted=np.array(self.history_deleted),
++            seed_policy_state=np.asarray(seed_policy_state, dtype=object),
++            counters=self.counters.dumps(),
++            partial_segment_iters=partial_segment_iters,
++            hosts=self._hosts,
++            **aux,
++        )
+     self.log_info('Inference checkpoint saved.')
+ 
+-  def _maybe_save_checkpoint(self):
++  def _maybe_save_checkpoint(self, partial_segment_iters=0):
+     """Attempts to save a checkpoint.
+ 
+     A checkpoint is only saved if the canvas is configured to keep checkpoints
+     and if sufficient time has passed since the last one was saved.
++
++    Args:
++      partial_segment_iters: if this checkpoint is for an in-flight segment,
++        number of inference iterations already executed; 0 otherwise
+     """
+     if self.checkpoint_path is None or self.checkpoint_interval_sec <= 0:
+       return
+@@ -697,5 +833,8 @@ def _maybe_save_checkpoint(self):
+     if time.time() - self.checkpoint_last < self.checkpoint_interval_sec:
+       return
+ 
+-    self.save_checkpoint(self.checkpoint_path)
++    with Canvas.io_lock:
++      self.save_checkpoint(
++          self.checkpoint_path, partial_segment_iters=partial_segment_iters
++      )
+     self.checkpoint_last = time.time()
+diff --git a/ffn/inference/runner.py b/ffn/inference/runner.py
+index d7ca3e2..f7cb53f 100644
+--- a/ffn/inference/runner.py
++++ b/ffn/inference/runner.py
+@@ -14,15 +14,18 @@
+ # ==============================================================================
+ """Helper code for managing FFN inference runs."""
+ 
++import copy
+ import functools
+ import json
+-from typing import Any
++from typing import Any, Optional
+ 
++from absl import flags
+ from absl import logging
+ from connectomics.common import bounding_box
+ import numpy as np
+ import tensorflow.compat.v1 as tf
+ from tensorflow.io import gfile
++
+ from ..training import model as ffn_model
+ from ..training.import_util import import_symbol
+ from . import align
+@@ -36,6 +39,21 @@
+ from .inference_utils import timer_counter
+ 
+ 
++REQUIRE_GPU = flags.DEFINE_boolean(
++    'require_gpu',
++    True,
++    'Whether to crash in case a GPU TF device cannot be acquired.',
++)
++_LOG_DEVICE_PLACEMENT = flags.DEFINE_boolean(
++    'log_device_placement', False, 'For tf.Config.'
++)
++
++# pylint:disable=invalid-name
++Tuple3i = tuple[int, int, int]
++
++# pylint:enable=invalid-name
++
++
+ class Runner:
+   """Helper for managing FFN inference runs.
+ 
+@@ -51,15 +69,16 @@ class Runner:
+   init_seg_volume: storage.Volume | None
+   _image_volume: storage.Volume | None
+   _mask_volumes: dict[str, storage.Volume]
+-  model: ffn_model.FFNModel
++  _model_info: ffn_model.ModelInfo
+   _shift_mask_volume: storage.Volume | None
+   _aligner: align.Aligner
+-  session: tf.Session
+   movement_policy_fn: Any
+ 
+   def __init__(self):
+     self.counters = inference_utils.Counters()
+     self.executor = None
++    self._exec_interface = executor.ExecutorInterface()
++    self.canvases = {}
+ 
+   def __del__(self):
+     self.stop_executor()
+@@ -70,42 +89,104 @@ def stop_executor(self):
+     No-op when no executor is active.
+     """
+     if self.executor is not None:
+-      self.executor.stop_server()
++      try:
++        self.executor.stop_server()
++      except executor.TerminationException:
++        pass
+       self.executor = None
+ 
+-  def _load_model_checkpoint(self, checkpoint_path):
+-    """Restores the inference model from a training checkpoint.
++  def _load_tf_model_checkpoint(
++      self, session: tf.Session, checkpoint_path: str
++  ):
++    """Restores the inference model from a TF model checkpoint.
+ 
+     Args:
+-      checkpoint_path: the string path to the checkpoint file to load
++      session: TF session to use.
++      checkpoint_path: the string path to the checkpoint file to load.
+     """
+-    with timer_counter(self.counters, 'restore-tf-checkpoint'):
+-      logging.info('Loading checkpoint.')
++    with inference_utils.timer_counter(self.counters, 'restore-tf-checkpoint'):
++      logging.info('Loading checkpoint: %s', checkpoint_path)
+       saver = tf.train.Saver()
+-      saver.restore(self.session, checkpoint_path)
++      saver.restore(session, checkpoint_path)
+       logging.info('Checkpoint loaded.')
+ 
+-  def start(self, request, batch_size=1, exec_cls=None, session=None):
++  def _get_tf_model(self, model_name: str):
++    return import_symbol(model_name)
++
++  def _init_tf_model(
++      self,
++      request: inference_pb2.InferenceRequest,
++      batch_size: int,
++      session: Optional[tf.Session] = None,
++  ) -> tf.Session:
++    """Initializes a TensorFlow model."""
++    if session is None:
++      tf.reset_default_graph()
++      config = tf.ConfigProto(log_device_placement=_LOG_DEVICE_PLACEMENT.value)
++      try:
++        config.MergeFrom(request.tf_config)
++      except AttributeError:
++        pass
++      session = tf.Session(config=config)
++
++    logging.info('Available TF devices: %r', session.list_devices())
++    if REQUIRE_GPU.value and not any(
++        x.device_type == 'GPU' for x in session.list_devices()
++    ):
++      raise RuntimeError('Failed to initialize a GPU device for TensorFlow.')
++
++    # Initialize the FFN model.
++    model_class = self._get_tf_model(request.model_name)
++    if request.model_args:
++      args = json.loads(request.model_args)
++    else:
++      args = {}
++    args['batch_size'] = batch_size
++    model = model_class(**args)
++
++    self._model_info = model.info
++
++    if any(dev.device_type == 'TPU' for dev in session.list_devices()):
++      exec_cls = executor.TPUExecutor
++    else:
++      exec_cls = executor.ThreadingBatchExecutor
++    self.executor = exec_cls(
++        self._exec_interface,
++        model,
++        model.info,
++        session,
++        self.counters,
++        batch_size,
++    )
++
++    self._load_tf_model_checkpoint(session, request.model_checkpoint_path)
++    return session
++
++  def start(self, request, batch_size: int = 1, session: tf.Session = None):
+     """Opens input volumes and initializes the FFN."""
++    request = copy.deepcopy(request)
+     self.request = request
+     assert self.request.segmentation_output_dir
+-
+     logging.debug('Received request:\n%s', request)
+ 
+     if not gfile.exists(request.segmentation_output_dir):
+       gfile.makedirs(request.segmentation_output_dir)
+ 
++    self.stop_executor()
++    session = self._init_tf_model(request, batch_size, session)
++
+     with timer_counter(self.counters, 'volstore-open'):
+       # Disabling cache compression can improve access times by 20-30%
+       # as of Aug 2016.
+       self._image_volume = storage.decorated_volume(
+-          request.image, cache_max_bytes=int(1e8),
+-          cache_compression=False)
++          request.image, cache_max_bytes=int(1e8), cache_compression=False
++      )
+       assert self._image_volume is not None
+ 
+       if request.HasField('init_segmentation'):
+         self.init_seg_volume = storage.decorated_volume(
+-            request.init_segmentation, cache_max_bytes=int(1e8))
++            request.init_segmentation, cache_max_bytes=int(1e8)
++        )
+       else:
+         self.init_seg_volume = None
+ 
+@@ -113,7 +194,9 @@ def _open_or_none(settings):
+         if settings.WhichOneof('volume_path') is None:
+           return None
+         return storage.decorated_volume(
+-            settings, cache_max_bytes=int(1e7), cache_compression=False)
++            settings, cache_max_bytes=int(1e7), cache_compression=False
++        )
++
+       self._mask_volumes = {}
+       self._shift_mask_volume = _open_or_none(request.shift_mask)
+ 
+@@ -123,39 +206,13 @@ def _open_or_none(settings):
+         self._aligner = align.Aligner()
+       else:
+         type_name = inference_pb2.AlignmentOptions.AlignType.Name(
+-            alignment_options.type)
++            alignment_options.type
++        )
+         error_string = 'Alignment for type %s is not implemented' % type_name
+         logging.error(error_string)
+         raise NotImplementedError(error_string)
+ 
+-    self.stop_executor()
+-
+-    if session is None:
+-      config = tf.ConfigProto()
+-      tf.reset_default_graph()
+-      session = tf.Session(config=config)
+-    self.session = session
+-    logging.info('Available TF devices: %r', self.session.list_devices())
+-
+-    # Initialize the FFN model.
+-    model_class = import_symbol(request.model_name)
+-    if request.model_args:
+-      args = json.loads(request.model_args)
+-    else:
+-      args = {}
+-
+-    args['batch_size'] = batch_size
+-    self.model = model_class(**args)
+-
+-    if exec_cls is None:
+-      exec_cls = executor.ThreadingBatchExecutor
+-
+-    self.executor = exec_cls(
+-        self.model, self.session, self.counters, batch_size)
+-    self.movement_policy_fn = movement.get_policy_fn(request, self.model.info)
+-
+-    self._load_model_checkpoint(request.model_checkpoint_path)
+-
++    assert self.executor is not None
+     self.executor.start_server()
+ 
+   def make_restrictor(self, corner, subvol_size, image, alignment):
+@@ -164,10 +221,14 @@ def make_restrictor(self, corner, subvol_size, image, alignment):
+ 
+     if self.request.masks:
+       with timer_counter(self.counters, 'load-mask'):
+-        final_mask = storage.build_mask(self.request.masks,
+-                                        corner, subvol_size,
+-                                        self._mask_volumes,
+-                                        image, alignment)
++        final_mask = storage.build_mask(
++            self.request.masks,
++            corner,
++            subvol_size,
++            self._mask_volumes,
++            image,
++            alignment,
++        )
+ 
+         if np.all(final_mask):
+           logging.info('Everything masked.')
+@@ -177,10 +238,14 @@ def make_restrictor(self, corner, subvol_size, image, alignment):
+ 
+     if self.request.seed_masks:
+       with timer_counter(self.counters, 'load-seed-mask'):
+-        seed_mask = storage.build_mask(self.request.seed_masks,
+-                                       corner, subvol_size,
+-                                       self._mask_volumes,
+-                                       image, alignment)
++        seed_mask = storage.build_mask(
++            self.request.seed_masks,
++            corner,
++            subvol_size,
++            self._mask_volumes,
++            image,
++            alignment,
++        )
+ 
+         if np.all(seed_mask):
+           logging.info('All seeds masked.')
+@@ -195,45 +260,53 @@ def make_restrictor(self, corner, subvol_size, image, alignment):
+         shift_size = -(-np.array(subvol_size) // (1, s, s))
+ 
+         shift_alignment = alignment.rescaled(
+-            np.array((1.0, 1.0, 1.0)) / (1, s, s))
++            np.array((1.0, 1.0, 1.0)) / (1, s, s)
++        )
+         src_corner, src_size = shift_alignment.expand_bounds(
+-            shift_corner, shift_size, forward=False)
++            shift_corner, shift_size, forward=False
++        )
+         src_corner, src_size = storage.clip_subvolume_to_bounds(
+-            src_corner, src_size, self._shift_mask_volume)
++            src_corner, src_size, self._shift_mask_volume
++        )
+         src_end = src_corner + src_size
+ 
+         expanded_shift_mask = self._shift_mask_volume[
+             0:2,  #
+-            src_corner[0]:src_end[0],  #
+-            src_corner[1]:src_end[1],  #
+-            src_corner[2]:src_end[2]]
++            src_corner[0] : src_end[0],  #
++            src_corner[1] : src_end[1],  #
++            src_corner[2] : src_end[2],
++        ]
+         shift_mask = np.array([
+             shift_alignment.align_and_crop(
+-                src_corner, expanded_shift_mask[i], shift_corner, shift_size)
+-            for i in range(2)])
++                src_corner, expanded_shift_mask[i], shift_corner, shift_size
++            )
++            for i in range(2)
++        ])
+         shift_mask = alignment.transform_shift_mask(corner, s, shift_mask)
+ 
+         if self.request.HasField('shift_mask_fov'):
+           shift_mask_fov = bounding_box.BoundingBox(
+               start=self.request.shift_mask_fov.start,
+-              size=self.request.shift_mask_fov.size)
++              size=self.request.shift_mask_fov.size,
++          )
+         else:
+-          shift_mask_diameter = np.array(self.model.info.input_image_size)
++          shift_mask_diameter = np.array(self._model_info.input_image_size)
+           shift_mask_fov = bounding_box.BoundingBox(
+-              start=-(shift_mask_diameter // 2), size=shift_mask_diameter)
++              start=-(shift_mask_diameter // 2), size=shift_mask_diameter
++          )
+ 
+         kwargs.update({
+             'shift_mask': shift_mask,
+             'shift_mask_fov': shift_mask_fov,
+             'shift_mask_scale': self.request.shift_mask_scale,
+-            'shift_mask_threshold': self.request.shift_mask_threshold})
++            'shift_mask_threshold': self.request.shift_mask_threshold,
++        })
+ 
+-    if kwargs:
+-      return movement.MovementRestrictor(**kwargs)
+-    else:
+-      return None
++      return movement.MovementRestrictor(**kwargs) if kwargs else None
+ 
+-  def make_canvas(self, corner, subvol_size, **canvas_kwargs):
++  def make_canvas(
++      self, corner: Tuple3i, subvol_size: Tuple3i, **canvas_kwargs
++  ) -> tuple[Optional[inference.Canvas], Optional[align.Alignment]]:
+     """Builds the Canvas object for inference on a subvolume.
+ 
+     Args:
+@@ -258,13 +331,16 @@ def make_canvas(self, corner, subvol_size, **canvas_kwargs):
+ 
+       # Bounding box for the aligned destination subvolume.
+       dst_corner, dst_size = alignment.expand_bounds(
+-          corner, subvol_size, forward=True)
++          corner, subvol_size, forward=True
++      )
+       # Bounding box for the pre-aligned imageset to be fetched from the volume.
+       src_corner, src_size = alignment.expand_bounds(
+-          dst_corner, dst_size, forward=False)
++          dst_corner, dst_size, forward=False
++      )
+       # Ensure that the request bounds don't extend beyond volume bounds.
+       src_corner, src_size = storage.clip_subvolume_to_bounds(
+-          src_corner, src_size, self._image_volume)
++          src_corner, src_size, self._image_volume
++      )
+ 
+       logging.info('Requested bounds are %r + %r', corner, subvol_size)
+       logging.info('Destination bounds are %r + %r', dst_corner, dst_size)
+@@ -280,15 +356,19 @@ def get_data_3d(volume: storage.Volume, bbox: bounding_box.BoundingBox):
+         if data.ndim == 4:
+           data = data.squeeze(axis=0)
+         return data
++
+       src_bbox = bounding_box.BoundingBox(
+-          start=src_corner[::-1], size=src_size[::-1])
++          start=src_corner[::-1], size=src_size[::-1]
++      )
+       src_image = get_data_3d(self._image_volume, src_bbox)
+-      logging.info('Fetched image of size %r prior to transform',
+-                   src_image.shape)
++      logging.info(
++          'Fetched image of size %r prior to transform', src_image.shape
++      )
+ 
+       def align_and_crop(image):
+-        return alignment.align_and_crop(src_corner, image, dst_corner, dst_size,
+-                                        forward=True)
++        return alignment.align_and_crop(
++            src_corner, image, dst_corner, dst_size, forward=True
++        )
+ 
+       # Align and crop to the dst bounding box.
+       image = align_and_crop(src_image)
+@@ -297,29 +377,40 @@ def align_and_crop(image):
+       logging.info('Image data loaded, shape: %r.', image.shape)
+ 
+     restrictor = self.make_restrictor(dst_corner, dst_size, image, alignment)
+-
+-    image = (image.astype(np.float32) -
+-             self.request.image_mean) / self.request.image_stddev
+     if restrictor == self.ALL_MASKED:
+       return None, None
+ 
++    image = (
++        image.astype(np.float32) - self.request.image_mean
++    ) / self.request.image_stddev
++
++    exc = self.executor
++    if exc is None:
++      # If executor doesn't exist, we're in the process of shutting down.
++      raise executor.TerminationException
++
+     canvas = inference.Canvas(
+-        self.model,
+-        self.executor,
++        self._model_info,
++        exc.get_client(subvol_counters),
+         image,
+         self.request.inference_options,
+         counters=subvol_counters,
+         restrictor=restrictor,
+-        movement_policy_fn=self.movement_policy_fn,
++        movement_policy_fn=movement.get_policy_fn(
++            self.request, self._model_info
++        ),
+         checkpoint_path=storage.checkpoint_path(
+-            self.request.segmentation_output_dir, corner),
++            self.request.segmentation_output_dir, corner
++        ),
+         checkpoint_interval_sec=self.request.checkpoint_interval,
+         corner_zyx=dst_corner,
+-        **canvas_kwargs)
++        **canvas_kwargs
++    )
+ 
+     if self.request.HasField('init_segmentation'):
+-      canvas.init_segmentation_from_volume(self.init_seg_volume, src_corner,
+-                                           src_bbox.end[::-1], align_and_crop)
++      canvas.init_segmentation_from_volume(
++          self.init_seg_volume, src_corner, src_bbox.end[::-1], align_and_crop
++      )
+     return canvas, alignment
+ 
+   def get_seed_policy(self, corner, subvol_size):
+@@ -327,7 +418,7 @@ def get_seed_policy(self, corner, subvol_size):
+ 
+     Args:
+       corner: the original corner of the requested subvolume, before any
+-          modification e.g. dynamic alignment.
++        modification e.g. dynamic alignment.
+       subvol_size: the original requested size.
+ 
+     Returns:
+@@ -345,11 +436,11 @@ def save_segmentation(self, canvas, alignment, target_path, prob_path):
+     Args:
+       canvas: Canvas object containing the segmentation
+       alignment: the local Alignment used with the canvas, or None
+-      target_path: path to the file where the segmentation should
+-          be saved
+-      prob_path: path to the file where the segmentation probability
+-          map should be saved
++      target_path: path to the file where the segmentation should be saved
++      prob_path: path to the file where the segmentation probability map should
++        be saved
+     """
++
+     def unalign_image(im3d):
+       if alignment is None:
+         return im3d
+@@ -358,7 +449,8 @@ def unalign_image(im3d):
+           im3d,
+           alignment.corner,
+           alignment.size,
+-          forward=False)
++          forward=False,
++      )
+ 
+     def unalign_origins(origins, canvas_corner):
+       out_origins = dict()
+@@ -379,7 +471,8 @@ def unalign_origins(origins, canvas_corner):
+         target_path,
+         request=self.request.SerializeToString(),
+         counters=canvas.counters.dumps(),
+-        overlaps=canvas.overlaps)
++        overlaps=canvas.overlaps,
++    )
+ 
+     # Save probability map separately. This has to happen after the
+     # segmentation is saved, as `save_subvolume` will create any necessary
+@@ -388,7 +481,7 @@ def unalign_origins(origins, canvas_corner):
+     with storage.atomic_file(prob_path) as fd:
+       np.savez_compressed(fd, qprob=prob)
+ 
+-  def run(self, corner, subvol_size, reset_counters=True):
++  def run(self, corner: Tuple3i, subvol_size: Tuple3i, reset_counters=True):
+     """Runs FFN inference over a subvolume.
+ 
+     Args:
+@@ -404,11 +497,14 @@ def run(self, corner, subvol_size, reset_counters=True):
+       self.counters.reset()
+ 
+     seg_path = storage.segmentation_path(
+-        self.request.segmentation_output_dir, corner)
++        self.request.segmentation_output_dir, corner
++    )
+     prob_path = storage.object_prob_path(
+-        self.request.segmentation_output_dir, corner)
++        self.request.segmentation_output_dir, corner
++    )
+     cpoint_path = storage.checkpoint_path(
+-        self.request.segmentation_output_dir, corner)
++        self.request.segmentation_output_dir, corner
++    )
+ 
+     if gfile.exists(seg_path):
+       return None
+@@ -417,17 +513,27 @@ def run(self, corner, subvol_size, reset_counters=True):
+     if canvas is None:
+       return None
+ 
++    assert alignment is not None
++
+     if gfile.exists(cpoint_path):
+-      canvas.restore_checkpoint(cpoint_path)
++      partial_segment_iters = canvas.restore_checkpoint(cpoint_path)
+ 
+     if self.request.alignment_options.save_raw:
+-      image_path = storage.subvolume_path(self.request.segmentation_output_dir,
+-                                          corner, 'align')
++      image_path = storage.subvolume_path(
++          self.request.segmentation_output_dir, corner, 'align'
++      )
+       with storage.atomic_file(image_path) as fd:
+         np.savez_compressed(fd, im=canvas.image)
+ 
+-    canvas.segment_all(seed_policy=self.get_seed_policy(corner, subvol_size))
++    # keep a record of canvases executing inference. this is used to save
++    # checkpoints in case termination is requested.
++    self.canvases[corner] = canvas
++    canvas.segment_all(
++        seed_policy=self.get_seed_policy(corner, subvol_size),
++        partial_segment_iters=partial_segment_iters,
++    )
+     self.save_segmentation(canvas, alignment, seg_path, prob_path)
++    del self.canvases[corner]
+ 
+     # Attempt to remove the checkpoint file now that we no longer need it.
+     try:
+diff --git a/ffn/inference/storage.py b/ffn/inference/storage.py
+index 9aa9b53..baa468e 100644
+--- a/ffn/inference/storage.py
++++ b/ffn/inference/storage.py
+@@ -52,6 +52,25 @@ def __repr__(self):
+     return f'{self.__class__.__name__}({repr(self.tstore)})'
+ 
+ 
++class NumpyArray(np.ndarray):
++  """ndarray with a clear method.
++
++  Provides dense in-memory storage for FFN inference.
++  """
++
++  def __new__(cls, default_value=0, **kwargs):
++    ret = super(NumpyArray, cls).__new__(cls, **kwargs)
++    ret.default_value = default_value
++    return ret
++
++  def __init__(self, *args, **kwargs):
++    del args, kwargs
++    self.clear()
++
++  def clear(self):
++    self[...] = self.default_value
++
++
+ def decorated_volume(settings, **kwargs) -> Volume:
+   """Converts DecoratedVolume proto object into volume objects.
+ 
+diff --git a/ffn/training/import_util.py b/ffn/training/import_util.py
+index 2f93a90..61c2dc6 100644
+--- a/ffn/training/import_util.py
++++ b/ffn/training/import_util.py
+@@ -12,11 +12,10 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ # ==============================================================================
+-"""Contains a utility function for dynamically importing symbols from modules.
+-"""
++"""Functions for dynamically importing symbols from modules."""
+ 
+ import importlib
+-import logging
++from absl import logging
+ 
+ 
+ def import_symbol(specifier, default_packages='ffn.training.models'):
+diff --git a/notebooks/ffn_inference_colab_demo.ipynb b/notebooks/ffn_inference_colab_demo.ipynb
+index cc8c5a8..b2d3bec 100644
+--- a/notebooks/ffn_inference_colab_demo.ipynb
++++ b/notebooks/ffn_inference_colab_demo.ipynb
+@@ -143,6 +143,8 @@
+         "id": "c5Am7tyqupBl"
+       },
+       "source": [
++        "from absl import flags\n",
++        "flags.FLAGS(['./unused'])\n",
+         "config = '''image {\n",
+         "  hdf5: \"third_party/neuroproof_examples/training_sample2/grayscale_maps.h5:raw\"\n",
+         "}\n",

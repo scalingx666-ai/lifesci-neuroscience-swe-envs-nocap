@@ -1,0 +1,2233 @@
+diff --git a/mri_histo_util/CMakeLists.txt b/mri_histo_util/CMakeLists.txt
+index 8cff40499e6..97dd0d501f3 100755
+--- a/mri_histo_util/CMakeLists.txt
++++ b/mri_histo_util/CMakeLists.txt
+@@ -2,6 +2,7 @@ project(mri_histo_atlas_segment)
+ 
+ install_configured(mri_histo_atlas_segment DESTINATION bin)
+ install_configured(mri_histo_atlas_segment_fast DESTINATION bin)
++install_configured(mri_histo_atlas_segment_fireants DESTINATION bin)
+ 
+ if (FSPYTHON_INSTALL_TREE)
+    install(DIRECTORY ERC_bayesian_segmentation DESTINATION ../fspython/python/packages)
+diff --git a/mri_histo_util/ERC_bayesian_segmentation/ERC_bayesian_segmentation/custom_cc_labeldiff_loss.py b/mri_histo_util/ERC_bayesian_segmentation/ERC_bayesian_segmentation/custom_cc_labeldiff_loss.py
+new file mode 100755
+index 00000000000..12f350834fd
+--- /dev/null
++++ b/mri_histo_util/ERC_bayesian_segmentation/ERC_bayesian_segmentation/custom_cc_labeldiff_loss.py
+@@ -0,0 +1,309 @@
++'''
++Cross correlation
++'''
++from time import time, sleep
++import torch
++from torch.utils.checkpoint import checkpoint
++from torch import nn
++from torch.nn import functional as F
++from typing import Union, Tuple, List, Optional, Dict, Any, Callable
++from fireants.types import ItemOrList
++import numpy as np
++
++@torch.jit.script
++def gaussian_1d(
++    sigma: torch.Tensor, truncated: float = 4.0, approx: str = "erf", normalize: bool = True
++) -> torch.Tensor:
++    """
++    one dimensional Gaussian kernel.
++    Args:
++        sigma: std of the kernel
++        truncated: tail length
++        approx: discrete Gaussian kernel type, available options are "erf", "sampled", and "scalespace".
++            - ``erf`` approximation interpolates the error function;
++            - ``sampled`` uses a sampled Gaussian kernel;
++            - ``scalespace`` corresponds to
++              https://en.wikipedia.org/wiki/Scale_space_implementation#The_discrete_Gaussian_kernel
++              based on the modified Bessel functions.
++        normalize: whether to normalize the kernel with `kernel.sum()`.
++    Raises:
++        ValueError: When ``truncated`` is non-positive.
++    Returns:
++        1D torch tensor
++    """
++    sigma = torch.as_tensor(sigma, dtype=torch.float, device=sigma.device if isinstance(sigma, torch.Tensor) else None)
++    device = sigma.device
++    if truncated <= 0.0:
++        raise ValueError(f"truncated must be positive, got {truncated}.")
++    tail = int(max(float(sigma) * truncated, 0.5) + 0.5)
++    if approx.lower() == "erf":
++        x = torch.arange(-tail, tail + 1, dtype=torch.float, device=device)
++        t = 0.70710678 / torch.abs(sigma)
++        out = 0.5 * ((t * (x + 0.5)).erf() - (t * (x - 0.5)).erf())
++        out = out.clamp(min=0)
++    elif approx.lower() == "sampled":
++        x = torch.arange(-tail, tail + 1, dtype=torch.float, device=sigma.device)
++        out = torch.exp(-0.5 / (sigma * sigma) * x**2)
++        if not normalize:  # compute the normalizer
++            out = out / (2.5066282 * sigma)
++    else:
++        raise NotImplementedError(f"Unsupported option: approx='{approx}'.")
++    return out / out.sum() if normalize else out  # type: ignore
++
++
++@torch.jit.script
++def make_rectangular_kernel(kernel_size: int) -> torch.Tensor:
++    return torch.ones(kernel_size)
++
++@torch.jit.script
++def make_triangular_kernel(kernel_size: int) -> torch.Tensor:
++    fsize = (kernel_size + 1) // 2
++    if fsize % 2 == 0:
++        fsize -= 1
++    f = torch.ones((1, 1, fsize), dtype=torch.float).div(fsize)
++    padding = (kernel_size - fsize) // 2 + fsize // 2
++    return F.conv1d(f, f, padding=padding).reshape(-1)
++
++@torch.jit.script
++def make_gaussian_kernel(kernel_size: int) -> torch.Tensor:
++    sigma = torch.tensor(kernel_size / 3.0)
++    kernel = gaussian_1d(sigma=sigma, truncated=(kernel_size // 2) * 1.0, approx="sampled", normalize=False) * (
++        2.5066282 * sigma
++    )
++    return kernel[:kernel_size]
++
++@torch.jit.script
++def _separable_filtering_conv(
++    input_: torch.Tensor,
++    kernels: List[torch.Tensor],
++    pad_mode: str,
++    spatial_dims: int,
++    paddings: List[int],
++    num_channels: int,
++) -> torch.Tensor:
++
++    # re-write from recursive to non-recursive for torch.jit to work
++    # for d in range(spatial_dims-1, -1, -1):
++    for d in range(spatial_dims):
++        s = [1] * len(input_.shape)
++        s[d + 2] = -1
++        _kernel = kernels[d].reshape(s)
++        # if filter kernel is unity, don't convolve
++        if _kernel.numel() == 1 and _kernel[0] == 1:
++            continue
++
++        _kernel = _kernel.repeat([num_channels, 1] + [1] * spatial_dims)
++        _padding = [0] * spatial_dims
++        _padding[d] = paddings[d]
++        _reversed_padding = _padding[::-1]
++
++        # translate padding for input to torch.nn.functional.pad
++        _reversed_padding_repeated_twice: list[list[int]] = [[p, p] for p in _reversed_padding]
++        _sum_reversed_padding_repeated_twice: list[int] = []
++        for p in _reversed_padding_repeated_twice:
++            _sum_reversed_padding_repeated_twice.extend(p)
++        # _sum_reversed_padding_repeated_twice: list[int] = sum(_reversed_padding_repeated_twice, [])
++
++        padded_input = F.pad(input_, _sum_reversed_padding_repeated_twice, mode=pad_mode)
++        # update input
++        if spatial_dims == 1:
++            input_ = F.conv1d(input=padded_input, weight=_kernel, groups=num_channels)
++        elif spatial_dims == 2:
++            input_ = F.conv2d(input=padded_input, weight=_kernel, groups=num_channels)
++        elif spatial_dims == 3:
++            input_ = F.conv3d(input=padded_input, weight=_kernel, groups=num_channels)
++        else:
++            raise NotImplementedError(f"Unsupported spatial_dims: {spatial_dims}.")
++    return input_
++
++@torch.jit.script
++def separable_filtering(x: torch.Tensor, kernels: ItemOrList[torch.Tensor], mode: str = "zeros") -> torch.Tensor:
++# def separable_filtering(x: torch.Tensor, kernels: ItemOrList[torch.Tensor], mode: str = "zeros") -> torch.Tensor:
++    """
++    Apply 1-D convolutions along each spatial dimension of `x`.
++    Args:
++        x: the input image. must have shape (batch, channels, H[, W, ...]).
++        kernels: kernel along each spatial dimension.
++            could be a single kernel (duplicated for all spatial dimensions), or
++            a list of `spatial_dims` number of kernels.
++        mode (string, optional): padding mode passed to convolution class. ``'zeros'``, ``'reflect'``, ``'replicate'``
++            or ``'circular'``. Default: ``'zeros'``. See ``torch.nn.Conv1d()`` for more information.
++    Raises:
++        TypeError: When ``x`` is not a ``torch.Tensor``.
++    Examples:
++    .. code-block:: python
++        >>> import torch
++        >>> img = torch.randn(2, 4, 32, 32)  # batch_size 2, channels 4, 32x32 2D images
++        # applying a [-1, 0, 1] filter along each of the spatial dimensions.
++        # the output shape is the same as the input shape.
++        >>> out = separable_filtering(img, torch.tensor((-1., 0., 1.)))
++        # applying `[-1, 0, 1]`, `[1, 0, -1]` filters along two spatial dimensions respectively.
++        # the output shape is the same as the input shape.
++        >>> out = separable_filtering(img, [torch.tensor((-1., 0., 1.)), torch.tensor((1., 0., -1.))])
++    """
++
++    if not isinstance(x, torch.Tensor):
++        raise TypeError(f"x must be a torch.Tensor but is {type(x).__name__}.")
++
++    spatial_dims = len(x.shape) - 2
++    if isinstance(kernels, torch.Tensor):
++        kernels = [kernels] * spatial_dims
++    _kernels = [s.to(x) for s in kernels]
++    _paddings = [(k.shape[0] - 1) // 2 for k in _kernels]
++    n_chs = x.shape[1]
++    pad_mode = "constant" if mode == "zeros" else mode
++    return _separable_filtering_conv(x, _kernels, pad_mode, spatial_dims, _paddings, n_chs)
++
++
++# dict
++kernel_dict = {
++    "rectangular": make_rectangular_kernel,
++    "triangular": make_triangular_kernel,
++    "gaussian": make_gaussian_kernel,
++}
++
++class HybridDiceLabelDiffloss(nn.Module):
++    """
++    Local squared zero-normalized cross-correlation.
++    The loss is based on a moving kernel/window over the y_true/y_pred,
++    within the window the square of zncc is calculated.
++    The kernel can be a rectangular / triangular / gaussian window.
++    The final loss is the averaged loss over all windows.
++    Adapted from:
++        https://github.com/voxelmorph/voxelmorph/blob/legacy/src/losses.py
++        DeepReg (https://github.com/DeepRegNet/DeepReg)
++    """
++
++    def __init__(
++        self,
++        spatial_dims: int = 3,
++        kernel_size: int = 3,
++        kernel_type: str = "rectangular",
++        reduction: str = "mean",
++        smooth_nr: float = 1e-5,
++        smooth_dr: float = 1e-5,
++        unsigned: bool = True,
++        checkpointing: bool = False,
++        rel_weight_labeldiff: float = 1.0,
++    ) -> None:
++        """
++        Args:
++            spatial_dims: number of spatial dimensions, {``1``, ``2``, ``3``}. Defaults to 3.
++            kernel_size: kernel spatial size, must be odd.
++            kernel_type: {``"rectangular"``, ``"triangular"``, ``"gaussian"``}. Defaults to ``"rectangular"``.
++            reduction: {``"none"``, ``"mean"``, ``"sum"``}
++                Specifies the reduction to apply to the output. Defaults to ``"mean"``.
++                - ``"none"``: no reduction will be applied.
++                - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
++                - ``"sum"``: the output will be summed.
++            smooth_nr: a small constant added to the numerator to avoid nan.
++            smooth_dr: a small constant added to the denominator to avoid nan.
++            rel_weight_labeldiff: relative weight of Label Difference loss
++            split: do we want to split computation across 2 GPUs? (if pred and target are on different GPUs)
++                default: False (assumes they are on same device and big enough to fit on one GPU)
++        """
++        super().__init__()
++        self.ndim = spatial_dims
++        if self.ndim != 3:
++            raise ValueError("Unsupported ndim, only 3-d inputs are supported")
++        if reduction != 'mean':
++            raise ValueError("Unsupported reduction, only mean is supported")
++        self.reduction = reduction
++        self.unsigned = unsigned
++
++        self.kernel_size = kernel_size
++        if self.kernel_size % 2 == 0:
++            raise ValueError(f"kernel_size must be odd, got {self.kernel_size}")
++
++        # _kernel = look_up_option(kernel_type, kernel_dict)
++        _kernel = kernel_dict[kernel_type]
++        self.kernel = _kernel(self.kernel_size)
++        self.kernel.requires_grad = False
++        self.kernel_nd, self.kernel_vol = self.get_kernel_vol()   # get nD kernel and its volume
++        self.smooth_nr = float(smooth_nr)
++        self.smooth_dr = float(smooth_dr)
++        self.rel_weight_labeldiff = rel_weight_labeldiff
++        self.checkpointing = checkpointing
++
++    def get_kernel_vol(self):
++        vol = self.kernel
++        for _ in range(self.ndim - 1):
++            vol = torch.matmul(vol.unsqueeze(-1), self.kernel.unsqueeze(0))
++        return vol, torch.sum(vol)
++
++    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
++        """
++        Args:
++            pred: the shape should be BNH[WD].
++            target: the shape should be BNH[WD].
++        Raises:
++            ValueError: When ``self.reduction`` is not "mean"".
++        """
++        if pred.ndim - 2 != 3:
++            raise ValueError(f"expecting pred with 3 spatial dimensions, got pred of shape {pred.shape}")
++        if target.shape != pred.shape:
++            raise ValueError(f"ground truth has differing shape ({target.shape}) from pred ({pred.shape})")
++        if mask is not None:
++            raise ValueError('Mask should always be None')
++
++        # sum over kernel
++        def cc_checkpoint_fn(target, pred, kernel, kernel_vol):
++            '''
++            This function is used to compute the intermediate results of the loss.
++            '''
++            t2, p2, tp = target * target, pred * pred, target * pred
++            kernel, kernel_vol = kernel.to(pred), kernel_vol.to(pred)
++            # kernel_nd = self.kernel_nd.to(pred)
++            kernels = [kernel] * self.ndim
++            kernels_t = kernels_p = kernels
++            kernel_vol_t = kernel_vol_p = kernel_vol
++            # compute intermediates
++            t_sum = separable_filtering(target, kernels=kernels_t)
++            p_sum = separable_filtering(pred, kernels=kernels_p)
++            t2_sum = separable_filtering(t2, kernels=kernels_t)
++            p2_sum = separable_filtering(p2, kernels=kernels_p)
++            tp_sum = separable_filtering(tp, kernels=kernels_t)  # use target device's output
++            # average over kernel
++            t_avg = t_sum / kernel_vol_t
++            p_avg = p_sum / kernel_vol_p
++            # normalized cross correlation between t and p
++            # sum[(t - mean[t]) * (p - mean[p])] / std[t] / std[p]
++            # denoted by num / denom
++            # assume we sum over N values
++            # num = sum[t * p - mean[t] * p - t * mean[p] + mean[t] * mean[p]]
++            #     = sum[t*p] - sum[t] * sum[p] / N * 2 + sum[t] * sum[p] / N
++            #     = sum[t*p] - sum[t] * sum[p] / N
++            #     = sum[t*p] - sum[t] * mean[p] = cross
++            # the following is actually squared ncc
++            cross = (tp_sum.to(pred) - p_avg * t_sum.to(pred))  # on pred device
++            t_var = torch.max(
++                t2_sum - t_avg * t_sum, torch.as_tensor(self.smooth_dr, dtype=t2_sum.dtype, device=t2_sum.device)
++            ).to(pred)
++            p_var = torch.max(
++                p2_sum - p_avg * p_sum, torch.as_tensor(self.smooth_dr, dtype=p2_sum.dtype, device=p2_sum.device)
++            )
++            if self.unsigned:
++                ncc: torch.Tensor = (cross * cross + self.smooth_nr) / ((t_var * p_var) + self.smooth_dr)
++            else:
++                ncc: torch.Tensor = (cross + self.smooth_nr) / ((torch.sqrt(t_var) * torch.sqrt(p_var)) + self.smooth_dr)
++            return ncc
++        
++        if self.checkpointing:
++            ncc = checkpoint(cc_checkpoint_fn, target[:,0:1,:,:,:], pred[:,0:1,:,:,:], self.kernel, self.kernel_vol)
++        else:
++            ncc = cc_checkpoint_fn(target[:,0:1,:,:,:], pred[:,0:1,:,:,:], self.kernel, self.kernel_vol)
++
++        lnccloss = (1.0 - torch.mean(ncc))
++
++        diff = torch.abs(target[:, 1:target.shape[1], :, :, :] - pred[:, 1:target.shape[1], :, :, :])
++        labeldiffloss = 0.5 * diff.sum(dim=1).mean([1,2,3])
++
++        loss = lnccloss  + labeldiffloss * self.rel_weight_labeldiff
++
++        return (loss/(1.0 + self.rel_weight_labeldiff))
++
++
++
++
++
++
+diff --git a/mri_histo_util/ERC_bayesian_segmentation/data_simplified/combined_aseg_labels_fireants.yaml b/mri_histo_util/ERC_bayesian_segmentation/data_simplified/combined_aseg_labels_fireants.yaml
+new file mode 100755
+index 00000000000..955664e420e
+--- /dev/null
++++ b/mri_histo_util/ERC_bayesian_segmentation/data_simplified/combined_aseg_labels_fireants.yaml
+@@ -0,0 +1,215 @@
++Aseg Combined Structures:
++- Background:
++  - 0
++  - 4
++  - 5
++  - 43
++  - 44
++  - 24
++  - 14
++  - 15
++- White Matter:
++  - 2
++  - 41
++  - 16
++  - 161
++  - 162
++- Gray Matter:
++  - 17
++  - 53
++  - 18
++  - 54
++  - 1000
++  - 1001
++  - 1002
++  - 1003
++  - 1004
++  - 1005
++  - 1006
++  - 1007
++  - 1008
++  - 1009
++  - 1010
++  - 1011
++  - 1012
++  - 1013
++  - 1014
++  - 1015
++  - 1016
++  - 1017
++  - 1018
++  - 1019
++  - 1020
++  - 1021
++  - 1022
++  - 1023
++  - 1024
++  - 1025
++  - 1026
++  - 1027
++  - 1028
++  - 1029
++  - 1030
++  - 1031
++  - 1032
++  - 1033
++  - 1034
++  - 1035
++  - 2000
++  - 2001
++  - 2002
++  - 2003
++  - 2004
++  - 2005
++  - 2006
++  - 2007
++  - 2008
++  - 2009
++  - 2010
++  - 2011
++  - 2012
++  - 2013
++  - 2014
++  - 2015
++  - 2016
++  - 2017
++  - 2018
++  - 2019
++  - 2020
++  - 2021
++  - 2022
++  - 2023
++  - 2024
++  - 2025
++  - 2026
++  - 2027
++  - 2028
++  - 2029
++  - 2030
++  - 2031
++  - 2032
++  - 2033
++  - 2034
++  - 2035
++- Cerebellum White Matter:
++  - 7
++  - 46
++- Cerebellum Gray Matter:
++  - 8
++  - 47
++- Caudate and Accumbens:
++  - 11
++  - 50
++  - 26
++  - 58
++- Putamen:
++  - 12
++  - 51
++- White Thalamus:
++  - 10
++  - 49
++- Gray Thalamus:
++  - 10
++  - 49
++- Pallidum:
++  - 13
++  - 52
++- Substantia Nigra and STN and Red Nucleus:
++  - 16
++  - 161
++  - 162
++- Gray Brainstem nuclei:
++  - 16
++  - 161
++  - 162
++- White Brainstem nuclei:
++  - 16
++  - 161
++  - 162
++- Gray hypothalamus:
++  - 28
++  - 60
++- White hypothalamus:
++  - 28
++  - 60
++- Cerebellar Other:
++  - 7
++  - 46
++- Hippocampal White Matter:
++  - 17
++  - 53
++  - 18
++  - 54
++  - 1000
++  - 1001
++  - 1002
++  - 1003
++  - 1004
++  - 1005
++  - 1006
++  - 1007
++  - 1008
++  - 1009
++  - 1010
++  - 1011
++  - 1012
++  - 1013
++  - 1014
++  - 1015
++  - 1016
++  - 1017
++  - 1018
++  - 1019
++  - 1020
++  - 1021
++  - 1022
++  - 1023
++  - 1024
++  - 1025
++  - 1026
++  - 1027
++  - 1028
++  - 1029
++  - 1030
++  - 1031
++  - 1032
++  - 1033
++  - 1034
++  - 1035
++  - 2000
++  - 2001
++  - 2002
++  - 2003
++  - 2004
++  - 2005
++  - 2006
++  - 2007
++  - 2008
++  - 2009
++  - 2010
++  - 2011
++  - 2012
++  - 2013
++  - 2014
++  - 2015
++  - 2016
++  - 2017
++  - 2018
++  - 2019
++  - 2020
++  - 2021
++  - 2022
++  - 2023
++  - 2024
++  - 2025
++  - 2026
++  - 2027
++  - 2028
++  - 2029
++  - 2030
++  - 2031
++  - 2032
++  - 2033
++  - 2034
++  - 2035
++
+diff --git a/mri_histo_util/ERC_bayesian_segmentation/data_simplified/combined_atlas_labels_fireants.yaml b/mri_histo_util/ERC_bayesian_segmentation/data_simplified/combined_atlas_labels_fireants.yaml
+new file mode 100755
+index 00000000000..ca4c296723b
+--- /dev/null
++++ b/mri_histo_util/ERC_bayesian_segmentation/data_simplified/combined_atlas_labels_fireants.yaml
+@@ -0,0 +1,283 @@
++Combined Structures:
++- Background:
++  - 0
++  - 50
++- White Matter:
++  - 7
++  - 68
++  - 120
++  - 130
++  - 199
++  - 100
++  - 161
++  - 208
++  - 209
++- Gray Matter:
++  - 103
++  - 108
++  - 111
++  - 117
++  - 128
++  - 99
++  - 113
++  - 125
++  - 157
++  - 344
++  - 369
++  - 409
++  - 567
++  - 340
++  - 563
++  - 419
++  - 373
++  - 572
++  - 345
++  - 370
++  - 374
++  - 410
++  - 420
++  - 564
++  - 573
++  - 341
++  - 568
++  - 371
++  - 375
++  - 411
++  - 421
++  - 565
++  - 569
++  - 574
++  - 342
++  - 346
++  - 326
++  - 347
++  - 576
++  - 558
++  - 404
++  - 364
++  - 405
++  - 559
++  - 365
++  - 561
++  - 407
++  - 367
++  - 575
++  - 422
++  - 432
++  - 320
++  - 238
++  - 277
++  - 278
++  - 279
++  - 301
++  - 377
++  - 217
++  - 240
++  - 242
++  - 214
++  - 215
++  - 216
++  - 295
++  - 2001
++  - 2002
++  - 2003
++  - 2005
++  - 2006
++  - 2007
++  - 2008
++  - 2009
++  - 2010
++  - 2011
++  - 2012
++  - 2013
++  - 2014
++  - 2015
++  - 2016
++  - 2017
++  - 2018
++  - 2019
++  - 2020
++  - 2021
++  - 2022
++  - 2023
++  - 2024
++  - 2025
++  - 2026
++  - 2027
++  - 2028
++  - 2029
++  - 2030
++  - 2031
++  - 2032
++  - 2033
++  - 2034
++  - 2035
++- Cerebellum White Matter:
++  - 846
++- Cerebellum Gray Matter:
++  - 595
++  - 597
++- Caudate and Accumbens:
++  - 48
++  - 118
++  - 393
++  - 101
++  - 184
++- Putamen:
++  - 79
++  - 349
++  - 102
++  - 174
++- White Thalamus:
++  - 276
++  - 444
++  - 430
++  - 201
++  - 314
++  - 381
++  - 382
++  - 394
++  - 458
++  - 283
++  - 493
++  - 519
++  - 254
++  - 191
++  - 312
++  - 285
++  - 425
++  - 284
++  - 396
++  - 479
++  - 350
++  - 222
++  - 397
++  - 484
++  - 218
++  - 492
++  - 322
++  - 442
++  - 190
++  - 246
++  - 517
++  - 478
++  - 226
++  - 303
++  - 398
++  - 426
++  - 424
++- Gray Thalamus:
++  - 400
++  - 274
++  - 395
++  - 423
++  - 811
++  - 441
++  - 504
++  - 512
++  - 510
++  - 378
++  - 221
++  - 379
++  - 313
++  - 282
++  - 225
++  - 224
++  - 399
++  - 286
++  - 223
++  - 454
++  - 380
++  - 813
++  - 219
++  - 220
++  - 252
++  - 253
++  - 443
++  - 508
++  - 578
++- Pallidum:
++  - 119
++  - 206
++- Substantia Nigra and STN and Red Nucleus:
++  - 310
++  - 352
++  - 315
++  - 316
++  - 321
++  - 385
++- Gray Brainstem nuclei:
++  - 496 # pretectal_region
++  - 498 # peripeduncular_nucleus
++  - 465 # PAG
++  - 114 # optic_nerve
++  - 412 # fasciculus_retroflexus_(habenuno-interpeduncular_tract)
++  - 414 # pontine_nucleus
++  - 521 # DR
++  - 654 # inferior_olive
++  - 666 # facial_nucleus
++  - 687 # solitary_tract
++  - 765 # central_gray_of_medulla_oblongata
++  - 843 # infundibular_stalk
++  - 435 # VTA: moved from gray BS to white BS in summer 2024 and then back after further inspectio of Edlow brain
++  - 541 # colliculus: moved from gray BS to white BS in summer 2024 and then back after further inspectio of Edlow brain
++- White Brainstem nuclei:
++  - 384 # midbrain
++  - 451 # interstitial_nucleus_of_cajal
++  - 506 # pineal_body
++  - 580 # pons
++  - 611 # white_matter_of_hindbrain
++  - 697 # inferior_cerebellar_peduncle
++  - 531 # SCP: moved from gray BS in summer 2024
++  - 662 # medulla: moved from gray BS in summer 2024
++- Gray hypothalamus:
++  - 256
++  - 275
++  - 304
++  - 147
++  - 150
++  - 192
++  - 193
++  - 194
++  - 207
++  - 227
++  - 228
++  - 229
++  - 243
++  - 244
++  - 245
++  - 255
++  - 268
++  - 297
++  - 308
++  - 149 #moved here from white hypothalamus following Nellie's suggestion
++  - 160 #moved here from white hypothalamus following Nellie's suggestion
++  - 181 #moved here from white hypothalamus following Nellie's suggestion
++  - 196 #moved here from white hypothalamus following Nellie's suggestion
++  - 230 #moved here from white hypothalamus following Nellie's suggestion
++  - 232 #moved here from white hypothalamus following Nellie's suggestion
++- White hypothalamus:
++  - 305
++  - 306
++  - 307
++  - 234
++  - 298
++  - 309
++  - 433
++- Cerebellar Other:
++  - 721
++  - 715
++  - 751
++  - 752
++- Hippocampal White Matter:
++  - 461
++  - 343
++  - 368
++  - 372
++  - 408
++  - 418
++  - 562
++  - 566
++  - 571
++  - 339
++  - 354
+\ No newline at end of file
+diff --git a/mri_histo_util/ERC_bayesian_segmentation/data_simplified/gmm_components_fireants.yaml b/mri_histo_util/ERC_bayesian_segmentation/data_simplified/gmm_components_fireants.yaml
+new file mode 100755
+index 00000000000..bf6589cf543
+--- /dev/null
++++ b/mri_histo_util/ERC_bayesian_segmentation/data_simplified/gmm_components_fireants.yaml
+@@ -0,0 +1,18 @@
++Number of components in a class:
++  - Background: 1 #At the moment the background is handled separately so keep this at 1
++  - White Matter: 2
++  - Gray Matter: 1
++  - Cerebellum White Matter: 1
++  - Cerebellum Gray Matter: 1
++  - Caudate and Accumbens: 1
++  - Putamen: 1
++  - White Thalamus: 1
++  - Gray Thalamus: 1
++  - Pallidum: 1
++  - Substantia Nigra and STN and Red Nucleus: 1
++  - Gray Brainstem nuclei: 1
++  - White Brainstem nuclei: 1
++  - Gray hypothalamus: 1
++  - White hypothalamus: 1
++  - Cerebellar Other: 1
++  - Hippocampal White Matter: 1
+diff --git a/mri_histo_util/ERC_bayesian_segmentation/ext/my_functions.py b/mri_histo_util/ERC_bayesian_segmentation/ext/my_functions.py
+index 87ad6a077d4..fde6dce1da1 100644
+--- a/mri_histo_util/ERC_bayesian_segmentation/ext/my_functions.py
++++ b/mri_histo_util/ERC_bayesian_segmentation/ext/my_functions.py
+@@ -40,6 +40,37 @@ def cropLabelVol(V,
+ 
+     return cropped, cropping
+ 
++##################
++def cropLabelVolTorch(V,
++                 margin=10,
++                 threshold=0):
++
++    margin = torch.tensor(margin, device=V.device, dtype=torch.long)
++    if len(V.shape) < 2:
++        V = V[..., None]
++    if len(V.shape) < 3:
++        V = V[..., None]
++    # Now crop
++    idx = torch.where(V > threshold)
++    i1 = torch.min(idx[0]) - margin
++    j1 = torch.min(idx[1]) - margin
++    k1 = torch.min(idx[2]) - margin
++    i2 = torch.max(idx[0]) + margin
++    j2 = torch.max(idx[1]) + margin
++    k2 = torch.max(idx[2]) + margin
++    # out of bounds check
++    i1 = i1 if i1>=0 else 0
++    j1 = j1 if j1 >= 0 else 0
++    k1 = k1 if k1 >= 0 else 0
++    i2 = i2 if i2 < V.shape[0] else (V.shape[0] - 1)
++    j2 = j2 if j2 < V.shape[1] else (V.shape[1] - 1)
++    k2 = k2 if k2 < V.shape[2] else (V.shape[2] - 1)
++
++    cropping = [i1, j1, k1, i2, j2, k2]
++    cropped = V[i1:i2, j1:j2, k1:k2]
++
++    return cropped, cropping
++
+ ###############################3
+ 
+ def applyCropping(V, cropping):
+@@ -99,11 +130,13 @@ def MRIwrite(volume, aff, filename, dtype=None):
+ 
+ ###############################3
+ 
+-def MRIread(filename, dtype=None, im_only=False):
++def MRIread(filename, dtype=None, im_only=False, as_closest_canonical=False):
+ 
+     assert filename.endswith(('.nii', '.nii.gz', '.mgz')), 'Unknown data file: %s' % filename
+ 
+     x = nib.load(filename)
++    if as_closest_canonical:
++        x = nib.as_closest_canonical(x)
+     volume = x.get_fdata()
+     aff = x.affine
+ 
+@@ -115,7 +148,119 @@ def MRIread(filename, dtype=None, im_only=False):
+     else:
+         return volume, aff
+ 
+-###############################3
++###############################
++
++def getM(ref, mov):
++    device = ref.device
++    dtype = torch.float
++    zmat = torch.zeros(ref.shape[::-1], device=device, dtype=dtype)
++    zcol = torch.zeros([ref.shape[1], 1], device=device, dtype=dtype)
++    ocol = torch.ones([ref.shape[1], 1], device=device, dtype=dtype)
++    zero = torch.zeros(zmat.shape, device=device, dtype=dtype)
++    A = torch.concatenate([
++        torch.concatenate([torch.t(ref), zero, zero, ocol, zcol, zcol], axis=1),
++        torch.concatenate([zero, torch.t(ref), zero, zcol, ocol, zcol], axis=1),
++        torch.concatenate([zero, zero, torch.t(ref), zcol, zcol, ocol], axis=1)], axis=0)
++    b = torch.concatenate([torch.t(mov[0, :]), torch.t(mov[1, :]), torch.t(mov[2, :])], axis=0)
++    x = (torch.linalg.inv(torch.t(A) @ A))  @ (torch.t(A) @ b)
++    M = torch.tensor([
++        [x[0], x[1], x[2], x[9]],
++        [x[3], x[4], x[5], x[10]],
++        [x[6], x[7], x[8], x[11]],
++        [0, 0, 0, 1]], device=device, dtype=dtype)
++    return M
++
++
++###############################
++def fast_3D_interp_torch(X, II, JJ, KK, mode, pad_value=0):
++    if mode=='nearest':
++        IIr = torch.round(II).long()
++        JJr = torch.round(JJ).long()
++        KKr = torch.round(KK).long()
++
++        ok = torch.full(II.shape, True, device=X.device, dtype=torch.bool)
++
++        mask = (IIr < 0)
++        ok[mask] = False
++        IIr[mask] = 0
++
++        mask = (JJr < 0)
++        ok[mask] = False
++        JJr[mask] = 0
++
++        mask = (KKr < 0)
++        ok[mask] = False
++        KKr[mask] = 0
++
++        mask = (IIr > (X.shape[0] - 1))
++        ok[mask] = False
++        IIr[mask] = (X.shape[0] - 1)
++
++        mask = (JJr > (X.shape[1] - 1))
++        ok[mask] = False
++        JJr[mask] = (X.shape[1] - 1)
++
++        mask = (KKr > (X.shape[2] - 1))
++        ok[mask] = False
++        KKr[mask] = (X.shape[2] - 1)
++
++        Y = X[IIr, JJr, KKr]
++
++        Y[ok==False] = pad_value
++
++    elif mode=='linear':
++        ok = (II>0) & (JJ>0) & (KK>0) & (II<=X.shape[0]-1) & (JJ<=X.shape[1]-1) & (KK<=X.shape[2]-1)
++        IIv = II[ok]
++        JJv = JJ[ok]
++        KKv = KK[ok]
++
++        fx = torch.floor(IIv).long()
++        cx = fx + 1
++        cx[cx > (X.shape[0] - 1)] = (X.shape[0] - 1)
++        wcx = IIv - fx
++        wfx = 1 - wcx
++
++        fy = torch.floor(JJv).long()
++        cy = fy + 1
++        cy[cy > (X.shape[1] - 1)] = (X.shape[1] - 1)
++        wcy = JJv - fy
++        wfy = 1 - wcy
++
++        fz = torch.floor(KKv).long()
++        cz = fz + 1
++        cz[cz > (X.shape[2] - 1)] = (X.shape[2] - 1)
++        wcz = KKv - fz
++        wfz = 1 - wcz
++
++        c000 = X[fx, fy, fz]
++        c100 = X[cx, fy, fz]
++        c010 = X[fx, cy, fz]
++        c110 = X[cx, cy, fz]
++        c001 = X[fx, fy, cz]
++        c101 = X[cx, fy, cz]
++        c011 = X[fx, cy, cz]
++        c111 = X[cx, cy, cz]
++
++        c00 = c000 * wfx + c100 * wcx
++        c01 = c001 * wfx + c101 * wcx
++        c10 = c010 * wfx + c110 * wcx
++        c11 = c011 * wfx + c111 * wcx
++
++        c0 = c00 * wfy + c10 * wcy
++        c1 = c01 * wfy + c11 * wcy
++
++        c = c0 * wfz + c1 * wcz
++
++        Y = torch.full(II.shape, pad_value, device=X.device, dtype=X.dtype)
++        Y[ok] = c.float()
++
++    else:
++        raise Exception('mode must be linear or nearest')
++
++    return Y
++
++
++################################
+ 
+ def downsampleMRI2d(X, aff, shape, factors, mode='image'):
+ 
+@@ -305,7 +450,6 @@ def conv_slow_fallback(x, kernel):
+         y = y.addcmul_(x[i], kernel[i])
+     return y
+ 
+-
+ ########################
+ 
+ def myzoom_torch(X, aff, newsize, device):
+@@ -941,7 +1085,8 @@ def get_priors_or_posteriors(atlas_names, atlas_size, grids, atlas_resolution,
+     prefetch_factor = max(prefetch//workers, 1)
+     label_loader = DataLoader(LabelDataset(atlas_names), num_workers=workers, prefetch_factor=prefetch_factor)
+     for n, (prior_indices, prior_values) in enumerate(label_loader):
+-        print('Reading in label ' + str(n + 1) + ' of ' + str(n_labels), end='\r', flush=True)
++        # print('Reading in label ' + str(n + 1) + ' of ' + str(n_labels), end='\r', flush=True)  TODO: go back to this version when releasing the code
++        print('Reading in label ' + str(n + 1) + ' of ' + str(n_labels))
+ 
+         if prior_indices.numel() == 0:
+             continue
+diff --git a/mri_histo_util/ERC_bayesian_segmentation/scripts/segment_fireants.py b/mri_histo_util/ERC_bayesian_segmentation/scripts/segment_fireants.py
+new file mode 100755
+index 00000000000..9043df039f3
+--- /dev/null
++++ b/mri_histo_util/ERC_bayesian_segmentation/scripts/segment_fireants.py
+@@ -0,0 +1,967 @@
++#Imports
++import os
++import sys
++basepath = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
++sys.path.append(basepath)
++from pathlib import Path
++BASE_PATH = str(Path(__file__).resolve().parents[1])
++sys.path.append(str(Path(__file__).resolve().parents[1]))
++import numpy as np
++import torch
++from torch.utils.data import Dataset, DataLoader
++import ext.my_functions as my
++from datetime import datetime
++import ERC_bayesian_segmentation.relabeling as relab
++import glob
++import scipy.sparse as sp
++import ext.bias_field_correction_torch as bf
++import csv
++import argparse
++import math
++from torch.nn.functional import grid_sample
++from fireants.io import Image,BatchedImages
++from fireants.registration import AffineRegistration, GreedyRegistration
++import SimpleITK as sitk
++from time import time
++from ERC_bayesian_segmentation.custom_cc_labeldiff_loss import HybridDiceLabelDiffloss
++
++########################################################
++
++parser = argparse.ArgumentParser(description='Bayesian segmentation.')
++parser.add_argument("--i", help="Image to segment.")
++parser.add_argument("--i_seg", help="SynthSeg of image to segment (must include parcels). Will be computed if it does not exist")
++parser.add_argument("--i_field", help="Registration to MNI, provided by EasyReg, for left-right division etc. Will be computed if if does not exist")
++parser.add_argument("--atlas_dir", help="Atlas directory")
++parser.add_argument("--side", help="Hemisphere to segment (left or right).")
++parser.add_argument("--bf_mode", help="bias field basis function: dct, polynomial, or hybrid", default="dct")
++parser.add_argument("--o", help="Output directory.")
++parser.add_argument("--write_rgb", action="store_true", help="Write soft segmentation to dis as RGB file.")
++parser.add_argument("--write_bias_corrected", action="store_true", help="Write bias field corrected image to disk")
++parser.add_argument("--cpu", action="store_true", help="Use CPU instead of GPU")
++parser.add_argument("--threads", type=int, default=1, help="(optional) Number of CPU cores to be used. Default is 1. You can use -1 to use all available cores")
++parser.add_argument("--skip", type=int, default=1, help="(optional) Skipping factor to easy memory requirements of priors when estimating Gaussian parameters. Default is 1.")
++parser.add_argument("--resolution", type=float, default=0.4, help="(optional) Resolution of output segmentation")
++parser.add_argument("--skip_bf", action="store_true", help="Skip bias field correction")
++parser.add_argument("--smooth_grad_sigma", type=float, default=1.00, help="(optional) Parameter of Greedy FireANTs registration")
++parser.add_argument("--smooth_warp_sigma", type=float, default=0.25, help="(optional) Parameter of Greedy FireANTs registration")
++parser.add_argument("--optimizer_lr", type=float, default=0.5, help="(optional) Parameter of Greedy FireANTs registration")
++parser.add_argument("--cc_kernel_size", type=int, default=7, help="(optional) Parameter of Greedy FireANTs registration")
++parser.add_argument("--rel_weight_labeldiff", type=float, default=2.5, help="(optional) Relative weight of labels in Greedy FireANTs registration")
++parser.add_argument("--save_atlas_nonlinear_reg", action="store_true", help="Save nonlinear atlas registration")
++args = parser.parse_args()
++
++
++
++########################################################
++if args.i is None:
++    raise Exception('Input image is required')
++if args.i_seg is None:
++    raise Exception('SynthSeg file  of input image is required')
++if args.i_field is None:
++    raise Exception('Atlas registration file of input image is required')
++if args.atlas_dir is None:
++    raise Exception('Atlas directory must be provided')
++if args.o is None:
++    raise Exception('Output directory must be provided')
++if args.side is None:
++    raise Exception('side must be provided (left or right)')
++else:
++    if (args.side!='left') and (args.side!='right'):
++        raise Exception('Side must be left or right but you specified: ' + args.side)
++
++########################################################
++
++if args.cpu:
++    os.environ["CUDA_VISIBLE_DEVICES"] = ""
++else:
++    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
++
++########################################################
++
++# limit the number of threads to be used if running on CPU
++if args.threads<0:
++    args.threads = os.cpu_count()
++    print('using all available threads ( %s )' % args.threads)
++else:
++    print('using %s thread(s)' % args.threads)
++torch.set_num_threads(args.threads)
++
++########################################################
++
++# Disable gradients
++torch.set_grad_enabled(False)
++
++
++################
++
++# Input data
++input_volume = args.i
++input_seg = args.i_seg
++atlas_field = args.i_field
++atlas_dir = args.atlas_dir
++LUT_file = os.path.join(BASE_PATH, 'data_simplified', 'AllenAtlasLUT')
++output_dir = args.o
++skip_bf = args.skip_bf
++bf_mode = args.bf_mode
++side = args.side
++resolution = args.resolution
++if (resolution<=0):
++    print('Resolution must be non-negative; Exitting...')
++    sys.exit(1)
++skip = args.skip
++if (skip<1):
++    print('Skip cannot be less than 1; exitting...')
++    sys.exit(1)
++
++########################################################
++# Detect problems with output directory right off the bat
++if os.path.exists(output_dir):
++    if len(os.listdir(output_dir))==0:
++        print('Warning: output directory exists')
++    else:
++        pass
++        #raise Exception('Ouput directory exists and is not empty; exitting...')
++else:
++    os.mkdir(output_dir)
++
++
++########################################################
++
++# Constants
++dtype = torch.float32
++SET_BG_TO_CSF = True # True = median of ventricles -> it seems much better than 0!
++RESOLUTION_ATLAS = 0.2
++TOL = 1e-9
++
++############
++
++if dtype == torch.float64:
++    numpy_dtype = np.float64
++elif dtype == torch.float32:
++    numpy_dtype = np.float32
++elif dtype == torch.float16:
++    numpy_dtype = np.float16
++else:
++    raise Exception('type not supported')
++
++########################################################
++
++if torch.cuda.is_available():
++    print('Using the GPU')
++    device = torch.device('cuda:0')
++else:
++    print('Using the CPU')
++    device = torch.device('cpu')
++
++########################################################
++
++now = datetime.now()
++
++current_time = now.strftime("%H:%M:%S")
++print("Current Time =", current_time)
++
++########################################################
++print('Reading input image')
++Iim, aff = my.MRIread(input_volume)
++Iim = np.squeeze(Iim)
++
++########################################################
++synthseg_exists = False
++if os.path.isfile(input_seg):
++    print('Found input synthseg segmentation')
++    synthseg_exists = True
++
++if synthseg_exists:
++    print('Input segmentation exists; making sure it includes parcellation!')
++    tmp, _ = my.MRIread(input_seg)
++    if np.sum(tmp>1000)==0:
++        raise Exception('Segmentation does not include parcellation! Please use different file or re-run SynthSeg with --parc')
++else:
++    print('Running SynthSeg')
++    cmd = 'mri_synthseg --i ' + input_volume +  ' --o '  + input_seg + ' --threads ' + str(args.threads) + ' --cpu --parc --robust '
++    cmd = cmd + ' --vol ' + output_dir + '/SynthSeg_volumes.csv'
++    a = os.system(cmd + ' >/dev/null')
++    if a > 0:
++        print('Error in mri_synthseg; exitting...')
++        sys.exit(1)
++
++
++TMP_RESAMPLED = output_dir + '/tmp.resampled.mgz'
++a = os.system('mri_convert ' + input_seg + ' ' + TMP_RESAMPLED + ' -rl ' + input_volume + ' -rt nearest -odt float >/dev/null')
++if a>0:
++    print('Error in mri_convert; exitting...')
++    sys.exit(1)
++Sim, _ = my.MRIread(TMP_RESAMPLED)
++os.system('rm -rf ' + TMP_RESAMPLED)
++
++########################################################
++if skip_bf==False:
++    print('Correcting bias field')
++    print('   Trying model with polynomial basis functions')
++    try:
++        Iim, _ = bf.correct_bias(Iim, Sim, maxit=100, penalty=0.1, order=6, device=device, dtype=dtype, basis=bf_mode)
++    except:
++        if device.type=='cpu':
++            raise Exception('Bias correction failed (out of memory?)')
++        else:
++            print('Bias correction on GPU failed; trying with CPU')
++            Iim, _ = bf.correct_bias(Iim, Sim, maxit=100, penalty=0.1, order=4, device='cpu', dtype=dtype, basis=bf_mode)
++    if args.write_bias_corrected:
++        aux = (Iim / np.max(Iim) * 255).astype(np.uint8)
++        my.MRIwrite(aux, aff, output_dir + '/bias.corrected.nii.gz')
++
++print('Normalizing intensities')
++Iim = Iim * 110 / np.median(Iim[(Sim==2) | (Sim==41)])
++
++# We should do tensors at this point...
++Sim = torch.tensor(Sim, dtype=torch.int, device=device)
++Iim = torch.tensor(Iim, dtype=dtype, device=device)
++
++########################################################
++
++# TODO: do this within python at some point...
++print('Subdividing brainstem into left and right halves, and cropping bottom if needed')
++BRAINSTEM = 16
++BRAINSTEM_L = 161
++BRAINSTEM_R = 162
++
++if os.path.isfile(atlas_field):
++    print('   Registration file found; no need to run EasyReg!')
++else:
++    print('   Running EasyReg')
++    mni_image = os.path.join(BASE_PATH, 'data_mni', 'mni.nii.gz')
++    mni_seg = os.path.join(BASE_PATH, 'data_mni', 'mni.synthseg.nii.gz')
++    a = os.system('mri_easyreg --flo ' + mni_image +
++                  ' --ref ' + input_volume + ' --flo_seg ' + mni_seg + ' --ref_seg ' + input_seg +
++                  ' --threads ' + str(args.threads) + ' --fwd_field ' + atlas_field + '  >/dev/null')
++    if a>0:
++        print('Error in mri_easyreg; exitting...')
++        sys.exit(1)
++
++FIELD, FIELDaff = my.MRIread(atlas_field)
++FIELD = torch.tensor(FIELD, dtype=dtype, device=device)
++# sanity check
++if np.sum(np.abs(aff-FIELDaff))>1e-6:
++    raise Exception('affine matrix of deformation field does not coincide with that of input')
++    sys.exit(1)
++
++# kill bottom of medulla
++CSF = 24
++Sim[((Sim==BRAINSTEM) | (Sim==CSF)) & (FIELD[...,2]<(-60))] = 0
++# Subdivide
++LEFT = (FIELD[...,0]<0)
++Sim[(Sim==BRAINSTEM) & LEFT] = BRAINSTEM_L
++Sim[(Sim==BRAINSTEM) & (LEFT==0)] = BRAINSTEM_R
++del LEFT, FIELD
++
++#######################################
++
++# Prepare data for hemisphere at hand
++print('  Creating and applying mask for ' + side + ' hemisphere')
++if side=='left':
++    M = ( (Sim < 30) | (Sim==161) | ( (Sim > 1000) & (Sim < 2000) ) )
++else: # right hemi
++    M = ( ( (Sim > 40) & (Sim<100) )  | (Sim==162) | (Sim > 2000) )
++if True:
++    M[Sim==4] = 0
++    M[Sim==5] = 0
++    M[Sim==43] = 0
++    M[Sim==44] = 0
++M[Sim==14] = 0
++M[Sim==15] = 0
++M[Sim==24] = 0
++M[Sim==0] = 0
++# I now do this with the resampled mask later on, to avoid blurring mask edges
++# Iim[M==0] = 0
++Mim, cropping = my.cropLabelVolTorch(M, margin=5)
++del M
++Sim = my.applyCropping(Sim, cropping)
++Iim = my.applyCropping(Iim, cropping)
++aff[:3, -1] = aff[:3, -1] + aff[:-1, :-1] @ np.array([cropping[0].detach().cpu().numpy(), cropping[1].detach().cpu().numpy(), cropping[2].detach().cpu().numpy()])
++
++##### Version with and without parcels
++SimParc = Sim.clone()
++Sim[Sim >= 2000] = 42
++Sim[Sim > 1000] = 3
++
++
++########################################################
++
++# Read atlas
++print('Reading in atlas')
++
++# ASEG labels are hard coded for each hemi, no biggie
++if side=='left':
++    aseg_label_list = np.array(
++        [2, 7, 8, 10, 11, 12, 13, 17, 18, 26, 28, 161, 1001, 1002, 1003, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012,
++         1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030,
++         1031, 1032, 1033, 1034, 1035]).astype(int)
++else:
++    aseg_label_list = np.array(
++        [41, 46, 47, 49, 50, 51, 52, 53, 54, 58, 60, 162, 2001, 2002, 2003, 2005, 2006, 2007, 2008, 2009, 2010, 2011,
++         2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028, 2029,
++         2030, 2031, 2032, 2033, 2034, 2035]).astype(int)
++
++# Get the label groupings and atlas labels from the config files
++tissue_index, grouping_labels, label_list, number_of_gmm_components = relab.get_tissue_settings(
++            os.path.join(BASE_PATH, 'data_simplified', 'atlas_names_and_labels.yaml'),
++            os.path.join(BASE_PATH, 'data_simplified', 'combined_atlas_labels_fireants.yaml'),
++            os.path.join(BASE_PATH, 'data_simplified', 'combined_aseg_labels_fireants.yaml'),
++            os.path.join(BASE_PATH, 'data_simplified', 'gmm_components_fireants.yaml'),
++            aseg_label_list
++)
++
++tidx = tissue_index[np.where(label_list == 0)[0][0]]
++if tidx>0:
++    raise Exception('First tissue class must be the background')
++n_tissues = np.max(tissue_index) + 1
++n_labels = len(label_list)
++atlas_names = sorted(glob.glob(atlas_dir + '/label_*.npz'))
++atlas_size = np.load(atlas_dir + '/size.npy')
++
++class LabelDataset(Dataset):
++
++    def __init__(self, fnames):
++        self.fnames = fnames
++
++    def __len__(self):
++        return len(self.fnames)
++
++    def __getitem__(self, item):
++        print(item, self.fnames[item])
++        prior = sp.load_npz(self.fnames[item])
++        prior_indices = torch.as_tensor(prior.row)
++        prior_values = torch.as_tensor(prior.data)
++        return prior_indices, prior_values
++
++# TODO: without this line, I get weird runtime errors...
++prefetch = 4
++workers = 2
++prefetch_factor = max(prefetch//workers, 1)
++label_loader = DataLoader(LabelDataset(atlas_names), num_workers=workers, prefetch_factor=prefetch_factor)
++A = np.zeros([*atlas_size, n_tissues], dtype=numpy_dtype)
++# We keep track of these probability masses we use to correct differences in labeling between A and SynthSeg
++MLhippo = np.zeros(atlas_size, dtype=numpy_dtype)
++CLAUSTRUM = np.zeros(atlas_size, dtype=numpy_dtype)
++RETICULAR = np.zeros(atlas_size, dtype=numpy_dtype)
++LGN =  np.zeros(atlas_size, dtype=numpy_dtype)
++AMYGDALA =  np.zeros(atlas_size, dtype=numpy_dtype)
++for n, (prior_indices, prior_values) in enumerate(label_loader):
++    print('Reading in label ' + str(n+1) + ' of ' + str(n_labels))
++    if prior_indices.numel() == 0:
++        continue
++    prior_indices = torch.as_tensor(prior_indices, device=device, dtype=torch.long).squeeze()
++    prior_values = torch.as_tensor(prior_values, device=device, dtype=dtype).squeeze()
++    idx = tissue_index[n]
++    if n == 0:
++        prior = torch.sparse_coo_tensor(prior_indices[None], prior_values,
++                                        [torch.Size(atlas_size).numel()]).to_dense()
++        del prior_indices, prior_values
++        prior = prior.reshape(torch.Size(atlas_size)).cpu().numpy()
++        A[:, :, :, idx] = A[:, :, :, idx] + prior
++    else:
++        prior_indices = my.ind2sub(prior_indices, atlas_size)
++        min_x, max_x = prior_indices[0].min().item(), prior_indices[0].max().item() + 1
++        min_y, max_y = prior_indices[1].min().item(), prior_indices[1].max().item() + 1
++        min_z, max_z = prior_indices[2].min().item(), prior_indices[2].max().item() + 1
++        crop_atlas_size = [max_x - min_x, max_y - min_y, max_z - min_z]
++        prior_indices[0] -= min_x
++        prior_indices[1] -= min_y
++        prior_indices[2] -= min_z
++        prior = torch.sparse_coo_tensor(prior_indices, prior_values, crop_atlas_size).to_dense()
++        crop = (slice(min_x, max_x), slice(min_y, max_y), slice(min_z, max_z))
++        A[(*crop, idx)] = A[(*crop, idx)] + prior.cpu().numpy()
++        # Hack to create maps for claustrum/reticular, LGN, and molecular layer
++        if np.any(np.array([343, 368, 372, 408, 418, 562, 566, 571, 339, 354])==label_list[n]):
++            MLhippo[crop] += prior.cpu().numpy()
++        if np.any(np.array([102, 174])==label_list[n]):
++            CLAUSTRUM[crop] += prior.cpu().numpy()
++        if label_list[n]==254:
++            RETICULAR[crop] += prior.cpu().numpy()
++        if label_list[n]==484:
++            LGN[crop] += prior.cpu().numpy()
++        if np.any(np.array([215,216,377,217,214,242,301,238,240,277,278,279])==label_list[n]):
++            AMYGDALA[crop] += prior.cpu().numpy()
++
++A = torch.tensor(A, dtype=dtype, device=device)
++if side=='left':
++    aff_A = np.diag([.2, .2, .2, 1])
++else:
++    aff_A = np.diag([-.2, .2, .2, 1])
++
++################
++# fake image
++MU_CSF = 0
++if side=='left':
++    MU_WM = torch.median(Iim[Sim==2])
++    MU_GM = torch.median(Iim[(Sim==3) | (Sim==17) | (Sim==18)])
++    MU_WM_CEREBELLUM = torch.median(Iim[Sim==7])
++    MU_GM_CEREBELLUM = torch.median(Iim[Sim==8])
++    MU_CAUDATE = torch.median(Iim[Sim==11])
++    MU_PUTAMEN = torch.median(Iim[Sim==12])
++    MU_PALLIDUM = torch.median(Iim[Sim == 13])
++else:
++    MU_WM = torch.median(Iim[Sim==41])
++    MU_GM = torch.median(Iim[(Sim==42) | (Sim==53) | (Sim==54)])
++    MU_WM_CEREBELLUM = torch.median(Iim[Sim==46])
++    MU_GM_CEREBELLUM = torch.median(Iim[Sim==47])
++    MU_CAUDATE = torch.median(Iim[Sim==50])
++    MU_PUTAMEN = torch.median(Iim[Sim==51])
++    MU_PALLIDUM = torch.median(Iim[Sim == 52])
++mid = 0.5 * MU_WM + 0.5 * MU_GM
++delta = (MU_WM - MU_GM) / 16.0
++MU_TH_LATERAL = mid + 2 * delta
++MU_TH_MEDIAL = mid - 2 * delta
++MU_RN = MU_WM + 9 * delta
++MU_GM_BS = MU_WM - 1 * delta
++MU_WM_BS = MU_WM + 6 * delta
++MU_HYPO = mid - 3 * delta
++MU_MAM_BODY = MU_WM
++MU_DG_CEREBELLUM = mid - 1 * delta
++MU_WM_HIPPO = mid + 1 * delta
++
++cheating_means = torch.zeros([17], device=device, dtype=dtype)
++cheating_means[0] = MU_CSF
++cheating_means[1] = MU_WM
++cheating_means[2] = MU_GM
++cheating_means[3] = MU_WM_CEREBELLUM
++cheating_means[4] = MU_GM_CEREBELLUM
++cheating_means[5] = MU_CAUDATE
++cheating_means[6] = MU_PUTAMEN
++cheating_means[7] = MU_TH_LATERAL
++cheating_means[8] = MU_TH_MEDIAL
++cheating_means[9] = MU_PALLIDUM
++cheating_means[10] = MU_RN
++cheating_means[11] = MU_GM_BS
++cheating_means[12] = MU_WM_BS
++cheating_means[13] = MU_HYPO
++cheating_means[14] = MU_MAM_BODY
++cheating_means[15] = MU_DG_CEREBELLUM
++cheating_means[16] = MU_WM_HIPPO
++
++sigma =  torch.tensor(10.0, device=device, dtype=dtype)
++if False:
++    AL = torch.argmax(A, axis=-1)
++    muI = cheating_means[AL]
++    # sigmaI = np.sqrt(vars_ini)[AL]
++    sigmaI = sigma * torch.ones(AL.shape, device=device, dtype=dtype)
++else:
++    muI = torch.zeros(A.shape[:-1], device=device, dtype=dtype)
++    for l in range(A.shape[-1]):
++        muI += (A[:,:,:,l] * cheating_means[l])
++    sigmaI = sigma * torch.ones(muI.shape, device=device, dtype=dtype)
++
++Ifake = torch.normal(muI, sigmaI)
++del muI
++del sigmaI
++Ifake[Ifake<0] = 0
++native_resolution = np.sqrt(np.sum(aff[:-1,:-1]**2, axis=0))
++# we blur a bit less since the atlas is blurry already (default power factor at W/2 is 5.0)
++Ifake, aff_fake = my.torch_resize(Ifake, aff_A, native_resolution, device, dtype=dtype, power_factor_at_half_width=(0.5*5.0))
++
++# For the linear registration, we used the centroids, as in EasyReg.
++if side=='left':
++    labels = np.array([2,4,5,7,8,10,11,12,13,161,17,18,26,28,1001,1002,1003,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,1015,1016,1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1027,1028,1029,1030,1031,1032,1033,1034,1035])
++else:
++    labels = np.array([41,43,44,46,47,49,50,51,52,162, 53, 54, 58, 60, 2001,2002,2003,2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025,2026,2027,2028,2029,2030,2031,2032,2033,2034,2035])
++nlab = len(labels)
++imageCOGvox = torch.zeros([4, nlab], device=device, dtype=dtype)
++ok = torch.ones(nlab, device=device, dtype=torch.bool)
++for l in range(nlab):
++    aux = torch.where(SimParc == labels[l])
++    if len(aux[0]) > 50:
++        imageCOGvox[0, l] = torch.median(aux[0].to(dtype))
++        imageCOGvox[1, l] = torch.median(aux[1].to(dtype))
++        imageCOGvox[2, l] = torch.median(aux[2].to(dtype))
++        imageCOGvox[3, l] = 1.0
++    else:
++        ok[l] = False
++imageCOGras = torch.tensor(aff, device=device, dtype=dtype) @ imageCOGvox
++fakeCOGras = torch.tensor([[49.4,63.4,44.4,59.4,51.4,67.4,63.4,51.4,58.4,73.4,52.4,56.4,71.4,70.4,18.4,76.4,38.4,70.4,62.4,42.4,32.4,24.4,74.4,46.4,55.4,61.4,75.4,15.4,54.4,75.4,27.4,33.4,27.4,66.4,28.4,77.4,31.4,73.4,75.4,42.4,70.4,58.4,22.4,18.4,71.4,53.4,28.4,39.4],[117.4,107.4,116.4,81.4,69.4,113.4,147.4,137.4,131.4,105.4,112.4,130.4,147.4,117.4,86.4,161.4,147.4,41.4,131.4,81.4,59.4,98.4,79.4,31.4,169.4,53.4,179.4,111.4,99.4,103.4,155.4,181.4,171.4,39.4,112.4,113.4,127.4,63.4,183.4,189.4,168.4,62.4,128.4,95.4,206.4,152.4,111.4,136.4],[110.4,103.4,70.4,46.4,50.4,93.4,99.4,85.4,84.4,53.4,67.4,63.4,77.4,75.4,95.4,122.4,144.4,111.4,50.4,67.4,124.4,55.4,102.4,95.4,64.4,84.4,67.4,68.4,67.4,148.4,98.4,69.4,89.4,102.4,138.4,129.4,138.4,128.4,87.4,109.4,143.4,147.4,77.4,122.4,68.4,42.4,94.4,83.4],[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]], device=device, dtype=dtype)
++if side=='right':
++    fakeCOGras[0, :] = -fakeCOGras[0, :]
++fakeCOGvox = torch.linalg.inv(torch.tensor(aff_fake, device=device, dtype=dtype)) @ fakeCOGras
++imageCOGvox = imageCOGvox[:,ok]
++imageCOGras = imageCOGras[:,ok]
++fakeCOGras = fakeCOGras[:,ok]
++fakeCOGvox = fakeCOGvox[:,ok]
++# Resampling
++II, JJ, KK = np.meshgrid(np.arange(Iim.shape[0]), np.arange(Iim.shape[1]), np.arange(Iim.shape[2]), indexing='ij')
++II = torch.tensor(II, device=device, dtype=dtype)
++JJ = torch.tensor(JJ, device=device, dtype=dtype)
++KK = torch.tensor(KK, device=device, dtype=dtype)
++affine = my.getM(imageCOGvox[:-1,:], fakeCOGvox[:-1,:])
++II2 = affine[0, 0] * II + affine[0, 1] * JJ + affine[0, 2] * KK + affine[0, 3]
++JJ2 = affine[1, 0] * II + affine[1, 1] * JJ + affine[1, 2] * KK + affine[1, 3]
++KK2 = affine[2, 0] * II + affine[2, 1] * JJ + affine[2, 2] * KK + affine[2, 3]
++RSlin = my.fast_3D_interp_torch(Ifake, II2, JJ2, KK2, 'linear')
++fake_filename = output_dir + '/temp_fake_linear.nii.gz'
++my.MRIwrite(RSlin.detach().cpu().numpy(), aff, fake_filename)
++del II, JJ, KK, II2, JJ2, KK2
++del RSlin
++
++##############################################
++# OK we're ready for nonlinear registration! #
++##############################################
++print('Nonlinear registration of fake image with FireANTs')
++# It's sad we need to write to disk... but there's no easy way of biulding a SimpleITK object
++# from a generic affine vox2ras matrix :-S
++ref_filename = output_dir + '/temp_reference.nii.gz'
++my.MRIwrite((Iim*Mim).detach().cpu().numpy(), aff, ref_filename)
++
++# FireANTs!
++# Prepare reference image, with intensities in 1st channel, and a bunch of segmentations concatenated
++image1 = Image.load_file(ref_filename, device=device)
++SimP = (Sim*Mim).permute([2, 1, 0])[None, None, ...]
++# GM, WM, CGM, CA/PU/AC, TH, PA, BG, AM
++if side=='left':
++    groups = [[3,  17],  [2],  [8], [11, 12, 26], [10], [13], [0,  4,  5, 14, 15, 24, 41, 42, 43, 44, 46, 47, 49, 50, 51, 52, 53, 54, 58, 60, 162], [18]]
++else:
++    groups = [[42, 53], [41], [47], [50, 51, 58], [49], [52], [0, 43, 44, 14, 15, 24,  2,  3,  4,  5,  7,  8, 10, 11, 12, 13, 17, 18, 26, 28, 161], [54]]
++for group in groups:
++    M = torch.zeros(SimP.shape, device=device, dtype=dtype)
++    for lab in group:
++        M[SimP == lab] = 1.0
++    image1.array = torch.cat([image1.array, M], dim=1)
++del SimP, M
++
++# Same for the fake image (requires resampling atlas)
++image2 = Image.load_file(fake_filename, device=device)
++# GM, WM, CGM, CA/PU/AC, TH, PA, BG, AM
++frame_sets = [[2], [1], [4],  [5,6], [7,8], [9], [0]]
++II, JJ, KK = np.meshgrid(np.arange(Iim.shape[0]), np.arange(Iim.shape[1]), np.arange(Iim.shape[2]), indexing='ij')
++II = torch.tensor(II, device=device, dtype=dtype)
++JJ = torch.tensor(JJ, device=device, dtype=dtype)
++KK = torch.tensor(KK, device=device, dtype=dtype)
++affine = np.linalg.inv(aff_A) @ my.getM(imageCOGvox[:-1,:], fakeCOGras[:-1,:]).detach().cpu().numpy()
++II2 = affine[0, 0] * II + affine[0, 1] * JJ + affine[0, 2] * KK + affine[0, 3]
++JJ2 = affine[1, 0] * II + affine[1, 1] * JJ + affine[1, 2] * KK + affine[1, 3]
++KK2 = affine[2, 0] * II + affine[2, 1] * JJ + affine[2, 2] * KK + affine[2, 3]
++del II, JJ, KK
++
++for framelist in frame_sets:
++    M = torch.zeros(II2.shape, device=device, dtype=dtype)
++    for frame in framelist:
++        pad = 1.0 if frame==0 else 0.0
++        if frame == 2:
++            M += my.fast_3D_interp_torch(A[..., frame] + torch.tensor(MLhippo - AMYGDALA, device=device, dtype=dtype) , II2, JJ2, KK2, 'linear', pad_value=pad)
++        elif frame == 1:
++            M += my.fast_3D_interp_torch(A[..., frame] + torch.tensor(CLAUSTRUM + RETICULAR, device=device, dtype=dtype) , II2, JJ2, KK2, 'linear', pad_value=pad)
++        elif frame==6:
++            M += my.fast_3D_interp_torch(A[..., frame] - torch.tensor(CLAUSTRUM, device=device, dtype=dtype), II2, JJ2, KK2, 'linear', pad_value=pad)
++        elif frame==8:
++            M += my.fast_3D_interp_torch(A[..., frame] - torch.tensor(LGN + RETICULAR, device=device, dtype=dtype), II2, JJ2, KK2, 'linear', pad_value=pad)
++        else:
++            M += my.fast_3D_interp_torch(A[..., frame], II2, JJ2, KK2, 'linear', pad_value=pad)
++    image2.array = torch.cat([image2.array, M.permute([2, 1, 0])[None, None, ...]], dim=1)
++# Amygdala is a bit special because it's on its own
++M = my.fast_3D_interp_torch(torch.tensor(AMYGDALA, device=device, dtype=dtype) , II2, JJ2, KK2, 'linear', pad_value=0)
++image2.array = torch.cat([image2.array, M.permute([2, 1, 0])[None, None, ...]], dim=1)
++del II2, JJ2, KK2, M, MLhippo, CLAUSTRUM, RETICULAR, LGN, AMYGDALA
++
++#FireANTs options
++torch.set_grad_enabled(True)
++batch1 = BatchedImages([image1])
++batch2 = BatchedImages([image2])
++scales = [4, 2, 1]; iterations = [300, 100, 30]
++if np.mean(native_resolution)<0.7:
++    scales = [6, 4, 2, 1]; iterations = [300, 100, 30, 30]
++if np.mean(native_resolution)<0.5:
++    scales = [8, 4, 2, 1]; iterations = [300, 100, 30, 30]
++if np.mean(native_resolution)<0.3:
++    scales = [12, 8, 4, 2, 1]; iterations = [300, 100, 30, 30, 30]
++if np.mean(native_resolution) < 0.2:
++    scales = [16, 8, 4, 2, 1]; iterations = [300, 100, 30, 30, 30]
++
++reg = GreedyRegistration(scales=scales, iterations=iterations,
++            fixed_images=batch1, moving_images=batch2,
++            loss_type='custom',
++            custom_loss=HybridDiceLabelDiffloss(kernel_size=args.cc_kernel_size, rel_weight_labeldiff=args.rel_weight_labeldiff),
++            deformation_type='compositive',
++            smooth_grad_sigma=args.smooth_grad_sigma, smooth_warp_sigma=args.smooth_warp_sigma,
++            optimizer='adam', optimizer_lr=args.optimizer_lr,
++            reduction='mean')  # crucial option, for proper display of loss...
++
++start = time()
++reg.optimize(save_transformed=False)
++end = time()
++print("Runtime nonlinear registration: ", end - start, "seconds")
++moved = reg.evaluate(batch1, batch2)
++reference_img = image1.itk_image
++moved_image_np = moved[0, 0].detach().cpu().numpy()
++moved_sitk_image = sitk.GetImageFromArray(moved_image_np)
++moved_sitk_image.SetOrigin(reference_img.GetOrigin())
++moved_sitk_image.SetSpacing(reference_img.GetSpacing())
++moved_sitk_image.SetDirection(reference_img.GetDirection())
++if args.save_atlas_nonlinear_reg:
++    fake_filename_deformed = output_dir + '/atlas_nonlinear_reg.' + side + '.nii.gz'
++    sitk.WriteImage(moved_sitk_image, fake_filename_deformed)
++warped_coords = reg.get_warped_coordinates(batch1, batch2).detach()
++del image1, image2, batch1, batch2, reg, moved, moved_sitk_image
++torch.set_grad_enabled(False)
++# if False: # this is how FireANTs does it
++#     resampled = grid_sample(RSlin.permute([2,1,0])[None, None, ...], warped_coords, mode='bilinear', align_corners=True).squeeze().permute([2,1,0])
++#     my.MRIwrite(torch.squeeze(resampled).detach().cpu().numpy(),aff,'/tmp/test.nii.gz')
++# if False: # an easier way to look at it?
++#     resampled = grid_sample(RSlin[None, None, ...], warped_coords.flip(4), mode='bilinear', align_corners=True).squeeze().permute([2,1,0])
++#     my.MRIwrite(torch.squeeze(resampled).detach().cpu().numpy(),aff,'/tmp/test2.nii.gz')
++# if False: # yet another way to look at it?
++#     resampled = grid_sample(RSlin[None, None, ...], warped_coords.permute([0,3,2,1,4]).flip(4), mode='bilinear', align_corners=True).squeeze()
++#     my.MRIwrite(torch.squeeze(resampled).detach().cpu().numpy(),aff,'/tmp/test3.nii.gz')
++
++
++########################################################
++print('Computing initial values for means and variances')
++mus_ini = []
++vars_ini = []
++mixture_weights = []
++
++for t in range(len(number_of_gmm_components)-1):
++    x = []
++    for l in grouping_labels[t+1]:
++        x.append(Iim[SimParc==l])
++
++    if len(x) > 0:
++        x = torch.concatenate(x)
++        mu = torch.median(x)
++        std = 1.4826 * torch.median(torch.abs(x - mu))
++        var = std ** 2
++        if number_of_gmm_components[t+1]==1:
++            mus_ini.append(mu[None])
++            vars_ini.append(var[None])
++            mixture_weights.append(torch.ones(1,dtype=dtype,device=device))
++        else:
++            # Estimate GMM with shared variance (avoids a component with tiny variance)
++            nc = number_of_gmm_components[t+1]
++            nx = len(x)
++            gmm_mus = torch.linspace(mu - 0.5 * std, mu + 0.5 * std, nc, dtype=dtype, device=device)
++            gmm_var= var * torch.ones(1, dtype=dtype, device=device)
++            gmm_ws = (1 / float(nc)) * torch.ones(nc, dtype=dtype, device=device)
++            W = torch.zeros([nx, nc], dtype=dtype, device=device)
++            for its in range(200):
++                # E step
++                for c in range(nc):
++                    W[:, c] = gmm_ws[c] / torch.sqrt(2.0 * torch.pi * torch.sqrt(gmm_var)) * torch.exp(-0.5 * (x - gmm_mus[c])**2 / gmm_var)
++                normalizer = torch.sum(W + 1e-9, axis=1)
++                # print(-torch.mean(torch.log(normalizer)))
++                W /= normalizer[:, None]
++                # M step
++                denominators = torch.sum(W, axis=0)
++                gmm_ws = denominators / torch.sum(denominators)
++                gmm_var = 0
++                for c in range(nc):
++                    gmm_mus[c] = torch.sum(W[:, c] * x) / denominators[c]
++                    aux = x - gmm_mus[c]
++                    gmm_var += torch.sum(W[:, c] * aux * aux)
++                gmm_var /= torch.sum(denominators)
++
++            mus_ini.append(gmm_mus)
++            vars_ini.append(gmm_var * torch.ones(nc, dtype=dtype, device=device))
++            mixture_weights.append(gmm_ws)
++
++mus_ini = torch.concatenate(mus_ini)
++vars_ini = torch.concatenate(vars_ini)
++mixture_weights = torch.concatenate(mixture_weights)
++
++if SET_BG_TO_CSF:
++    x = []
++    if side=='left':
++        for l in [4, 5]: # , 24]:
++            x.append(Iim[Sim==l])
++    else:
++        for l in [43, 44]: # , 24]:
++            x.append(Iim[Sim==l])
++    mu_bg  = torch.median(torch.concatenate(x))
++else:
++    mu_bg = torch.tensor(0, dtype=dtype, device=device)
++
++########################################################
++
++# EM for GMM parameters
++print('Estimating GMM parameters')
++
++print('  Resizing image, mask, and coordinates')
++I_r, aff_r = my.torch_resize(Iim, aff, resolution, device, dtype=dtype)
++M_r, _ = my.torch_resize(Mim, aff, resolution, device, dtype=dtype)
++I_r[M_r<0.5] = mu_bg
++Iim_shape = Iim.shape
++del Iim, Mim, Sim, SimParc
++
++print('  Deforming atlas')
++# OK so we need to create a field of coordinates and then resize it.
++# The tricky bit is concatenating the nonlinear transform (in [0,1]) with the linear
++wc_r, _ = my.torch_resize(warped_coords[0].permute([2,1,0,3]), aff, resolution, device, dtype=dtype)
++del warped_coords
++# we'll worry about skip later
++# first bit: from [-1,1] of linearly registered, to absolute coordinates
++T1 = torch.eye(4, device=device, dtype=dtype)
++for k in range(3):
++    T1[k, k] = 0.5 * (Iim_shape[k] - 1)
++    T1[k, -1] = T1[k, k]
++# second bit: vox2vox transform to fake  space
++T2 = my.getM(imageCOGvox[:-1,:], fakeCOGvox[:-1,:])
++# third bit: from vox to [-1, 1] coordinates that can be used with atlas at any resolution
++T3 = torch.eye(4, device=device, dtype=dtype)
++for k in range(3):
++    T3[k, k] = 2 / (Ifake.shape[k] - 1)
++    T3[k, -1] = -1
++T = T3 @ T2 @ T1
++I = T[0, 0] * wc_r[..., 0] + T[0, 1] * wc_r[..., 1] + T[0, 2] * wc_r[..., 2] + T[0, 3]
++J = T[1, 0] * wc_r[..., 0] + T[1, 1] * wc_r[..., 1] + T[1, 2] * wc_r[..., 2] + T[1, 3]
++K = T[2, 0] * wc_r[..., 0] + T[2, 1] * wc_r[..., 1] + T[2, 2] * wc_r[..., 2] + T[2, 3]
++del wc_r
++# we can now resample
++priors = grid_sample(A.permute([3,0,1,2])[None, ...],
++                     torch.stack([K[::skip,::skip,::skip],
++                                  J[::skip,::skip,::skip],
++                                  I[::skip,::skip,::skip]], axis=-1)[None,...], align_corners=True)
++priors = torch.permute(priors[0], [1, 2, 3, 0])
++# Deal with voxels outside the FOV
++missing_mass = 1 - torch.sum(priors, axis=-1)
++priors[..., 0] += missing_mass
++
++####
++print('  EM for parameter estimation')
++# data
++means = torch.tensor([mu_bg, *mus_ini], device=device, dtype=dtype)
++var_bg = torch.min(vars_ini)
++variances = torch.tensor([var_bg, *vars_ini], device=device, dtype=dtype)
++weights = torch.tensor([1.0, *mixture_weights], dtype=dtype, device=device)
++W = torch.zeros([*priors.shape[:-1], number_of_gmm_components.sum()], dtype=dtype, device=device)
++x = I_r[::skip, ::skip, ::skip]
++
++# We now put a Scaled inverse chi-squared prior on the variances to prevent them from going to zero
++prior_count = 100 / (resolution ** 3) / (skip ** 3)
++prior_variance = var_bg
++loglhood_old = -10000
++for em_it in range(100):
++    # E step
++    for c in range(n_tissues):
++        prior = priors[:, :, :, c]
++        num_components = number_of_gmm_components[c]
++        for g in range(num_components):
++            gaussian_number = sum(number_of_gmm_components[:c]) + g
++            d = x - means[gaussian_number]
++            W[:, :, :, gaussian_number] = weights[gaussian_number] * prior * torch.exp(
++                -d * d / (2 * variances[gaussian_number])) / torch.sqrt(
++                2.0 * torch.pi * variances[gaussian_number])
++
++    normalizer = 1e-9 + torch.sum(W, dim=-1, keepdim=True)
++    loglhood = torch.mean(torch.log(normalizer)).detach().cpu().numpy()
++    W = W / normalizer
++
++    # M step
++    prior_loglhood = torch.zeros(1,dtype=dtype,device=device)
++    for c in range(number_of_gmm_components.sum()):
++        # crucially, we skip the background when we update the parameters (but we still add it to the cost)
++        if c > 0:
++            norm = torch.sum(W[:, :, :, c])
++            means[c] = torch.sum(x * W[:, :, :, c]) / norm
++            d = x - means[c]
++            variances[c] = (torch.sum(d * d * W[:, :, :, c]) + prior_count * prior_variance) / ( norm + prior_count + 2)
++        v = variances[c]
++        prior_loglhood = prior_loglhood - ((1 + 0.5 * prior_count) * torch.log(v) + 0.5 * prior_count * prior_variance / v) / torch.numel(normalizer)
++    loglhood = loglhood + prior_loglhood.detach().cpu().numpy()
++
++    mixture_weights = torch.sum(W[:, :, :, 1:].reshape([np.prod(priors.shape[:-1]), number_of_gmm_components.sum() - 1]) + 1e-9, axis=0)
++    for c in range(n_tissues - 1):
++        # mixture weights are normalized (those belonging to one mixture sum to one)
++        num_components = number_of_gmm_components[c + 1]
++        gaussian_numbers = torch.tensor(np.sum(number_of_gmm_components[1:c + 1]) + \
++                                        np.array(range(num_components)), device=device, dtype=dtype).long()
++
++        mixture_weights[gaussian_numbers] /= torch.sum(mixture_weights[gaussian_numbers])
++
++    weights[1:] = mixture_weights
++
++    if (torch.sum(torch.isnan(means)) > 0) or (torch.sum(torch.isnan(variances)) > 0):
++        print('nan in Gaussian parameters...')
++        import pdb;
++
++        pdb.set_trace()
++
++    print('         Step %d of EM, -loglhood = %.6f' % (em_it + 1, -loglhood ), flush=True)
++    if (loglhood - loglhood_old) < TOL:
++        print('         Decrease in loss below tolerance limit')
++        break
++    else:
++        loglhood_old = loglhood
++
++
++###########
++
++print('Computing Gaussians at full resolution (we will reuse over and over)')
++GAUSSIAN_LHOODS = torch.zeros([*I_r.shape, sum(number_of_gmm_components)], dtype=dtype, device=device)
++for c in range(sum(number_of_gmm_components)):
++    # The 1e-9 ensures no zeros were prior is not zero
++    GAUSSIAN_LHOODS[..., c] = 1.0 / torch.sqrt(2 * math.pi * variances[c]) * torch.exp(
++    -0.5 * torch.pow(I_r - means[c], 2.0) / variances[c]) + 1e-9
++
++print('Computing normalizers (faster to do now with clustered priors)')
++# We deform one class at the time; slower, but less memory
++normalizers = torch.zeros(GAUSSIAN_LHOODS.shape[:-1], dtype=dtype, device=device)
++# normalizers[h] = 1e-9
++gaussian_number = 0
++for c in range(A.shape[-1]):
++    prior = grid_sample(A[None, None, ..., c], torch.stack([K, J, I], axis=-1)[None, ...], align_corners=True)[0,0,...]
++    if c==0: # background
++        prior[(I < (-1)) | (I > 1) | (J < (-1)) | (J > 1) | (K < (-1)) | (K > 1)] = 1.0
++    lhood = torch.zeros_like(prior)
++    for g in range(number_of_gmm_components[c]):
++        lhood += (weights[gaussian_number] * GAUSSIAN_LHOODS[..., gaussian_number])
++        gaussian_number += 1
++    normalizers += (prior * lhood)
++Ashape = A.shape
++del A
++
++print('Deforming one label at the time')
++names, colors = my.read_LUT(LUT_file)
++seg = torch.zeros(normalizers.shape, dtype=torch.int, device=device)
++seg_rgb = torch.zeros([*normalizers.shape, 3], dtype=dtype, device=device)
++max_p = torch.zeros(normalizers.shape, dtype=dtype, device=device)
++vols = torch.zeros(n_labels, device=device, dtype=dtype)
++
++# TODO: choose good number of workers/prefetch factor
++for n, (prior_indices, prior_values) in enumerate(label_loader):
++    print('Deforming label ' + str(n + 1) + ' of ' + str(n_labels))
++
++    if prior_indices.numel() == 0:
++        continue
++    prior_indices = torch.as_tensor(prior_indices, device=device, dtype=torch.long).squeeze()
++    prior_values = torch.as_tensor(prior_values, device=device, dtype=dtype).squeeze()
++
++    if n == 0:
++        # background
++        prior = torch.sparse_coo_tensor(prior_indices[None], prior_values,
++                                        [torch.Size(atlas_size).numel()]).to_dense()
++        del prior_indices, prior_values
++        prior = prior.reshape(torch.Size(atlas_size))
++
++    else:
++
++        # find bounding box of label in atlas space
++        prior_indices = my.ind2sub(prior_indices, atlas_size)
++        min_x, max_x = prior_indices[0].min().item(), prior_indices[0].max().item()
++        min_y, max_y = prior_indices[1].min().item(), prior_indices[1].max().item()
++        min_z, max_z = prior_indices[2].min().item(), prior_indices[2].max().item()
++        crop_atlas_size = [max_x - min_x + 1, max_y - min_y + 1, max_z - min_z + 1]
++        prior_indices[0] -= min_x
++        prior_indices[1] -= min_y
++        prior_indices[2] -= min_z
++        prior = torch.sparse_coo_tensor(prior_indices, prior_values, crop_atlas_size).to_dense()
++        del prior_indices, prior_values
++
++    skip_this_label = False
++    if n==0:
++        Irescaled = I
++        Jrescaled = J
++        Krescaled = K
++        lr_crop = (slice(None),) * 3
++    else:
++        # find bounding box of label in MRI space
++        Irescaled = I * ((Ashape[0] - 1) / (max_x - min_x)) + ( (Ashape[0] - 1 - min_x - max_x) / (max_x - min_x) )
++        Jrescaled = J * ((Ashape[1] - 1) / (max_y - min_y)) + ( (Ashape[1] - 1 - min_y - max_y) / (max_y - min_y) )
++        Krescaled = K * ((Ashape[2] - 1) / (max_z - min_z)) + ( (Ashape[2] - 1 - min_z - max_z) / (max_z - min_z) )
++        mask = (Irescaled >= (-1))
++        mask &= (Irescaled <= 1)
++        mask &= (Jrescaled >= (-1))
++        mask &= (Jrescaled <= 1)
++        mask &= (Krescaled >= (-1))
++        mask &= (Krescaled <= 1)
++        if mask.any()==False:
++            skip_this_label = True
++        else:
++            nx, ny, nz = mask.shape
++            tmp = mask.reshape([nx, -1]).any(-1).nonzero()
++            lr_min_x, lr_max_x = tmp.min().item(), tmp.max().item() + 1
++            tmp = mask.movedim(0, -1).reshape([ny, -1]).any(-1).nonzero()
++            lr_min_y, lr_max_y = tmp.min().item(), tmp.max().item() + 1
++            tmp = mask.reshape([-1, nz]).any(0).nonzero()
++            lr_min_z, lr_max_z = tmp.min().item(), tmp.max().item() + 1
++            del tmp, mask
++            lr_crop = (slice(lr_min_x, lr_max_x), slice(lr_min_y, lr_max_y), slice(lr_min_z, lr_max_z))
++
++    if skip_this_label==False:
++
++        prior_resampled = grid_sample(prior[None, None, ...], torch.stack([Krescaled[lr_crop], Jrescaled[lr_crop], Irescaled[lr_crop]], axis=-1)[None, ...], align_corners=True)[0, 0, ...]
++        if n==0: # background
++            prior_resampled[(Krescaled[lr_crop]<(-1)) | (Krescaled[lr_crop]>1) | (Jrescaled[lr_crop]<(-1)) | (Jrescaled[lr_crop]>1)  | (Irescaled[lr_crop]<(-1)) | (Irescaled[lr_crop]>1)  ] = 1.0
++        del Irescaled; del Jrescaled; del Krescaled
++        num_components = number_of_gmm_components[tissue_index[n]]
++        gaussian_numbers = torch.tensor(np.sum(number_of_gmm_components[:tissue_index[n]]) + \
++                                np.array(range(num_components)), device=device, dtype=dtype).long()
++        lhood = torch.sum(GAUSSIAN_LHOODS[:, :, :, gaussian_numbers] * weights[None, None, None, gaussian_numbers], 3)
++        post = torch.squeeze(prior_resampled)
++        post *= lhood[lr_crop]
++        post /= normalizers[lr_crop]
++        if n==0:
++            post[torch.isnan(post)] = 1.0
++        else:
++            post[torch.isnan(post)] = 0.0
++        del prior_resampled
++        vols[n] = torch.sum(post) * (resolution ** 3)
++        mask = (post > max_p[lr_crop])
++        max_p[lr_crop][mask] = post[mask]
++        lab = int(label_list[n])
++        seg[lr_crop].masked_fill_(mask, lab)
++        del mask
++        for c in range(3):
++            seg_rgb[(*lr_crop, c)].add_(post, alpha=colors[lab][c])
++print('\n')
++
++########################################################
++
++print('Writing results to disk')
++my.MRIwrite(seg.detach().cpu().numpy().astype(np.uint16), aff_r, output_dir + '/seg.' + side + '.nii.gz')
++if args.write_rgb:
++    my.MRIwrite(seg_rgb.detach().cpu().numpy().astype(np.uint8), aff_r, output_dir + '/seg.' + side + '.rgb.nii.gz')
++vols = vols.detach().cpu().numpy()
++with open(output_dir + '/vols.' + side + '.csv', 'w') as csvfile:
++    writer = csv.writer(csvfile)
++    aux = label_list[1:]
++    row = []
++    for l in aux:
++        row.append(names[int(l)])
++    writer.writerow(row)
++    row = []
++    for j in range(1, len(vols)):
++        row.append(str(vols[j]))
++    writer.writerow(row)
++# Copy LUT file, for convenience
++a = os.system('cp ' + LUT_file + ' ' + output_dir +  '/lut.txt >/dev/null')
++if a==0:
++    LUT_file = output_dir +  '/lut.txt'
++
++# Clean up
++os.system('rm -rf '  + output_dir +  '/temp*.nii.gz >/dev/null')
++
++# Print commands to visualize output
++print('You can try these commands to visualize outputs:')
++cmd = '  freeview -v ' + input_volume
++if args.write_bias_corrected:
++    cmd = cmd + ' -v ' + output_dir + '/bias.corrected.nii.gz '
++cmd = cmd + ' -v ' + output_dir + '/seg.' + side + '.nii.gz:colormap=lut:lut=' + LUT_file
++if args.write_rgb:
++    cmd = cmd + ' -v ' + output_dir + '/seg.' + side + '.rgb.nii.gz:rgb=true'
++if args.save_atlas_nonlinear_reg:
++    cmd = cmd + ' ' + fake_filename_deformed
++print(cmd)
++print('  oocalc ' + output_dir + '/vols.' + side + '.csv')
++print(' ')
++print('All done!')
++
++
++
++
++
++
++now2 = datetime.now()
++
++current_time = now2.strftime("%H:%M:%S")
++print("Current Time =", current_time)
++
++runtime = now2 - now
++
++print("Running Time =", runtime)
++
++
+diff --git a/mri_histo_util/README.md b/mri_histo_util/README.md
+index b662a647b97..4377e465ef0 100644
+--- a/mri_histo_util/README.md
++++ b/mri_histo_util/README.md
+@@ -19,12 +19,10 @@ Scientific Reports, 13 (2023): 6657.
+ 
+ ## Prerequisites:
+ 
+-This code requires a modern version of FreeSurfer (7.4.0 or newer), which must be sourced before running the code.
+-
+ The first time you run the method, it will prompt you to download the atlas files, which are not distributed with the code.
+ 
+ 
+-## Usage for 'full' Bayesian version (slow):
++## Usage for 'full' Bayesian version (slow, not recommended):
+ 
+ To run the code, please use the script segment.sh as follows:
+ 
+@@ -75,20 +73,33 @@ You can visualize the output by CDing into the results directory and running the
+ 
+ freeview -v bf_corrected.mgz -v seg_left.mgz:colormap=lut:lut=lookup_table.txt -v seg_right.mgz:colormap=lut:lut=lookup_table.txt
+  
+-## Alternative 'fast' version:
++## Alternative 'fast' versions:
+ 
+-We also distribute a fast version, where the atlas deformation is pre-computed with a neural network,
++We also distribute two faster version, where the atlas deformation is pre-computed
+ and then kept constant during the optimization, such that we only need to run the EM algorithm once for
+ the Gaussian parameters and that is it.
+ 
++There are two sub-versions. One uses FireANTs (Jena et al., https://arxiv.org/abs/2404.01249) to register to the target
++scan a fake cartoon derived from the atlas. This version actively tries to fit smaller structures and
++subregions. The command line is:
++
++mri_histo_atlas_segment_fireants INPUT_SCAN OUTPUT_DIRECTORY GPU THREADS [BF_MODE]
++
++The other version uses SynthMorph (Hoffmann et al., Imaging Neuroscience, 2024), a neural network for 
++image registration. This version is faster and does OK for 1mm isotropic scans. However, SynthMorph 
++relies heavily on fitting the boundaries of whole structures and does not the map smaller regions 
++as well (e.g., thalamic nuclei). Therefore, we do not recommend it for images with resolution better 
++than 1mm isotropic (e.g., ex vivo scans).
++
+ mri_histo_atlas_segment_fast INPUT_SCAN OUTPUT_DIRECTORY GPU THREADS [BF_MODE]
+ 
+-The options are similar to mri_histo_atlas_segment, but the atlas and gmm modes are always 'simplified' and '1mm', respectively. 
++For both commands, the options are similar to mri_histo_atlas_segment, but the atlas and gmm modes are always 'simplified' and '1mm', respectively. 
+ The output files in the output directory follow the same convention.
+ 
+-This faster version is particularly useful if you are running the code on the CPU rather than CPU. 
+-On a semi-modern desktop, the run time should be less than an hour (note that it segments both 
+-hemispheres in a single run, as opposed to the full Bayesian version).
++These faster versions are particularly useful if you are running the code on the CPU rather than CPU. 
++On a semi-modern desktop, the run time should be less than an hour; note that mri_histo_atlas_segment_fireants
++runs once per hemisphere, whhile mri_histo_atlas_segment_fast segments both hemispheres in a single run.
++
+ 
+ 
+ 
+diff --git a/mri_histo_util/mri_histo_atlas_segment_fireants b/mri_histo_util/mri_histo_atlas_segment_fireants
+new file mode 100755
+index 00000000000..f9edce7f3da
+--- /dev/null
++++ b/mri_histo_util/mri_histo_atlas_segment_fireants
+@@ -0,0 +1,128 @@
++#!/usr/bin/env bash
++
++# Exit at any error
++set -e
++
++# Make sure FreeSurfer is sourced
++[ ! -e "$FREESURFER_HOME" ] && echo "error: freesurfer has not been properly sourced" && exit 1
++
++# If requesting help
++if  [ $# == 1 ] && [  $1 == "--help" ]
++then
++  echo " "
++  echo "Bayesian segmentation with histological whole brain atlas (version with FireANTs registratio)."
++  echo " "
++  echo "Next-Generation histological atlas for high-resolution segmentation of human brain MRI"
++  echo "Casamitjana et al. (in preparation)"
++  echo " "
++  echo "Usage:"
++  echo "   mri_histo_atlas_segment_fireants INPUT_SCAN OUTPUT_DIRECTORY GPU THREADS [BF_MODE]"
++  echo " "
++  echo "INPUT SCAN: scan to process, in mgz or nii(.gz) format"
++  echo "OUTPUT_DIRECTORY: directory with segmentations, volume files, etc"
++  echo "GPU: set to 1 to use the GPU; requires a fat (~48GB) GPU!"
++  echo "THREADS: number of CPU threads to use (use -1 for all available threads)"
++  echo "BF_MODE (optional): bias field model: dct (default), polynomial, or hybrid"
++  echo " "
++  exit 0
++fi
++
++# If number of arguments is incorrect
++if [ $# -lt 4 ] || [ $# -gt 5 ]
++then
++  echo " "
++  echo "Incorrect number of arguments."
++  echo "Usage: "
++  echo " "
++  echo "   mri_histo_atlas_segment_fireants INPUT_SCAN OUTPUT_DIRECTORY GPU THREADS [BF_MODE]"
++  echo " "
++  echo "Or, for help"
++  echo " "
++  echo "   mri_histo_atlas_segment_fireants --help"
++  echo " "
++  exit 1
++fi
++
++# Parse arguments
++INPUT=$1
++OUTPUT_DIR=$2
++CPU_FLAG=' '
++if [ $3 -eq 0 ]
++then
++  CPU_FLAG='--cpu'
++fi
++THREADS=$4
++BF_MODE='dct'
++if [ $# -gt 4 ]
++then
++  BF_MODE=$5
++fi
++
++# Find path to shell script
++BASEPATH="$FREESURFER_HOME/python/packages/ERC_bayesian_segmentation/"
++
++# Try to find atlas data
++ATLAS_DIR="$BASEPATH/atlas_simplified"
++
++if [ ! -f "$ATLAS_DIR/size.npy" ];
++then
++  echo " "
++  echo "   Atlas files not found. Please download atlas from: "
++  echo "      https://ftp.nmr.mgh.harvard.edu/pub/dist/lcnpublic/dist/Histo_Atlas_Iglesias_2023/atlas_simplified.zip "
++  echo "   and uncompress it into:  "
++  echo "      $BASEPATH/ "
++  echo "   You only need to do this once. You can use the following three commands (may require root access): "
++  echo "      1: cd $BASEPATH"
++  echo "      2a (in Linux): wget https://ftp.nmr.mgh.harvard.edu/pub/dist/lcnpublic/dist/Histo_Atlas_Iglesias_2023/atlas_simplified.zip "
++  echo "      2b (in MAC): curl -o atlas.zip https://ftp.nmr.mgh.harvard.edu/pub/dist/lcnpublic/dist/Histo_Atlas_Iglesias_2023/atlas_simplified.zip "
++  echo "      3. unzip atlas_simplified.zip"
++  echo " "
++  echo "   After correct extraction, the directory: "
++  echo "      $ATLAS_DIR "
++  echo "   should contain files: size.npy, label_001.npz, label_002.npz, ..."
++  echo " "
++  exit 1
++fi
++
++# Create command line arguments and run!
++SYNTHSEG="$OUTPUT_DIR/SynthSeg.mgz"
++FIELD="$OUTPUT_DIR/atlas_registration.nii.gz"
++RESOLUTION="0.4"
++SKIP="3"
++
++echo "  "
++echo "******************************"
++echo "* Working on left hemisphere *"
++echo "******************************"
++echo "  "
++cmd="fspython $BASEPATH/scripts/segment_fireants.py --i $INPUT --i_seg $SYNTHSEG  --i_field $FIELD  --atlas_dir $ATLAS_DIR --o $OUTPUT_DIR --threads $THREADS --resolution $RESOLUTION --skip $SKIP  --save_atlas_nonlinear_reg --write_bias_corrected  $CPU_FLAG --side left"
++echo "Running command:"
++echo $cmd
++echo "  "
++$cmd
++
++echo "  "
++echo "*******************************"
++echo "* Working on right hemisphere *"
++echo "*******************************"
++echo "  "
++cmd="fspython $BASEPATH/scripts/segment_fireants.py --i $INPUT --i_seg $SYNTHSEG  --i_field $FIELD  --atlas_dir $ATLAS_DIR --o $OUTPUT_DIR --threads $THREADS --resolution $RESOLUTION --skip $SKIP  --save_atlas_nonlinear_reg --write_bias_corrected  $CPU_FLAG --side right"
++echo "Running command:"
++echo $cmd
++echo "  "
++$cmd
++
++echo "  "
++echo "*****************"
++echo "* All done!!!!! *"
++echo "*****************"
++echo "  "
++
++
++
++
++
++
++
++
++
+diff --git a/python/requirements.txt b/python/requirements.txt
+index 0ac01a3698e..646650ab7b0 100644
+--- a/python/requirements.txt
++++ b/python/requirements.txt
+@@ -26,4 +26,4 @@ Werkzeug
+ # capping urllib to avoid this conflict with OpenSSL:
+ # https://github.com/urllib3/urllib3/issues/2168
+ urllib3<=1.26.15
+-
++fireants@git+https://github.com/jnolan14/FireANTs.git@FS_integration

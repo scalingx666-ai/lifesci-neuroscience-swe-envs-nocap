@@ -1,0 +1,1139 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5900005..291c2f0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -559,6 +559,28 @@ directly with results from 2.x.
+ - Phase locking uses unit-normalized coefficients with the same batched
+   reduction. Phase-lag measures use bounded signal-row tiles and cache only
+   reduced moments.
++- The phase-lag-index family forms its observation-level tiles in reused
++  buffers. Without observation weights and with at least 64 averaged
++  observations per window (`PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS`), the first
++  phase-lag call reduces all four moments the family needs from one pass and
++  retains them (up to four `(n_time_windows, n_frequencies, n_signals,
++  n_signals)` arrays) until `clear_cache()`. In that regime, on a 2000-sample,
++  100-trial, 32-signal multitaper spectrum (500 observations; CPU,
++  `benchmarks/bench_default_measures.py`), the four phase-lag measures together
++  take 1.4 s instead of 3.9 s, the eleven default measures 3.5 s instead of
++  5.9 s, and a single phase-lag measure is 1.1-1.9x faster with a lower peak
++  (741 -> 536 MB of traced allocation). With fewer observations (e.g. a
++  time-resolved single-trial spectrum with 3 tapers) or with observation
++  weights, only the requested moments are computed, because there the extra
++  moments cost more than re-forming the tiles; on 1199 windows x 3 tapers x
++  32 signals a single phase-lag measure is 1.1-1.3x faster than before with an
++  unchanged peak, and a lone weighted measure on a Hann `MorletWavelet` with
++  `smoothing_time` about 1.2-1.4x faster. Outputs are unchanged: every
++  default measure is bit-identical except
++  `debiased_squared_weighted_phase_lag_index`, which differs only by
++  summation-order rounding in the squared moment (<= 1.4e-17 on the 250- and
++  500-observation benchmark cases; up to 2.5e-13 with three observations,
++  where the debiasing denominator is ill-conditioned).
+ - Compact subset spectral-Granger factors only the requested 2-by-2 spectra.
+ - Global coherence uses chunked batched eigendecomposition/SVD for modest
+   decomposition dimensions and retains a per-bin sparse fallback for large
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 207d1d6..ef7234b 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -72,6 +72,15 @@ uv run ruff check --fix src/ tests/
+ uv run mypy src/
+ ```
+ 
++### Benchmarking
++```bash
++# Time the default measures and save their outputs; re-run with --compare after
++# any connectivity.py change to cached intermediates (fails above 1e-12). Add
++# --cases a b c for the time-resolved few-observation case (several minutes)
++uv run python benchmarks/bench_default_measures.py --save baseline.npz
++uv run python benchmarks/bench_default_measures.py --compare baseline.npz
++```
++
+ ### Building and Release
+ ```bash
+ # Build sdist and wheel into dist/ (hatchling + hatch-vcs; hatch itself is not installed)
+diff --git a/README.md b/README.md
+index 11ab868..cce59c4 100644
+--- a/README.md
++++ b/README.md
+@@ -104,14 +104,14 @@ and the frequency resolution you need, use `suggest_parameters`:
+ from spectral_connectivity import suggest_parameters
+ 
+ params = suggest_parameters(
+-    sampling_frequency=1000,
++    sampling_frequency=sampling_frequency,
+     signal_duration=10.0,  # seconds
+     desired_freq_resolution=2.0,  # Hz
+ )
+ # -> time_halfbandwidth_product=3.0, time_window_duration=3.0, n_tapers=5, ...
+ coherence = multitaper_connectivity(
+     time_series,
+-    sampling_frequency=1000,
++    sampling_frequency=sampling_frequency,
+     method="coherence_magnitude",
+     time_halfbandwidth_product=params["time_halfbandwidth_product"],
+     time_window_duration=params["time_window_duration"],
+diff --git a/benchmarks/bench_default_measures.py b/benchmarks/bench_default_measures.py
+new file mode 100644
+index 0000000..c07fa0d
+--- /dev/null
++++ b/benchmarks/bench_default_measures.py
+@@ -0,0 +1,219 @@
++"""Time the default connectivity measures and check their outputs for parity.
++
++Three fixed cases (seed 0, 1000 Hz, white noise):
++
++- (a) ``n_time=5000, n_trials=50, n_signals=8, time_window_duration=0.5``
++- (b) ``n_time=2000, n_trials=100, n_signals=32, time_window_duration=None``
++- (c) time-resolved, few observations per window: ``n_time=60000, n_trials=1,
++  n_signals=32, time_window_duration=0.1, time_window_step=0.05,
++  time_halfbandwidth_product=2`` (1199 windows of 3 tapers). Run it with
++  ``--cases a b c``; ``pairwise_spectral_granger_prediction`` over 1199 windows
++  makes each repeat take several minutes.
++
++For each case this times the multitaper transform, then every measure in
++``DEFAULT_METHODS`` (``coherence_magnitude`` among them) on a fresh
++``Connectivity``, and the whole default set on one ``Connectivity`` (the way
++the wrapper computes it, sharing cached intermediates), and likewise the
++default phase-lag-index measures together. The measure timings
++start from the precomputed coefficients, so they exclude the transform. Each
++time is the fastest of ``--repeat`` runs, printed with the process's peak
++resident memory so far.
++
++Usage
++-----
++Capture a baseline before changing cached intermediates in ``connectivity.py``,
++then check the change against it::
++
++    uv run python benchmarks/bench_default_measures.py --save baseline.npz
++    uv run python benchmarks/bench_default_measures.py --compare baseline.npz
++
++``--save`` writes every default measure's array (from the default-set run) for
++the cases run to one ``.npz``. ``--compare`` prints the largest absolute
++difference per measure against that file and exits non-zero when any exceeds
++``1e-12`` or the NaN patterns differ.
++"""
++
++from __future__ import annotations
++
++import argparse
++import sys
++import time
++import warnings
++from collections.abc import Callable
++from typing import Any
++
++import numpy as np
++
++from spectral_connectivity import DEFAULT_METHODS, Connectivity, Multitaper
++
++try:
++    import resource
++except ImportError:  # Windows: no getrusage, so no peak-memory column
++    resource = None  # type: ignore[assignment]
++
++SAMPLING_FREQUENCY = 1000.0
++TOLERANCE = 1e-12
++PHASE_LAG_MEASURES = tuple(name for name in DEFAULT_METHODS if "phase_lag" in name)
++CASES: dict[str, dict[str, Any]] = {
++    "a": {"n_time": 5000, "n_trials": 50, "n_signals": 8, "time_window_duration": 0.5},
++    "b": {"n_time": 2000, "n_trials": 100, "n_signals": 32, "time_window_duration": None},
++    "c": {
++        "n_time": 60000,
++        "n_trials": 1,
++        "n_signals": 32,
++        "time_window_duration": 0.1,
++        "time_window_step": 0.05,
++        "time_halfbandwidth_product": 2,
++    },
++}
++# Case keys that set the simulated data's shape; the rest go to Multitaper.
++SHAPE_KEYS = ("n_time", "n_trials", "n_signals")
++
++
++def _peak_rss_mb() -> float:
++    """Peak resident memory of this process so far, in MB (NaN without ``resource``)."""
++    if resource is None:
++        return np.nan
++    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
++    # ru_maxrss is bytes on macOS and kilobytes on Linux.
++    return peak / 2**20 if sys.platform == "darwin" else peak / 2**10
++
++
++def _best_time(function: Callable[[], Any], repeat: int) -> tuple[float, Any]:
++    """Fastest wall time of ``repeat`` calls and the last call's result."""
++    best = np.inf
++    result = None
++    for _ in range(repeat):
++        start = time.perf_counter()
++        result = function()
++        best = min(best, time.perf_counter() - start)
++    return best, result
++
++
++def _connectivity(multitaper: Multitaper, coefficients: np.ndarray) -> Connectivity:
++    """A fresh ``Connectivity`` on precomputed coefficients (no FFT timed)."""
++    return Connectivity(coefficients, frequencies=multitaper.frequencies, time=multitaper.time)
++
++
++def _measure_set(
++    multitaper: Multitaper, coefficients: np.ndarray, measures: tuple[str, ...]
++) -> dict[str, np.ndarray]:
++    """Compute ``measures`` in turn on one ``Connectivity``, sharing its caches."""
++    connectivity = _connectivity(multitaper, coefficients)
++    return {name: getattr(connectivity, name)() for name in measures}
++
++
++def run_case(
++    name: str, parameters: dict[str, Any], repeat: int
++) -> tuple[list[tuple[str, float, float]], dict[str, np.ndarray]]:
++    """Time one case; return ``(label, seconds, peak MB)`` rows and its outputs."""
++    rng = np.random.default_rng(0)
++    time_series = rng.standard_normal(
++        (parameters["n_time"], parameters["n_trials"], parameters["n_signals"])
++    )
++    rows = []
++
++    multitaper = Multitaper(
++        time_series,
++        sampling_frequency=SAMPLING_FREQUENCY,
++        **{key: value for key, value in parameters.items() if key not in SHAPE_KEYS},
++    )
++    seconds, coefficients = _best_time(multitaper.fft, repeat)
++    rows.append(("Multitaper.fft", seconds, _peak_rss_mb()))
++
++    for measure in DEFAULT_METHODS:
++        seconds, _ = _best_time(
++            lambda measure=measure: getattr(
++                _connectivity(multitaper, coefficients), measure
++            )(),
++            repeat,
++        )
++        rows.append((measure, seconds, _peak_rss_mb()))
++
++    seconds, _ = _best_time(
++        lambda: _measure_set(multitaper, coefficients, PHASE_LAG_MEASURES), repeat
++    )
++    rows.append(
++        (f"phase-lag set ({len(PHASE_LAG_MEASURES)} measures)", seconds, _peak_rss_mb())
++    )
++    seconds, outputs = _best_time(
++        lambda: _measure_set(multitaper, coefficients, DEFAULT_METHODS), repeat
++    )
++    rows.append(("default set", seconds, _peak_rss_mb()))
++    print(f"\nCase ({name}): {parameters}, fourier_coefficients {coefficients.shape}")
++    memory_header = f" {'peak MB':>9}" if resource is not None else ""
++    print(f"{'measure':<45} {'seconds':>9}{memory_header}")
++    for label, row_seconds, peak in rows:
++        memory = f" {peak:>9.0f}" if resource is not None else ""
++        print(f"{label:<45} {row_seconds:>9.3f}{memory}")
++    return rows, outputs
++
++
++def max_abs_difference(actual: np.ndarray, expected: np.ndarray) -> float:
++    """Largest absolute difference; ``inf`` if shapes or NaN patterns differ."""
++    if actual.shape != expected.shape:
++        return np.inf
++    actual_nan, expected_nan = np.isnan(actual), np.isnan(expected)
++    if not np.array_equal(actual_nan, expected_nan):
++        return np.inf
++    finite = ~actual_nan
++    if not finite.any():
++        return 0.0
++    return float(np.max(np.abs(actual[finite] - expected[finite])))
++
++
++def _positive_int(text: str) -> int:
++    value = int(text)
++    if value < 1:
++        msg = f"must be at least 1, got {value}"
++        raise argparse.ArgumentTypeError(msg)
++    return value
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    group = parser.add_mutually_exclusive_group()
++    group.add_argument("--save", metavar="PATH", help="write the outputs to an .npz")
++    group.add_argument("--compare", metavar="PATH", help="compare with a saved .npz")
++    parser.add_argument(
++        "--repeat", type=_positive_int, default=3, help="runs per timing; the fastest is kept"
++    )
++    parser.add_argument(
++        "--cases",
++        nargs="+",
++        choices=sorted(CASES),
++        default=["a", "b"],
++        help="cases to run (default: a b; case c spends minutes in spectral Granger)",
++    )
++    args = parser.parse_args()
++
++    outputs = {}
++    with warnings.catch_warnings():
++        # Diagnostics (e.g. Wilson-factorization convergence) are not timed data.
++        warnings.simplefilter("ignore")
++        for name in args.cases:
++            _, case_outputs = run_case(name, CASES[name], args.repeat)
++            outputs.update({f"{name}/{m}": value for m, value in case_outputs.items()})
++
++    if args.save:
++        np.savez(args.save, **outputs)
++        print(f"\nSaved {len(outputs)} arrays to {args.save}")
++    if args.compare:
++        with np.load(args.compare) as baseline:
++            failed = False
++            print(f"\n{'case/measure':<50} {'max abs diff':>14}")
++            for key, value in outputs.items():
++                if key not in baseline.files:
++                    failed = True
++                    print(f"{key:<50} {'FAIL: missing':>14}")
++                    continue
++                difference = max_abs_difference(value, baseline[key])
++                failed |= not difference <= TOLERANCE
++                print(f"{key:<50} {difference:>14.3e}")
++        print(f"\n{'FAIL' if failed else 'PASS'}: tolerance {TOLERANCE:g}")
++        return int(failed)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/index.md b/docs/index.md
+index cd92552..bddae48 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -85,14 +85,14 @@ and the frequency resolution you need, use `suggest_parameters`:
+ from spectral_connectivity import suggest_parameters
+ 
+ params = suggest_parameters(
+-    sampling_frequency=1000,
++    sampling_frequency=sampling_frequency,
+     signal_duration=10.0,  # seconds
+     desired_freq_resolution=2.0,  # Hz
+ )
+ # -> time_halfbandwidth_product=3.0, time_window_duration=3.0, n_tapers=5, ...
+ coherence = multitaper_connectivity(
+     time_series,
+-    sampling_frequency=1000,
++    sampling_frequency=sampling_frequency,
+     method="coherence_magnitude",
+     time_halfbandwidth_product=params["time_halfbandwidth_product"],
+     time_window_duration=params["time_window_duration"],
+diff --git a/pyproject.toml b/pyproject.toml
+index 781b284..510d21b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -202,6 +202,7 @@ ignore = [
+ [tool.ruff.lint.per-file-ignores]
+ "__init__.py" = ["F401"]  # Allow unused imports in __init__.py
+ "tests/*" = ["ARG"]  # pytest fixtures are used by name, not by value
++"benchmarks/*" = ["T201"]  # benchmark scripts report to stdout
+ 
+ [tool.ruff.lint.pydocstyle]
+ convention = "numpy"
+diff --git a/src/spectral_connectivity/connectivity.py b/src/spectral_connectivity/connectivity.py
+index 5a64f2a..c7d4a33 100644
+--- a/src/spectral_connectivity/connectivity.py
++++ b/src/spectral_connectivity/connectivity.py
+@@ -85,11 +85,12 @@
+ }
+ 
+ # Per-observation functions of Im(S_ij) averaged by the phase-lag-index family;
+-# see Connectivity._imaginary_cross_spectrum_moments.
++# see Connectivity._imaginary_cross_spectrum_moments. They look ``xp`` up when
++# called, not at import, so a swapped backend (the device-emulation tests) applies.
+ _IMAGINARY_MOMENTS: dict[str, Callable[[BackendArray], BackendArray]] = {
+-    "sign": xp.sign,
++    "sign": lambda imaginary: xp.sign(imaginary),
+     "imaginary": lambda imaginary: imaginary,
+-    "absolute": xp.abs,
++    "absolute": lambda imaginary: xp.abs(imaginary),
+     "squared": lambda imaginary: imaginary**2,
+ }
+ # Im(X_j conj(X_i)) = -Im(X_i conj(X_j)), exactly in floating point too, so each
+@@ -159,9 +160,27 @@ def _validated_rank(rank: int | None) -> int | None:
+ 
+ 
+ # Peak workspace cap for the phase-lag-index family's observation-level signal
+-# tiles. The final reduced signal-by-signal result is unavoidable, but the large
+-# trial/taper/time-resolved outer product is never materialized in full.
++# tiles. The tile loop holds two float buffers of this many elements, plus, one
++# at a time, the three boolean comparison temporaries of the same count that
++# each tile's sign and NaN reductions make. The final reduced signal-by-signal
++# result is unavoidable, but the large trial/taper/time-resolved outer product
++# is never materialized in full.
+ PHASE_LAG_INDEX_MAX_WORKSPACE_ELEMENTS = 16_000_000
++# Fewest averaged observations (``Connectivity.n_observations``) at which, without
++# observation weights, the first phase-lag measure reduces all four moments from
++# one tile pass instead of only the requested ones. A tile holds n_observations
++# times as many values as each reduced moment, so with many observations the
++# tile formation dominates and two extra reductions are nearly free, while with
++# few (e.g. time-resolved single-trial spectra) writing and retaining two extra
++# window-resolved moments costs more than re-forming the tile for a later
++# measure. Measured on 32 signals, 100 FFT bins, CPU, with windows x
++# observations held near 3600: a lone phase_lag_index computing all four was
++# 1.49x (3 observations), 1.33x (8), 1.23x (16), 1.15x (32), 1.08x (64) and
++# 1.03-1.07x (128-500) the time of computing only its two, while the four
++# phase-lag measures together took 0.80x (3) to 0.42x (500) the time. 64 is
++# the smallest count at which a lone measure costs at most 10% more and is
++# also faster than before one-pass reduction (0.75-0.79 s vs 0.89 s).
++PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS = 64
+ # Element cap for the complex coefficients gathered per chunk of channel pairs
+ # by ``Connectivity._subset_cross_spectral_matrix``. The gather and its
+ # observation-major copy are each at most this size (32 MB at complex128), so
+@@ -3492,19 +3511,45 @@ def _imaginary_cross_spectrum_moments(
+         ``debiased_squared_weighted_phase_lag_index``) each average a function --
+         ``sign``, identity, ``abs`` or square -- of the imaginary part of the
+         per-observation cross-spectral matrix, with the diagonal zeroed. This
+-        returns the requested reduced moments, computing (and caching) any not
+-        already available from signal-row tiles of the observation-level
++        returns the requested reduced moments from a cache, computing any that
++        are missing from signal-row tiles of the observation-level
+         cross-spectrum. Only the non-negative bins are reduced, and each tile
+         covers targets from its first row on; the strict lower triangle is then
+         filled by pair symmetry (``_IMAGINARY_MOMENT_PAIR_SYMMETRY``).
+ 
+-        Computing only the requested keys keeps a single-measure call
+-        (e.g. ``phase_lag_index`` needs only ``"sign"``) from doing the other
+-        measures' reductions or retaining their moments. Each tile is reduced
+-        immediately, avoiding an observation-resolved ``n_signals**2``
+-        intermediate. The reduced ``n_signals**2`` outputs are unavoidable. The
+-        cached moments are invalidated with the other cached intermediates and
+-        are treated as read-only (callers copy before any in-place edit).
++        Which moments a call computes depends on the regime. Without
++        observation weights and with at least
++        ``PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS`` averaged observations,
++        forming the tiles (memory traffic over every observation) dominates the
++        cost and each reduction is a single further pass over a tile, so the
++        first request reduces all four moments from one formation; that costs
++        less than forming the tiles again for a later measure that needs
++        different moments. The four reduced moments (each ``(n_time_windows,
++        n_frequencies, n_signals, n_signals)`` for the default expectation) are
++        then retained until :meth:`clear_cache`. In this regime a single
++        measure is also faster and has a lower peak than before (741 -> 536 MB
++        of traced allocation for one measure on a 100-trial, 5-taper,
++        1001-bin, 32-signal spectrum), because the tiles reuse two buffers
++        instead of fresh temporaries.
++
++        Otherwise only the missing requested moments are computed. With few
++        observations (e.g. a time-resolved single-trial spectrum with 3
++        tapers) each window-resolved moment is nearly as large as the tile, so
++        writing and retaining two extra ones cost more than re-forming the
++        tiles later (a lone ``phase_lag_index`` on 1199 windows x 3 tapers x
++        100 bins x 32 signals took 1.49x as long and 1.5x the peak memory).
++        With observation weights each moment is a full weighted
++        :meth:`_expectation` with tile-sized temporaries; computing all four
++        made a lone weighted measure 7-14% (``phase_lag_index``) and 33-54%
++        (``weighted_phase_lag_index``) slower on a Hann-weighted Morlet
++        transform (4000 samples, 40 trials, 16 signals, 30 frequencies).
++
++        Each tile is reduced immediately (see :meth:`_reduce_phase_lag_tile`)
++        into two workspace buffers allocated once per call, avoiding an
++        observation-resolved ``n_signals**2`` intermediate. The reduced
++        ``n_signals**2`` outputs are unavoidable. The cached moments are
++        invalidated with the other cached intermediates and are treated as
++        read-only (callers copy before any in-place edit).
+ 
+         Parameters
+         ----------
+@@ -3520,8 +3565,7 @@ def _imaginary_cross_spectrum_moments(
+         """
+         self._validate_multiple_signals()
+         cache = self._imaginary_moment_cache
+-        missing = [key for key in keys if key not in cache]
+-        if missing:
++        if any(key not in cache for key in keys):
+             coefficients = self._nonnegative_fourier_coefficients()
+             n_signals = coefficients.shape[-1]
+             kept_observation_axes = [
+@@ -3534,9 +3578,22 @@ def _imaginary_cross_spectrum_moments(
+                 n_signals,
+             )
+             real_dtype = coefficients.real.dtype
++            # Without weights and with many observations all four moments are
++            # cheap single-pass reductions of the tile, so they are computed
++            # together (see PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS). Otherwise
++            # only the missing requested ones are: with weights each is a full
++            # ``_expectation`` with tile-sized temporaries, and with few
++            # observations the reduced moments are nearly as large as the tile.
+             # Filled here and cached only once complete, so an error partway
+             # through leaves no uninitialized moments behind.
+-            moments = {key: xp.empty(result_shape, dtype=real_dtype) for key in missing}
++            if (
++                self._observation_weights is None
++                and self.n_observations >= PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS
++            ):
++                computed_keys = list(_IMAGINARY_MOMENTS)
++            else:
++                computed_keys = list(dict.fromkeys(key for key in keys if key not in cache))
++            moments = {key: xp.empty(result_shape, dtype=real_dtype) for key in computed_keys}
+ 
+             observation_frequency_elements = int(np.prod(coefficients.shape[:-1]))
+             elements_per_source = max(1, observation_frequency_elements * n_signals)
+@@ -3559,18 +3616,46 @@ def _imaginary_cross_spectrum_moments(
+             # makes the tiles' broadcast products stride badly through memory.
+             real = xp.ascontiguousarray(coefficients.real)
+             imag = xp.ascontiguousarray(coefficients.imag)
++            # Each tile is a contiguous view of the leading part of these flat
++            # buffers, so later (narrower) tiles reuse the first tile's memory.
++            workspace_size = observation_frequency_elements * signals_per_block * n_signals
++            tile_buffer = xp.empty(workspace_size, dtype=real_dtype)
++            scratch_buffer = xp.empty(workspace_size, dtype=real_dtype)
++            observation_frequency_shape = coefficients.shape[:-1]
++            block_diagonal = xp.arange(signals_per_block)
++            # Contracts a tile's observation axes in the squared moment, e.g.
++            # "abcdef,abcdef->adef" (time, trial, taper, frequency, row, column).
++            letters = "abcdef"
++            kept = "".join(
++                letter
++                for axis, letter in enumerate(letters)
++                if axis not in self._expectation_axes
++            )
++            squared_subscripts = f"{letters},{letters}->{kept}"
+             for start in range(0, n_signals, signals_per_block):
+                 stop = min(n_signals, start + signals_per_block)
+-                imaginary = (
+-                    imag[..., start:stop, xp.newaxis] * real[..., xp.newaxis, start:]
+-                    - real[..., start:stop, xp.newaxis] * imag[..., xp.newaxis, start:]
++                tile_shape = (*observation_frequency_shape, stop - start, n_signals - start)
++                tile_size = (
++                    observation_frequency_elements * (stop - start) * (n_signals - start)
+                 )
+-                local_diagonal = xp.arange(stop - start)
++                imaginary = tile_buffer[:tile_size].reshape(tile_shape)
++                scratch = scratch_buffer[:tile_size].reshape(tile_shape)
++                xp.multiply(
++                    imag[..., start:stop, xp.newaxis],
++                    real[..., xp.newaxis, start:],
++                    out=imaginary,
++                )
++                xp.multiply(
++                    real[..., start:stop, xp.newaxis],
++                    imag[..., xp.newaxis, start:],
++                    out=scratch,
++                )
++                xp.subtract(imaginary, scratch, out=imaginary)
++                local_diagonal = block_diagonal[: stop - start]
+                 imaginary[..., local_diagonal, local_diagonal] = 0
+-
+-                for key, reduced in moments.items():
+-                    moment = _IMAGINARY_MOMENTS[key](imaginary)
+-                    reduced[..., start:stop, start:] = self._expectation(moment)
++                self._reduce_phase_lag_tile(
++                    imaginary, scratch, moments, start, stop, squared_subscripts
++                )
+ 
+             # Overwrite the strict lower triangle from the upper one: the pairs
+             # each tile skipped and the in-tile lower entries alike.
+@@ -3582,6 +3667,74 @@ def _imaginary_cross_spectrum_moments(
+             cache.update(moments)
+         return tuple(cache[key] for key in keys)
+ 
++    def _reduce_phase_lag_tile(
++        self,
++        imaginary: BackendArray,
++        scratch: BackendArray,
++        moments: dict[str, BackendArray],
++        start: int,
++        stop: int,
++        squared_subscripts: str,
++    ) -> None:
++        """Average the four phase-lag moments of one tile into ``moments``.
++
++        Parameters
++        ----------
++        imaginary : array, shape (n_time_windows, n_trials, n_tapers, n_nonnegative_frequencies, stop - start, n_signals - start)
++            ``Im(X_i conj(X_j))`` per observation for source rows
++            ``start:stop`` and targets ``start:``, with the diagonal zeroed.
++        scratch : array, same shape as ``imaginary``
++            Workspace; overwritten.
++        moments : dict of str to array, each shape (..., n_nonnegative_frequencies, n_signals, n_signals)
++            Reduced moments to fill, keyed as ``_IMAGINARY_MOMENTS``: all four
++            or the requested subset (see :meth:`_imaginary_cross_spectrum_moments`).
++            The block
++            ``[..., start:stop, start:]`` of each is written.
++        start, stop : int
++            The tile's source rows.
++        squared_subscripts : str
++            ``einsum`` subscripts contracting ``imaginary * imaginary`` over the
++            averaged observation axes (used without observation weights).
++
++        Notes
++        -----
++        Without observation weights every moment is a plain mean, reduced in a
++        single pass over the tile. The sign moment is counted from boolean
++        comparisons, which are False for NaN, so bins with any NaN observation
++        are set to NaN explicitly, as the mean of ``sign`` would give. The
++        ``imaginary`` moment is the mean of the same per-observation values as
++        ``absolute`` rather than the imaginary part of the (differently
++        rounded) cross-spectral matrix, so their ratio in
++        ``weighted_phase_lag_index`` is exactly 1 in magnitude at a constant
++        lag above the no-lag guard (:meth:`_has_no_phase_lag`, below which it
++        is defined as 0). With observation weights each moment goes through
++        :meth:`_expectation`, which needs the per-observation values.
++        """
++        block = (..., slice(start, stop), slice(start, None))
++        if self._observation_weights is not None:
++            for key, reduced in moments.items():
++                reduced[block] = self._expectation(_IMAGINARY_MOMENTS[key](imaginary))
++            return
++
++        observation_axes = self._expectation_axes
++        n_observations = self.n_observations
++        if "sign" in moments:
++            positive = xp.count_nonzero(imaginary > 0, axis=observation_axes)
++            negative = xp.count_nonzero(imaginary < 0, axis=observation_axes)
++            invalid = xp.any(xp.isnan(imaginary), axis=observation_axes)
++            moments["sign"][block] = xp.where(
++                invalid, xp.nan, (positive - negative) / n_observations
++            )
++        if "imaginary" in moments:
++            moments["imaginary"][block] = xp.mean(imaginary, axis=observation_axes)
++        if "squared" in moments:
++            # Sum of squares without materializing imaginary * imaginary.
++            squared_sum = xp.einsum(squared_subscripts, imaginary, imaginary)
++            moments["squared"][block] = squared_sum / n_observations
++        if "absolute" in moments:
++            xp.abs(imaginary, out=scratch)
++            moments["absolute"][block] = xp.mean(scratch, axis=observation_axes)
++
+     @_asnumpy
+     def phase_lag_index(self) -> NDArray[np.floating]:
+         """Return non-parametric synchrony measure mitigating power differences.
+diff --git a/tests/test_connectivity.py b/tests/test_connectivity.py
+index 42462cf..c243ed9 100644
+--- a/tests/test_connectivity.py
++++ b/tests/test_connectivity.py
+@@ -12,6 +12,8 @@
+     _sanitized_nonnegative_granger,
+ )
+ from spectral_connectivity.connectivity import (
++    EXPECTATION_AXES,
++    PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS,
+     Connectivity,
+     DirectedOrientationWarning,
+     _bandpass,
+@@ -21,7 +23,7 @@
+     _total_outflow,
+ )
+ from spectral_connectivity.simulate import simulate_MVAR, simulate_shared_oscillation
+-from spectral_connectivity.transforms import Multitaper
++from spectral_connectivity.transforms import MorletWavelet, Multitaper
+ from tests._var_oracle import (
+     _STRONG_CHAIN_COEFFICIENTS,
+     _analytic_var,
+@@ -1756,7 +1758,7 @@ def test_coherency_zero_power_returns_nan():
+     assert np.all(np.isnan(imag_coh[..., 1, 0]))
+ 
+ 
+-@pytest.mark.parametrize("expectation_type", ["trials_tapers", "tapers"])
++@pytest.mark.parametrize("expectation_type", sorted(EXPECTATION_AXES))
+ def test_phase_lag_index_family_matches_per_fcn_reference(expectation_type):
+     """The tiled phase-lag-index family matches the per-fcn reference path.
+ 
+@@ -1822,67 +1824,368 @@ def non_negative(a):  # the non-negative bins (DC through Nyquist) reported
+     np.testing.assert_array_equal(warm.debiased_squared_weighted_phase_lag_index(), cold_dwpli)
+ 
+ 
+-def test_phase_lag_index_moments_are_computed_lazily():
+-    """A single-measure call computes only the moments that measure needs.
++PHASE_LAG_MOMENTS = ("sign", "imaginary", "absolute", "squared")
+ 
+-    The reduced imaginary-cross-spectrum moments are computed per key on demand,
+-    so a lone ``phase_lag_index`` does not also compute (or retain) the other
+-    measures' moments, while the family shares the ones already computed.
++
++def _many_observation_coefficients(rng, n_signals=4):
++    """Coefficients with exactly ``PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS``
++    averaged observations (trials x 4 tapers), shape (1, n_trials, 4, 16, n_signals).
+     """
+-    rng = np.random.default_rng(1)
+-    shape = (2, 6, 4, 16, 4)
+-    fc = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex128)
++    n_trials = -(-PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS // 4)
++    shape = (1, n_trials, 4, 16, n_signals)
++    return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+ 
+-    pli_only = Connectivity(fc)
+-    pli_only.phase_lag_index()
+-    # "absolute" is the zero-lag test's scale.
+-    assert set(pli_only.__dict__["_imaginary_moment_cache"]) == {"sign", "absolute"}
+ 
+-    wpli_only = Connectivity(fc)
+-    wpli_only.weighted_phase_lag_index()
+-    assert set(wpli_only.__dict__["_imaginary_moment_cache"]) == {
+-        "imaginary",
+-        "absolute",
+-    }
++@pytest.mark.parametrize(
++    ("many_observations", "expected_keys"),
++    [(False, {"sign", "absolute"}), (True, set(PHASE_LAG_MOMENTS))],
++)
++def test_lone_phase_lag_index_computes_all_moments_only_with_many_observations(
++    many_observations, expected_keys
++):
++    """Reducing the two moments a later measure might need pays off only when
++    each tile holds many observations per reduced value. With few (a
++    time-resolved single-trial spectrum), a lone PLI computes only its own."""
++    rng = np.random.default_rng(2)
++    if many_observations:
++        fc = _many_observation_coefficients(rng)
++    else:
++        shape = (8, 1, 3, 16, 4)  # 3 observations in each of 8 windows
++        fc = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
++    conn = Connectivity(fc)
++    assert (conn.n_observations >= PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS) == many_observations
+ 
+-    # The family accumulates all four moments across measures.
+-    family = Connectivity(fc)
+-    family.phase_lag_index()
+-    family.weighted_phase_lag_index()
+-    family.debiased_squared_weighted_phase_lag_index()
+-    assert set(family.__dict__["_imaginary_moment_cache"]) == {
+-        "sign",
+-        "imaginary",
+-        "absolute",
+-        "squared",
+-    }
++    pli = conn.phase_lag_index()
++    assert set(conn._imaginary_moment_cache) == expected_keys
++    np.testing.assert_array_equal(pli, Connectivity(fc).phase_lag_index())
++
++
++@pytest.mark.parametrize("offset", [-1, 0], ids=["just_below", "at"])
++def test_phase_lag_moment_regime_switches_at_the_threshold(offset):
++    """A lone PLI reduces all four moments from exactly
++    ``PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS`` observations, not one fewer."""
++    n_observations = PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS + offset
++    shape = (1, n_observations, 1, 16, 3)
++    rng = np.random.default_rng(4)
++    conn = Connectivity(rng.standard_normal(shape) + 1j * rng.standard_normal(shape))
++    assert conn.n_observations == n_observations
++
++    conn.phase_lag_index()
++    expected = set(PHASE_LAG_MOMENTS) if offset == 0 else {"sign", "absolute"}
++    assert set(conn._imaginary_moment_cache) == expected
++
++
++def test_reassigning_observation_weights_recomputes_phase_lag_moments():
++    """Weights assigned after a measure has run replace the unweighted moments
++    it cached (all four, with this many observations)."""
++    rng = np.random.default_rng(6)
++    fc = _many_observation_coefficients(rng)
++    weights = rng.uniform(0.2, 1.8, size=(*fc.shape[:-1], 1))
++    conn = Connectivity(fc)
++    unweighted = conn.weighted_phase_lag_index()
++    assert set(conn._imaginary_moment_cache) == set(PHASE_LAG_MOMENTS)
++
++    conn.observation_weights = weights
++    reweighted = conn.weighted_phase_lag_index()
++    expected = Connectivity(fc, observation_weights=weights).weighted_phase_lag_index()
++    assert not np.allclose(unweighted, expected, equal_nan=True)  # premise
++    np.testing.assert_array_equal(reweighted, expected)
++
++
++@pytest.mark.parametrize("first_measure", PHASE_LAG_MEASURES)
++def test_phase_lag_moments_are_computed_together_once(first_measure):
++    """With many observations, any one phase-lag measure caches all four
++    moments from one pass over the tiles, so every later measure of the family
++    reads them without re-forming a tile."""
++    conn = Connectivity(_many_observation_coefficients(np.random.default_rng(1)))
++
++    with patch.object(
++        conn, "_reduce_phase_lag_tile", wraps=conn._reduce_phase_lag_tile
++    ) as reduce_tile:
++        getattr(conn, first_measure)()
++        assert reduce_tile.call_count == 1  # 4 signals fit in one tile
++        cached = dict(conn.__dict__["_imaginary_moment_cache"])
++        assert set(cached) == {"sign", "imaginary", "absolute", "squared"}
++
++        for measure in PHASE_LAG_MEASURES:
++            getattr(conn, measure)()
++        assert reduce_tile.call_count == 1
++    # The cached arrays themselves are reused, not recomputed and replaced.
++    for key, moment in conn.__dict__["_imaginary_moment_cache"].items():
++        assert moment is cached[key]
++
++
++def _cap_phase_lag_workspace(monkeypatch, shape, sources_per_tile):
++    """Size the phase-lag tile workspace for ``sources_per_tile`` source signals.
++
++    A tile holds the non-negative bins of every observation for each
++    source-target pair, so one source row of two-sided coefficients of
++    ``shape`` (time, trial, taper, fft bin, signal) takes
++    ``n_time * n_trials * n_tapers * n_nonnegative * n_signals`` elements.
++    """
++    import spectral_connectivity.connectivity as connectivity_module
+ 
+-    # A repeated measure reuses the cached moment object (it is not recomputed).
+-    reuse = Connectivity(fc)
+-    reuse.phase_lag_index()
+-    cached_sign = reuse.__dict__["_imaginary_moment_cache"]["sign"]
+-    reuse.phase_lag_index()
+-    assert reuse.__dict__["_imaginary_moment_cache"]["sign"] is cached_sign
++    n_nonnegative = shape[3] // 2 + 1
++    elements_per_source = int(np.prod(shape[:3])) * n_nonnegative * shape[-1]
++    monkeypatch.setattr(
++        connectivity_module,
++        "PHASE_LAG_INDEX_MAX_WORKSPACE_ELEMENTS",
++        sources_per_tile * elements_per_source,
++    )
+ 
+ 
+-def test_failed_phase_lag_reduction_caches_nothing():
+-    """An error partway through the moment reduction must not leave partially
+-    filled moments in the cache for a later measure to return."""
++def test_failed_phase_lag_reduction_caches_nothing(monkeypatch):
++    """An error partway through the tile loop must not leave partially filled
++    moments in the cache for a later measure to return."""
+     rng = np.random.default_rng(3)
+     shape = (1, 4, 3, 8, 3)
+     fc = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+     expected = Connectivity(fc).debiased_squared_phase_lag_index()
+ 
++    # One source signal per tile, and the second tile fails after the first
++    # has been written.
++    _cap_phase_lag_workspace(monkeypatch, shape, sources_per_tile=1)
+     conn = Connectivity(fc)
++    reduce_tile = conn._reduce_phase_lag_tile
++    calls = []
++
++    def fail_on_second_tile(*args):
++        calls.append(args[3])
++        if len(calls) == 2:
++            raise MemoryError
++        return reduce_tile(*args)
++
+     with (
+-        patch.object(conn, "_expectation", side_effect=MemoryError),
++        patch.object(conn, "_reduce_phase_lag_tile", side_effect=fail_on_second_tile),
+         pytest.raises(MemoryError),
+     ):
+         conn.phase_lag_index()
++    assert calls == [0, 1]
+     assert not conn.__dict__["_imaginary_moment_cache"]
+     np.testing.assert_array_equal(conn.debiased_squared_phase_lag_index(), expected)
+ 
+ 
++@pytest.fixture
++def hann_morlet_coefficients():
++    """Morlet coefficients and their non-uniform (Hann) observation weights.
++
++    Returns
++    -------
++    coefficients : ndarray, shape (30, 4, 20, 2, 3)
++        One-sided (time, trial, smoothing sample, frequency, signal): 80
++        observations, enough that without weights a lone measure would reduce
++        all four phase-lag moments.
++    weights : ndarray, shape (30, 4, 20, 2, 1)
++    """
++    rng = np.random.default_rng(11)
++    wavelet = MorletWavelet(
++        rng.standard_normal((600, 4, 3)),
++        200.0,
++        [10.0, 20.0],
++        smoothing_time=0.1,
++        smoothing_kernel="hann",
++    )
++    coefficients = wavelet.fft()
++    weights = np.asarray(wavelet.observation_weights)
++    assert np.ptp(weights) > 0  # the weighted path, not a uniform shortcut
++    return coefficients, weights
++
++
++def test_weighted_phase_lag_moments_are_computed_per_request(hann_morlet_coefficients):
++    """With observation weights each moment is a full weighted expectation, so a
++    lone measure computes only the moments it needs, and a later measure adds
++    only its missing ones."""
++    coefficients, weights = hann_morlet_coefficients
++    conn = Connectivity(coefficients, observation_weights=weights, is_one_sided=True)
++    # Only the weights keep this on the per-request path.
++    assert conn.n_observations >= PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS
++    cache = conn._imaginary_moment_cache
++
++    conn.phase_lag_index()
++    assert set(cache) == {"sign", "absolute"}  # "absolute" scales the no-lag test
++    cached_absolute = cache["absolute"]
++
++    conn.weighted_phase_lag_index()
++    assert set(cache) == {"sign", "imaginary", "absolute"}
++    assert cache["absolute"] is cached_absolute  # not recomputed
++
++
++@pytest.mark.parametrize("weighted", [False, True])
++def test_weighted_phase_lag_index_is_exactly_one_at_a_tiny_constant_lag(
++    weighted, hann_morlet_coefficients
++):
++    """At a constant 1e-13 rad lag every observation's Im(X_0 conj X_1) is a
++    tiny positive difference of large products. E[Im] and E[|Im|] average the
++    same per-observation values, so wPLI is exactly 1, not a ratio of two
++    differently rounded estimates."""
++    if weighted:
++        coefficients, weights = hann_morlet_coefficients
++        signal = coefficients[..., 0]
++    else:
++        rng = np.random.default_rng(12)
++        shape = (1, 50, 5, 8)
++        signal = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
++        weights = None
++    lagged = np.stack([signal, signal * np.exp(-1j * 1e-13)], axis=-1)
++    conn = Connectivity(lagged, observation_weights=weights, is_one_sided=weighted)
++
++    np.testing.assert_array_equal(conn.weighted_phase_lag_index()[..., 0, 1], 1.0)
++    np.testing.assert_array_equal(conn.phase_lag_index()[..., 0, 1], 1.0)
++
++
++def test_phase_lag_moments_match_definition_under_observation_weights(
++    hann_morlet_coefficients,
++):
++    """With observation weights, each moment is the weighted mean over trials
++    and smoothing samples of a function of Im(X_i conj X_j), diagonal zeroed."""
++    coefficients, weights = hann_morlet_coefficients
++    conn = Connectivity(coefficients, observation_weights=weights, is_one_sided=True)
++
++    real, imag = coefficients.real, coefficients.imag
++    imaginary = (
++        imag[..., :, np.newaxis] * real[..., np.newaxis, :]
++        - real[..., :, np.newaxis] * imag[..., np.newaxis, :]
++    )
++    diagonal = np.arange(coefficients.shape[-1])
++    imaginary[..., diagonal, diagonal] = 0
++    pair_weights = weights[..., np.newaxis]  # (time, trial, sample, frequency, 1, 1)
++
++    def weighted_mean(values):
++        return np.sum(pair_weights * values, axis=(1, 2)) / np.sum(pair_weights, axis=(1, 2))
++
++    definitions = {
++        "sign": np.sign,
++        "imaginary": lambda values: values,
++        "absolute": np.abs,
++        "squared": np.square,
++    }
++    moments = conn._imaginary_cross_spectrum_moments(*definitions)
++    for (key, function), moment in zip(definitions.items(), moments, strict=True):
++        np.testing.assert_allclose(
++            moment, weighted_mean(function(imaginary)), rtol=1e-12, atol=1e-12, err_msg=key
++        )
++
++
++def _connectivity_with_one_nan_observation():
++    """Coefficients with one NaN observation at non-negative bin 5, and the
++    (time, non-negative frequency) bins it invalidates."""
++    rng = np.random.default_rng(5)
++    shape = (1, 8, 3, 16, 2)
++    coefficients = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
++    coefficients[0, 3, 1, 5, 0] = np.nan
++    with pytest.warns(UserWarning, match="NaN or Inf"):
++        conn = Connectivity(coefficients)
++    invalid = np.zeros((1, 9), dtype=bool)
++    invalid[0, 5] = True
++    return conn, invalid
++
++
++def _morlet_connectivity_with_nan_edges():
++    """Morlet ``edge_mode="nan"`` marks its edge bins invalid through zero
++    observation weights; returns those (time, frequency) bins."""
++    rng = np.random.default_rng(6)
++    wavelet = MorletWavelet(
++        rng.standard_normal((600, 4, 2)), 200.0, [10.0, 20.0], edge_mode="nan"
++    )
++    conn = Connectivity.from_transform(wavelet)
++    return conn, ~np.asarray(wavelet.valid_time_frequency)
++
++
++@pytest.mark.parametrize(
++    "make_connectivity",
++    [_connectivity_with_one_nan_observation, _morlet_connectivity_with_nan_edges],
++)
++def test_phase_lag_moments_propagate_nan_observations(make_connectivity):
++    """A bin with a missing observation is NaN in every phase-lag measure, as
++    the mean of sign(Im) is; the sign moment's positive/negative counts alone
++    would treat the NaN as a zero-sign observation."""
++    conn, invalid = make_connectivity()
++    assert invalid.any()
++    assert (~invalid).any()
++    for measure in PHASE_LAG_MEASURES:
++        # Pre-existing: the weighted measures' _divide_where meets NaN / NaN
++        # moments and NumPy may emit "invalid value encountered in divide".
++        quiet_nan_division = (
++            np.errstate(invalid="ignore") if "weighted" in measure else nullcontext()
++        )
++        with quiet_nan_division:
++            value = getattr(conn, measure)()
++        for pair in [(0, 1), (1, 0)]:
++            pair_value = value[..., pair[0], pair[1]]
++            assert np.isnan(pair_value[invalid]).all(), measure
++            assert np.isfinite(pair_value[~invalid]).all(), measure
++
++
++def test_phase_lag_index_away_from_a_nan_observation_is_the_mean_sign():
++    """The bins without the NaN observation keep the plain mean of sign(Im)."""
++    conn, invalid = _connectivity_with_one_nan_observation()
++    coefficients = conn.fourier_coefficients[..., :9, :]
++    real, imag = coefficients.real, coefficients.imag
++    imaginary = imag[..., 0] * real[..., 1] - real[..., 0] * imag[..., 1]
++    expected = np.mean(np.sign(imaginary), axis=(1, 2))
++    np.testing.assert_array_equal(
++        conn.phase_lag_index()[..., 0, 1][~invalid], expected[~invalid]
++    )
++
++
++@pytest.mark.parametrize("n_trials", [4, 20], ids=["few_observations", "many_observations"])
++def test_phase_lag_index_counts_a_real_cross_spectrum_as_zero_sign(n_trials):
++    """An observation whose cross-spectrum is real (a flat trial on one
++    channel) has sign(Im) = 0 and adds nothing to the mean sign, in both
++    moment regimes."""
++    rng = np.random.default_rng(5)
++    shape = (1, n_trials, 4, 16, 3)
++    fc = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
++    fc[0, 1, :, :, 0] = 0
++    conn = Connectivity(fc)
++    assert (conn.n_observations >= PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS) == (n_trials == 20)
++
++    coefficients = fc[..., :9, :]
++    real, imag = coefficients.real, coefficients.imag
++    imaginary = imag[..., 0] * real[..., 1] - real[..., 0] * imag[..., 1]
++    expected = np.mean(np.sign(imaginary), axis=(1, 2))
++    np.testing.assert_array_equal(conn.phase_lag_index()[..., 0, 1], expected)
++
++
++def test_phase_lag_family_single_measure_matches_batch():
++    """PLI alone equals PLI after the rest of the family filled the cache."""
++    rng = np.random.default_rng(13)
++    shape = (2, 6, 4, 16, 4)
++    fc = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
++
++    batch = Connectivity(fc)
++    batch.weighted_phase_lag_index()
++    batch.debiased_squared_phase_lag_index()
++    batch.debiased_squared_weighted_phase_lag_index()
++    np.testing.assert_array_equal(batch.phase_lag_index(), Connectivity(fc).phase_lag_index())
++
++
++@pytest.mark.parametrize("weighted", [False, True])
++def test_phase_lag_moments_partial_last_block(monkeypatch, weighted):
++    """Five signals in tiles of two source rows (2, 2, then a partial 1) give
++    the same moments as one tile, with and without observation weights."""
++    rng = np.random.default_rng(14)
++    shape = (2, 4, 3, 12, 5)
++    fc = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
++    weights = rng.uniform(0.5, 1.5, (*shape[:-1], 1)) if weighted else None
++    single_block = Connectivity(fc, observation_weights=weights)
++    expected = single_block._imaginary_cross_spectrum_moments(*PHASE_LAG_MOMENTS)
++
++    _cap_phase_lag_workspace(monkeypatch, shape, sources_per_tile=2)
++    tiled = Connectivity(fc, observation_weights=weights)
++    with patch.object(
++        tiled, "_reduce_phase_lag_tile", wraps=tiled._reduce_phase_lag_tile
++    ) as reduce_tile:
++        actual = tiled._imaginary_cross_spectrum_moments(*PHASE_LAG_MOMENTS)
++    source_rows = [(call.args[3], call.args[4]) for call in reduce_tile.call_args_list]
++    assert source_rows == [(0, 2), (2, 4), (4, 5)]
++
++    for key, actual_moment, expected_moment in zip(
++        PHASE_LAG_MOMENTS, actual, expected, strict=True
++    ):
++        np.testing.assert_array_equal(actual_moment, expected_moment, err_msg=key)
++
++
+ @pytest.mark.parametrize("sources_per_tile", [1, 2])
+ def test_phase_lag_family_uses_tiled_workspace_not_full_outer_product(
+     monkeypatch, sources_per_tile
+@@ -1890,25 +2193,15 @@ def test_phase_lag_family_uses_tiled_workspace_not_full_outer_product(
+     """Every PLI variant works when the full observation CSM is unavailable,
+     and several tiles (including a narrower last one) mirror into the same
+     result as a single tile."""
+-    import spectral_connectivity.connectivity as connectivity_module
+-
+     rng = np.random.default_rng(19)
+     shape = (2, 5, 3, 12, 5)
+     coefficients = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+     expected_conn = Connectivity(coefficients)
+     expected = tuple(getattr(expected_conn, measure)() for measure in PHASE_LAG_MEASURES)
+ 
+-    # Size the workspace for ``sources_per_tile`` source signals per tile (it
+-    # holds the non-negative bins of every observation for each source-target
+-    # pair), then make any accidental access to the full observation-level outer
+-    # product fail loudly.
+-    n_nonnegative = shape[3] // 2 + 1
+-    elements_per_source = int(np.prod(shape[:3])) * n_nonnegative * shape[-1]
+-    monkeypatch.setattr(
+-        connectivity_module,
+-        "PHASE_LAG_INDEX_MAX_WORKSPACE_ELEMENTS",
+-        sources_per_tile * elements_per_source,
+-    )
++    # Tile ``sources_per_tile`` source signals at a time, then make any
++    # accidental access to the full observation-level outer product fail loudly.
++    _cap_phase_lag_workspace(monkeypatch, shape, sources_per_tile)
+     tiled = Connectivity(coefficients)
+     with patch.object(
+         Connectivity,
+diff --git a/tests/test_emulated_device_backend.py b/tests/test_emulated_device_backend.py
+index 526531c..dac3549 100644
+--- a/tests/test_emulated_device_backend.py
++++ b/tests/test_emulated_device_backend.py
+@@ -21,12 +21,14 @@
+ 
+ import operator
+ import types
++from unittest.mock import patch
+ 
+ import numpy as np
+ import pytest
+ import scipy.fft
+ 
+ from spectral_connectivity import Connectivity, _backend, minimum_phase_decomposition
++from spectral_connectivity.connectivity import PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS
+ 
+ _CONVERSION_MESSAGE = (
+     "Implicit conversion to a NumPy array is not allowed. "
+@@ -384,3 +386,50 @@ def test_multitaper_transform_runs_on_the_device(xp):
+     coherence = Connectivity.from_multitaper(multitaper).coherence_magnitude()
+     assert isinstance(coherence, np.ndarray)  # public results come back to the host
+     assert np.isfinite(coherence[..., 0, 1]).all()
++
++
++def test_phase_lag_family_runs_on_the_device(xp, monkeypatch):
++    """The phase-lag tile loop (ufunc ``out=``, ``count_nonzero`` over an axis
++    tuple, ``einsum``) runs on device arrays and matches the host result."""
++    measures = (
++        "phase_lag_index",
++        "weighted_phase_lag_index",
++        "directed_phase_lag_index",
++        "debiased_squared_phase_lag_index",
++        "debiased_squared_weighted_phase_lag_index",
++    )
++    # Enough observations that the first measure reduces all four moments.
++    coefficients = _coefficients(
++        np.random.default_rng(9), shape=(1, PHASE_LAG_ALL_MOMENTS_MIN_OBSERVATIONS, 1, 16, 3)
++    )
++    device = Connectivity(xp.asarray(coefficients))
++    with patch.object(
++        device, "_reduce_phase_lag_tile", wraps=device._reduce_phase_lag_tile
++    ) as reduce_tile:
++        on_device = {measure: getattr(device, measure)() for measure in measures}
++    assert reduce_tile.call_count == 1
++    assert isinstance(reduce_tile.call_args.args[0], xp.ndarray)
++
++    monkeypatch.undo()  # back to the NumPy backend for the reference
++    host = Connectivity(coefficients)
++    for measure in measures:
++        assert isinstance(on_device[measure], np.ndarray)
++        np.testing.assert_array_equal(on_device[measure], getattr(host, measure)())
++
++
++def test_weighted_phase_lag_family_runs_on_the_device(xp, monkeypatch):
++    """With observation weights each moment is a weighted expectation of a
++    per-observation function of Im(S); that path also runs on device arrays."""
++    # The debiased measures reject non-uniform weights, so they are not here.
++    measures = ("phase_lag_index", "weighted_phase_lag_index", "directed_phase_lag_index")
++    rng = np.random.default_rng(10)
++    coefficients = _coefficients(rng, shape=(1, 8, 1, 16, 3))
++    weights = rng.uniform(0.5, 1.5, size=(1, 8, 1, 16, 1))
++    device = Connectivity(xp.asarray(coefficients), observation_weights=xp.asarray(weights))
++    on_device = {measure: getattr(device, measure)() for measure in measures}
++
++    monkeypatch.undo()  # back to the NumPy backend for the reference
++    host = Connectivity(coefficients, observation_weights=weights)
++    for measure in measures:
++        assert isinstance(on_device[measure], np.ndarray)
++        np.testing.assert_allclose(on_device[measure], getattr(host, measure)(), rtol=1e-12)

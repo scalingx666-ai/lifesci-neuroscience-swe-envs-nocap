@@ -1,0 +1,1621 @@
+diff --git a/src/minisweagent/kernel_languages/contract.py b/src/minisweagent/kernel_languages/contract.py
+index 66657ec6f..08bd98cd1 100644
+--- a/src/minisweagent/kernel_languages/contract.py
++++ b/src/minisweagent/kernel_languages/contract.py
+@@ -36,6 +36,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ from pathlib import Path
+ 
+@@ -52,16 +53,487 @@ class ContractViolation(RuntimeError):
+ REQUIRED_HARNESS_MARKERS = ("GEAK_RESULT_LATENCY_MS", "GEAK_RESULT_SPEEDUP")
+ 
+ 
+-def validate_harness(path: Path) -> None:
++# ---------------------------------------------------------------------------
++# Worktree-bypass detection (the "always ~1.00x speedup" root cause)
++# ---------------------------------------------------------------------------
++#
++# GEAK evaluates a candidate by copying the repo into a per-slot worktree,
++# applying the patch there, exporting ``GEAK_WORK_DIR=<worktree>`` and putting
++# it first on ``PYTHONPATH`` (see ``kernel_languages/*/commandment.j2``), then
++# running ``harness.py``.  The contract is therefore: **the harness must resolve
++# every repository path from ``GEAK_WORK_DIR``** (include dirs, ``#include``
++# roots, build/output dirs, ``sys.path`` entries, files it opens).
++#
++# When an LLM-generated harness instead hardcodes an absolute path that points
++# at the ORIGINAL source repo (``REPO_ROOT = "/sgl-workspace/sglang"``,
++# ``hipcc -I /sgl-workspace/.../include``, ``sys.path.insert(0, "/abs")``), it
++# silently compiles/imports the un-patched baseline.  Correctness then always
++# PASSes and every measured speedup is ~1.00x, with no error — the optimizer
++# trains on a flat signal.  This detector is intentionally *mechanism-agnostic*:
++# it keys on "an absolute literal that points into the known repo root and is
++# NOT derived from the GEAK_WORK_DIR/GEAK_REPO_ROOT env contract", so it covers
++# C/C++ ``-I``, Python ``sys.path``, ``open()``, ``os.walk()``, build caches,
++# etc. with a single rule rather than one regex per kernel language.
++
++# Tokens whose presence on a line means the absolute path is the *sanctioned
++# env-derived fallback default* (e.g. ``os.environ.get("GEAK_WORK_DIR", "/repo")``)
++# rather than a hardcoded bypass.  Such lines are allowed.
++_ENV_DERIVE_TOKENS = (
++    "GEAK_WORK_DIR",
++    "GEAK_REPO_ROOT",
++    "os.environ",
++    "environ",
++    "getenv",
++)
++
++# Backstop patterns (used when the repo root is unknown at validation time):
++# absolute-path literals used in the canonical worktree-bypass forms.
++_ABS_LITERAL = r"/[^'\"\n]*"
++_BYPASS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
++    (
++        "sys.path pinned to an absolute literal",
++        re.compile(r"""sys\.path\.(?:insert|append|extend)\s*\([^)]*?['"](?P<path>/[^'"\n]+)['"]"""),
++    ),
++    (
++        "compiler include (-I) pinned to an absolute literal",
++        re.compile(r"""['"]?-I\s*(?P<path>/[^'"\n\s]+)"""),
++    ),
++    (
++        "absolute repo/include path assigned to a module-level constant",
++        re.compile(
++            r"""(?im)^\s*(?:REPO_ROOT|REPO|SRC_ROOT|SOURCE_ROOT|KERNEL_ROOT|INCLUDE_DIR|INC_DIR|"""
++            r"""[A-Z_]*INCLUDE[A-Z_]*|[A-Z_]*ROOT)\s*=\s*['"](?P<path>/[^'"\n]+)['"]"""
++        ),
++    ),
++)
++
++# System / toolchain prefixes that are legitimately referenced by absolute
++# literal (ROCm/CUDA includes, std headers, scratch, device nodes). A bare
++# absolute literal under one of these is NOT a source-repo bypass.
++_SYSTEM_PATH_PREFIXES = (
++    "/usr/",
++    "/opt/rocm",
++    "/opt/conda",
++    "/opt/venv",
++    "/opt/cuda",
++    "/usr/local",
++    "/lib/",
++    "/lib64/",
++    "/bin/",
++    "/sbin/",
++    "/etc/",
++    "/proc/",
++    "/sys/",
++    "/dev/",
++    "/tmp/",
++    "/var/",
++    "/run/",
++    "/root/.cache",
++    "/home/",
++)
++
++# A bare absolute-path *string literal* that appears as a collection element or
++# RHS value (e.g. ``CANDIDATES = ["/repo/python"]`` then iterated into
++# ``sys.path.insert(0, _p)``). The named-constant + sys.path-literal patterns
++# above miss this because the path hides in a list and the insert uses a
++# variable. We flag it when it points at a recognizable code/source tree — the
++# contract forbids ANY hardcoded source path; the only sanctioned literal is the
++# default arg of os.environ.get(...).
++_BARE_ABS_LITERAL = re.compile(r"""(?P<q>['"])(?P<path>/[A-Za-z0-9._][^'"\n]*?)(?P=q)""")
++
++# Source/package directory markers: an absolute literal whose path ends with (or
++# contains) one of these is almost certainly an import/include root, not a data
++# file or scratch path. Keeps backstop (3) precise (low false-positive).
++_CODE_TREE_MARKERS = (
++    "/python",
++    "/src",
++    "/csrc",
++    "/include",
++    "/lib",
++    "/cpp",
++    "/cuda",
++    "/hip",
++    "/kernels",
++    "/srt",
++)
++
++
++def _strip_comment_lines(text: str) -> list[tuple[int, str]]:
++    """Return ``(lineno, line)`` for lines that are not pure ``#`` comments.
++
++    ``lineno`` is 1-based.  We keep inline code with trailing comments (the
++    code part can still hold a bypass) but drop full-comment lines so a
++    documented counter-example doesn't trip the detector.
++    """
++    out: list[tuple[int, str]] = []
++    for i, line in enumerate(text.splitlines(), 1):
++        if line.lstrip().startswith("#"):
++            continue
++        out.append((i, line))
++    return out
++
++
++def _scan_context(text: str) -> tuple[set[int], dict[int, bool]]:
++    """Tokenize-based context so the line scanner avoids two false positives.
++
++    Returns ``(docstring_lines, env_lines)``:
++
++    * ``docstring_lines`` — physical line numbers that belong to a bare string
++      *expression statement* (module/function docstrings, stray string blocks).
++      A path inside one is documentation, not a real import/include path, so the
++      scanner skips it.
++    * ``env_lines`` — maps each physical line number to whether its enclosing
++      *logical* line contains an env-derive token. This collapses multi-line
++      calls so the literal default of e.g. ::
++
++          WORK_DIR = os.environ.get(
++              "GEAK_WORK_DIR",
++              "/repo",          # <- env-derived, NOT a hardcoded bypass
++          )
++
++      is recognised as the sanctioned env fallback even though the env token is
++      on a *previous* physical line.
++
++    On any tokenization failure returns empty structures so the caller falls
++    back to the (stricter) pure per-line behaviour.
++    """
++    import io
++    import tokenize
++
++    doc_lines: set[int] = set()
++    env_lines: dict[int, bool] = {}
++    physical = text.splitlines()
++    try:
++        toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
++    except Exception:  # noqa: BLE001 — best-effort; caller falls back
++        return doc_lines, env_lines
++
++    _skip = {
++        tokenize.NEWLINE,
++        tokenize.NL,
++        tokenize.INDENT,
++        tokenize.DEDENT,
++        tokenize.COMMENT,
++        tokenize.ENCODING,
++        tokenize.ENDMARKER,
++    }
++    cur: list[tokenize.TokenInfo] = []
++
++    def _flush(group: list[tokenize.TokenInfo]) -> None:
++        sig = [t for t in group if t.type not in _skip]
++        if not sig:
++            return
++        start = min(t.start[0] for t in sig)
++        end = max(t.end[0] for t in sig)
++        unit_text = "\n".join(physical[start - 1 : end])
++        has_env = any(tok in unit_text for tok in _ENV_DERIVE_TOKENS)
++        is_bare_string = len(sig) == 1 and sig[0].type == tokenize.STRING
++        for ln in range(start, end + 1):
++            if is_bare_string:
++                doc_lines.add(ln)
++            if has_env:
++                env_lines[ln] = True
++
++    for t in toks:
++        if t.type in (tokenize.INDENT, tokenize.DEDENT, tokenize.ENCODING):
++            continue
++        cur.append(t)
++        if t.type == tokenize.NEWLINE:
++            _flush(cur)
++            cur = []
++    _flush(cur)
++    return doc_lines, env_lines
++
++
++def _resolve_repo_roots(repo_root: str | os.PathLike[str] | None) -> list[str]:
++    """Collect candidate source-repo absolute prefixes to scan for.
++
++    Order/source: explicit ``repo_root`` arg, then ``GEAK_REPO_ROOT`` and
++    ``GEAK_WORK_DIR`` from the environment.  Both the literal and the
++    fully-resolved (realpath) form are included so a symlinked mount still
++    matches.  Returns a de-duplicated list of absolute path strings.
++    """
++    candidates: list[str] = []
++    raw = [repo_root, os.environ.get("GEAK_REPO_ROOT"), os.environ.get("GEAK_WORK_DIR")]
++    for r in raw:
++        if not r:
++            continue
++        s = str(r).rstrip("/")
++        if not s.startswith("/") or len(s) <= 1:
++            continue
++        candidates.append(s)
++        try:
++            real = str(Path(s).resolve()).rstrip("/")
++            if real and real != s and real.startswith("/") and len(real) > 1:
++                candidates.append(real)
++        except Exception:  # noqa: BLE001 — resolve is best-effort
++            pass
++    # de-dupe preserving order
++    seen: set[str] = set()
++    roots: list[str] = []
++    for c in candidates:
++        if c not in seen:
++            seen.add(c)
++            roots.append(c)
++    return roots
++
++
++#: Tokens that mean a path on this line feeds an import / compile / exec search
++#: context (the only way a hardcoded source path actually causes the *baseline*
++#: to be evaluated). If any of these is present the line is NOT provenance.
++_PATH_SINK_TOKENS: tuple[str, ...] = (
++    "sys.path",
++    "pythonpath",
++    "import ",
++    "__import__",
++    "open(",
++    "-isystem",
++    "load(",
++    "load_inline",
++    "cpp_extension",
++    "subprocess",
++    "popen",
++    "exec(",
++    "include_dirs",
++    "extra_include",
++)
++
++#: Tokens that mean the path is being emitted as text (recorded to a file or
++#: logged) rather than used as a filesystem search path.
++_OUTPUT_CALL_TOKENS: tuple[str, ...] = (
++    ".write(",
++    "print(",
++    ".info(",
++    ".debug(",
++    ".warning(",
++    ".error(",
++    ".exception(",
++    "logging.",
++    "logger.",
++    "sys.stderr",
++    "sys.stdout",
++)
++
++
++def _is_provenance_only(line: str) -> bool:
++    """True when a source-repo path on this line is pure provenance/log output.
++
++    A path written to a text file (``f.write("/repo/bench.py")``) or printed for
++    audit never participates in import/compile resolution, so it cannot make the
++    harness evaluate the unpatched baseline. Such a line is only provenance when
++    it emits the path via a write/print/log call AND carries no import/compile
++    sink token. Lines like ``sys.path.insert(0, "/repo")`` or ``-I/repo`` contain
++    a sink token and are therefore never treated as provenance.
++    """
++    low = line.lower()
++    if not any(tok in low for tok in _OUTPUT_CALL_TOKENS):
++        return False
++    return not any(tok in low for tok in _PATH_SINK_TOKENS)
++
++
++def find_source_repo_path_leaks(
++    text: str,
++    repo_root: str | os.PathLike[str] | None = None,
++) -> list[tuple[int, str, str]]:
++    """Detect harness lines that bypass ``GEAK_WORK_DIR`` via a hardcoded path.
++
++    Returns a list of ``(lineno, snippet, reason)`` for every offending line.
++    A line is an offender when it either:
++
++      * contains an absolute literal that begins with the known source-repo
++        root (``repo_root`` arg or ``GEAK_REPO_ROOT``/``GEAK_WORK_DIR`` env), or
++      * matches one of the canonical worktree-bypass forms
++        (``sys.path.insert(0, "/abs")``, ``-I/abs``, ``REPO_ROOT = "/abs"``),
++
++    AND the same line does NOT derive that path from the env contract (i.e. it
++    does not mention ``GEAK_WORK_DIR`` / ``os.environ`` / ``getenv``).  The
++    env-derived form, e.g. ``os.environ.get("GEAK_WORK_DIR", "/repo")``, is the
++    sanctioned fallback and is intentionally allowed.
++
++    Mechanism-agnostic by design: it keys on "absolute literal into the repo
++    root, not env-derived", so no per-language special-casing is needed.
++    """
++    roots = _resolve_repo_roots(repo_root)
++    findings: list[tuple[int, str, str]] = []
++    seen_lines: set[int] = set()
++    doc_lines, env_lines = _scan_context(text)
++
++    for lineno, line in _strip_comment_lines(text):
++        if lineno in seen_lines:
++            continue
++        # Skip documentation strings (paths there don't resolve imports).
++        if lineno in doc_lines:
++            continue
++        # Skip pure provenance/log output: a source path written to a text file
++        # or printed for audit never feeds an import/compile search path, so it
++        # cannot cause the unpatched baseline to be evaluated. (Lines that also
++        # contain an import/compile sink token are NOT exempted.)
++        if _is_provenance_only(line):
++            continue
++        # Env-derived if the literal sits on (or its enclosing multi-line call
++        # contains) an env-derive token.
++        env_derived = env_lines.get(lineno, False) or any(tok in line for tok in _ENV_DERIVE_TOKENS)
++
++        # (1) Prefix match against the known source-repo root(s).
++        if roots and not env_derived:
++            for root in roots:
++                # Match the root as a quoted-or-flagged absolute literal so we
++                # don't trip on unrelated substrings.
++                if re.search(rf"""['"=:\s]{re.escape(root)}(?:/|['"\s)]|$)""", line) or (root in line and "/" in line):
++                    findings.append(
++                        (
++                            lineno,
++                            line.strip()[:200],
++                            f"hardcoded absolute path into the source repo ('{root}') — "
++                            "derive it from os.environ['GEAK_WORK_DIR'] instead",
++                        )
++                    )
++                    seen_lines.add(lineno)
++                    break
++            if lineno in seen_lines:
++                continue
++
++        # (2) Backstop: canonical bypass forms regardless of repo_root.
++        if not env_derived:
++            for reason, pat in _BYPASS_PATTERNS:
++                m = pat.search(line)
++                if m:
++                    findings.append((lineno, line.strip()[:200], reason))
++                    seen_lines.add(lineno)
++                    break
++            if lineno in seen_lines:
++                continue
++
++        # (3) Backstop: a bare absolute-path string literal pointing at a
++        # code/source tree (>=2 path segments, not a system prefix), not
++        # env-derived. Catches a hardcoded source path hidden in a candidate
++        # list/tuple that is later fed into sys.path / -I via a variable — the
++        # exact shape that bypasses (1) (repo root unknown) and (2) (literal
++        # not adjacent to sys.path/-I/REPO_ROOT=). Only fires when the file
++        # actually manipulates import/include search paths, to avoid flagging
++        # unrelated string constants (e.g. result file paths).
++        if not env_derived and ("sys.path" in text or "-I" in text or "PYTHONPATH" in text):
++            for m in _BARE_ABS_LITERAL.finditer(line):
++                p = m.group("path").rstrip("/")
++                if p.lower().startswith(_SYSTEM_PATH_PREFIXES):
++                    continue
++                # require a real directory tree (>=2 segments) to skip e.g. "/"
++                if p.count("/") < 2:
++                    continue
++                # only a recognizable code/source tree (import/include root),
++                # not a data/result file path
++                if not any(mk in p.lower() for mk in _CODE_TREE_MARKERS):
++                    continue
++                findings.append(
++                    (
++                        lineno,
++                        line.strip()[:200],
++                        f"hardcoded absolute source path literal ('{p}') used in an "
++                        "import/include search context — derive it from "
++                        "os.environ['GEAK_WORK_DIR'] instead of pinning a fixed path",
++                    )
++                )
++                seen_lines.add(lineno)
++                break
++
++    return findings
++
++
++def _worktree_bypass_message(path: Path, leaks: list[tuple[int, str, str]]) -> str:
++    listed = "\n".join(f"  - line {ln}: {reason}\n      {snippet}" for ln, snippet, reason in leaks)
++    return (
++        f"harness {path} bypasses the GEAK worktree with hardcoded absolute path(s):\n"
++        f"{listed}\n\n"
++        "Why this is fatal: GEAK applies the candidate patch inside a per-slot "
++        "worktree exported as $GEAK_WORK_DIR (and put first on PYTHONPATH). A "
++        "harness that hardcodes a source-repo absolute path compiles/imports the "
++        "UNPATCHED baseline, so correctness always PASSes and every speedup reads "
++        "~1.00x with no error.\n"
++        "Fix (applies to every kernel language): resolve EVERY repository path "
++        "from the worktree, e.g.\n"
++        "    WORK_DIR = os.environ.get('GEAK_WORK_DIR', os.path.dirname(os.path.abspath(__file__)))\n"
++        "then build include flags as f'-I{WORK_DIR}/<subdir>', put compiled "
++        "artifacts under WORK_DIR in a DETERMINISTIC fixed-name build dir (it is "
++        "already per-slot-isolated because WORK_DIR differs per worktree) and do an "
++        "INCREMENTAL rebuild keyed on source mtime/hash (rebuild only when the "
++        "kernel source is newer than the artifact, otherwise reuse it — never an "
++        "unconditional cold rebuild every run), "
++        "and rely on PYTHONPATH for Python imports. Never write a literal source "
++        "path; if you keep one as a fallback, it must be the default of an "
++        "os.environ.get('GEAK_WORK_DIR', ...) lookup."
++    )
++
++
++_AITER_IMPORT_RE = re.compile(r"^\s*(?:import\s+aiter\b|from\s+aiter\b)", re.MULTILINE)
++
++
++def find_aiter_routing_violation(text: str) -> str | None:
++    """Detect aiter harnesses that fail to route the JIT to ``$GEAK_WORK_DIR``.
++
++    ``aiter`` is installed *editable* via a ``sys.meta_path`` finder, so
++    ``import aiter`` resolves to the ORIGINAL repo regardless of ``sys.path``
++    order. Two *independent* env vars must therefore be routed to the worktree
++    (see ``aiter/jit/core.py``):
++
++    * ``AITER_META_DIR`` controls the *source* dir
++      (``AITER_CSRC_DIR = $AITER_META_DIR/csrc``). If it is not overridden the
++      JIT compiles the BASELINE ``csrc/*.cu`` — the classic ~1.00x
++      worktree-bypass bug (sentinel-injected corruption is never seen).
++    * ``AITER_JIT_DIR`` controls the *build output* dir
++      (``bd_dir = get_user_jit_dir()/build`` and the final ``<module>.so``).
++      ``get_user_jit_dir()`` only honours ``$AITER_JIT_DIR``; otherwise it falls
++      back to the **aiter package dir itself** (writable editable install), so
++      build artifacts land in ``/sgl-workspace/aiter/aiter/jit/build`` —
++      polluting the source repo AND, under the parallel ``run_pool`` path,
++      making concurrent slots collide on a shared ``build/`` dir, ``<module>.so``
++      and ninja ``lock_<module>`` file.
++
++    A harness that imports aiter and compiles a ``csrc/*.cu`` kernel MUST set
++    *both* ``AITER_META_DIR`` and a per-worktree ``AITER_JIT_DIR`` (derived from
++    ``$GEAK_WORK_DIR``) before ``import aiter``. Returns a message describing the
++    first missing piece, else ``None``.
++    """
++    if not _AITER_IMPORT_RE.search(text):
++        return None
++    # Only relevant when the harness actually drives aiter's source compile.
++    compiles_csrc = ("csrc" in text) or (".cu" in text) or ("compile_ops" in text)
++    if not compiles_csrc:
++        return None
++    if "AITER_META_DIR" not in text:
++        return (
++            "aiter harness imports `aiter` and compiles a csrc/*.cu kernel but never "
++            "sets AITER_META_DIR from $GEAK_WORK_DIR. Because aiter is an editable "
++            "package (sys.meta_path finder), `import aiter` + sys.path.insert resolves "
++            "to the BASELINE repo, and aiter's JIT (AITER_CSRC_DIR=$AITER_META_DIR/csrc) "
++            "compiles the baseline kernel — every speedup is ~1.00x and correctness is "
++            "blind to the patch. Set os.environ['AITER_META_DIR'] = WORK_DIR (and a "
++            "per-slot AITER_JIT_DIR) BEFORE `import aiter`."
++        )
++    if "AITER_JIT_DIR" not in text:
++        return (
++            "aiter harness sets AITER_META_DIR (source routing) but never sets "
++            "AITER_JIT_DIR (build-output routing). aiter's get_user_jit_dir() only "
++            "honours $AITER_JIT_DIR; without it the JIT writes build/ and <module>.so "
++            "into the editable aiter package dir (/sgl-workspace/aiter/aiter/jit), "
++            "which (a) pollutes the SOURCE repo and (b) makes parallel run_pool slots "
++            "collide on a shared build dir / .so / ninja lock. Set a per-worktree "
++            "os.environ['AITER_JIT_DIR'] = os.path.join(WORK_DIR, ...) BEFORE `import aiter`."
++        )
++    return None
++
++
++def validate_harness(path: Path, repo_root: str | os.PathLike[str] | None = None) -> None:
+     """Verify a harness.py conforms to the universal contract.
+ 
+     Raises `ContractViolation` on any missing required surface. Today's checks
+     are simple substring / regex presence — PR-2 tightens them against the
+     fixture corpus (`tests/fixtures/harness_corpus/`).
+ 
+-    Today's behavior: always pass unless the file doesn't exist (so existing
+-    pipelines don't break). Full enforcement activates when `HarnessBuilder`
+-    lands in PR-2.
++    ``repo_root`` (when known by the caller) is forwarded to the worktree-bypass
++    detector so a hardcoded absolute path into the *source* repo is caught even
++    when ``GEAK_REPO_ROOT``/``GEAK_WORK_DIR`` are not set to that repo in the
++    environment (e.g. during preprocess, where ``GEAK_WORK_DIR`` points at the
++    subagent worktree, not the original source tree).
+     """
+     if not path.exists():
+         raise ContractViolation(f"harness path does not exist: {path}")
+@@ -78,6 +550,18 @@ def validate_harness(path: Path) -> None:
+                 f"harness {path} missing required flags {missing_flags} AND required markers {missing_markers}"
+             )
+ 
++    # Worktree-bypass gate: reject harnesses that hardcode an absolute path
++    # into the source repo instead of deriving it from $GEAK_WORK_DIR. This is
++    # the root cause of "always ~1.00x speedup" runs (baseline evaluated in
++    # place of the patched worktree). Opt out with GEAK_ALLOW_HARDCODED_PATHS=1.
++    if not os.environ.get("GEAK_ALLOW_HARDCODED_PATHS"):
++        leaks = find_source_repo_path_leaks(text, repo_root=repo_root)
++        if leaks:
++            raise ContractViolation(_worktree_bypass_message(path, leaks))
++        aiter_msg = find_aiter_routing_violation(text)
++        if aiter_msg:
++            raise ContractViolation(f"harness {path} {aiter_msg}")
++
+ 
+ # ---------------------------------------------------------------------------
+ # Commandment contract
+@@ -115,6 +599,8 @@ def validate_commandment(path: Path) -> None:
+     "ContractViolation",
+     "validate_harness",
+     "validate_commandment",
++    "find_source_repo_path_leaks",
++    "find_aiter_routing_violation",
+     "REQUIRED_HARNESS_FLAGS",
+     "REQUIRED_HARNESS_MARKERS",
+     "REQUIRED_COMMANDMENT_SECTIONS",
+diff --git a/src/minisweagent/kernel_languages/hip/builder_hints.md b/src/minisweagent/kernel_languages/hip/builder_hints.md
+index a062836ec..ff48ba976 100644
+--- a/src/minisweagent/kernel_languages/hip/builder_hints.md
++++ b/src/minisweagent/kernel_languages/hip/builder_hints.md
+@@ -41,3 +41,52 @@ the user's test file:
+ 
+ - Warmup 5 iterations; measure 100 and take the median (not mean).
+ - `hipDeviceSynchronize()` before/after each measurement.
++
++## aiter kernels — MANDATORY worktree routing (do NOT use sys.path alone)
++
++If the kernel lives in the **aiter** repo (`csrc/kernels/*.cu` invoked via a
++Python-callable like `aiter.add_rmsnorm_quant(...)`, built by aiter's JIT
++`@compile_ops` mechanism), the generic "prepend the worktree to `sys.path`"
++rule is NOT enough and will silently evaluate the BASELINE kernel:
++
++- `aiter` is installed **editable** via a `sys.meta_path` finder
++  (`__editable__...amd_aiter...finder.py`). That finder is consulted BEFORE the
++  `sys.path`-based finder, so `import aiter` resolves to the ORIGINAL repo
++  (`/sgl-workspace/aiter`) no matter what you insert at `sys.path[0]`.
++- aiter's JIT derives its source dir from `AITER_META_DIR` →
++  `AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"` (see `aiter/jit/core.py`). If you
++  don't override it, it points at the baseline tree, so patches to
++  `$GEAK_WORK_DIR/csrc/...cu` are never compiled. Result: correctness always
++  PASSes and every speedup is ~1.00x (the worktree-bypass bug).
++
++You MUST route aiter's JIT to the worktree by setting these env vars at the very
++top of the harness, BEFORE `import aiter` (this recipe is verified to make
++sentinel-injected worktree corruption fail correctness, i.e. the worktree IS
++evaluated):
++
++```python
++import os
++WORK_DIR = os.path.abspath(os.environ.get("GEAK_WORK_DIR", "/sgl-workspace/aiter"))
++# Fail loud if the kernel under test is not actually in the worktree.
++_kernel_rel = "csrc/kernels/<this_kernel>.cu"
++assert os.path.exists(os.path.join(WORK_DIR, _kernel_rel)), \
++    f"kernel not found under WORK_DIR={WORK_DIR}"
++# Route aiter's JIT source dir (AITER_CSRC_DIR = $AITER_META_DIR/csrc) to the worktree.
++os.environ["AITER_META_DIR"] = WORK_DIR
++# Per-slot JIT build cache so worktrees don't share artifacts.
++_gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
++os.environ["AITER_JIT_DIR"] = os.path.join(WORK_DIR, f"_geak_jit_gpu{_gpu}")
++# Force recompile ONLY when the worktree kernel source is newer than the cached
++# .so (incremental); a patched candidate has a newer mtime so it still rebuilds.
++_so = os.path.join(os.environ["AITER_JIT_DIR"], "<module>.so")
++_src = os.path.join(WORK_DIR, _kernel_rel)
++if (not os.path.exists(_so)) or os.path.getmtime(_src) > os.path.getmtime(_so):
++    os.environ["AITER_REBUILD"] = "2"
++else:
++    os.environ.pop("AITER_REBUILD", None)
++import aiter  # now resolves source/build under $GEAK_WORK_DIR
++```
++
++Do NOT rely on deleting the `.so` plus `sys.path.insert` — that does not change
++where aiter's editable finder resolves `import aiter`, nor where `AITER_CSRC_DIR`
++points. The `AITER_META_DIR` override is the only mechanism that works.
+diff --git a/src/minisweagent/kernel_languages/hip/commandment.j2 b/src/minisweagent/kernel_languages/hip/commandment.j2
+index deeef589b..853be6c24 100644
+--- a/src/minisweagent/kernel_languages/hip/commandment.j2
++++ b/src/minisweagent/kernel_languages/hip/commandment.j2
+@@ -32,25 +32,25 @@ export PYTHONPATH="${GEAK_WORK_DIR}:${GEAK_REPO_ROOT:-{{ repo_root }}}:${PYTHONP
+ ## Correctness
+ 
+ ```bash
+-cd "${GEAK_WORK_DIR}" && {{ correctness_command | default("python3 " + harness_path + " --correctness") }}
++cd "${GEAK_WORK_DIR}" && {{ correctness_command | default("python3 " + harness_path + " --correctness", true) }}
+ ```
+ 
+ ## Benchmark
+ 
+ ```bash
+-cd "${GEAK_WORK_DIR}" && {{ performance_command | default("python3 " + harness_path + " --benchmark") }}
++cd "${GEAK_WORK_DIR}" && {{ performance_command | default("python3 " + harness_path + " --benchmark", true) }}
+ ```
+ 
+ ## Full Benchmark
+ 
+ ```bash
+-cd "${GEAK_WORK_DIR}" && {{ performance_command | default("python3 " + harness_path + " --full-benchmark") }}
++cd "${GEAK_WORK_DIR}" && {{ performance_command | default("python3 " + harness_path + " --full-benchmark", true) }}
+ ```
+ 
+ ## Profile
+ 
+ ```bash
+-kernel-profile "cd ${GEAK_WORK_DIR} && {{ performance_command | default("python3 " + harness_path + " --profile") }}" \
++kernel-profile "cd ${GEAK_WORK_DIR} && {{ performance_command | default("python3 " + harness_path + " --profile", true) }}" \
+   --gpu-devices ${GEAK_GPU_DEVICE:-0} \
+   --replays {{ profile_replays | default(3) }} \
+   --json -o ${GEAK_WORK_DIR}/profile.json
+diff --git a/src/minisweagent/models/litellm_model.py b/src/minisweagent/models/litellm_model.py
+index d36ca634e..e48369f0d 100644
+--- a/src/minisweagent/models/litellm_model.py
++++ b/src/minisweagent/models/litellm_model.py
+@@ -328,10 +328,21 @@ def _query(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+             # as a request header. Preserve any other caller-supplied
+             # ``extra_headers`` verbatim.
+             filtered["extra_headers"] = dict(existing_headers)
++        # Bound every request with a wall-clock timeout. Without it, a stalled
++        # gateway socket (server accepted the connection but never sends bytes)
++        # blocks the read forever, the tenacity ``@retry`` never fires, and the
++        # whole preprocess/agent loop hangs indefinitely. ``litellm.Timeout`` is
++        # NOT in the no-retry exclusion list above (it does not subclass
++        # ``litellm.exceptions.APIError``), so a timed-out call is retried with
++        # exponential backoff. Override via ``GEAK_LLM_REQUEST_TIMEOUT`` (seconds).
++        request_timeout = filtered.pop("timeout", None)
++        if request_timeout is None:
++            request_timeout = float(os.getenv("GEAK_LLM_REQUEST_TIMEOUT", "600"))
+         try:
+             return litellm.completion(
+                 model=self.config.model_name,
+                 messages=messages,
++                timeout=request_timeout,
+                 **filtered,
+             )
+         except litellm.exceptions.AuthenticationError as e:
+diff --git a/src/minisweagent/run/postprocess/evaluation.py b/src/minisweagent/run/postprocess/evaluation.py
+index 840cc33b1..74eff8df2 100644
+--- a/src/minisweagent/run/postprocess/evaluation.py
++++ b/src/minisweagent/run/postprocess/evaluation.py
+@@ -356,15 +356,54 @@ def preflight_commandment_contract(
+     from minisweagent.run.preprocess.harness_utils import harness_supports_iterations
+ 
+     repo_root_path = Path(repo_root).resolve()
+-    is_git = (repo_root_path / ".git").exists()
+ 
+-    # For git repos, run in a temporary worktree so side effects (run.sh,
+-    # JIT caches, profile artifacts) never dirty the original repo.
+-    if is_git and output_dir is not None:
++    # Resolve the git TOPLEVEL via ``git rev-parse`` rather than a naive
++    # ``.git``-child check. For monorepo SUBDIRECTORIES (e.g.
++    # ``sglang/sgl-kernel``) there is no ``.git`` directly under ``repo_root``,
++    # so the old check evaluated to False and the smoke test fell back to
++    # running against the ORIGINAL source tree. That is a real isolation hole:
++    # it (a) lets a harness that depends on preprocess-seeded build state
++    # (e.g. a pre-existing ``_geak_build/``) pass spuriously, and (b) lets a
++    # harness that evaluates the baseline (instead of the worktree) pass — both
++    # surface later as the "always ~1.00x speedup" bug. Always run the preflight
++    # in a FRESH worktree of the toplevel so the harness is forced to be
++    # self-contained and fully worktree-resolved.
++    toplevel: Path | None = None
++    try:
++        _tl = subprocess.run(
++            ["git", "rev-parse", "--show-toplevel"],
++            cwd=str(repo_root_path),
++            capture_output=True,
++            text=True,
++            env=get_git_safe_env(repo_root_path),
++        )
++        if _tl.returncode == 0 and _tl.stdout.strip():
++            toplevel = Path(_tl.stdout.strip()).resolve()
++    except Exception:  # noqa: BLE001 — non-git or git missing: fall back below
++        toplevel = None
++
++    # Cleanup bookkeeping: the registered git worktree is always the TOPLEVEL
++    # checkout (``worktree_root``); for a subdir kernel ``preflight_dir`` is a
++    # path INSIDE it, so we must remove ``worktree_root`` via the toplevel repo,
++    # not ``preflight_dir`` (otherwise the monorepo checkout + a stale
++    # ``git worktree`` entry leak on disk).
++    cleanup_root: Path | None = None
++    cleanup_repo: str | None = None
++
++    if toplevel is not None and output_dir is not None:
+         from minisweagent.run.task_file import create_worktree
+ 
+-        preflight_dir = (Path(output_dir) / "_preflight_worktree").resolve()
+-        create_worktree(repo_root_path, preflight_dir)
++        try:
++            rel = repo_root_path.relative_to(toplevel)
++        except ValueError:
++            rel = Path(".")
++        worktree_root = (Path(output_dir) / "_preflight_worktree").resolve()
++        create_worktree(toplevel, worktree_root)
++        # For a subdir kernel, GEAK_WORK_DIR must point at the subdir INSIDE the
++        # worktree (where ``csrc/`` etc. live), not the monorepo root.
++        preflight_dir = (worktree_root / rel).resolve()
++        cleanup_root = worktree_root
++        cleanup_repo = str(toplevel)
+     else:
+         preflight_dir = repo_root_path
+ 
+@@ -430,8 +469,8 @@ def preflight_commandment_contract(
+         )
+         raise CommandmentExecutionError("PREFLIGHT", last_result.returncode, detail)
+     finally:
+-        if preflight_dir != repo_root_path:
+-            cleanup_eval_worktree(repo_root, preflight_dir)
++        if cleanup_root is not None and cleanup_repo is not None:
++            cleanup_eval_worktree(cleanup_repo, cleanup_root)
+ 
+ 
+ def recapture_commandment_baseline(
+diff --git a/src/minisweagent/run/preprocess/harness_utils.py b/src/minisweagent/run/preprocess/harness_utils.py
+index 4a2cc6d21..d08cc0365 100644
+--- a/src/minisweagent/run/preprocess/harness_utils.py
++++ b/src/minisweagent/run/preprocess/harness_utils.py
+@@ -1279,6 +1279,27 @@ def validate_harness(harness_path: str) -> tuple[bool, list[str]]:
+         if flag not in code_only_source:
+             errors.append(f"Harness source does not define '{flag}' flag")
+ 
++    # Worktree-bypass gate: a harness that hardcodes an absolute path into the
++    # source repo (REPO_ROOT="/...", hipcc -I /..., sys.path.insert(0, "/..."))
++    # compiles/imports the UNPATCHED baseline instead of the $GEAK_WORK_DIR
++    # worktree, so every speedup silently reads ~1.00x. Mechanism-agnostic:
++    # keys on "absolute literal into the repo root, not env-derived". Opt out
++    # with GEAK_ALLOW_HARDCODED_PATHS=1.
++    if not os.environ.get("GEAK_ALLOW_HARDCODED_PATHS"):
++        try:
++            from minisweagent.kernel_languages.contract import find_source_repo_path_leaks
++
++            leaks = find_source_repo_path_leaks(code_only_source)
++        except Exception:  # noqa: BLE001 — never let the detector break validation
++            leaks = []
++        for lineno, snippet, reason in leaks:
++            errors.append(
++                f"Line {lineno}: {reason}. This bypasses the GEAK worktree so the "
++                f"harness evaluates the BASELINE (every speedup ~1.00x). Derive the "
++                f"path from os.environ['GEAK_WORK_DIR'] (build artifacts under it too). "
++                f"Offending line: {snippet}"
++            )
++
+     for flag in RECOMMENDED_HARNESS_FLAGS:
+         if flag not in code_only_source:
+             msg = (
+diff --git a/src/minisweagent/run/preprocess/run_harness.py b/src/minisweagent/run/preprocess/run_harness.py
+index 31a55aae2..7dae6048c 100644
+--- a/src/minisweagent/run/preprocess/run_harness.py
++++ b/src/minisweagent/run/preprocess/run_harness.py
+@@ -38,6 +38,10 @@
+     "full-benchmark": "--full-benchmark",
+ }
+ 
++#: Per-mode harness subprocess timeouts (seconds). All env-overridable so that
++#: compiled kernels (HIP/CUDA), whose first benchmark run must build the whole
++#: extension from source, are not killed mid-compile (which triggers a costly
++#: recompile-on-retry loop). Env names match ``preprocess_v3/baseline.py``.
+ MODE_TIMEOUTS: dict[str, int] = {
+     "correctness": int(os.environ.get("GEAK_BENCH_TIMEOUT", os.environ.get("GEAK_CORRECTNESS_TIMEOUT", "900"))),
+     "profile": int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120")),
+@@ -64,12 +68,28 @@ def _build_env(
+     gpu_id: int,
+     env_overrides: dict[str, str] | None,
+ ) -> dict[str, str]:
+-    """Build subprocess environment matching COMMANDMENT SETUP conventions."""
++    """Build subprocess environment matching COMMANDMENT SETUP conventions.
++
++    ``repo_root`` here is the directory the harness must evaluate — at
++    optimization time this is the per-slot worktree, so we (a) put it first on
++    ``PYTHONPATH`` and (b) export it as ``GEAK_WORK_DIR``. A contract-compliant
++    harness resolves every repo path from ``GEAK_WORK_DIR``, which makes each
++    parallel slot self-contained: imports and build artifacts stay inside that
++    slot's worktree. We deliberately do NOT mutate global site-packages (no
++    ``pip install -e``), so the original sglang/vllm/aiter install is untouched
++    and parallel slots can never clobber a shared editable install.
++    """
+     env = os.environ.copy()
+ 
+     if repo_root:
+         existing = env.get("PYTHONPATH", "")
+         env["PYTHONPATH"] = f"{repo_root}:{existing}" if existing else repo_root
++        # Worktree-awareness contract: harnesses MUST read GEAK_WORK_DIR to
++        # locate the patched source. Setting it unconditionally also turns any
++        # ``os.environ.get("GEAK_WORK_DIR", "<baseline>")`` fallback into a
++        # no-op (the env already holds the right per-slot worktree).
++        env["GEAK_WORK_DIR"] = repo_root
++        env.setdefault("GEAK_REPO_ROOT", repo_root)
+ 
+     env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
+     env["PYTHONUNBUFFERED"] = "1"
+diff --git a/src/minisweagent/run/preprocess/unit_test_agent.py b/src/minisweagent/run/preprocess/unit_test_agent.py
+index 8f4a07634..b42bdf0e0 100644
+--- a/src/minisweagent/run/preprocess/unit_test_agent.py
++++ b/src/minisweagent/run/preprocess/unit_test_agent.py
+@@ -31,6 +31,52 @@ def __init__(self, model: Model, env: Environment, **kwargs):
+ _GEAK_PREPROCESS_INSTRUCTIONS_RELATIVE_PATH = "src/minisweagent/run/preprocess/INSTRUCTIONS.md"
+ 
+ 
++# Language-agnostic worktree-path rule injected into EVERY harness-generation
++# context (not per-kernel-language). This is the single most important harness
++# invariant: resolve all repo paths from $GEAK_WORK_DIR so the patched worktree
++# (not the baseline) is evaluated, keep parallel slots isolated, and never touch
++# the global environment. A static validator enforces it and triggers
++# regeneration on violation.
++_WORKTREE_PATH_DISCIPLINE = (
++    "## Worktree Path Discipline (MANDATORY — all kernel languages)\n"
++    "GEAK evaluates each candidate inside a per-slot worktree exported as "
++    "`$GEAK_WORK_DIR` (placed first on PYTHONPATH; SETUP `cd`s into it). The "
++    "harness MUST resolve EVERY repository path from `$GEAK_WORK_DIR`, never a "
++    "hardcoded absolute source path — otherwise it compiles/imports the UNPATCHED "
++    "baseline and every speedup silently reads ~1.00x.\n"
++    "- Derive once: "
++    "`WORK_DIR = os.environ.get('GEAK_WORK_DIR', os.path.dirname(os.path.abspath(__file__)))`.\n"
++    "- C/C++/HIP/CUDA/CK: build include flags as `f'-I{WORK_DIR}/<subdir>'`; put "
++    "compiled artifacts in a DETERMINISTIC build dir UNDER `WORK_DIR` (e.g. "
++    "`f'{WORK_DIR}/_geak_build'`). It is per-worktree-isolated because `WORK_DIR` "
++    "already differs per slot, so use a FIXED name (NOT a random/unique-per-run "
++    "dir) so repeated invocations in the same worktree reuse compiled objects. "
++    "Do an INCREMENTAL rebuild keyed on source mtime/hash: rebuild only when the "
++    "kernel source is newer than the built artifact (so a patched kernel is always "
++    "recompiled), otherwise reuse the cached build. NEVER do an unconditional cold "
++    "rebuild every run — for big compiled repos that turns harness validation into "
++    "a multi-hour recompile loop.\n"
++    "- Python: rely on PYTHONPATH; do NOT `sys.path.insert(0, '/abs')`; if you "
++    "must touch sys.path, derive it from `WORK_DIR` (e.g. `f'{WORK_DIR}/python'`). "
++    "NEVER add a hardcoded source-repo path as a sys.path fallback/candidate — not "
++    "even as an element of a candidate list/tuple. The worktree-derived entry must "
++    "be the ONLY one you insert; the sole permitted absolute literal anywhere is the "
++    "default arg of `os.environ.get('GEAK_WORK_DIR', <default>)`. A second hardcoded "
++    "candidate (e.g. `['/repo/python']`) will, via `sys.path.insert(0, ...)` in a "
++    "loop, end up AHEAD of the worktree and silently import the unpatched baseline.\n"
++    "- Do NOT `pip install -e` and do NOT mutate the global environment; GEAK "
++    "manages import resolution per-worktree so the original install is untouched "
++    "and parallel slots never collide.\n"
++    "- Shape budget (MANDATORY, keeps validation bounded): read "
++    "`_MAX_SHAPES = int(os.environ.get('GEAK_MAX_BENCHMARK_SHAPES', '0') or 0)` once. "
++    "When `_MAX_SHAPES > 0`, EVERY mode — including `--full-benchmark` — must cap its "
++    "selected configs to at most `_MAX_SHAPES` via the same positional `_pick` "
++    "(`--full-benchmark -> _pick(all_configs, _MAX_SHAPES)`). When unset/0, keep full "
++    "coverage. A `--full-benchmark` that ignores this budget times out during "
++    "validation and is rejected."
++)
++
++
+ def _extract_test_command(text: str) -> str:
+     match = re.search(r"TEST_COMMAND:\s*(.+)\s*$", text.strip(), re.MULTILINE)
+     if not match:
+@@ -62,6 +108,12 @@ def _extract_test_command(text: str) -> str:
+         "This is a HIP kernel (C++ compiled with hipcc).\n"
+         "- A build step is REQUIRED before running tests.\n"
+         "- Use the project's build system (CMake/Makefile) or compile with `hipcc` directly.\n"
++        "- CACHE the build: compile into a deterministic dir under `$GEAK_WORK_DIR` "
++        "(e.g. `$GEAK_WORK_DIR/_geak_build`) and rebuild ONLY when the kernel source "
++        "is newer than the built artifact (mtime/hash check). The harness is invoked "
++        "many times during validation (correctness + N benchmark repeats); an "
++        "unconditional cold rebuild each invocation makes a large repo take hours. A "
++        "patched kernel has a newer mtime, so the incremental check still recompiles it.\n"
+         "- Use host-side validation (compare GPU output against CPU reference).\n"
+         "- Use `hipEventElapsedTime` or `torch.cuda.Event` for benchmarking.\n"
+         "- NEVER use `sys.path.insert(0, '/absolute/path/...')`. "
+@@ -71,6 +123,11 @@ def _extract_test_command(text: str) -> str:
+         "This is a CUDA kernel (C++ compiled with nvcc).\n"
+         "- A build step is REQUIRED before running tests.\n"
+         "- Use the project's build system (CMake/Makefile) or compile with `nvcc` directly.\n"
++        "- CACHE the build: compile into a deterministic dir under `$GEAK_WORK_DIR` "
++        "and rebuild ONLY when the kernel source is newer than the built artifact "
++        "(mtime/hash). An unconditional cold rebuild on each of the many validation "
++        "invocations makes a large repo take hours; a patched kernel still recompiles "
++        "because its mtime is newer.\n"
+         "- Use host-side validation (compare GPU output against CPU reference).\n"
+         "- Use `cudaEventElapsedTime` or `torch.cuda.Event` for benchmarking."
+     ),
+@@ -153,6 +210,10 @@ def format_discovery_for_agent(result) -> str:
+             lines.append(guidance)
+             lines.append("")
+ 
++        # Universal worktree-path rule (language-agnostic; always injected).
++        lines.append(_WORKTREE_PATH_DISCIPLINE)
++        lines.append("")
++
+     # --- FILES YOU MUST READ ---
+     must_read: list[tuple[str, str]] = []
+     for b in result.benchmarks[:3]:
+diff --git a/src/minisweagent/run/preprocess_v3/adapter.py b/src/minisweagent/run/preprocess_v3/adapter.py
+index 48c4d0249..06364bc9d 100644
+--- a/src/minisweagent/run/preprocess_v3/adapter.py
++++ b/src/minisweagent/run/preprocess_v3/adapter.py
+@@ -118,6 +118,17 @@ def run_preprocess_v3(
+         output_dir=output_dir,
+     )
+ 
++    # Make the canonical SOURCE repo root visible to the worktree-bypass
++    # detector (``kernel_languages.contract.find_source_repo_path_leaks`` ->
++    # ``_resolve_repo_roots`` reads ``GEAK_REPO_ROOT``). Without this, harness
++    # validation during preprocess only sees ``GEAK_WORK_DIR`` (the *subagent*
++    # worktree), so a harness that hardcodes the original source tree (e.g.
++    # ``"/repo/python"`` in a sys.path candidate list) is NOT flagged and the
++    # optimizer silently evaluates the unpatched baseline (~1.00x). Force-set:
++    # GEAK_REPO_ROOT is by definition the original repo root, never a worktree.
++    if repo_root:
++        os.environ["GEAK_REPO_ROOT"] = str(repo_root)
++
+     if model is None:
+         raise RuntimeError(
+             "run_preprocess_v3: neither ``model`` nor ``model_factory`` was supplied; "
+@@ -166,9 +177,26 @@ def run_preprocess_v3(
+     )
+ 
+     if not result.success:
+-        raise RuntimeError(
+-            "v3 preprocess failed: " + ("; ".join(result.errors) if result.errors else "no artefacts produced")
+-        )
++        # Backstop salvage: a pure step/cost-limit abort must not discard a run
++        # whose essential artifacts (COMMANDMENT.md, and a harness on Path B)
++        # were already produced. The orchestrator normally salvages this case
++        # itself; this guards the residual path where success stayed False but
++        # the artifacts are on disk, so a step_limit overshoot can't tear down
++        # the whole GEAK pipeline. Genuine failures (no artifacts, or non-limit
++        # errors) still raise.
++        if _can_proceed_despite_failure(result):
++            logger.warning(
++                "v3 preprocess returned success=False (errors=%s) but required artifacts are "
++                "present (harness=%s, commandment=%s); proceeding into optimization with the "
++                "salvaged context instead of aborting.",
++                result.errors,
++                result.harness_path,
++                result.commandment_path,
++            )
++        else:
++            raise RuntimeError(
++                "v3 preprocess failed: " + ("; ".join(result.errors) if result.errors else "no artefacts produced")
++            )
+ 
+     return _preprocess_result_to_legacy_context(
+         result=result,
+@@ -466,6 +494,29 @@ def _build_orchestrator_task(
+ # ---------------------------------------------------------------------------
+ 
+ 
++def _can_proceed_despite_failure(result: PreprocessResult) -> bool:
++    """Whether a ``success=False`` result is still usable for optimization.
++
++    True only when (a) every recorded error is a budget-limit abort (step/cost
++    limit) — never a real tool crash — and (b) the essential artifacts exist on
++    disk: a COMMANDMENT.md always, plus a harness file on Path B. This is the
++    adapter-level mirror of the orchestrator's salvage so a step_limit overshoot
++    cannot abort the whole GEAK run when the harness + COMMANDMENT were produced.
++    """
++    errors = result.errors or []
++    if not errors:
++        return False
++    if not all(("step_limit" in e) or ("cost_limit" in e) or ("Limits exceeded" in e) for e in errors):
++        return False
++    commandment_path = result.commandment_path
++    if commandment_path is None or not Path(commandment_path).is_file():
++        return False
++    if result.path_taken == "A":
++        return True
++    harness_path = result.harness_path
++    return harness_path is not None and Path(harness_path).is_file()
++
++
+ def _preprocess_result_to_legacy_context(
+     *,
+     result: PreprocessResult,
+diff --git a/src/minisweagent/run/preprocess_v3/baseline.py b/src/minisweagent/run/preprocess_v3/baseline.py
+index e49f29522..0b8ce951d 100644
+--- a/src/minisweagent/run/preprocess_v3/baseline.py
++++ b/src/minisweagent/run/preprocess_v3/baseline.py
+@@ -58,11 +58,27 @@
+ _DEFAULT_NUM_REPLAYS = 3
+ _DEFAULT_QUICK = False
+ 
+-#: Per-mode subprocess timeouts (seconds). Override via environment variables:
++#: Per-mode subprocess timeouts (seconds). Match
++#: ``run/preprocess/run_harness.MODE_TIMEOUTS`` — both use the unified
++#: ``GEAK_BENCH_TIMEOUT`` env override.
++#:
++#: These MUST be env-overridable: for compiled kernels (HIP/CUDA, e.g.
++#: sgl-kernel ``*.cu``) the very first ``--benchmark`` / ``--full-benchmark``
++#: invocation has to build the entire extension from source, which can take
++#: well over the historical 600 s default. When that first run times out it
++#: returns no latency, the orchestrator retries, and each retry recompiles
++#: from scratch — a multi-hour rebuild loop that never warms the build cache.
++#: Allowing a larger ``GEAK_BENCH_TIMEOUT`` lets the first compile finish
++#: (warming the cache) so subsequent runs are fast.
+ #:   GEAK_BENCH_TIMEOUT    — benchmark + correctness gate (each keeps its own default)
+ #:   GEAK_PROFILE_TIMEOUT  — profiler-mcp invocation
+ _BENCHMARK_TIMEOUT_S = int(os.environ.get("GEAK_BENCH_TIMEOUT", "600"))
+ _PROFILE_TIMEOUT_S = int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120"))
++
++#: Short timeout for the correctness gate that runs before baseline collection.
++#: Goal: fail fast on a broken kernel rather than spending minutes running the
++#: full benchmark loop. Override via ``GEAK_BENCH_TIMEOUT`` (or the legacy
++#: ``GEAK_CORRECTNESS_GATE_TIMEOUT``).
+ _CORRECTNESS_GATE_TIMEOUT_S = int(
+     os.environ.get(
+         "GEAK_BENCH_TIMEOUT",
+@@ -344,6 +360,18 @@ def collect_baseline_metrics(
+     if not harness_path.is_file():
+         raise FileNotFoundError(f"collect_baseline_metrics: harness not found: {harness_path}")
+ 
++    # ``GEAK_BASELINE_REPEATS`` caps the number of benchmark invocations.
++    # Each invocation re-imports the (often heavy) kernel package, so on big
++    # repos like sglang the default of 5 dominates preprocess wall-time. The
++    # env override lets callers trade baseline-variance precision for speed
++    # (e.g. bounded CI / harness-eval validation) without touching the
++    # orchestrator tool defaults.
++    _repeats_override = os.environ.get("GEAK_BASELINE_REPEATS")
++    if _repeats_override:
++        try:
++            repeats = int(_repeats_override)
++        except ValueError:
++            pass
+     repeats = max(1, int(repeats))
+     cmd = _benchmark_command(harness_path)
+     cmd_str = " ".join(shlex.quote(c) for c in cmd)
+diff --git a/src/minisweagent/run/preprocess_v3/orchestrator.py b/src/minisweagent/run/preprocess_v3/orchestrator.py
+index b4920c346..7abe40825 100644
+--- a/src/minisweagent/run/preprocess_v3/orchestrator.py
++++ b/src/minisweagent/run/preprocess_v3/orchestrator.py
+@@ -197,6 +197,8 @@ class LimitsExceeded(TerminatingException):
+ 
+ Both are deterministic subprocess calls; do not dispatch a subagent.
+ 
++**Idempotency + bounded retries (CRITICAL — avoid step-limit loops).** Call each of ``collect_baseline`` and ``collect_profile`` AT MOST twice. If a call fails, you may retry it ONCE; if it still fails on the second attempt, stop retrying — do NOT keep re-running it. ``collect_profile`` is advisory for the optimizer and a persistent profile failure is NON-FATAL: proceed without a successful profile. If a deterministic tool or the verifier keeps failing past its retry budget and you cannot clear the blocker, go straight to the escape hatch in the Final section rather than re-running the same tool until the step limit.
++
+ ## Step 5 — render COMMANDMENT.md (deterministic)
+ 
+ Call ``render_commandment`` with these arguments ONLY:
+@@ -212,7 +214,11 @@ class LimitsExceeded(TerminatingException):
+ 
+ Call ``finish_preprocess`` with no arguments (or at most an optional one-paragraph ``summary``). All artifacts are already recorded on the orchestrator from the deterministic tool calls above; the finish call is purely a completion sentinel. Do NOT pass ``harness_path``, ``commandment_path``, ``output_dir``, ``kernel_path``, ``artifacts``, ``codebase_context_path``, or ``path_taken`` — those fields are derived from the orchestrator state.
+ 
+-After ``finish_preprocess`` returns, the orchestrator loop terminates.
++If ``finish_preprocess`` returns ``ok: false`` with a ``blockers`` list, read the ``next_action`` field: rerun the named failing tool (subject to the retry budget above) and call ``finish_preprocess`` again once the blocker clears.
++
++**Escape hatch (bounded termination).** If a blocker is unrecoverable — a deterministic tool (``collect_baseline`` / ``collect_profile``) or the harness-verifier has failed past its retry budget and you cannot clear it — call ``finish_preprocess(errors=["<short reason>"])``. Passing a non-empty ``errors`` list terminates the loop immediately with a partial result instead of spinning until the step limit. Use this rather than re-running a tool that keeps failing. A run that already produced a verified harness + COMMANDMENT.md is still salvageable downstream even if profiling failed, so terminating with a recorded error is far better than exhausting the step budget.
++
++After ``finish_preprocess`` returns (cleanly or via the escape hatch), the orchestrator loop terminates.
+ 
+ # Output discipline
+ 
+@@ -231,7 +237,7 @@ class LimitsExceeded(TerminatingException):
+ 6. ``collect_profile`` — deterministic; step 4 (Path A when harness is available, and Path B).
+ 7. ``render_commandment`` — deterministic; Path B step 5.
+ 8. ``commandment_from_user_command`` — Path A short-circuit. Mutually exclusive with ``dispatch_subagent("harness-generator", ...)``.
+-9. ``finish_preprocess`` — completion sentinel; terminates the loop only when final invariants pass.
++9. ``finish_preprocess`` — completion sentinel; terminates the loop when final invariants pass, OR immediately when called with a non-empty ``errors`` list (escape hatch for unrecoverable blockers).
+ 
+ Begin by classifying the task into Case A, B, or C. For Case A, skip discovery and go directly to ``commandment_from_user_command``. For Case B or C, call ``run_discovery`` first, then follow the case-specific action above.
+ """
+@@ -735,8 +741,12 @@ def _build_result(
+ 
+         Success semantics (commit set 5a — fix for open question #7):
+ 
+-        * Loop-level ``errors`` (e.g. ``LimitsExceeded``) always invalidate
+-          ``success``.
++        * Loop-level ``errors`` (e.g. ``LimitsExceeded``) normally invalidate
++          ``success`` — EXCEPT a pure step/cost-limit abort is salvaged to
++          ``success=True`` when the required artifacts (COMMANDMENT.md +
++          harness on Path B) already exist on disk. The limit error is then
++          demoted to a warning. This keeps a step_limit overshoot from
++          discarding an otherwise-usable preprocess run.
+         * ``finish_preprocess(errors=[...])`` — i.e. the LLM gracefully
+           gave up after exhausting the harness-verifier retry budget — is
+           treated as failure: the per-step errors are folded into
+@@ -786,6 +796,32 @@ def _build_result(
+             commandment_path=commandment_path,
+         )
+ 
++        # ── Salvage: a step/cost-limit abort must NOT discard a usable run. ──
++        # When the loop exhausted its step (or cost) budget before the LLM
++        # could call ``finish_preprocess`` cleanly, but the required artifacts
++        # (COMMANDMENT.md + harness on Path B / COMMANDMENT.md on Path A) were
++        # already produced on disk, treat the run as a success so the
++        # downstream optimization loop can proceed. The limit error is demoted
++        # to a warning instead of aborting the whole GEAK pipeline. We scope
++        # this strictly to limit-only failures so genuine tool crashes still
++        # surface as ``success=False``.
++        if not success and finish_payload is None and self._is_limit_only(real_errors):
++            if self._artifacts_sufficient_for_salvage(path_taken, harness_path, commandment_path):
++                logger.warning(
++                    "Preprocess hit a step/cost limit before finish_preprocess, but required "
++                    "artifacts are present (harness=%s, commandment=%s); salvaging run as success.",
++                    harness_path,
++                    commandment_path,
++                )
++                warnings = [
++                    "preprocess hit step/cost limit before finish_preprocess; required artifacts "
++                    "were already produced, so the run was salvaged as success",
++                    *real_errors,
++                    *warnings,
++                ]
++                real_errors = []
++                success = True
++
+         return PreprocessResult(
+             success=success,
+             kernel_language=kernel_language,  # type: ignore[arg-type]
+@@ -908,6 +944,37 @@ def _finalize_success(
+             return False
+         return True
+ 
++    @staticmethod
++    def _is_limit_only(errors: list[str]) -> bool:
++        """True iff ``errors`` is non-empty and every entry is a budget-limit abort.
++
++        Used by the salvage path: only a pure step/cost-limit exhaustion is
++        eligible for salvage. Any other error (tool crash, fatal exception)
++        keeps ``success=False`` so real failures are never masked.
++        """
++        if not errors:
++            return False
++        return all(("step_limit" in e) or ("cost_limit" in e) or ("Limits exceeded" in e) for e in errors)
++
++    @staticmethod
++    def _artifacts_sufficient_for_salvage(
++        path_taken: Literal["A", "B"],
++        harness_path: Path | None,
++        commandment_path: Path | None,
++    ) -> bool:
++        """Whether on-disk artifacts justify salvaging a limit-aborted run.
++
++        Path A needs the rendered COMMANDMENT.md (the harness IS the user's
++        command). Path B additionally needs the generated harness file. Both
++        paths verify the paths actually exist on disk, not merely that the
++        orchestrator recorded a non-``None`` path.
++        """
++        if commandment_path is None or not Path(commandment_path).is_file():
++            return False
++        if path_taken == "A":
++            return True
++        return harness_path is not None and Path(harness_path).is_file()
++
+     # -----------------------------------------------------------------
+     # Model wiring
+     # -----------------------------------------------------------------
+diff --git a/src/minisweagent/run/preprocess_v3/tools.py b/src/minisweagent/run/preprocess_v3/tools.py
+index f3793a3af..6505dd123 100644
+--- a/src/minisweagent/run/preprocess_v3/tools.py
++++ b/src/minisweagent/run/preprocess_v3/tools.py
+@@ -129,6 +129,15 @@ def _substitute_mode_flag(cmd: str, target_mode: str) -> str:
+ 
+ _DEFAULT_PROFILE_REPLAYS = 5
+ 
++#: Bounded-retry ceilings used by ``_finish_blockers`` so an unclearable
++#: deterministic-tool / verifier failure cannot spin the orchestrator loop up
++#: to its global ``step_limit``. Once these caps are hit the corresponding
++#: blocker is demoted (no longer blocks ``finish_preprocess``) and the
++#: partial/failed artifact is surfaced on the PreprocessResult instead.
++_MAX_DETERMINISTIC_PROBE_ATTEMPTS = 2
++#: Mirrors the prompt's "Maximum 3 generator attempts" budget for harness repair.
++_MAX_VERIFIER_ATTEMPTS = 3
++
+ 
+ def _build_profile_section(profile_cmd: str) -> str:
+     """Wrap a ``--profile`` harness invocation with warmup + ``kernel-profile``.
+@@ -1331,6 +1340,39 @@ def _impl(
+                 )
+             out_path = str(Path(output_dir) / "COMMANDMENT.md")
+ 
++        # Hard worktree-bypass gate (deterministic, final). A harness that
++        # hardcodes the source-repo path imports/builds the UNPATCHED baseline,
++        # so correctness always PASSes and every speedup reads ~1.00x with no
++        # error. Refuse to finalize such a harness into COMMANDMENT.md — return
++        # a directive that routes the orchestrator back to harness-generator.
++        # ``repo_root`` here is the canonical source repo, so the detector is
++        # precise regardless of the GEAK_WORK_DIR/GEAK_REPO_ROOT env state.
++        if not os.environ.get("GEAK_ALLOW_HARDCODED_PATHS"):
++            try:
++                from minisweagent.kernel_languages.contract import (
++                    ContractViolation,
++                    validate_harness,
++                )
++
++                validate_harness(Path(harness_path), repo_root=repo_root)
++            except ContractViolation as exc:
++                logger.error("render_commandment REJECTED harness (worktree bypass): %s", exc)
++                agent._collected.pop("harness_path", None)
++                return {
++                    "ok": False,
++                    "error": "worktree_bypass",
++                    "detail": str(exc),
++                    "next_action": (
++                        "Do NOT retry render_commandment. Re-dispatch the "
++                        "harness-generator subagent to regenerate the harness so it "
++                        "resolves EVERY path from os.environ['GEAK_WORK_DIR'] (no "
++                        "hardcoded source-repo path, not even as a sys.path fallback "
++                        "candidate). Then re-run the verifier before render_commandment."
++                    ),
++                }
++            except Exception as exc:  # noqa: BLE001 — never let the gate crash finalize
++                logger.debug("render_commandment bypass-gate skipped (validator error): %s", exc)
++
+         ctx = CommandmentContext(
+             kernel_path=Path(kernel_path),
+             harness_path=Path(harness_path),
+@@ -1630,9 +1672,12 @@ def _impl(
+                 "error": "finish_preprocess blocked: unresolved preprocess invariants",
+                 "blockers": blockers,
+                 "next_action": (
+-                    "Do not call finish_preprocess again yet. Fix the listed blockers by "
+-                    "rerunning the failed deterministic tool or redispatching the relevant "
+-                    "subagent, then call finish_preprocess only after all blockers are gone."
++                    "Fix the listed blockers by rerunning the failed deterministic tool or "
++                    "redispatching the relevant subagent, then call finish_preprocess once the "
++                    "blockers are gone. IMPORTANT: do NOT retry the same failing tool more than "
++                    "twice (verifier: 3x). If a blocker persists after that budget, it is "
++                    "unrecoverable here — call finish_preprocess(errors=['<short reason>']) to "
++                    "terminate with a partial result instead of looping until the step limit."
+                 ),
+             }
+         agent._finish_payload = payload
+@@ -1691,23 +1736,56 @@ def _finish_blockers(
+     if not agent._collected.get("harness_path"):
+         blockers.append("Path B missing harness_path")
+ 
++    def _tool_attempts(tool_name: str) -> int:
++        return sum(1 for tc in agent._tool_calls if tc.get("name") == tool_name)
++
++    # ── Bounded retries ──────────────────────────────────────────────
++    # verifier / baseline / profile success used to be HARD gates with no
++    # attempt ceiling: an environment- or format-level failure that can never
++    # succeed (e.g. a profiler that can't parse an unusual standalone harness)
++    # would block ``finish_preprocess`` forever, so the LLM kept re-running the
++    # failing tool until it exhausted the global step_limit. We now cap the
++    # number of attempts. Once the cap is hit, the unclearable blocker is
++    # DEMOTED (we stop blocking) so the sentinel can terminate cleanly; the
++    # failed/partial artifact still rides along in the PreprocessResult and the
++    # downstream salvage / success logic decides usability. ``profile`` is
++    # never required by the optimizer, so it is demoted most aggressively.
+     verifier_runs = [r for r in agent._subagent_runs if r.get("name") == "harness-verifier"]
++    verifier_ok = any(r.get("success") is True for r in verifier_runs)
+     if not verifier_runs:
+         blockers.append("Path B never dispatched harness-verifier")
+-    elif not any(r.get("success") is True for r in verifier_runs):
+-        blockers.append("Path B has no successful harness-verifier run")
++    elif not verifier_ok and len(verifier_runs) < _MAX_VERIFIER_ATTEMPTS:
++        blockers.append(
++            f"Path B has no successful harness-verifier run ({len(verifier_runs)}/{_MAX_VERIFIER_ATTEMPTS} attempts)"
++        )
+ 
+     baseline = agent._collected.get("baseline")
+-    if baseline is None:
+-        blockers.append("Path B missing baseline metrics")
+-    elif getattr(baseline, "success", True) is False:
+-        blockers.append("Path B baseline collection failed")
++    baseline_attempts = _tool_attempts("collect_baseline")
++    if baseline is None and baseline_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS:
++        blockers.append("Path B missing baseline metrics (call collect_baseline)")
++    elif (
++        baseline is not None
++        and getattr(baseline, "success", True) is False
++        and baseline_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS
++    ):
++        blockers.append(
++            f"Path B baseline collection failed ({baseline_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
++        )
+ 
+     profile = agent._collected.get("profile")
+-    if profile is None:
+-        blockers.append("Path B missing profile result")
+-    elif getattr(profile, "success", True) is False:
+-        blockers.append("Path B profile collection failed")
++    profile_attempts = _tool_attempts("collect_profile")
++    if profile is None and profile_attempts == 0:
++        # Profiling must be attempted at least once, but a repeated failure is
++        # non-fatal (profile is advisory for the optimizer, not required).
++        blockers.append("Path B missing profile result (call collect_profile)")
++    elif (
++        profile is not None
++        and getattr(profile, "success", True) is False
++        and profile_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS
++    ):
++        blockers.append(
++            f"Path B profile collection failed ({profile_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
++        )
+ 
+     if not agent._collected.get("commandment_path"):
+         blockers.append("Path B missing COMMANDMENT.md")
+diff --git a/src/minisweagent/tools/bash_command.py b/src/minisweagent/tools/bash_command.py
+index 6e52312aa..2c594856a 100644
+--- a/src/minisweagent/tools/bash_command.py
++++ b/src/minisweagent/tools/bash_command.py
+@@ -2,9 +2,37 @@
+ import logging
+ import os
+ import re
++import shlex
++import signal
+ import subprocess
+ from pathlib import Path
+ 
++# Default per-command wall-clock timeout (seconds). A find/grep over a huge
++# shared mount (e.g. /wekafs, tens of TB) would otherwise block until the
++# preprocess soft/hard cap fires, burning the whole preprocess budget. Override
++# with GEAK_BASH_TIMEOUT_S.
++_DEFAULT_BASH_TIMEOUT_S = 300.0
++
++# Recursive-traversal commands whose explicit path operands are range-checked
++# against the denylist below. Non-recursive commands (and any command we cannot
++# confidently parse) are left untouched and rely on the timeout backstop.
++_RECURSIVE_SCANNERS = frozenset({"find", "grep", "egrep", "fgrep", "rg", "ag", "fd", "fdfind", "ls", "du", "tree"})
++_GREP_LIKE = frozenset({"grep", "egrep", "fgrep"})
++
++# Scanners whose FIRST non-flag operand is a pattern/regex, not a path, so it
++# must be skipped before range-checking the remaining (path) operands.
++_PATTERN_FIRST = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "fd", "fdfind"})
++
++# Search roots that must never be scanned recursively: the multi-TB shared data
++# lake and the bare filesystem root (which contains it). Override/extend with a
++# ':'-separated GEAK_SEARCH_DENY_ROOTS (a bare "/" means "exactly /", not a
++# prefix, so it does not block legitimate /opt/rocm or /usr/include searches).
++_DEFAULT_DENY_ROOTS = ("/wekafs", "/")
++
++# Shell tokens that begin a new simple-command within a compound line, so each
++# sub-command's argv[0] can be re-evaluated against the scanner set.
++_CMD_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "{", "}", "\n"})
++
+ _OUTPUT_UNREADABLE = (
+     "The combined command output could not be decoded as a whole using the "
+     "process locale encoding. Part of the command (e.g. one stage such as "
+@@ -122,6 +150,145 @@ def _sandbox_command(command: str) -> str:
+             return rewritten
+         return command
+ 
++    @staticmethod
++    def _denied_roots() -> list[str]:
++        raw = os.environ.get("GEAK_SEARCH_DENY_ROOTS")
++        if raw is None:
++            return list(_DEFAULT_DENY_ROOTS)
++        return [d for d in raw.split(":") if d]
++
++    @staticmethod
++    def _path_in_deny(token: str, deny: list[str]) -> str | None:
++        """Resolve an absolute/`~` path token and return the matched deny root,
++        or None. A deny entry of "/" matches only the exact filesystem root, so
++        bounded system trees (``/opt/rocm``, ``/usr/include``) stay searchable."""
++        if not token.startswith(("/", "~")):
++            return None  # relative -> resolves under cwd (worktree); safe.
++        rp = os.path.realpath(Path(token).expanduser())
++        for d in deny:
++            if d == "/":
++                if rp == "/":
++                    return rp
++            elif rp == d.rstrip("/") or rp.startswith(d.rstrip("/") + "/"):
++                return rp
++        return None
++
++    @staticmethod
++    def _grep_is_recursive(flags: list[str]) -> bool:
++        for f in flags:
++            if f in ("--recursive", "--dereference-recursive"):
++                return True
++            if f.startswith("-") and not f.startswith("--") and ("r" in f[1:] or "R" in f[1:]):
++                return True
++        return False
++
++    @staticmethod
++    def _ls_is_recursive(flags: list[str]) -> bool:
++        # ls: only -R / --recursive walks; -r is merely reverse-sort.
++        for f in flags:
++            if f == "--recursive":
++                return True
++            if f.startswith("-") and not f.startswith("--") and "R" in f[1:]:
++                return True
++        return False
++
++    @classmethod
++    def _blocked_scan_root(cls, command: str) -> str | None:
++        """Return the offending deny-root if ``command`` recursively scans it.
++
++        Conservative & fail-open: any command we cannot confidently tokenize
++        (exotic quoting, ``$(...)``, etc.) returns None and falls back to the
++        timeout backstop. Only the recursive scanners in ``_RECURSIVE_SCANNERS``
++        are inspected, and grep/ls only when a recursion flag is present (a
++        single-file ``grep`` or a flat ``ls`` is bounded). Everything else
++        passes through untouched.
++        """
++        deny = cls._denied_roots()
++        if not deny:
++            return None
++        try:
++            tokens = shlex.split(command, comments=False)
++        except ValueError:
++            return None  # unbalanced quotes etc. -> let timeout handle it.
++
++        i = 0
++        at_cmd_start = True
++        while i < len(tokens):
++            tok = tokens[i]
++            if tok in _CMD_SEPARATORS:
++                at_cmd_start = True
++                i += 1
++                continue
++            if not at_cmd_start:
++                i += 1
++                continue
++            at_cmd_start = False
++            cmd = Path(tok).name
++            if cmd not in _RECURSIVE_SCANNERS:
++                i += 1
++                continue
++            # Collect this simple-command's operands up to the next separator.
++            j = i + 1
++            operands: list[str] = []
++            while j < len(tokens) and tokens[j] not in _CMD_SEPARATORS:
++                operands.append(tokens[j])
++                j += 1
++            flags = [o for o in operands if o.startswith("-")]
++            # grep/ls only walk when their recursion flag is present.
++            if cmd in _GREP_LIKE and not cls._grep_is_recursive(flags):
++                i = j
++                continue
++            if cmd == "ls" and not cls._ls_is_recursive(flags):
++                i = j
++                continue
++            # Pattern-first commands take a regex as their first non-flag
++            # operand (e.g. ``rg "/x" /path``); skip it so it is not mistaken
++            # for a path. find/du/tree/ls are path-first -> check all operands.
++            skipped_pattern = cmd not in _PATTERN_FIRST
++            for operand in operands:
++                if operand.startswith("-"):
++                    continue
++                if not skipped_pattern:
++                    skipped_pattern = True
++                    continue
++                hit = cls._path_in_deny(operand, deny)
++                if hit:
++                    return hit
++            i = j
++        return None
++
++    @staticmethod
++    def _run(command: str, env, cwd, timeout_s: float):
++        """Run ``command`` in its own process group and enforce ``timeout_s``.
++
++        ``start_new_session=True`` puts the shell and all its children in a
++        fresh process group, so on timeout we ``killpg`` the WHOLE group —
++        otherwise a runaway ``find`` orphaned by killing only the shell would
++        keep hammering the filesystem. Returns ``(stdout, stderr, rc, timed_out)``.
++        """
++        proc = subprocess.Popen(
++            command,
++            shell=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            env=env,
++            cwd=cwd,
++            start_new_session=True,
++        )
++        try:
++            out_b, err_b = proc.communicate(timeout=timeout_s)
++            return out_b, err_b, proc.returncode, False
++        except subprocess.TimeoutExpired:
++            try:
++                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
++            except (ProcessLookupError, PermissionError):
++                proc.kill()
++            try:
++                out_b, err_b = proc.communicate(timeout=5)
++            except subprocess.TimeoutExpired:
++                out_b, err_b = b"", b""
++            return out_b, err_b, -signal.SIGKILL, True
++
+     def __call__(
+         self,
+         *,
+@@ -138,36 +305,48 @@ def __call__(
+                 "output": f"Blocked dangerous command: {command}",
+                 "returncode": 1,
+             }
++        denied_root = self._blocked_scan_root(command)
++        if denied_root:
++            return {
++                "output": (
++                    f"Blocked recursive scan of '{denied_root}': it is a multi-TB "
++                    "shared mount outside the allowed search scope and would stall "
++                    "for a very long time. Restrict the search to your worktree "
++                    "($GEAK_WORK_DIR) or the source repo ($GEAK_REPO_ROOT), e.g. "
++                    '`grep -r <pattern> "$GEAK_WORK_DIR"`.'
++                ),
++                "returncode": 1,
++            }
+         else:
+             command = self._sandbox_command(command)
+             env = os.environ | self._env_override if self._env_override else None
+             cwd = self._cwd if self._cwd and Path(self._cwd).is_dir() else None
+             try:
+-                result = subprocess.run(
+-                    command,
+-                    shell=True,
+-                    capture_output=True,
+-                    text=False,
+-                    env=env,
+-                    cwd=cwd,
+-                    timeout=self.timeout,
++                # GEAK_BASH_TIMEOUT_S takes precedence; fall back to self.timeout
++                # (which itself reads main's GEAK_BASH_TIMEOUT) so both env names work.
++                timeout_s = float(os.environ.get("GEAK_BASH_TIMEOUT_S", self.timeout))
++            except (TypeError, ValueError):
++                timeout_s = float(self.timeout)
++            stdout_b, stderr_b, returncode, timed_out = self._run(command, env, cwd, timeout_s)
++            output_text = _decode_captured_output(stdout_b, stderr_b)
++
++            if timed_out:
++                notice = (
++                    f"Command terminated after exceeding the {timeout_s:.0f}s timeout "
++                    "(process group killed). If you were searching the filesystem, "
++                    "scope it to $GEAK_WORK_DIR / $GEAK_REPO_ROOT instead of a shared "
++                    "mount; otherwise split the work into smaller steps."
+                 )
+-            except subprocess.TimeoutExpired:
+-                return {
+-                    "output": f"TIMEOUT: command exceeded {self.timeout}s limit. "
+-                    "Override via GEAK_BASH_TIMEOUT env var.",
+-                    "returncode": -1,
+-                }
+-            output_text = _decode_captured_output(result.stdout, result.stderr)
++                output_text = f"{output_text}\n\n{notice}" if output_text else notice
+ 
+             if "COMMANDMENT.md" in command:
+                 output_text = self._maybe_validate_commandment(command, output_text)
+ 
+-            if result.returncode != 0:
++            if returncode != 0:
+                 output_text = output_text or "Command failed with no output."
+             return {
+                 "output": output_text or "Bash command executed successfully.",
+-                "returncode": result.returncode,
++                "returncode": returncode,
+             }
+ 
+     @staticmethod
+diff --git a/subagents/preprocess/harness-generator/SUBAGENT.yaml b/subagents/preprocess/harness-generator/SUBAGENT.yaml
+index d8b3262e2..d9b43aa89 100644
+--- a/subagents/preprocess/harness-generator/SUBAGENT.yaml
++++ b/subagents/preprocess/harness-generator/SUBAGENT.yaml
+@@ -50,6 +50,16 @@ system_prompt: |
+   - If any mode fails, fix the harness yourself and rerun the failing mode. You wrote the harness, so you own the first repair loop before submission.
+   - You may edit the new harness file you create to fix errors. Do NOT modify existing test scripts or kernel code.
+ 
++  ## Worktree Path Discipline (MANDATORY — read before writing any import/build path)
++  - At optimization time GEAK applies each candidate patch inside a PER-SLOT git worktree exported as `$GEAK_WORK_DIR` (placed first on PYTHONPATH). The harness MUST resolve EVERY repository path from `$GEAK_WORK_DIR` so it imports/compiles the PATCHED candidate — never the original source tree. If it reads the baseline, correctness always PASSes and every measured speedup is ~1.00x with no error, and the optimizer trains on a flat signal.
++  - Derive once at the top: `WORK_DIR = os.environ.get("GEAK_WORK_DIR", os.path.dirname(os.path.abspath(__file__)))`.
++  - Python imports: prepend the worktree's package dir to `sys.path` — e.g. `sys.path.insert(0, os.path.join(WORK_DIR, "python"))` (adjust `"python"` to wherever the package lives in the repo). Do this ONCE.
++  - NEVER hardcode an absolute source-repo path (e.g. `"/sgl-workspace/sglang/python"`), and NEVER add one as a fallback element in a sys.path candidate list/tuple — with `sys.path.insert(0, ...)` in a loop it would land AHEAD of the worktree and silently import the baseline. The worktree-derived entry must be the ONLY one you insert. The sole permitted absolute literal anywhere is the default arg of `os.environ.get("GEAK_WORK_DIR", <default>)`.
++  - C/C++/HIP/CUDA: build include flags as `f"-I{WORK_DIR}/<subdir>"`, compile into a DETERMINISTIC fixed-name dir under `WORK_DIR` (e.g. `f"{WORK_DIR}/_geak_build"`; it is already per-slot-isolated because WORK_DIR differs per worktree), and do an INCREMENTAL rebuild keyed on source mtime/hash — rebuild only when the kernel source is newer than the artifact (a patched kernel has a newer mtime so it still recompiles), otherwise reuse the cache. Never do an unconditional cold rebuild every run (turns validation into a multi-hour recompile loop).
++  - SELF-CONTAINED BUILD (MANDATORY): the harness MUST build the artifact ITSELF, from scratch, whenever the build dir / compiled `.so` is MISSING. Every candidate runs in a FRESH per-slot git worktree that does NOT contain any prior build — `_geak_build/` is untracked and will NOT be present. So the build cache is an OPTIMIZATION, never a PRECONDITION: `if artifact missing -> generate build files + compile; elif source newer -> recompile; else -> reuse`. NEVER `sys.exit`/raise demanding that a "preprocess seed" or pre-existing `_geak_build/<ext>` be present — that makes correctness fail on every fresh candidate worktree, so the optimizer sees a flat ~1.00x signal (the same failure mode as the worktree-bypass bug). You may reuse SHARED, READ-ONLY prebuilt third-party deps (e.g. composable_kernel / flashinfer headers) to speed the compile, but the kernel-under-test extension itself must always be buildable from only `$GEAK_WORK_DIR` + the toolchain.
++  - Do NOT `pip install -e` and do NOT mutate the global environment. A harness that violates this is rejected by the deterministic worktree-bypass gate and you will be asked to regenerate.
++  - When you TEST the harness, run it in the FOREGROUND and wait for it to finish (e.g. just `python3 <harness> --correctness`). NEVER launch the build in the background and poll for completion with `pgrep -f "ninja|hipcc"` (or any pattern that also matches the polling shell's own command line — that self-match makes the loop spin until the command timeout and wastes the whole preprocess budget). The harness already builds synchronously inside `subprocess.run(...)`; let it block and read its exit code.
++
+   Harness shape (the four CLI modes)
+   - `--full-benchmark`: runs ALL configs from the shape source file. Per-shape latency + dual-signal output markers (see below).
+   - `--benchmark`: runs `_pick(configs, 25)`. Same output format.
+@@ -114,6 +124,19 @@ system_prompt: |
+   - `--profile` → `_pick(configs, 5)`
+   - All four modes sample from the SAME ordered case stream.
+ 
++  MANDATORY shape budget (keeps harness validation bounded). Read the env
++  var `GEAK_MAX_BENCHMARK_SHAPES` ONCE near the top:
++      _MAX_SHAPES = int(os.environ.get("GEAK_MAX_BENCHMARK_SHAPES", "0") or 0)
++  When `_MAX_SHAPES > 0`, EVERY mode must cap its selected configs to at
++  most `_MAX_SHAPES` using the SAME positional `_pick`, e.g.:
++      def _cap(picked):
++          return _pick(picked, _MAX_SHAPES) if _MAX_SHAPES > 0 else picked
++  and apply `_cap(...)` to the list each mode runs — including
++  `--full-benchmark` (so `--full-benchmark → _cap(all configs)`).
++  When the env var is unset or 0, behaviour is unchanged (full coverage).
++  This is REQUIRED: a harness whose `--full-benchmark` ignores the budget
++  will time out during validation and be rejected.
++
+   Core principle
+   - The harness is a THIN WRAPPER around existing repo code. Do NOT reimplement what the repo already does — import and call its existing functions.
+ 
+diff --git a/subagents/preprocess/harness-verifier/SUBAGENT.yaml b/subagents/preprocess/harness-verifier/SUBAGENT.yaml
+index 03d71ab57..e2145c9f3 100644
+--- a/subagents/preprocess/harness-verifier/SUBAGENT.yaml
++++ b/subagents/preprocess/harness-verifier/SUBAGENT.yaml
+@@ -46,9 +46,18 @@ system_prompt: |
+   4. Recommended flag `--iterations`: missing it is a non-fatal warning (surface under `WARNINGS=`); do not auto-fix.
+   5. The `run_profile` function (or any function whose name contains `profile`) must NOT allocate tensors directly on CUDA. Match `torch\.(randn?|empty|zeros|ones|full)\([^)]*device\s*=\s*["']cuda["']` inside the body. **FIXABLE** — rewrite each match from `device="cuda"` to `device="cpu"` followed by `.to("cuda")`.
+   6. If source files were provided, the harness must not invent a standalone `ALL_CONFIGS` / `ALL_SHAPES` list that disagrees with the source file. Missing `harness_shapes_source.txt` is **FIXABLE** when the source path is obvious from context; otherwise fail with `FAILED_RULE=missing-shape-source`.
++  7. Worktree-bypass gate (CRITICAL — the "always ~1.00x speedup" root cause). The harness MUST resolve every repository path from `$GEAK_WORK_DIR`, never a hardcoded absolute source-repo path. Run the deterministic validator and treat ANY finding as fatal:
++        GEAK_REPO_ROOT="<repo_root>" python3 -c "import os,sys; from minisweagent.kernel_languages.contract import find_source_repo_path_leaks; leaks=find_source_repo_path_leaks(open(sys.argv[1]).read(), repo_root=os.environ['GEAK_REPO_ROOT']); print('\n'.join(f'L{l}: {r}' for l,_,r in leaks)); sys.exit(1 if leaks else 0)" "<harness_path>"
++     A leak means the harness imports/builds the UNPATCHED baseline. This is **NOT FIXABLE by you** (do not patch around it by hardcoding another path) — escalate to the generator with `FAILED_RULE=worktree-bypass` and a CORRECTION_HINT naming the offending line, instructing it to derive the path from `os.environ['GEAK_WORK_DIR']` and remove any hardcoded source-path fallback/candidate.
++
++  7b. aiter JIT-routing gate (CRITICAL — same ~1.00x root cause, aiter-specific). `aiter` is installed EDITABLE via a `sys.meta_path` finder, so `import aiter` resolves to the BASELINE repo regardless of `sys.path` order, and aiter's JIT compiles `AITER_CSRC_DIR=$AITER_META_DIR/csrc`. A harness that imports `aiter` and compiles a `csrc/*.cu` kernel MUST set `os.environ["AITER_META_DIR"] = WORK_DIR` (and a per-slot `AITER_JIT_DIR`) BEFORE `import aiter`, or it silently evaluates the baseline. Run the deterministic validator and treat any finding as fatal:
++        python3 -c "import sys; from minisweagent.kernel_languages.contract import find_aiter_routing_violation as f; m=f(open(sys.argv[1]).read()); print(m or ''); sys.exit(1 if m else 0)" "<harness_path>"
++     If it fails, escalate to the generator with `FAILED_RULE=aiter-routing` and a CORRECTION_HINT instructing it to set BOTH `AITER_META_DIR=$GEAK_WORK_DIR` (source routing) AND a per-worktree `AITER_JIT_DIR=os.path.join(WORK_DIR, ...)` (build-output routing) before `import aiter` — sys.path alone does NOT work for editable aiter, and a missing `AITER_JIT_DIR` makes aiter write `build/` + `<module>.so` into the source package dir (pollutes the repo AND makes parallel `run_pool` slots collide on a shared build dir / .so / ninja lock). Do NOT fix this by hardcoding paths.
++
++  7c. Self-contained build gate (CRITICAL — compiled kernels). Every candidate runs in a FRESH per-slot worktree with NO prior build (`_geak_build/` is untracked, absent). The harness MUST build the artifact itself when missing — it must NOT `sys.exit`/raise demanding a pre-existing build dir or "preprocess seed". Inspect the harness build path: if it errors out when the build dir / `.so` is absent (instead of generating build files + compiling), that harness fails on every fresh candidate (flat ~1.00x signal). Escalate with `FAILED_RULE=non-self-contained-build` and a CORRECTION_HINT: "build the extension from scratch when the artifact is missing (cache is an optimization, not a precondition); only shared READ-ONLY third-party deps may be assumed prebuilt".
+ 
+   Phase 2 — Runtime validation (run the harness directly)
+-  Run the four CLI modes in this order, short-circuiting on first failure. For each subprocess `cd <repo_root>` first and set `HIP_VISIBLE_DEVICES=<gpu_id>`, `PYTHONUNBUFFERED=1`, `PYTHONPATH=<repo_root>:$PYTHONPATH`, `GEAK_BENCHMARK_ITERATIONS=5`:
++  Run the four CLI modes in this order, short-circuiting on first failure. Run each mode in the FOREGROUND with the timeout shown and read its exit code — NEVER background the build and poll with `pgrep -f "ninja|hipcc"` (that pattern also matches the polling shell itself, so the loop never exits and burns the whole budget). For each subprocess `cd <repo_root>` first and set `HIP_VISIBLE_DEVICES=<gpu_id>`, `PYTHONUNBUFFERED=1`, `PYTHONPATH=<repo_root>:$PYTHONPATH`, `GEAK_BENCHMARK_ITERATIONS=5`:
+ 
+       python3 <harness_path> --correctness   # timeout 1800 s
+       python3 <harness_path> --profile       # timeout  120 s
+@@ -65,7 +74,7 @@ system_prompt: |
+   - `device="cuda"` allocation inside `run_profile` (Phase 1 rule 5) → already handled above; re-check at runtime.
+   - Hardcoded shape lists that don't match the harness's mode flags → rewrite to use the discovered config list.
+   - Missing `harness_shapes_source.txt` when the authoritative shape/test source path is provided → create it with that exact path (or `user_task:production` for explicit user-shape override).
+-  - Missing `sys.path` injection when `ImportError` is for a sibling module of `kernel_path` → prepend `sys.path.insert(0, repo_root)` once at the top.
++  - Missing `sys.path` injection when `ImportError` is for a sibling module of `kernel_path` → prepend a WORKTREE-DERIVED entry once at the top: `WORK_DIR = os.environ.get("GEAK_WORK_DIR", os.path.dirname(os.path.abspath(__file__)))` then `sys.path.insert(0, os.path.join(WORK_DIR, "<pkg-subdir>"))`. NEVER inject a hardcoded absolute path (`sys.path.insert(0, "/abs/repo")`) or `sys.path.insert(0, repo_root)` with a literal — that re-introduces the worktree bypass.
+   - Wrong `torch.manual_seed(<n>)` (not 42 or absent) → set to 42.
+   - Per-tensor dtype/device drift that the source benchmark file declares clearly (e.g. test file uses `int32` for indices and harness uses `int64`) → coerce to match source.
+ 

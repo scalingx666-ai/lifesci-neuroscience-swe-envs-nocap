@@ -1,0 +1,2338 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2eae17c3..4e33993e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+ ## [Unreleased]
+ 
+ ### Added
++- **Tree binaries sync (desktop, Stage A).** `list_binaries` walks the whole vault for
++  registry binary formats (not only `attachments/`), sharing the `attachment_hashes`
++  cache; each tree binary is registered as a server `files` row via `POST /api/files`
++  with the local `files.id` (persisted under `files` in `.context/config.json`) and
++  uploaded with `docId` so the server's resolver ACL applies. Downloads of tree paths go
++  through `write_tree_binary` (its own guard; `ensure_attachment_rel` untouched for
++  server-supplied `attachments/` paths) and are remembered for one watcher echo. Any
++  `syncAs: attachment` change now routes to attachment sync instead of the note path.
++  Extracted text is pushed to `PUT /api/vaults/:id/blobs/:blobId/text` after
++  `files-indexed`. Rename of a tree binary still does not propagate (pinned test; Stage B).
+ - **Attachment transport (desktop).** `AttachmentSync.pass` uses the server's
+   `intent → PUT → complete` flow when offered (404 ⇒ legacy POST, remembered per server
+   URL): a dedupe hit sends zero bytes, 402 aborts the pass with one toast, 413/415 skip
+diff --git a/app/apps/desktop/src-tauri/src/attachments.rs b/app/apps/desktop/src-tauri/src/attachments.rs
+index 994d3307..406104c9 100644
+--- a/app/apps/desktop/src-tauri/src/attachments.rs
++++ b/app/apps/desktop/src-tauri/src/attachments.rs
+@@ -5,7 +5,7 @@
+ 
+ use crate::error::{AppError, AppResult};
+ use crate::notefile::sha256_file;
+-use crate::vault::{is_ignored_name, resolve_in_vault};
++use crate::vault::{is_allowed_file, is_ignored_name, is_note_file, rel_path_is_ignored, resolve_in_vault};
+ use once_cell::sync::Lazy;
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+@@ -102,10 +102,48 @@ fn ensure_attachment_rel(rel: &str) -> AppResult<()> {
+     Ok(())
+ }
+ 
++/// The write guard for a binary that lives in the TREE rather than in
++/// `attachments/` — a `.docx` a teammate dropped into `Team/`, which another
++/// device has to materialise at that same path.
++///
++/// Deliberately a SECOND guard rather than a relaxation of
++/// {@link ensure_attachment_rel}: that one still bounds every
++/// `attachments/`-targeted write, and widening it would hand a member who sets
++/// a blob's `rel_path` the whole vault. What this one accepts is exactly the set
++/// the binary walk produces — a surfaced, non-note extension outside `.context`,
++/// `.git`, dotfiles and `DENIED_DIRS` — so a server-supplied path can name a
++/// file the user could have dropped there themselves and nothing else. Notes
++/// are refused because they belong to the CRDT pipeline; a blob must never be
++/// able to overwrite one.
++fn ensure_tree_binary_rel(rel: &str) -> AppResult<()> {
++    if rel.is_empty() || rel_path_is_ignored(rel) {
++        return Err(AppError::new("invalid tree binary path"));
++    }
++    let name = rel.rsplit('/').next().unwrap_or(rel);
++    if !is_allowed_file(name) || is_note_file(name) {
++        return Err(AppError::new("not a syncable binary file type"));
++    }
++    Ok(())
++}
++
++/// Atomic write of raw bytes to a TREE binary path (see
++/// {@link ensure_tree_binary_rel}). Same temp+rename as `write_binary_file`,
++/// different accepted set.
++pub fn write_tree_binary(vault: &Path, rel: &str, bytes: &[u8]) -> AppResult<()> {
++    ensure_tree_binary_rel(rel)?;
++    write_bytes_atomic(vault, rel, bytes)
++}
++
+ /// Atomic write of raw bytes: temp file in the same dir, then rename over the
+ /// target so readers never observe a half-written file. Creates parent dirs.
+ pub fn write_binary_file(vault: &Path, rel: &str, bytes: &[u8]) -> AppResult<()> {
+     ensure_attachment_rel(rel)?;
++    write_bytes_atomic(vault, rel, bytes)
++}
++
++/// The write itself, once a caller's guard has accepted the path. Private, so
++/// nothing can reach it without passing one of the two guards above.
++fn write_bytes_atomic(vault: &Path, rel: &str, bytes: &[u8]) -> AppResult<()> {
+     let abs = resolve_in_vault(vault, rel)?;
+     let parent = abs
+         .parent()
+@@ -173,11 +211,73 @@ pub fn list_attachments_cached(
+     vault: &Path,
+     cached: &HashMap<String, HashEntry>,
+ ) -> AppResult<AttachmentListing> {
+-    let root = vault.join("attachments");
++    let root = vault.join(ATTACHMENTS_DIR);
+     let mut found: Vec<(String, PathBuf, u64, i64)> = Vec::new();
+     if root.is_dir() {
+-        walk(vault, &root, &mut found)?;
++        walk(vault, &root, &|_| true, &mut found)?;
+     }
++    hash_listing(found, cached)
++}
++
++/// The vault-root store for content-addressed attachments (editor drops).
++/// Mirrors `vault.rs`'s own constant and `stats.rs ATTACHMENTS_DIR`.
++pub const ATTACHMENTS_DIR: &str = "attachments";
++/// The same, as a path prefix — compared per file, so it is a constant rather
++/// than a `format!` per candidate.
++const ATTACHMENTS_PREFIX: &str = "attachments/";
++
++/// Does the binary sync mirror this vault-relative path?
++///
++/// Two sets, deliberately: everything under the root `attachments/` store (its
++/// files are content-addressed and hidden, and the names are ours, so the
++/// extension is not a question anyone asked), plus every TREE binary — a
++/// surfaced, non-note extension anywhere else in the vault. `.context/`,
++/// `.git`, dotfiles and `DENIED_DIRS` are out of both, and notes are out of the
++/// second: they ride the CRDT bridge, not the blob store.
++pub fn is_syncable_binary(rel: &str) -> bool {
++    if rel.is_empty() || rel_path_is_ignored(rel) {
++        return false;
++    }
++    if rel.starts_with(ATTACHMENTS_PREFIX) {
++        return true;
++    }
++    let name = rel.rsplit('/').next().unwrap_or(rel);
++    is_allowed_file(name) && !is_note_file(name)
++}
++
++/// The same listing over the WHOLE vault: `attachments/` plus every tree binary
++/// (see {@link is_syncable_binary}).
++///
++/// A strict superset of {@link list_attachments_cached}, which is why the two
++/// share one hash cache: the binary walk re-states every attachment entry, so
++/// writing its cache back prunes nothing the attachment walk still wants. (The
++/// reverse is not true — an `attachments/`-only walk would prune the tree
++/// entries — which is why `list_attachments` has no caller left in the sync
++/// path.)
++pub fn list_binaries_cached(
++    vault: &Path,
++    cached: &HashMap<String, HashEntry>,
++) -> AppResult<AttachmentListing> {
++    let mut found: Vec<(String, PathBuf, u64, i64)> = Vec::new();
++    if vault.is_dir() {
++        walk(vault, vault, &is_syncable_binary, &mut found)?;
++    }
++    hash_listing(found, cached)
++}
++
++/// Every syncable binary in the vault, hashed. The uncached twin of
++/// {@link list_binaries_cached}, for callers and tests with no index.
++pub fn list_binaries(vault: &Path) -> AppResult<Vec<AttachmentMeta>> {
++    Ok(list_binaries_cached(vault, &HashMap::new())?.items)
++}
++
++/// Hash what a walk found, reusing a cached sha wherever `(size, mtime)` says
++/// the bytes cannot have moved. Shared by both walks — the only difference
++/// between them is which files reach here.
++fn hash_listing(
++    mut found: Vec<(String, PathBuf, u64, i64)>,
++    cached: &HashMap<String, HashEntry>,
++) -> AppResult<AttachmentListing> {
+     // Deterministic order (stable diffs, stable tests).
+     found.sort_by(|a, b| a.0.cmp(&b.0));
+ 
+@@ -209,22 +309,35 @@ pub fn list_attachments_cached(
+ }
+ 
+ /// Collect `(rel_path, abs, size, mtime_ns)` for every non-ignored file under
+-/// `dir`. Deliberately reads no contents — hashing is the caller's decision,
+-/// because the cache may already know the answer.
+-fn walk(vault: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u64, i64)>) -> AppResult<()> {
++/// `dir` that `keep` accepts. Deliberately reads no contents — hashing is the
++/// caller's decision, because the cache may already know the answer.
++///
++/// `keep` is asked about the vault-relative PATH, not the name: "is this under
++/// `attachments/`" is the one question the whole-vault walk cannot answer from
++/// a file name alone.
++fn walk(
++    vault: &Path,
++    dir: &Path,
++    keep: &dyn Fn(&str) -> bool,
++    out: &mut Vec<(String, PathBuf, u64, i64)>,
++) -> AppResult<()> {
+     for entry in std::fs::read_dir(dir)? {
+         let entry = entry?;
+         let name = entry.file_name().to_string_lossy().to_string();
+         if is_ignored_name(&name) {
+-            continue; // skip dotfiles / .context / .git and our .*.tmp writes
++            continue; // skip dotfiles / .context / .git / node_modules and our .*.tmp writes
+         }
+         let path = entry.path();
+         let file_type = entry.file_type()?;
+         if file_type.is_dir() {
+-            walk(vault, &path, out)?;
++            walk(vault, &path, keep, out)?;
+         } else if file_type.is_file() {
++            let rel = rel_from(vault, &path);
++            if !keep(&rel) {
++                continue;
++            }
+             let meta = entry.metadata()?;
+-            out.push((rel_from(vault, &path), path, meta.len(), mtime_ns(&meta)));
++            out.push((rel, path, meta.len(), mtime_ns(&meta)));
+         }
+     }
+     Ok(())
+@@ -427,11 +540,15 @@ pub async fn upload_file(
+     Ok(UploadOutcome { status, etag, error })
+ }
+ 
+-/// Stream `url` into a vault-relative attachment path, atomically.
++/// Stream `url` into a vault-relative binary path, atomically.
+ ///
+-/// WRITE scope is `attachments/` only (`ensure_attachment_rel`): the path comes
+-/// from the server, so a member who set a blob's `rel_path` to `.context/…` or
+-/// to a note must not be able to make every teammate's client overwrite it.
++/// WRITE scope is one of the two guards, never `resolve_in_vault` alone: the
++/// path comes from the SERVER, so a member who set a blob's `rel_path` to
++/// `.context/…` or to a note must not be able to make every teammate's client
++/// overwrite it. `tree: false` is the `attachments/` store
++/// (`ensure_attachment_rel`); `tree: true` is a binary that lives in the tree
++/// (`ensure_tree_binary_rel`) — a surfaced non-note extension outside the
++/// ignored dirs, and nothing else.
+ ///
+ /// Bytes land in `.<name>.tmp` beside the target and are hashed as they are
+ /// written; the rename only happens once the digest matches `expected_sha256`.
+@@ -443,8 +560,13 @@ pub async fn download_file(
+     url: &str,
+     headers: &HashMap<String, String>,
+     expected_sha256: Option<&str>,
++    tree: bool,
+ ) -> AppResult<DownloadOutcome> {
+-    ensure_attachment_rel(rel)?;
++    if tree {
++        ensure_tree_binary_rel(rel)?;
++    } else {
++        ensure_attachment_rel(rel)?;
++    }
+     let abs = resolve_in_vault(vault, rel)?;
+     let parent = abs
+         .parent()
+@@ -694,6 +816,7 @@ mod tests {
+                 "http://127.0.0.1:9/never-reached",
+                 &headers,
+                 None,
++                false,
+             ));
+             assert!(err.is_err(), "{rel} must be refused");
+         }
+@@ -701,6 +824,117 @@ mod tests {
+         assert!(!tmp.path().join("attachments").exists());
+     }
+ 
++    /// The tree-scoped download takes a server path too, and its accepted set
++    /// is exactly `write_tree_binary`'s — notes and the hidden store included in
++    /// what it refuses.
++    #[test]
++    fn tree_download_refuses_everything_write_tree_binary_refuses() {
++        let tmp = tempfile::tempdir().unwrap();
++        let headers = HashMap::new();
++        for rel in [
++            ".context/index.sqlite",
++            "Team/Plans.md",
++            "Team/../../escape.png",
++            "Team/.hidden/x.png",
++            "node_modules/pkg/logo.png",
++            "Team/Makefile",
++        ] {
++            let err = block_on(download_file(
++                tmp.path(),
++                rel,
++                "http://127.0.0.1:9/never-reached",
++                &headers,
++                None,
++                true,
++            ));
++            assert!(err.is_err(), "{rel} must be refused");
++        }
++    }
++
++    /// `write_tree_binary` is the materialize guard: a surfaced non-note
++    /// extension anywhere the walk would have found it, and nothing else.
++    #[test]
++    fn write_tree_binary_accepts_only_tree_binaries() {
++        let tmp = tempfile::tempdir().unwrap();
++        for rel in ["Team/report.docx", "Media/clip.mp4", "attachments/x.png", "top.csv"] {
++            write_tree_binary(tmp.path(), rel, &[1, 2, 3]).unwrap_or_else(|e| panic!("{rel}: {e:?}"));
++            assert!(tmp.path().join(rel).is_file());
++        }
++        for rel in [
++            "Notes/Plan.md",          // a note: the CRDT pipeline owns it
++            "Notes/page.html",        // ditto (NOTE_EXTS is wider than markdown)
++            ".context/config.json",   // the hidden store, never writable
++            "../escape.png",          // traversal
++            "/etc/evil.png",          // absolute
++            "Team/.hidden/x.png",     // dotfile segment
++            "node_modules/a/logo.png",// a denied dir
++            "Notes/script.js",        // not a surfaced extension
++            "Notes/x.txt",            // a note extension, despite looking inert
++        ] {
++            assert!(
++                write_tree_binary(tmp.path(), rel, &[1]).is_err(),
++                "{rel} must be refused"
++            );
++        }
++    }
++
++    /// The whole-vault walk: every tree binary plus the `attachments/` store,
++    /// and nothing the tree walk itself ignores.
++    #[test]
++    fn binary_walk_covers_the_tree_and_skips_notes_and_ignored_dirs() {
++        let tmp = tempfile::tempdir().unwrap();
++        let write = |rel: &str| {
++            let abs = tmp.path().join(rel);
++            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
++            std::fs::write(&abs, rel.as_bytes()).unwrap();
++        };
++        write("Team/report.docx");
++        write("Team/Notes.md");
++        write("Media/clip.mp4");
++        write("attachments/abc123.png");
++        write("attachments/no-extension");
++        write(".context/index.sqlite");
++        write(".hidden/secret.png");
++        write("node_modules/pkg/logo.png");
++        write("Team/script.js");
++        write("Team/notes.txt");
++
++        let items = list_binaries(tmp.path()).unwrap();
++        let paths: Vec<_> = items.iter().map(|i| i.rel_path.as_str()).collect();
++        assert_eq!(
++            paths,
++            vec![
++                "Media/clip.mp4",
++                "Team/report.docx",
++                // The store is listed whatever the file is called — its names
++                // are ours, and an extension-less blob still has to sync.
++                "attachments/abc123.png",
++                "attachments/no-extension",
++            ]
++        );
++        // Every entry carries a real hash (the diff is keyed by it).
++        assert!(items.iter().all(|i| i.sha256.len() == 64));
++    }
++
++    /// The binary walk is a superset of the attachment walk, which is what lets
++    /// the two share one hash cache.
++    #[test]
++    fn binary_walk_is_a_superset_of_the_attachment_walk() {
++        let tmp = tempfile::tempdir().unwrap();
++        write_binary_file(tmp.path(), "attachments/a.png", &[1, 2, 3]).unwrap();
++        write_tree_binary(tmp.path(), "Team/report.docx", &[4, 5]).unwrap();
++        let attachments = list_attachments(tmp.path()).unwrap();
++        let binaries = list_binaries(tmp.path()).unwrap();
++        for a in &attachments {
++            assert!(
++                binaries.iter().any(|b| b.rel_path == a.rel_path && b.sha256 == a.sha256),
++                "{} missing from the binary walk",
++                a.rel_path
++            );
++        }
++        assert_eq!(binaries.len(), attachments.len() + 1);
++    }
++
+     /// A part upload names a byte range; one outside the file is a bug in the
+     /// caller's arithmetic, not something to send a truncated part for.
+     #[test]
+diff --git a/app/apps/desktop/src-tauri/src/commands.rs b/app/apps/desktop/src-tauri/src/commands.rs
+index 77b6981d..b0d3c742 100644
+--- a/app/apps/desktop/src-tauri/src/commands.rs
++++ b/app/apps/desktop/src-tauri/src/commands.rs
+@@ -6,7 +6,7 @@ use crate::attachments::{self, AttachmentMeta, FileStat};
+ use crate::error::{io_ctx, AppError, AppResult};
+ use crate::import_export::{self, ImportSummary};
+ use crate::index::{
+-    Backlink, FileText, GraphEdge, Index, NoteMeta, NoteTitle, ResolvedLink, SearchResult,
++    Backlink, FileRow, FileText, GraphEdge, Index, NoteMeta, NoteTitle, ResolvedLink, SearchResult,
+     YjsPruneReport, YjsState, YjsStateVector,
+ };
+ use crate::notefile;
+@@ -1497,6 +1497,19 @@ pub async fn get_file_text(
+     guard.file_text(&path)
+ }
+ 
++/// Every tier-2 `files` row: id, path, ext, kind, size, text status.
++///
++/// The sync layer's half of the ACL fix — a tree binary is registered on the
++/// server under THIS id, so the two sides name one identity and the blob's
++/// `doc_id` resolves through `shares` like a note's. One call rather than a
++/// `get_file_text` per path: the binary walk asks about every file it found.
++#[tauri::command]
++pub async fn list_file_rows(state: State<'_, AppState>) -> AppResult<Vec<FileRow>> {
++    let (_, index) = require_vault(&state)?;
++    let guard = index.lock().unwrap();
++    guard.file_rows()
++}
++
+ #[tauri::command]
+ pub async fn get_backlinks(
+     state: State<'_, AppState>,
+@@ -1892,6 +1905,24 @@ pub fn write_binary_file(
+     attachments::write_binary_file(&vault, &meta.rel_path, &bytes)
+ }
+ 
++/// Materialize a binary that lives in the TREE — a `.docx` a teammate dropped
++/// into `Team/`, arriving on this device as a blob with that rel_path.
++///
++/// A second command rather than a looser `write_binary_file`: the
++/// `attachments/` guard still bounds every write aimed at the hidden store, and
++/// this one accepts exactly what the binary walk produces (see
++/// `attachments.rs ensure_tree_binary_rel`). Notes are refused here as firmly
++/// as `.context/` is — a blob must never be able to overwrite a CRDT note.
++#[tauri::command(async)]
++pub fn write_tree_binary(
++    state: State<'_, AppState>,
++    request: tauri::ipc::Request<'_>,
++) -> AppResult<()> {
++    let (meta, bytes) = raw_frame::<WriteBinaryMeta>(request.body())?;
++    let (vault, _) = require_vault_at(&state, meta.expected_epoch)?;
++    attachments::write_tree_binary(&vault, &meta.rel_path, &bytes)
++}
++
+ /// The attachment listing the sync diff runs on — path, size and sha256 for
+ /// every file under `attachments/`.
+ ///
+@@ -1914,15 +1945,48 @@ pub async fn list_attachments(
+         guard.attachment_hash_cache().unwrap_or_default()
+     };
+     let listing = attachments::list_attachments_cached(&vault, &cached)?;
+-    if listing.changed {
++    save_hash_cache(&index, &listing);
++    Ok(listing.items)
++}
++
++/// The same listing over the WHOLE vault: `attachments/` plus every tree binary
++/// (a `.docx` in `Team/`, a `.mp4` in `Media/`). This is what the sync diff
++/// runs on since tree binaries became `files` rows — `list_attachments` stays
++/// for callers that want only the hidden store.
++///
++/// Same two brief lock takes as `list_attachments`, and the same cache: the
++/// binary walk is a superset of the attachment walk, so writing its cache back
++/// prunes nothing the other one wants.
++#[tauri::command]
++pub async fn list_binaries(
++    state: State<'_, AppState>,
++    expected_epoch: Option<u64>,
++) -> AppResult<Vec<AttachmentMeta>> {
++    let (vault, index) = require_vault_at(&state, expected_epoch)?;
++    let cached = {
+         let guard = index.lock().unwrap();
+-        if let Err(e) = guard.save_attachment_hash_cache(&listing.cache) {
+-            log::warn!("[attachments] hash cache write failed: {e}");
+-        }
+-    }
++        guard.attachment_hash_cache().unwrap_or_default()
++    };
++    let listing = attachments::list_binaries_cached(&vault, &cached)?;
++    save_hash_cache(&index, &listing);
+     Ok(listing.items)
+ }
+ 
++/// Persist a walk's hash cache, if it moved. A failure here costs a re-hash
++/// next pass and nothing else, so it is logged rather than returned.
++fn save_hash_cache(
++    index: &std::sync::Mutex<crate::index::Index>,
++    listing: &attachments::AttachmentListing,
++) {
++    if !listing.changed {
++        return;
++    }
++    let guard = index.lock().unwrap();
++    if let Err(e) = guard.save_attachment_hash_cache(&listing.cache) {
++        log::warn!("[attachments] hash cache write failed: {e}");
++    }
++}
++
+ /// Stream one attachment (or one multipart part of it) to a presigned URL.
+ ///
+ /// See `attachments.rs` for why the bytes go through Rust instead of the
+@@ -1961,6 +2025,7 @@ pub async fn download_attachment(
+     rel_path: String,
+     headers: Option<HashMap<String, String>>,
+     expected_sha256: Option<String>,
++    tree: Option<bool>,
+     expected_epoch: Option<u64>,
+ ) -> AppResult<attachments::DownloadOutcome> {
+     let (vault, _) = require_vault_at(&state, expected_epoch)?;
+@@ -1970,6 +2035,9 @@ pub async fn download_attachment(
+         &url,
+         &headers.unwrap_or_default(),
+         expected_sha256.as_deref(),
++        // Absent means the hidden store, which is what every caller meant
++        // before tree binaries existed.
++        tree.unwrap_or(false),
+     )
+     .await
+ }
+diff --git a/app/apps/desktop/src-tauri/src/lib.rs b/app/apps/desktop/src-tauri/src/lib.rs
+index c7c6c177..a13cdd2d 100644
+--- a/app/apps/desktop/src-tauri/src/lib.rs
++++ b/app/apps/desktop/src-tauri/src/lib.rs
+@@ -206,6 +206,7 @@ pub fn run() {
+             commands::trash_note,
+             commands::search_notes,
+             commands::get_file_text,
++            commands::list_file_rows,
+             commands::get_backlinks,
+             commands::graph_edges,
+             commands::graph_edges_for,
+@@ -222,7 +223,9 @@ pub fn run() {
+             commands::read_binary_file,
+             commands::file_stat,
+             commands::write_binary_file,
++            commands::write_tree_binary,
+             commands::list_attachments,
++            commands::list_binaries,
+             commands::upload_attachment,
+             commands::download_attachment,
+             commands::vault_stats,
+diff --git a/app/apps/desktop/src/App.tsx b/app/apps/desktop/src/App.tsx
+index 14e5accd..175b2bd9 100644
+--- a/app/apps/desktop/src/App.tsx
++++ b/app/apps/desktop/src/App.tsx
+@@ -25,6 +25,7 @@ import * as ipc from "./lib/ipc";
+ import * as perf from "./lib/perf";
+ import { implicatedFolders, refreshWorthy } from "./lib/tree/lazyTree";
+ import { syncManager } from "./lib/sync/docSession";
++import { routesToAttachmentSync } from "./lib/sync/attachments";
+ import {
+   backgroundUpdateCheck,
+   checkForUpdate,
+@@ -861,6 +862,7 @@ export default function App() {
+     let unlistenFile: (() => void) | undefined;
+     let unlistenVault: (() => void) | undefined;
+     let unlistenIndex: (() => void) | undefined;
++    let unlistenIndexed: (() => void) | undefined;
+     // Coalesce sidebar refreshes: a bulk change (e.g. importing a folder) emits
+     // many `file-changed` batches in quick succession; refreshing the tree on
+     // each one re-renders the whole sidebar repeatedly and flickers hover state.
+@@ -909,9 +911,15 @@ export default function App() {
+         const open = useStore.getState().openNote;
+         const forSync: ipc.FileChanged[] = [];
+         for (const e of changes) {
+-          // Attachments are content-synced, not indexed/CRDT-bridged. A change
+-          // under `attachments/` triggers a debounced two-way blob reconcile.
+-          if (e.path === "attachments" || e.path.startsWith("attachments/")) {
++          // Binaries are content-synced, not CRDT-bridged: a change to one
++          // triggers a debounced two-way blob reconcile and nothing else.
++          //
++          // The test is the FORMAT, not the folder. It used to be "does this
++          // path start with `attachments/`", which was the same question back
++          // when the hidden store was the only home a binary had — a `.docx`
++          // dropped into a folder fell through to the note path below, where an
++          // unmapped file means "register it as a note" (`routesToAttachmentSync`).
++          if (routesToAttachmentSync(e.path)) {
+             syncManager.handleAttachmentChanged();
+             continue;
+           }
+@@ -959,6 +967,12 @@ export default function App() {
+       unlistenVault = await ipc.onVaultOpened((v) => {
+         useStore.getState().setVault(v);
+       });
++      // Rust finished pulling the words out of these binaries. The sync layer
++      // offers them to the server as search fuel (never as content) — already
++      // coalesced in Rust, and debounced again there.
++      unlistenIndexed = await ipc.onFilesIndexed((paths) => {
++        syncManager.handleFilesIndexed(paths);
++      });
+       // The background index rebuild committed: everything derived from the
+       // index catches up. Stale epochs (a vault switched during a long rebuild)
+       // are dropped — the open that replaced it gets its own event.
+@@ -975,6 +989,7 @@ export default function App() {
+       unlistenFile?.();
+       unlistenVault?.();
+       unlistenIndex?.();
++      unlistenIndexed?.();
+       if (refreshTimer) clearTimeout(refreshTimer);
+     };
+   }, []);
+diff --git a/app/apps/desktop/src/lib/__tests__/api.test.ts b/app/apps/desktop/src/lib/__tests__/api.test.ts
+index 48307e92..fa4079b2 100644
+--- a/app/apps/desktop/src/lib/__tests__/api.test.ts
++++ b/app/apps/desktop/src/lib/__tests__/api.test.ts
+@@ -323,6 +323,69 @@ describe("ApiClient against a mocked fetch", () => {
+   });
+ });
+ 
++/**
++ * The two calls a tree binary adds (PR3 Stage A). Both are wire contracts with
++ * the server half, so the bodies are asserted literally rather than by shape.
++ */
++describe("ApiClient tree-binary routes", () => {
++  it("registers a `files` row at /api/files with the local id as `docId`", async () => {
++    const { impl, calls } = fakeFetch(() => ({
++      status: 201,
++      json: { id: "local-1", docId: "local-1", vaultId: "v1", folderId: "f1", path: "Team/report.docx" },
++    }));
++    const api = new ApiClient({ baseUrl: "https://api.test", token: "t", fetchImpl: impl });
++
++    const row = await api.registerFile({ vaultId: "v1", id: "local-1", path: "Team/report.docx" });
++
++    expect(calls[0].method).toBe("POST");
++    expect(calls[0].url).toBe("https://api.test/api/files");
++    // No `folderId`: the server resolves the parent FROM the path, which is
++    // what keeps `rel_path` and `folder_id` in agreement.
++    expect(calls[0].body).toEqual({ vaultId: "v1", path: "Team/report.docx", docId: "local-1" });
++    expect(row.docId).toBe("local-1");
++  });
++
++  it("PUTs extracted text, and stops offering it after a 404", async () => {
++    let status = 204;
++    const { impl, calls } = fakeFetch(() => ({ status, json: {} }));
++    const api = new ApiClient({ baseUrl: "https://api.test", token: "t", fetchImpl: impl });
++
++    await api.uploadBlobText("v1", "blob-1", {
++      chars: 5,
++      content: "hello",
++      source: "client",
++      docId: "local-1",
++      sha256: "abc",
++    });
++    expect(calls[0].method).toBe("PUT");
++    expect(calls[0].url).toBe("https://api.test/api/vaults/v1/blobs/blob-1/text");
++    expect(calls[0].body).toEqual({
++      chars: 5,
++      content: "hello",
++      source: "client",
++      docId: "local-1",
++      sha256: "abc",
++    });
++    expect(api.supportsBlobText()).toBe(true);
++
++    status = 404;
++    await expect(
++      api.uploadBlobText("v1", "blob-2", { chars: 1, content: "x", source: "client", sha256: "d" }),
++    ).rejects.toThrow();
++    expect(api.supportsBlobText()).toBe(false);
++    // Known-negative now: the next call answers locally, with no round trip.
++    const before = calls.length;
++    await expect(
++      api.uploadBlobText("v1", "blob-3", { chars: 1, content: "x", source: "client", sha256: "e" }),
++    ).rejects.toThrow();
++    expect(calls.length).toBe(before);
++
++    // Capabilities belong to ONE server: pointing at another re-asks.
++    api.setBaseUrl("https://other.test");
++    expect(api.supportsBlobText()).toBeNull();
++  });
++});
++
+ /**
+  * `health()` — the one probe in api.ts that must NOT fail closed (#91).
+  *
+diff --git a/app/apps/desktop/src/lib/api.ts b/app/apps/desktop/src/lib/api.ts
+index 2cf9457c..d3902997 100644
+--- a/app/apps/desktop/src/lib/api.ts
++++ b/app/apps/desktop/src/lib/api.ts
+@@ -203,6 +203,23 @@ export interface RegisteredFolder {
+   color?: string | null;
+ }
+ 
++/**
++ * A `files` row — the server's generic "this vault path is a doc" record, the
++ * binary twin of {@link RegisteredNote}.
++ *
++ * It exists so a tree binary has a doc_id the ACL can resolve: `shares`,
++ * `effectivePermission` and `listReadableDocsInVault` all already walk these
++ * rows, so registering one is what makes a `.docx` in a shared folder obey the
++ * folder's grant instead of the blob store's path heuristic.
++ */
++export interface RegisteredFile {
++  id: string;
++  docId?: string;
++  vaultId?: string;
++  folderId?: string | null;
++  path: string;
++}
++
+ export interface Share {
+   id: string;
+   // `vault` appears on exactly one row: the whole-vault Read-only posture that
+@@ -723,6 +740,10 @@ export class ApiClient {
+   private blobIntentSupported: boolean | null = null;
+   /** Same tri-state for `GET /api/blobs/:id/url` (presigned download). */
+   private blobUrlSupported: boolean | null = null;
++  /** Same tri-state for `PUT /api/vaults/:id/blobs/:id/text` (extracted text).
++   *  A 404 here means the server predates the route OR has forgotten the blob;
++   *  either way there is nothing to retry, so the whole session stops asking. */
++  private blobTextSupported: boolean | null = null;
+ 
+   constructor(opts: ApiClientOptions = {}) {
+     this.baseUrl = stripTrailingSlash(opts.baseUrl ?? DEFAULT_SERVER_URL);
+@@ -754,6 +775,7 @@ export class ApiClient {
+       // Capabilities are per server (see `blobIntentSupported`).
+       this.blobIntentSupported = null;
+       this.blobUrlSupported = null;
++      this.blobTextSupported = null;
+     }
+     this.baseUrl = next;
+   }
+@@ -1663,6 +1685,32 @@ export class ApiClient {
+     await this.request<unknown>("DELETE", `/api/notes/${encodeURIComponent(id)}`);
+   }
+ 
++  /**
++   * Register a tree binary as a `files` row, so its blob has a doc_id the
++   * permission resolver understands.
++   *
++   * `id` is the LOCAL `files.id` (a uuid the SQLite index keeps stable per path
++   * across rebuilds), supplied the way `createNote` supplies a note's docId, so
++   * this device's index and the server name the same identity. `folderId` is
++   * deliberately not sent: the server resolves the parent from the path
++   * (`resolveParentFolder`), which is the rule that keeps `rel_path` and
++   * `folder_id` in agreement — a mismatch comes back as 400
++   * `path_folder_mismatch`.
++   */
++  async registerFile(input: {
++    vaultId: string;
++    id: string;
++    path: string;
++  }): Promise<RegisteredFile> {
++    // `/api/files`, not `/api/registry/files`: the registry router is mounted at
++    // `/api` (see the server's `http/app.ts`), exactly like `/api/notes` and
++    // `/api/folders` beside it.
++    const { data } = await this.request<RegisteredFile>("POST", "/api/files", {
++      body: { vaultId: input.vaultId, path: input.path, docId: input.id },
++    });
++    return data;
++  }
++
+   // ---- Versioning ---------------------------------------------------------
+ 
+   /** A note's stored versions, newest first (no content). Needs `view`. */
+@@ -1930,11 +1978,17 @@ export class ApiClient {
+     bytes: Uint8Array;
+     mime?: string;
+     fileName?: string;
++    /** The `files` row this blob's bytes belong to (tree binaries only) —
++     *  stored as `blobs.doc_id` so the ACL resolves the file, not its path. */
++    docId?: string | null;
+   }): Promise<BlobMeta> {
+     const headers = this.baseHeaders();
+     headers["Content-Type"] = input.mime ?? "application/octet-stream";
+     headers["x-rel-path"] = input.relPath;
+     if (input.fileName) headers["x-file-name"] = input.fileName;
++    // A header rather than a body field, because the body IS the file here. An
++    // older server ignores it and falls back to the path heuristic.
++    if (input.docId) headers["x-doc-id"] = input.docId;
+ 
+     // Copy into a fresh ArrayBuffer so the fetch body is a clean BodyInit.
+     const buf = input.bytes.slice().buffer;
+@@ -1986,6 +2040,9 @@ export class ApiClient {
+       mime: string;
+       relPath: string;
+       filename?: string | null;
++      /** The `files` row these bytes belong to — see {@link registerFile}. The
++       *  server stores it as `blobs.doc_id`; an older one ignores it. */
++      docId?: string | null;
+     },
+   ): Promise<BlobIntent> {
+     if (this.blobIntentSupported === false) {
+@@ -2056,6 +2113,55 @@ export class ApiClient {
+     }
+   }
+ 
++  /** Whether this server is known to accept extracted text (null = unasked). */
++  supportsBlobText(): boolean | null {
++    return this.blobTextSupported;
++  }
++
++  /**
++   * Hand the server the plain text Rust already extracted from a blob, so the
++   * team's search can find a `.docx` by what is inside it.
++   *
++   * Ranking fuel and snippets only — never served as content, never an
++   * authorization input, and re-derivable from the bytes, which is what makes a
++   * CLIENT-supplied extraction acceptable: a member who can upload the file can
++   * already write any words they like into a note. The server caps the body at
++   * 1 MB (413) and answers 409 when the blob's own sha does not match the one
++   * this text describes, so a racing re-upload cannot attach stale words to new
++   * bytes.
++   *
++   * 404 disables it for the whole session (remembered per server URL like
++   * {@link createBlobIntent}'s probe): it means either a server that predates
++   * the route or a blob it has forgotten, and neither is worth a retry per
++   * file.
++   */
++  async uploadBlobText(
++    vaultId: string,
++    blobId: string,
++    body: {
++      chars: number;
++      content: string;
++      source: "client";
++      docId?: string | null;
++      sha256: string;
++    },
++  ): Promise<void> {
++    if (this.blobTextSupported === false) {
++      throw new BlobTransportError(404, "not_found", "server has no blob text route");
++    }
++    try {
++      await this.request<unknown>(
++        "PUT",
++        `/api/vaults/${encodeURIComponent(vaultId)}/blobs/${encodeURIComponent(blobId)}/text`,
++        { body },
++      );
++      this.blobTextSupported = true;
++    } catch (e) {
++      if (e instanceof ApiError && e.status === 404) this.blobTextSupported = false;
++      throw asBlobError(e);
++    }
++  }
++
+   /**
+    * PUT raw bytes at a presigned URL from the WEBVIEW — the fallback for when
+    * the Rust streaming command is unavailable (tests, or a build without it).
+diff --git a/app/apps/desktop/src/lib/ipc.ts b/app/apps/desktop/src/lib/ipc.ts
+index dee5d94b..a100e490 100644
+--- a/app/apps/desktop/src/lib/ipc.ts
++++ b/app/apps/desktop/src/lib/ipc.ts
+@@ -166,6 +166,19 @@ export interface FileText {
+   text: string;
+ }
+ 
++/** One tier-2 `files` row (mirrors the Rust `FileRow`). `id` is the identity a
++ *  tree binary is registered under on the server — stable per path across
++ *  index rebuilds, which is what makes it safe to supply. */
++export interface FileRow {
++  id: string;
++  path: string;
++  ext: string | null;
++  kind: string | null;
++  size: number;
++  /** pending | ok | skipped_size | unsupported | error (Rust `TextStatus`). */
++  textStatus: string;
++}
++
+ export interface Backlink {
+   id: string;
+   path: string;
+@@ -473,6 +486,9 @@ export const searchNotes = (query: string) =>
+  *  (a note, an attachment, or something the walk ignores). */
+ export const getFileText = (path: string) =>
+   invoke<FileText | null>("get_file_text", { path });
++/** Every `files` row (id + path + text status) — the sync layer's source of
++ *  stable ids for registering tree binaries. One call for the whole walk. */
++export const listFileRows = () => invoke<FileRow[]>("list_file_rows");
+ export const getBacklinks = (noteId: string) =>
+   invoke<Backlink[]>("get_backlinks", { noteId });
+ /** Every resolved graph edge (source id -> target id) in one call — backs the
+@@ -623,9 +639,41 @@ export const writeBinaryFile = (
+     frame({ relPath, expectedEpoch: expectedEpoch ?? null }, bytes),
+   );
+ 
++/**
++ * Materialize a binary that lives in the TREE (not under `attachments/`) — a
++ * file a teammate dropped into a folder, arriving here as a blob.
++ *
++ * A separate command because it is a separate WRITE GUARD: `writeBinaryFile`
++ * still refuses everything outside `attachments/`, and this one accepts exactly
++ * the set the binary walk produces — a surfaced, non-note extension outside
++ * `.context/`, `.git`, dotfiles and the denied dirs. A server-supplied path can
++ * therefore name a file the user could have dropped there themselves, and
++ * nothing else; notes are refused as firmly as `.context/` is.
++ */
++export const writeTreeBinary = (
++  relPath: string,
++  bytes: Uint8Array,
++  expectedEpoch?: VaultEpoch,
++) =>
++  invoke<void>(
++    "write_tree_binary",
++    frame({ relPath, expectedEpoch: expectedEpoch ?? null }, bytes),
++  );
++
+ export const listAttachments = (expectedEpoch?: VaultEpoch) =>
+   invoke<AttachmentMeta[]>("list_attachments", { expectedEpoch: expectedEpoch ?? null });
+ 
++/**
++ * Every syncable binary in the vault: the `attachments/` store PLUS the tree
++ * binaries (a `.docx` in `Team/`, a `.mp4` in `Media/`) — what the blob diff
++ * runs on now that a tree binary gets its own `files` row and ACL.
++ *
++ * A superset of {@link listAttachments}, sharing its hash cache, so the widened
++ * walk still costs a `stat` per file rather than a re-read.
++ */
++export const listBinaries = (expectedEpoch?: VaultEpoch) =>
++  invoke<AttachmentMeta[]>("list_binaries", { expectedEpoch: expectedEpoch ?? null });
++
+ /**
+  * Stream an attachment (or one byte range of it) to a presigned URL from RUST.
+  *
+@@ -669,6 +717,9 @@ export const downloadAttachment = (
+     relPath: string;
+     headers?: Record<string, string>;
+     expectedSha256?: string | null;
++    /** True when `relPath` is a TREE binary, so Rust applies the tree guard
++     *  ({@link writeTreeBinary}) instead of the `attachments/` one. */
++    tree?: boolean;
+   },
+   expectedEpoch?: VaultEpoch,
+ ) =>
+@@ -677,6 +728,7 @@ export const downloadAttachment = (
+     relPath: input.relPath,
+     headers: input.headers ?? {},
+     expectedSha256: input.expectedSha256 ?? null,
++    tree: input.tree ?? false,
+     expectedEpoch: expectedEpoch ?? null,
+   });
+ 
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts b/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts
+index 2acba1a0..ae548329 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts
+@@ -706,6 +706,36 @@ describe("SyncManager.handleLocalFilesChanged", () => {
+     vi.useRealTimers();
+   });
+ 
++  it("never lets a binary reach the note path — no pull, no push, no `notes` row", async () => {
++    // A `.docx` dropped into a folder is the blob mirror's, and everything in
++    // this method reads an unmapped file as a note nobody has registered yet.
++    // `App.tsx` short-circuits it; this is the same rule where the damage would
++    // be done (`routesToAttachmentSync`).
++    vi.useFakeTimers();
++    const sm = new SyncManager();
++    await enable(sm);
++    fakeRegistry.pull.mockClear();
++
++    sm.handleLocalFilesChanged([
++      { path: "Team/report.docx", kind: "tree" },
++      { path: "Media/clip.mp4", kind: "modified" },
++      { path: "attachments/abc.png", kind: "tree" },
++      { path: "Team/gone.xlsx", kind: "removed" },
++    ]);
++    expect(sm.hasPendingRegistryPull()).toBe(false);
++    await vi.advanceTimersByTimeAsync(5000);
++    expect(fakeRegistry.pull).not.toHaveBeenCalled();
++    expect(connects.order).toEqual([]);
++
++    // A note in the same batch still routes normally.
++    sm.handleLocalFilesChanged([
++      { path: "Team/report.docx", kind: "tree" },
++      { path: "Team/Plan.md", kind: "modified" },
++    ]);
++    expect(sm.hasPendingRegistryPull()).toBe(true);
++    vi.useRealTimers();
++  });
++
+   it("the single-event form still routes exactly like one batch of one", async () => {
+     vi.useFakeTimers();
+     const sm = new SyncManager();
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/registry.test.ts b/app/apps/desktop/src/lib/sync/__tests__/registry.test.ts
+index 32292b0e..25a6daad 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/registry.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/registry.test.ts
+@@ -563,6 +563,54 @@ describe("VaultRegistry.reconcile — seeding and materialization rules", () =>
+     expect(reg.consumeMaterialized("Echo.md")).toBe(false);
+     expect(reg.consumeMaterialized("Never-written.md")).toBe(false);
+   });
++
++  it("claims an echo for a binary the blob mirror materialized too", async () => {
++    // A tree binary lands on disk the same way and owes the same one echo —
++    // the sync layer marks it (`AttachmentSync.downloadOne`) through this.
++    const { api } = fakeApi({ vaults: [{ id: "v1", name: "laptop", organization_id: ORG }] });
++    const reg = new VaultRegistry(api);
++    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "laptop" }, emptyTree());
++
++    reg.markMaterialized("Team/report.docx");
++    expect(reg.consumeMaterialized("Team/report.docx")).toBe(true);
++    expect(reg.consumeMaterialized("Team/report.docx")).toBe(false);
++  });
++});
++
++describe("VaultRegistry tree-binary `files` map", () => {
++  it("persists registered binaries under their own config key, never into `docs`", async () => {
++    const { api } = fakeApi({
++      vaults: [{ id: "v1", name: "laptop", organization_id: ORG }],
++      notes: [{ id: "n1", rel_path: "Welcome.md" }],
++    });
++    const reg = new VaultRegistry(api);
++    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "laptop" }, emptyTree());
++
++    expect(reg.getFileId("Team/report.docx")).toBeNull();
++    reg.setFileId("Team/report.docx", "file-1");
++    expect(reg.getFileId("Team/report.docx")).toBe("file-1");
++
++    // The write is checkpointed, never a synchronous read-modify-write — the
++    // next pass's flush is what puts it on disk.
++    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "laptop" }, emptyTree());
++    const writes = vi.mocked(ipc.setVaultConfig).mock.calls;
++    const written = writes[writes.length - 1][0] as string;
++    const cfg = JSON.parse(written) as { files?: Record<string, string>; docs?: Record<string, string> };
++    expect(cfg.files).toEqual({ "Team/report.docx": "file-1" });
++    // The note map is the CRDT join and a binary must never appear in it: it
++    // feeds `registerNote`, the bridge and the content uploader.
++    expect(Object.keys(cfg.docs ?? {})).not.toContain("Team/report.docx");
++  });
++
++  it("forgets binary ids on a vault switch — an id from vault A names nothing in B", async () => {
++    const { api } = fakeApi({ vaults: [{ id: "v1", name: "laptop", organization_id: ORG }] });
++    const reg = new VaultRegistry(api);
++    await reconcileWithTree(reg, { organizationId: ORG, vaultName: "laptop" }, emptyTree());
++    reg.setFileId("Team/report.docx", "file-1");
++
++    reg.reset();
++    expect(reg.getFileId("Team/report.docx")).toBeNull();
++  });
+ });
+ 
+ describe("VaultRegistry.registerNote", () => {
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/treeBinaries.test.ts b/app/apps/desktop/src/lib/sync/__tests__/treeBinaries.test.ts
+new file mode 100644
+index 00000000..5d3640e5
+--- /dev/null
++++ b/app/apps/desktop/src/lib/sync/__tests__/treeBinaries.test.ts
+@@ -0,0 +1,470 @@
++// Tree binaries: the half of the blob mirror that lives in the vault tree
++// rather than in the hidden `attachments/` store (PR3 Stage A).
++//
++// Three things are load-bearing here and each has a test that fails loudly if
++// it moves: a tree binary is REGISTERED as a `files` row before its bytes go
++// (that id is what the ACL resolves), it materializes through the TREE write
++// guard and claims its own watcher echo, and its extracted text reaches the
++// server exactly once per blob — as search fuel, never as content.
++//
++// The fourth is a non-behaviour: renaming a tree binary does NOT propagate,
++// because identity is still sha256. Pinned below so Stage B's path-keyed diff
++// has to delete the assertion on purpose.
++
++import { describe, expect, it, vi } from "vitest";
++import {
++  AttachmentSync,
++  isSafeTreeBinaryRelPath,
++  isUnderAttachments,
++  routesToAttachmentSync,
++  type AttachmentSyncDeps,
++} from "../attachments";
++
++/** An error shaped like the api client's `BlobTransportError`. */
++function serverError(status: number, code?: string) {
++  return Object.assign(new Error(code ?? `HTTP ${status}`), { status, code });
++}
++
++interface Log {
++  registered: Array<{ relPath: string; id: string }>;
++  intents: Array<{ relPath: string; docId: string | null | undefined }>;
++  legacyUploads: Array<{ relPath: string; docId: string | null | undefined }>;
++  treeWrites: string[];
++  attachmentWrites: string[];
++  materialized: string[];
++  texts: Array<{ blobId: string; docId: string | null | undefined; chars: number }>;
++  remembered: Array<{ relPath: string; id: string }>;
++}
++
++/**
++ * A vault whose binaries live wherever the test puts them, wired to a server
++ * that speaks the intent flow. Timers are hand-driven: `fire()` runs whatever
++ * the sync armed, which is how the text pass is inspected without waiting.
++ */
++function makeVault(
++  files: Array<{ relPath: string; sha256?: string }>,
++  extra: Partial<AttachmentSyncDeps> = {},
++) {
++  const log: Log = {
++    registered: [],
++    intents: [],
++    legacyUploads: [],
++    treeWrites: [],
++    attachmentWrites: [],
++    materialized: [],
++    texts: [],
++    remembered: [],
++  };
++  const timers: Array<() => void> = [];
++  const setTimeoutImpl = ((cb: () => void) => {
++    timers.push(cb);
++    return timers.length as unknown as ReturnType<typeof setTimeout>;
++  }) as typeof setTimeout;
++
++  const deps: AttachmentSyncDeps = {
++    listLocal: async () =>
++      files.map((f) => ({ relPath: f.relPath, sha256: f.sha256 ?? `sha-${f.relPath}`, size: 3 })),
++    readLocal: async () => new Uint8Array([1, 2, 3]),
++    writeLocal: async (relPath) => {
++      log.attachmentWrites.push(relPath);
++    },
++    writeTreeLocal: async (relPath) => {
++      log.treeWrites.push(relPath);
++    },
++    markMaterialized: (relPath) => {
++      log.materialized.push(relPath);
++    },
++    listServer: async () => [],
++    uploadServer: async (relPath, _bytes, _mime, docId) => {
++      log.legacyUploads.push({ relPath, docId });
++    },
++    downloadServer: async () => new Uint8Array([9]),
++    createIntent: async (input) => {
++      log.intents.push({ relPath: input.relPath, docId: input.docId });
++      return {
++        blobId: `blob-for-${input.relPath}`,
++        completeUrl: `https://api.test/blobs/${input.relPath}/complete`,
++        upload: {
++          kind: "single" as const,
++          method: "PUT",
++          url: "https://s3.test/put",
++          headers: {},
++          expiresAt: Date.now() + 60_000,
++          direct: true,
++        },
++      };
++    },
++    completeUpload: async () => {},
++    putFile: async () => ({ status: 204, etag: null }),
++    // The local index: one uuid per path, stable across rebuilds.
++    localFileIds: async () => new Map(files.map((f, i) => [f.relPath, `local-id-${i}`])),
++    knownFileId: () => null,
++    registerFile: async ({ relPath, id }) => {
++      log.registered.push({ relPath, id });
++      return id; // the server adopts the supplied id, like `createNote` does
++    },
++    rememberFileId: (relPath, id) => {
++      log.remembered.push({ relPath, id });
++    },
++    fileText: async (relPath) => ({
++      sha256: `sha-${relPath}`,
++      status: "ok",
++      chars: 5,
++      text: "hello",
++    }),
++    uploadText: async (input) => {
++      log.texts.push({ blobId: input.blobId, docId: input.docId, chars: input.chars });
++    },
++    ...extra,
++  };
++
++  const sync = new AttachmentSync(
++    deps,
++    400,
++    setTimeoutImpl,
++    (() => {}) as unknown as typeof clearTimeout,
++  );
++  /** Run every timer armed so far (the text pass), then let it settle. */
++  const fire = async () => {
++    const pending = timers.splice(0, timers.length);
++    for (const t of pending) t();
++    await Promise.resolve();
++    await Promise.resolve();
++    await Promise.resolve();
++  };
++  return { sync, deps, log, fire };
++}
++
++describe("tree binaries register as `files` rows", () => {
++  it("registers a tree binary under the local index id, then uploads with that doc_id", async () => {
++    const { sync, log } = makeVault([{ relPath: "Team/report.docx" }]);
++    const res = await sync.reconcile();
++
++    expect(res.uploaded).toBe(1);
++    // The id is the LOCAL `files.id` — one identity across the index, the
++    // server row and the blob.
++    expect(log.registered).toEqual([{ relPath: "Team/report.docx", id: "local-id-0" }]);
++    expect(log.intents).toEqual([{ relPath: "Team/report.docx", docId: "local-id-0" }]);
++    // And it is remembered, so the next session pays no round trip for it.
++    expect(log.remembered).toEqual([{ relPath: "Team/report.docx", id: "local-id-0" }]);
++  });
++
++  it("never registers a file in the hidden `attachments/` store", async () => {
++    const { sync, log } = makeVault([{ relPath: "attachments/abc123.png" }]);
++    await sync.reconcile();
++
++    // Content-addressed, hidden, reachable only through the note that embeds
++    // it: there is no tree location for the ACL to resolve, so it keeps the
++    // blob store's path heuristic.
++    expect(log.registered).toEqual([]);
++    expect(log.intents).toEqual([{ relPath: "attachments/abc123.png", docId: undefined }]);
++  });
++
++  it("reuses the id `.context/config.json` already remembers, without asking again", async () => {
++    const { sync, log } = makeVault([{ relPath: "Team/report.docx" }], {
++      knownFileId: () => "id-from-config",
++    });
++    await sync.reconcile();
++
++    expect(log.registered).toEqual([]);
++    expect(log.intents[0].docId).toBe("id-from-config");
++  });
++
++  it("uploads without a doc_id when the server refuses the row, and stops asking", async () => {
++    const registerFile = vi.fn(async () => {
++      throw serverError(403, "no_write_access");
++    });
++    const { sync, log } = makeVault([{ relPath: "Team/report.docx" }], { registerFile });
++    await sync.reconcile();
++    await sync.reconcile();
++
++    // The bytes still go — the file is the user's, the ACL just falls back.
++    expect(log.intents.map((i) => i.docId)).toEqual([undefined, undefined]);
++    // One refusal is enough: asking again every pass is a guaranteed 403 a pass.
++    expect(registerFile).toHaveBeenCalledTimes(1);
++  });
++
++  it("retries after a path_folder_mismatch — the registry pull that fixes it is already queued", async () => {
++    const registerFile = vi.fn(async () => {
++      throw serverError(400, "path_folder_mismatch");
++    });
++    const { sync } = makeVault([{ relPath: "Team/report.docx" }], { registerFile });
++    await sync.reconcile();
++    await sync.reconcile();
++
++    expect(registerFile).toHaveBeenCalledTimes(2);
++  });
++
++  it("keeps asking after a failure that was never a decision (offline, 5xx)", async () => {
++    // A refusal is a decision; a dropped connection is not. Treating the second
++    // as the first would cost the file its doc_id — and its real ACL — for the
++    // rest of the session.
++    const registerFile = vi.fn(async () => {
++      throw new Error("network down");
++    });
++    const { sync } = makeVault([{ relPath: "Team/report.docx" }], { registerFile });
++    await sync.reconcile();
++    await sync.reconcile();
++
++    expect(registerFile).toHaveBeenCalledTimes(2);
++  });
++
++  it("reads the local id map once per pass, not once per file", async () => {
++    const localFileIds = vi.fn(async () => new Map([["a.docx", "id-a"], ["b.xlsx", "id-b"]]));
++    const { sync } = makeVault([{ relPath: "a.docx" }, { relPath: "b.xlsx" }], { localFileIds });
++    await sync.reconcile();
++
++    expect(localFileIds).toHaveBeenCalledTimes(1);
++  });
++
++  it("carries the doc_id on the legacy route too (as `x-doc-id`)", async () => {
++    const { sync, log } = makeVault([{ relPath: "Team/report.docx" }], {
++      createIntent: async () => {
++        throw serverError(404, "not_found");
++      },
++    });
++    await sync.reconcile();
++
++    expect(log.legacyUploads).toEqual([{ relPath: "Team/report.docx", docId: "local-id-0" }]);
++  });
++
++  it("registers nothing when the local index has no `files` row yet", async () => {
++    // The extraction worker is seconds behind a drop; the next pass has the id.
++    const { sync, log } = makeVault([{ relPath: "Team/report.docx" }], {
++      localFileIds: async () => new Map(),
++    });
++    await sync.reconcile();
++
++    expect(log.registered).toEqual([]);
++    expect(log.intents[0].docId).toBeUndefined();
++  });
++});
++
++describe("tree binary rename (Stage A's known limit)", () => {
++  it("does NOT propagate a rename — identity is still sha256", async () => {
++    // The server holds the bytes under the OLD path; the disk has them under a
++    // new one. Nothing to upload (the sha is known) and nothing to download
++    // (the sha is local), so another device keeps the old name. Stage B's
++    // path-keyed diff over `files.id` is what changes this — deliberately, by
++    // deleting this test.
++    const { sync, log } = makeVault([{ relPath: "Team/renamed.docx", sha256: "same-bytes" }], {
++      listServer: async () => [
++        { id: "blob-1", sha256: "same-bytes", relPath: "Team/original.docx" },
++      ],
++    });
++    const res = await sync.reconcile();
++
++    expect(res).toEqual({ uploaded: 0, downloaded: 0 });
++    expect(log.registered).toEqual([]);
++    expect(log.treeWrites).toEqual([]);
++  });
++});
++
++describe("materializing a tree binary", () => {
++  it("writes through the TREE guard and claims its own watcher echo", async () => {
++    const { sync, log } = makeVault([], {
++      listServer: async () => [
++        { id: "blob-1", sha256: "sha-remote", relPath: "Team/from-teammate.docx" },
++      ],
++      downloadUrl: async () => ({ url: "https://api.test/blobs/blob-1", expiresAt: null, direct: false }),
++      fetchBytes: async () => new Uint8Array([4, 5, 6]),
++    });
++    const res = await sync.reconcile();
++
++    expect(res.downloaded).toBe(1);
++    expect(log.treeWrites).toEqual(["Team/from-teammate.docx"]);
++    expect(log.attachmentWrites).toEqual([]);
++    // Our own write, ~150ms before its watcher event: claimed the way the
++    // registry claims a materialized note, or the echo reads as an edit.
++    expect(log.materialized).toEqual(["Team/from-teammate.docx"]);
++  });
++
++  it("tells Rust which guard to apply when it streams the file itself", async () => {
++    const seen: Array<{ relPath: string; tree: boolean }> = [];
++    const { sync } = makeVault([], {
++      listServer: async () => [
++        { id: "b1", sha256: "s1", relPath: "Team/deck.pptx" },
++        { id: "b2", sha256: "s2", relPath: "attachments/img.png" },
++      ],
++      downloadUrl: async () => ({ url: "https://s3.test/get", expiresAt: null, direct: true }),
++      fetchToFile: async (input) => {
++        seen.push({ relPath: input.relPath, tree: input.tree });
++        return { status: 200, bytes: 3 };
++      },
++    });
++    await sync.reconcile();
++
++    expect(seen).toEqual([
++      { relPath: "Team/deck.pptx", tree: true },
++      { relPath: "attachments/img.png", tree: false },
++    ]);
++  });
++
++  it("refuses a server path neither guard accepts", async () => {
++    const { sync, log } = makeVault([], {
++      listServer: async () => [
++        { id: "evil-note", sha256: "s1", relPath: "Team/Plans.md" },
++        { id: "evil-ctx", sha256: "s2", relPath: ".context/index.sqlite" },
++        { id: "evil-up", sha256: "s3", relPath: "Team/../../escape.png" },
++        { id: "ok", sha256: "s4", relPath: "Team/ok.docx" },
++      ],
++      downloadUrl: async () => ({ url: "https://api.test/b", expiresAt: null, direct: false }),
++      fetchBytes: async () => new Uint8Array([1]),
++    });
++    const res = await sync.reconcile();
++
++    expect(res.downloaded).toBe(1);
++    expect(log.treeWrites).toEqual(["Team/ok.docx"]);
++  });
++});
++
++describe("extracted text upload", () => {
++  it("sends a blob's text once, after `files-indexed`, with its doc_id", async () => {
++    const { sync, log, fire } = makeVault([{ relPath: "Team/report.docx" }]);
++    await sync.reconcile(); // registers + uploads, which also queues the text
++    await fire();
++
++    expect(log.texts).toEqual([
++      { blobId: "blob-for-Team/report.docx", docId: "local-id-0", chars: 5 },
++    ]);
++
++    // A second signal for the same blob sends nothing: text describes BYTES.
++    sync.handleFilesIndexed(["Team/report.docx"]);
++    await fire();
++    expect(log.texts).toHaveLength(1);
++  });
++
++  it("skips a file whose extraction has not finished, or produced nothing", async () => {
++    const { sync, log, fire } = makeVault([{ relPath: "Media/clip.mp4" }], {
++      fileText: async () => ({ sha256: "sha-Media/clip.mp4", status: "pending", chars: 0, text: "" }),
++    });
++    await sync.reconcile();
++    await fire();
++
++    expect(log.texts).toEqual([]);
++  });
++
++  it("skips a path whose blob the server does not hold yet", async () => {
++    const { sync, log, fire } = makeVault([], {
++      // Nothing local, nothing uploaded — so no blob to attach the text to.
++      fileText: async () => ({ sha256: "sha-unknown", status: "ok", chars: 4, text: "word" }),
++    });
++    await sync.reconcile();
++    sync.handleFilesIndexed(["Team/never-uploaded.docx"]);
++    await fire();
++
++    expect(log.texts).toEqual([]);
++  });
++
++  it("stops offering text for the whole session after one 404", async () => {
++    const uploadText = vi.fn(async () => {
++      throw serverError(404, "not_found");
++    });
++    const { sync, fire } = makeVault(
++      [{ relPath: "Team/a.docx" }, { relPath: "Team/b.docx" }],
++      { uploadText },
++    );
++    await sync.reconcile();
++    await fire();
++    sync.handleFilesIndexed(["Team/a.docx", "Team/b.docx"]);
++    await fire();
++
++    // One probe, not one per file and not one per pass: a 404 is either a
++    // server without the route or a blob it has forgotten.
++    expect(uploadText).toHaveBeenCalledTimes(1);
++  });
++
++  it("never retries a blob the server refused the text of (413/409)", async () => {
++    const uploadText = vi.fn(async () => {
++      throw serverError(413, "text_too_large");
++    });
++    const { sync, fire } = makeVault([{ relPath: "Team/huge.docx" }], { uploadText });
++    await sync.reconcile();
++    await fire();
++    sync.handleFilesIndexed(["Team/huge.docx"]);
++    await fire();
++
++    expect(uploadText).toHaveBeenCalledTimes(1);
++  });
++
++  it("caps what it sends at a million characters, on a character boundary", async () => {
++    const { sync, log, fire } = makeVault([{ relPath: "Team/big.docx" }], {
++      fileText: async () => ({
++        sha256: "sha-Team/big.docx",
++        status: "ok",
++        chars: 2_000_000,
++        // The last kept character is a high surrogate unless the cap backs off.
++        text: "a".repeat(999_999) + "😀".repeat(10),
++      }),
++    });
++    await sync.reconcile();
++    await fire();
++
++    expect(log.texts[0].chars).toBe(999_999);
++  });
++
++  it("drops the pending text pass when the vault stops being current", async () => {
++    let current = true;
++    const { sync, log, fire } = makeVault([{ relPath: "Team/report.docx" }], {
++      isCurrent: () => current,
++    });
++    await sync.reconcile();
++    current = false;
++    await fire();
++
++    expect(log.texts).toEqual([]);
++  });
++});
++
++describe("watcher routing", () => {
++  it("routes every binary to the blob mirror and every note to the CRDT path", () => {
++    // Before this, only `attachments/` short-circuited, so a `.docx` dropped
++    // into a folder reached the note path — where an unmapped file means
++    // "register it as a note".
++    for (const binary of [
++      "Team/report.docx",
++      "Team/sheet.xlsx",
++      "Media/clip.mp4",
++      "Data/rows.csv",
++      "attachments/abc.png",
++      "attachments",
++      "Photos/holiday.PNG",
++    ]) {
++      expect(routesToAttachmentSync(binary)).toBe(true);
++    }
++    for (const note of [
++      "Team/Plans.md",
++      "Notes/readme.txt",
++      "Notes/page.html",
++      "Board.canvas",
++      "Projects", // a folder: the tree event the registry pull is for
++      "Notes/LICENSE",
++    ]) {
++      expect(routesToAttachmentSync(note)).toBe(false);
++    }
++  });
++});
++
++describe("tree binary path guard", () => {
++  it("accepts what a user could have dropped, and nothing else", () => {
++    expect(isSafeTreeBinaryRelPath("Team/report.docx")).toBe(true);
++    expect(isSafeTreeBinaryRelPath("clip.mp4")).toBe(true);
++    // Notes belong to the CRDT pipeline; a blob must never overwrite one.
++    expect(isSafeTreeBinaryRelPath("Team/Plans.md")).toBe(false);
++    expect(isSafeTreeBinaryRelPath("notes.txt")).toBe(false);
++    // Hidden/derived state, traversal, and types the vault does not surface.
++    expect(isSafeTreeBinaryRelPath(".context/index.sqlite")).toBe(false);
++    expect(isSafeTreeBinaryRelPath("Team/.hidden/x.png")).toBe(false);
++    expect(isSafeTreeBinaryRelPath("Team/../escape.png")).toBe(false);
++    expect(isSafeTreeBinaryRelPath("src/app.js")).toBe(false);
++    expect(isSafeTreeBinaryRelPath("Makefile")).toBe(false);
++    expect(isSafeTreeBinaryRelPath("")).toBe(false);
++  });
++
++  it("knows which home a path belongs to", () => {
++    expect(isUnderAttachments("attachments/a.png")).toBe(true);
++    expect(isUnderAttachments("attachments")).toBe(true);
++    expect(isUnderAttachments("Team/attachments/a.png")).toBe(false);
++    expect(isUnderAttachments("Team/a.png")).toBe(false);
++  });
++});
+diff --git a/app/apps/desktop/src/lib/sync/attachments.ts b/app/apps/desktop/src/lib/sync/attachments.ts
+index 969941a4..da34cc0a 100644
+--- a/app/apps/desktop/src/lib/sync/attachments.ts
++++ b/app/apps/desktop/src/lib/sync/attachments.ts
+@@ -1,8 +1,30 @@
+-// Attachment sync (Phase 3 blob store, spec 02 §2/§5A). Diffs the vault's local
+-// `attachments/` files against the server's blob list BY CONTENT HASH (sha256)
+-// and moves the delta both ways: upload local-only files, download server-only
+-// files into `attachments/`. Attachments never enter the note/CRDT pipeline —
+-// this is a plain content-addressed file mirror.
++// Binary sync (Phase 3 blob store, spec 02 §2/§5A). Diffs the vault's local
++// binaries against the server's blob list BY CONTENT HASH (sha256) and moves
++// the delta both ways: upload local-only files, download server-only files onto
++// disk. Binaries never enter the note/CRDT pipeline — this is a plain
++// content-addressed file mirror.
++//
++// ── Two homes, one mirror (PR3 Stage A) ────────────────────────────────────
++// `attachments/` is the hidden, content-addressed store an editor drop writes
++// to. A TREE binary is anything else the vault surfaces and the CRDT does not
++// own — `Team/report.docx`, `Media/clip.mp4`. Both ride this mirror, and the
++// difference is what happens either side of the bytes:
++//
++//   • a tree binary is REGISTERED as a server `files` row first, under the
++//     local index's `files.id`, and its blob carries that id as `doc_id` — so
++//     the permission resolver answers for the FILE (folder shares, org grants,
++//     the sealed posture) instead of falling back to the blob store's path
++//     heuristic. That ACL fix is the whole point of Stage A;
++//   • a tree binary materializes through the TREE write guard
++//     (`ipc.writeTreeBinary`), never through the `attachments/` one, which
++//     stays exactly as strict as it was for server-supplied paths.
++//
++// Identity is still sha256 in both directions, which is Stage A's known
++// limit: RENAMING a tree binary does not propagate (the bytes are unchanged, so
++// the diff sees nothing to do and another device keeps the old name), and two
++// paths holding identical bytes collapse to one blob. Stage B replaces the
++// diff with a path-keyed one over `files.id`; the rename no-op is pinned by a
++// test so that change is a visible one.
+ //
+ // The diff is pure and unit-tested in isolation; the `AttachmentSync` class
+ // wires it to injected I/O (ApiClient + Tauri ipc) and debounces watcher-driven
+@@ -28,7 +50,7 @@
+ // back to the legacy `POST /api/vaults/:id/blobs` and remembers, so exactly one
+ // upload pays for the probe.
+ 
+-import { mimeForPath as mimeForFormat } from "../formats";
++import { formatFor, isNoteExt, mimeForPath as mimeForFormat } from "../formats";
+ import type {
+   BlobCompleteBody,
+   BlobDownloadTarget,
+@@ -77,11 +99,71 @@ export function isSafeAttachmentRelPath(relPath: string): boolean {
+   );
+ }
+ 
++/** Does this vault-relative path live in the hidden `attachments/` store? */
++export function isUnderAttachments(relPath: string): boolean {
++  return relPath === "attachments" || relPath.startsWith("attachments/");
++}
++
++/**
++ * Whether a server-supplied `relPath` is a safe TREE binary target — the
++ * mirror of {@link isSafeAttachmentRelPath} for files that live in the tree.
++ *
++ * Same threat: the server stores the uploader's path verbatim, so this is what
++ * a member could aim at every teammate's disk. Accepted is exactly what a user
++ * could have dropped there themselves — no traversal, no dotfile or hidden
++ * segment, and an extension the format registry surfaces as a non-note (so a
++ * blob can never overwrite a `.md`, and never lands inside `.context/`).
++ *
++ * Rust re-decides all of it (`attachments.rs ensure_tree_binary_rel`) and is
++ * the authority, including the denied build dirs this side does not enumerate;
++ * this filter is what keeps the pass from queueing work Rust will refuse.
++ */
++export function isSafeTreeBinaryRelPath(relPath: string): boolean {
++  if (!relPath) return false;
++  const parts = relPath.split(/[\\/]/);
++  if (parts.length === 0) return false;
++  if (!parts.every((seg) => seg !== "" && seg !== "." && seg !== ".." && !seg.startsWith(".")))
++    return false;
++  if (isNoteExt(relPath)) return false;
++  const format = formatFor(relPath);
++  return !!format && format.surface && format.syncAs === "attachment";
++}
++
++/**
++ * Can this server blob be placed on disk at the path the server names?
++ *
++ * Two guards, one per home, and never a relaxation of either: a path under
++ * `attachments/` must satisfy {@link isSafeAttachmentRelPath}, anything else
++ * must satisfy {@link isSafeTreeBinaryRelPath}.
++ */
++export function isSafeBlobRelPath(relPath: string): boolean {
++  return isUnderAttachments(relPath)
++    ? isSafeAttachmentRelPath(relPath)
++    : isSafeTreeBinaryRelPath(relPath);
++}
++
++/**
++ * Is a watcher event for this path the BINARY sync's business rather than the
++ * note pipeline's?
++ *
++ * The routing rule `App.tsx` applies to every watcher batch. It used to be
++ * "does the path start with `attachments/`", which was true of every binary
++ * back when the only binaries lived there — a `.docx` dropped into a folder
++ * fell through to the note path, where an unmapped file means "register it as a
++ * note". The format registry answers it properly: the CRDT family is `syncAs:
++ * "note"`, everything else the vault surfaces is a blob.
++ */
++export function routesToAttachmentSync(path: string): boolean {
++  if (isUnderAttachments(path)) return true;
++  return formatFor(path)?.syncAs === "attachment";
++}
++
+ /**
+  * Pure content-hash diff. A file is "the same" iff its sha256 matches; rel_path
+  * is not part of identity (dedupe is by content), so a rename with unchanged
+- * bytes is a no-op. Server blobs without a sha or a rel_path — or with a
+- * relPath outside `attachments/` (see {@link isSafeAttachmentRelPath}) — can't
++ * bytes is a no-op — see the module header for why that is Stage A's known
++ * limit rather than a decision. Server blobs without a sha or a rel_path — or
++ * with a relPath neither guard accepts (see {@link isSafeBlobRelPath}) — can't
+  * be placed on disk, so they're skipped from the download set.
+  */
+ export function diffAttachments(
+@@ -93,11 +175,7 @@ export function diffAttachments(
+ 
+   const toUpload = local.filter((a) => !serverShas.has(a.sha256));
+   const toDownload = server.filter(
+-    (b) =>
+-      !!b.sha256 &&
+-      !!b.relPath &&
+-      isSafeAttachmentRelPath(b.relPath) &&
+-      !localShas.has(b.sha256),
++    (b) => !!b.sha256 && !!b.relPath && isSafeBlobRelPath(b.relPath) && !localShas.has(b.sha256),
+   );
+   return { toUpload, toDownload };
+ }
+@@ -188,6 +266,26 @@ function isMissingCommand(e: unknown): boolean {
+  */
+ const EXPIRED_PRESIGN: readonly number[] = [401, 403];
+ 
++/** How long a `files-indexed` burst collects before the text pass runs. */
++const TEXT_DEBOUNCE_MS = 800;
++
++/**
++ * The server rejects extracted text over 1 MB (413). Characters are not bytes,
++ * so this cap is the cheap half: slice at a million characters — never inside a
++ * surrogate pair, which would send a lone half and land as U+FFFD — and let the
++ * server's own 413 handle text that is still over the byte cap after it (marked
++ * permanent for that blob, never retried).
++ */
++const MAX_TEXT_CHARS = 1_000_000;
++
++function capText(text: string): string {
++  if (text.length <= MAX_TEXT_CHARS) return text;
++  let end = MAX_TEXT_CHARS;
++  const last = text.charCodeAt(end - 1);
++  if (last >= 0xd800 && last <= 0xdbff) end -= 1; // don't split a surrogate pair
++  return text.slice(0, end);
++}
++
+ /** `attachments/a/b.png` → `b.png`. */
+ function baseName(relPath: string): string {
+   const parts = relPath.split("/");
+@@ -204,17 +302,31 @@ export interface AttachmentSyncDeps {
+    * to always-current when omitted (unit tests).
+    */
+   isCurrent?: () => boolean;
+-  /** List local attachment files under `attachments/`. */
++  /** List the vault's local binaries — `attachments/` AND the tree binaries
++   *  (`ipc.listBinaries`). */
+   listLocal: () => Promise<LocalAttachment[]>;
+   /** Read a local attachment's bytes (vault-relative path). */
+   readLocal: (relPath: string) => Promise<Uint8Array>;
+-  /** Atomically write bytes to a vault-relative path (creates dirs). */
++  /** Atomically write bytes to a path under `attachments/` (creates dirs). */
+   writeLocal: (relPath: string, bytes: Uint8Array) => Promise<void>;
++  /** The same for a TREE binary, through the tree write guard. Absent means
++   *  this host cannot materialize outside `attachments/` (unit tests), and
++   *  those downloads are skipped rather than forced through the wrong guard. */
++  writeTreeLocal?: (relPath: string, bytes: Uint8Array) => Promise<void>;
++  /** Claim the watcher echo for a path THIS device just wrote, exactly as the
++   *  registry does for a materialized note (`registry.markMaterialized`). */
++  markMaterialized?: (relPath: string) => void;
+   /** List the server's blobs for this vault. */
+   listServer: () => Promise<ServerBlob[]>;
+   /** LEGACY upload: POST the whole body in one shot. The fallback for a server
+-   *  with no intent route, and the reason that route stays forever. */
+-  uploadServer: (relPath: string, bytes: Uint8Array, mime: string) => Promise<void>;
++   *  with no intent route, and the reason that route stays forever. `docId` is
++   *  the `files` row a tree binary belongs to — sent as `x-doc-id`. */
++  uploadServer: (
++    relPath: string,
++    bytes: Uint8Array,
++    mime: string,
++    docId?: string | null,
++  ) => Promise<void>;
+   /** LEGACY download: GET `/api/blobs/:id` and hand back the bytes. */
+   downloadServer: (id: string) => Promise<Uint8Array>;
+ 
+@@ -230,6 +342,8 @@ export interface AttachmentSyncDeps {
+     size: number;
+     mime: string;
+     filename: string;
++    /** The `files` row these bytes belong to (tree binaries only). */
++    docId?: string | null;
+   }) => Promise<BlobIntent>;
+   /** POST the intent's `completeUrl` once every byte is in. Idempotent. */
+   completeUpload?: (completeUrl: string, body: BlobCompleteBody) => Promise<void>;
+@@ -255,12 +369,14 @@ export interface AttachmentSyncDeps {
+   }) => Promise<PutResult>;
+   /** Ask where a blob's bytes are right now (presign or our own route). */
+   downloadUrl?: (blobId: string) => Promise<BlobDownloadTarget>;
+-  /** Stream a URL to disk from Rust, hash-verified and atomic. */
++  /** Stream a URL to disk from Rust, hash-verified and atomic. `tree` picks
++   *  the write guard Rust applies — never inferred there, always stated here. */
+   fetchToFile?: (input: {
+     url: string;
+     relPath: string;
+     headers: Record<string, string>;
+     expectedSha256?: string | null;
++    tree: boolean;
+   }) => Promise<{ status: number; bytes: number }>;
+   /** GET bytes from a (possibly presigned) URL in the webview — fallback. */
+   fetchBytes?: (url: string, headers: Record<string, string>) => Promise<Uint8Array>;
+@@ -274,6 +390,31 @@ export interface AttachmentSyncDeps {
+   authHeaders?: () => Record<string, string>;
+   /** Tell the user something terminal happened (a full vault). */
+   notify?: (text: string, tone?: "error" | "neutral" | "success") => void;
++
++  // ---- Tree binaries: `files` rows + extracted text (PR3 Stage A) ---------
++
++  /** Local `files.id` per vault-relative path (`ipc.listFileRows`). The id the
++   *  server row is created under, so both sides name one identity. */
++  localFileIds?: () => Promise<Map<string, string>>;
++  /** The `files` id this vault already registered for a path, from
++   *  `.context/config.json` — so a reconnect costs no round trip per binary. */
++  knownFileId?: (relPath: string) => string | null;
++  /** Create (or adopt) the server `files` row and answer with its id. */
++  registerFile?: (input: { relPath: string; id: string }) => Promise<string | null>;
++  /** Remember a registered row for the next session. */
++  rememberFileId?: (relPath: string, id: string) => void;
++  /** The extracted text the INDEX holds for a path (`ipc.getFileText`). */
++  fileText?: (
++    relPath: string,
++  ) => Promise<{ sha256: string; status: string; chars: number; text: string } | null>;
++  /** Hand that text to the server as ranking fuel for team search. */
++  uploadText?: (input: {
++    blobId: string;
++    docId?: string | null;
++    sha256: string;
++    chars: number;
++    content: string;
++  }) => Promise<void>;
+ }
+ 
+ export interface ReconcileResult {
+@@ -310,6 +451,34 @@ export class AttachmentSync {
+   /** The storage-full toast is raised at most once per sync instance. */
+   private storageLimitNotified = false;
+ 
++  // ---- Tree binaries -----------------------------------------------------
++
++  /** relPath → server `files` id, for the paths registered this session. */
++  private readonly fileIds = new Map<string, string>();
++  /** The local index's path → `files.id` map, read once per pass. */
++  private localIds: Map<string, string> | null = null;
++  /**
++   * Tree binaries the server has REFUSED a `files` row for in a way retrying
++   * cannot fix — no write access, the frozen root, or a path another identity
++   * already holds. Their bytes still upload (without a `doc_id`, i.e. with the
++   * blob store's old path heuristic for ACL); what stops is asking again every
++   * pass.
++   */
++  private readonly registerRefused = new Set<string>();
++  /** sha256 → the blob the server holds for it. Rebuilt from each listing and
++   *  extended by each upload, so the text pass can name a blob by content. */
++  private readonly blobIdBySha = new Map<string, string>();
++  /** Does this server accept extracted text? `false` after one 404 (see
++   *  `api.uploadBlobText`) — the whole session then stops offering it. */
++  private textSupported: boolean | null = null;
++  /** Blobs whose text this session has already sent (or permanently failed to
++   *  send). Keyed by blob id: text describes BYTES, so one send per blob. */
++  private readonly textDone = new Set<string>();
++  /** Paths waiting for a text pass, and its own debounce — deliberately
++   *  separate from the byte mirror's, so extraction never delays an upload. */
++  private pendingText = new Set<string>();
++  private textTimer: ReturnType<typeof setTimeout> | null = null;
++
+   constructor(
+     private readonly deps: AttachmentSyncDeps,
+     private readonly debounceMs = 400,
+@@ -358,6 +527,13 @@ export class AttachmentSync {
+       return { uploaded: 0, downloaded: 0 };
+     }
+     if (!this.current()) return { uploaded: 0, downloaded: 0 };
++    // Re-read per pass: a file dropped a second ago has no `files` row yet, and
++    // the next pass is when it does.
++    this.localIds = null;
++    // What the server holds, by content — the text pass names a blob this way,
++    // and a file that was uploaded by ANOTHER device (so never passes through
++    // `uploadOne` here) is only ever knowable from the listing.
++    for (const b of server) if (b.sha256) this.blobIdBySha.set(b.sha256, b.id);
+     const { toUpload, toDownload } = diffAttachments(local, server);
+ 
+     let uploaded = 0;
+@@ -404,6 +580,11 @@ export class AttachmentSync {
+    */
+   private async uploadOne(a: LocalAttachment): Promise<boolean> {
+     const mime = mimeForPath(a.relPath);
++    // A tree binary is a `files` row FIRST: the id has to exist before the
++    // bytes, because it is what the blob carries as `doc_id` and what the
++    // permission resolver answers for. A failure here is not fatal — the bytes
++    // still go, with the pre-Stage-A path heuristic deciding who may read them.
++    const docId = await this.ensureFileRow(a.relPath);
+     // Read lazily and at most once: the deduped path must move NO bytes and
+     // must not even open the file, which is what makes a second device's first
+     // sync a few JSON round trips instead of re-uploading the whole store.
+@@ -414,7 +595,10 @@ export class AttachmentSync {
+     };
+ 
+     if (!this.deps.createIntent || this.intentSupported === false) {
+-      await this.deps.uploadServer(a.relPath, await loadBytes(), mime);
++      await this.deps.uploadServer(a.relPath, await loadBytes(), mime, docId);
++      // The legacy route answers with the blob, but through a dep that reports
++      // nothing — so the text for this path waits for the next listing to name
++      // its blob, which is exactly what the pass already does.
+       return true;
+     }
+ 
+@@ -426,6 +610,7 @@ export class AttachmentSync {
+         size: a.size ?? (await loadBytes()).byteLength,
+         mime,
+         filename: baseName(a.relPath),
++        docId,
+       });
+       this.intentSupported = true;
+     } catch (e) {
+@@ -434,7 +619,7 @@ export class AttachmentSync {
+         // A server from before this flow. Remembered, so the NEXT file skips
+         // the probe entirely rather than paying a 404 each time.
+         this.intentSupported = false;
+-        await this.deps.uploadServer(a.relPath, await loadBytes(), mime);
++        await this.deps.uploadServer(a.relPath, await loadBytes(), mime, docId);
+         return true;
+       }
+       if (status === 402) {
+@@ -454,9 +639,15 @@ export class AttachmentSync {
+       throw e;
+     }
+ 
+-    if ("deduped" in intent && intent.deduped) return true; // zero bytes moved
++    if ("deduped" in intent && intent.deduped) {
++      // Zero bytes moved — but the server now names the blob these bytes are,
++      // which is all the text pass needs.
++      if (intent.blob?.id) this.noteBlob(a.sha256, intent.blob.id, a.relPath);
++      return true;
++    }
+     if (!("upload" in intent)) throw new Error("intent answered with no upload target");
+     const { upload, completeUrl } = intent;
++    this.noteBlob(a.sha256, intent.blobId, a.relPath);
+ 
+     if (upload.kind === "single") {
+       const put = () =>
+@@ -633,6 +824,18 @@ export class AttachmentSync {
+    */
+   private async downloadOne(b: ServerBlob): Promise<void> {
+     const relPath = b.relPath as string;
++    const tree = !isUnderAttachments(relPath);
++    // A tree binary needs a host that can write outside `attachments/`. Without
++    // one (a unit test, an older host) it is left alone rather than pushed
++    // through the attachment guard, which would refuse it anyway.
++    if (tree && !this.deps.writeTreeLocal && !this.deps.fetchToFile) {
++      throw new Error(`no tree-binary write transport for ${relPath}`);
++    }
++    // Claim the watcher echo BEFORE the write, the way the registry does for a
++    // materialized note: the file lands ~150ms before the event, and an echo
++    // read as an external edit is how our own placeholder came to be treated as
++    // somebody's change (#93).
++    this.deps.markMaterialized?.(relPath);
+     let target: BlobDownloadTarget | null = null;
+     if (this.deps.downloadUrl && this.downloadUrlSupported !== false) {
+       try {
+@@ -654,6 +857,7 @@ export class AttachmentSync {
+             relPath,
+             headers,
+             expectedSha256: b.sha256,
++            tree,
+           });
+           return;
+         } catch (e) {
+@@ -663,13 +867,191 @@ export class AttachmentSync {
+         }
+       }
+       if (this.deps.fetchBytes) {
+-        await this.deps.writeLocal(relPath, await this.deps.fetchBytes(target.url, headers));
++        await this.writeOne(relPath, await this.deps.fetchBytes(target.url, headers), tree);
+         return;
+       }
+     }
+ 
+     // Legacy: the server proxies the bytes on `/api/blobs/:id`.
+-    await this.deps.writeLocal(relPath, await this.deps.downloadServer(b.id));
++    await this.writeOne(relPath, await this.deps.downloadServer(b.id), tree);
++  }
++
++  /** Write downloaded bytes through the guard that matches their home. */
++  private async writeOne(relPath: string, bytes: Uint8Array, tree: boolean): Promise<void> {
++    if (!tree) {
++      await this.deps.writeLocal(relPath, bytes);
++      return;
++    }
++    const write = this.deps.writeTreeLocal;
++    if (!write) throw new Error(`no tree-binary write transport for ${relPath}`);
++    await write(relPath, bytes);
++  }
++
++  // ---- `files` rows ------------------------------------------------------
++
++  /**
++   * The server `files` id for a tree binary, registering one if this device has
++   * not already.
++   *
++   * `undefined` for anything under `attachments/` (those blobs stay
++   * path-addressed and keep the old ACL heuristic), for a host with no registry
++   * dep, for a path the local index has no `files` row for yet (the extraction
++   * worker is seconds behind a drop — the next pass registers it), and for a
++   * refusal. In every one of those cases the bytes still upload; only the
++   * doc_id is missing.
++   */
++  private async ensureFileRow(relPath: string): Promise<string | undefined> {
++    if (isUnderAttachments(relPath)) return undefined;
++    if (!this.deps.registerFile) return undefined;
++    const remembered = this.fileIds.get(relPath) ?? this.deps.knownFileId?.(relPath) ?? null;
++    if (remembered) {
++      this.fileIds.set(relPath, remembered);
++      return remembered;
++    }
++    if (this.registerRefused.has(relPath)) return undefined;
++    const localId = (await this.localFileId(relPath)) ?? null;
++    if (!localId) return undefined;
++    try {
++      const id = await this.deps.registerFile({ relPath, id: localId });
++      if (!id) return undefined;
++      this.fileIds.set(relPath, id);
++      this.deps.rememberFileId?.(relPath, id);
++      return id;
++    } catch (e) {
++      const status = errStatus(e);
++      const code = errCode(e);
++      // Three outcomes, and which one this is decides whether we ever ask again:
++      //  • 400 `path_folder_mismatch` — the server resolved a different parent
++      //    than our path implies, because its folder rows are mid-reconcile.
++      //    Per file, never fatal, retried next pass: the registry pull that
++      //    fixes it is already queued;
++      //  • any other ANSWER (403 no write access, the frozen root, a path
++      //    another identity already holds) is a decision, not a hiccup —
++      //    asking again every pass is a guaranteed refusal every pass;
++      //  • no status, or a 5xx — we never reached a decision. Offline, a
++      //    restarting server. Those must not cost the file its doc_id forever.
++      const permanent = status != null && status >= 400 && status < 500 && status !== 400;
++      if (permanent) this.registerRefused.add(relPath);
++      console.warn(
++        `[attachments] ${relPath} — no files row (${status ?? "?"} ${code ?? "?"})${
++          permanent ? "; uploading without a doc_id" : "; retrying next pass"
++        }`,
++        e,
++      );
++      return undefined;
++    }
++  }
++
++  /**
++   * The LOCAL index's `files.id` for a path.
++   *
++   * One listing per PASS, not per file: a vault where 300 binaries need
++   * registering would otherwise cross the IPC bridge 300 times for a map that
++   * does not change while the pass runs.
++   */
++  private async localFileId(relPath: string): Promise<string | undefined> {
++    if (!this.deps.localFileIds) return undefined;
++    if (!this.localIds) {
++      try {
++        this.localIds = await this.deps.localFileIds();
++      } catch (e) {
++        console.warn("[attachments] local file ids unavailable", e);
++        this.localIds = new Map();
++      }
++    }
++    return this.localIds.get(relPath);
++  }
++
++  // ---- Extracted text ----------------------------------------------------
++
++  /** Remember which blob holds these bytes, and offer its text. */
++  private noteBlob(sha256: string, blobId: string, relPath: string): void {
++    if (sha256 && blobId) this.blobIdBySha.set(sha256, blobId);
++    // A file the index extracted BEFORE it was ever uploaded gets no second
++    // `files-indexed` event, so the upload is the other trigger.
++    this.scheduleText([relPath]);
++  }
++
++  /**
++   * `files-indexed` arrived: these paths now have extracted text in the index,
++   * and the server can have it as search fuel.
++   *
++   * Debounced and entirely off the byte mirror's path — a 200-file drop emits
++   * a handful of coalesced batches from Rust, and none of them may delay an
++   * upload.
++   */
++  handleFilesIndexed(paths: string[]): void {
++    this.scheduleText(paths);
++  }
++
++  private scheduleText(paths: string[]): void {
++    if (!this.deps.uploadText || !this.deps.fileText) return;
++    if (this.textSupported === false) return;
++    if (!this.current()) return;
++    for (const p of paths) this.pendingText.add(p);
++    if (this.pendingText.size === 0) return;
++    if (this.textTimer) this.clearTimeoutImpl(this.textTimer);
++    this.textTimer = this.setTimeoutImpl(() => {
++      this.textTimer = null;
++      void this.drainText().catch((e) => console.warn("[attachments] text pass failed", e));
++    }, TEXT_DEBOUNCE_MS);
++  }
++
++  /** Send the extracted text for every queued path whose blob we can name. */
++  private async drainText(): Promise<void> {
++    const paths = [...this.pendingText];
++    this.pendingText = new Set();
++    const upload = this.deps.uploadText;
++    const read = this.deps.fileText;
++    if (!upload || !read) return;
++    for (const relPath of paths) {
++      if (!this.current()) return;
++      if (this.textSupported === false) return;
++      let text: Awaited<ReturnType<typeof read>>;
++      try {
++        text = await read(relPath);
++      } catch (e) {
++        console.warn("[attachments] extracted text unavailable", relPath, e);
++        continue;
++      }
++      // `pending` is the worker still working; anything else with no words is
++      // a file whose text is legitimately empty (a video, an unsupported type).
++      if (!text || text.status !== "ok" || text.chars <= 0 || !text.sha256) continue;
++      const blobId = this.blobIdBySha.get(text.sha256);
++      // Not uploaded yet — the byte mirror will name the blob, and its own
++      // completion re-queues this path.
++      if (!blobId) continue;
++      if (this.textDone.has(blobId)) continue;
++      const content = capText(text.text);
++      try {
++        await upload({
++          blobId,
++          docId: this.fileIds.get(relPath) ?? this.deps.knownFileId?.(relPath) ?? null,
++          sha256: text.sha256,
++          chars: content.length,
++          content,
++        });
++        this.textDone.add(blobId);
++      } catch (e) {
++        const status = errStatus(e);
++        if (status === 404) {
++          // The route is absent, or the blob is. Neither is worth another file.
++          this.textSupported = false;
++          this.pendingText.clear();
++          console.warn("[attachments] server takes no extracted text — stopping for this session");
++          return;
++        }
++        if (status === 413 || status === 409) {
++          // 413: our char cap still overflowed the server's byte cap (multibyte
++          // text). 409: the blob's bytes moved under us, and the new bytes get
++          // their own extraction. Both are permanent for THIS blob.
++          this.textDone.add(blobId);
++          console.warn(`[attachments] ${relPath} text refused (${status}) — not retrying`);
++          continue;
++        }
++        console.warn("[attachments] text upload failed", relPath, e);
++      }
++    }
+   }
+ 
+   /** Debounced reconcile — collapses a burst of watcher events into one pass. */
+@@ -695,6 +1077,12 @@ export class AttachmentSync {
+       this.clearTimeoutImpl(this.timer);
+       this.timer = null;
+     }
++    // The text pass holds the same captured vaultId and must die with it.
++    if (this.textTimer) {
++      this.clearTimeoutImpl(this.textTimer);
++      this.textTimer = null;
++    }
++    this.pendingText.clear();
+   }
+ 
+   /** True while a debounced pass is still armed (teardown assertions/tests). */
+diff --git a/app/apps/desktop/src/lib/sync/docSession.ts b/app/apps/desktop/src/lib/sync/docSession.ts
+index 996700fb..a6e941a3 100644
+--- a/app/apps/desktop/src/lib/sync/docSession.ts
++++ b/app/apps/desktop/src/lib/sync/docSession.ts
+@@ -21,7 +21,7 @@ import { colorForUser, presenceUser } from "../presence/color";
+ import { viewingDocId } from "../presence/viewingDocId";
+ import type { ActivityStatus } from "../prefs";
+ import { toast } from "../toast";
+-import { AttachmentSync } from "./attachments";
++import { AttachmentSync, routesToAttachmentSync } from "./attachments";
+ import { ContentUploader, type UploadFailure } from "./contentUpload";
+ import { collectCrdtGarbage } from "./crdtGc";
+ import { runPool } from "./pool";
+@@ -1341,6 +1341,14 @@ export class SyncManager implements InboundHost {
+   ): void {
+     const scope = this.scope;
+     if (!this.enabled || !scope || !scope.isCurrent()) return;
++    // Binaries are the blob mirror's business and nothing of this path's.
++    // `App.tsx` already routes them to `handleAttachmentChanged`; this is the
++    // same rule stated where the damage would be done, because everything below
++    // reads an unmapped file as "a note nobody registered yet" — which is how a
++    // `.docx` in a folder used to earn a registry pull per watcher event, and
++    // would earn a `notes` row the moment anything downstream stopped checking.
++    changes = changes.filter((c) => !routesToAttachmentSync(c.path));
++    if (changes.length === 0) return;
+     // ONE registry pull for the whole batch, however many items ask for it. The
+     // watcher already debounces into batches, and an AI writing 200 new files
+     // used to re-enter `handleRegistryChanged` 200 times per batch — 200 timer
+@@ -3354,6 +3362,19 @@ export class SyncManager implements InboundHost {
+     this.attachments?.scheduleReconcile();
+   }
+ 
++  /**
++   * The index finished extracting text for these tree binaries (`files-indexed`).
++   *
++   * Public like `handleAttachmentChanged`: it is an external signal for this
++   * vault, and the sync layer decides what it is worth. All it does is offer
++   * the words to the server for team search — it never moves bytes and never
++   * blocks the blob mirror.
++   */
++  handleFilesIndexed(paths: string[]): void {
++    if (!this.enabled || paths.length === 0) return;
++    this.attachments?.handleFilesIndexed(paths);
++  }
++
+   /** Build the AttachmentSync from the reconciled server vault id + ipc/api.
+    *  Bound to `scope`: the captured `vaultId` is only valid while that vault is
+    *  open, so both the pass guard and the pinned IPC epoch reference it. */
+@@ -3366,15 +3387,23 @@ export class SyncManager implements InboundHost {
+     const epoch = scope.vaultEpoch;
+     this.attachments = new AttachmentSync({
+       isCurrent: () => scope.isCurrent(),
+-      listLocal: () => ipc.listAttachments(epoch),
++      // The WHOLE vault, not just `attachments/`: a `.docx` in `Team/` is a
++      // blob like any other since it got its own `files` row (PR3 Stage A).
++      listLocal: () => ipc.listBinaries(epoch),
+       readLocal: (relPath) => ipc.readBinaryFile(relPath, epoch),
+       writeLocal: (relPath, bytes) => ipc.writeBinaryFile(relPath, bytes, epoch),
++      // A tree binary materializes through its OWN guard; the `attachments/`
++      // one stays exactly as strict as it was for server-supplied paths.
++      writeTreeLocal: (relPath, bytes) => ipc.writeTreeBinary(relPath, bytes, epoch),
++      // Our own write, so its watcher echo is not an external edit — the same
++      // one-echo-per-path claim the registry makes for a materialized note.
++      markMaterialized: (relPath) => this.registry.markMaterialized(relPath),
+       listServer: () => api.listVaultBlobs(vaultId),
+       // The legacy pair: still the whole flow for a server that predates the
+       // intent route, and the fallback the client drops to on its 404.
+-      uploadServer: (relPath, bytes, mime) =>
++      uploadServer: (relPath, bytes, mime, docId) =>
+         api
+-          .uploadBlob({ vaultId, relPath, bytes, mime, fileName: baseName(relPath) })
++          .uploadBlob({ vaultId, relPath, bytes, mime, fileName: baseName(relPath), docId })
+           .then(() => undefined),
+       downloadServer: (id) => api.downloadBlob(id),
+       // intent → PUT → complete. Bytes go through Rust (epoch-pinned, streamed
+@@ -3387,6 +3416,7 @@ export class SyncManager implements InboundHost {
+           mime: input.mime,
+           relPath: input.relPath,
+           filename: input.filename,
++          docId: input.docId,
+         }),
+       completeUpload: (completeUrl, body) =>
+         api.completeBlob(completeUrl, body).then(() => undefined),
+@@ -3405,6 +3435,29 @@ export class SyncManager implements InboundHost {
+       putBytes: (input) => api.uploadBytesTo(input),
+       downloadUrl: (blobId) => api.blobDownloadUrl(blobId),
+       fetchToFile: (input) => ipc.downloadAttachment(input, epoch),
++      // ---- Tree binaries: the `files` row that carries their ACL ----------
++      localFileIds: async () =>
++        new Map((await ipc.listFileRows()).map((r) => [r.path, r.id])),
++      knownFileId: (relPath) => this.registry.getFileId(relPath),
++      registerFile: async ({ relPath, id }) => {
++        const row = await api.registerFile({ vaultId, id, path: relPath });
++        // The server echoes the row's own id — which is ours today, and is what
++        // lets a future path-adopting server hand back the identity it already
++        // holds without this side having to guess.
++        return row.docId ?? row.id ?? null;
++      },
++      rememberFileId: (relPath, id) => this.registry.setFileId(relPath, id),
++      // Extracted text: Rust already pulled the words out for local search, so
++      // the server gets a copy as ranking fuel rather than re-parsing the file.
++      fileText: (relPath) => ipc.getFileText(relPath),
++      uploadText: (input) =>
++        api.uploadBlobText(vaultId, input.blobId, {
++          chars: input.chars,
++          content: input.content,
++          source: "client",
++          docId: input.docId,
++          sha256: input.sha256,
++        }),
+       fetchBytes: (url, headers) => api.downloadBytesFrom(url, headers),
+       // Only ever applied to a download URL the SERVER serves; a presigned one
+       // is fetched clean (see `sync/attachments.ts`).
+diff --git a/app/apps/desktop/src/lib/sync/registry.ts b/app/apps/desktop/src/lib/sync/registry.ts
+index bb845530..315998d9 100644
+--- a/app/apps/desktop/src/lib/sync/registry.ts
++++ b/app/apps/desktop/src/lib/sync/registry.ts
+@@ -64,6 +64,21 @@ interface VaultSyncConfig {
+   docs?: Record<string, string>;
+   /** folder relPath → server folder id. */
+   folders?: Record<string, string>;
++  /**
++   * TREE BINARY relPath → server `files` row id (PR3 Stage A).
++   *
++   * A separate key from `docs`, and it must stay separate: `docs` is the CRDT
++   * note map that every sync path keys off, and a binary must never appear in
++   * it (nothing about a `.docx` may reach `NoteBridge`, `ContentUploader` or
++   * `registerNote`). All this remembers is "the server already has a `files`
++   * row for this path under this id", so a reconnect skips the re-registration
++   * round trip per binary.
++   *
++   * Like `docs` it is an optimization, never proof: re-registering is an
++   * idempotent create with a client-supplied id, so a wiped `.context/` costs
++   * one POST per binary and nothing else.
++   */
++  files?: Record<string, string>;
+   /**
+    * docIds whose CONTENT this device has confirmed on the server (the bulk
+    * upload's resume point — see `ContentUploader`).
+@@ -376,6 +391,10 @@ export class VaultRegistry {
+    *  Null = not built / invalidated; see `canonicalNotePath`. */
+   private byPathCi: Map<string, string> | null = null;
+   private folderByPath = new Map<string, string>();
++  /** Tree-binary relPath → server `files` id (see `VaultSyncConfig.files`).
++   *  Deliberately NOT part of `byPath`/`byDocId`: those two are the CRDT note
++   *  join, and a binary has no Y.Doc, no bridge and no content upload. */
++  private fileByPath = new Map<string, string>();
+   /** docIds whose content this device has confirmed on the server. See
+    *  `VaultSyncConfig.pushed` for why this is an optimization, not a guarantee. */
+   private pushed = new Set<string>();
+@@ -665,6 +684,8 @@ export class VaultRegistry {
+     // Paths, so they belong to the vault we are leaving.
+     this.aliasPaths.clear();
+     this.folderByPath.clear();
++    // Server ids for vault A's binaries name nothing in vault B.
++    this.fileByPath.clear();
+     this.pushed.clear();
+     // A surviving baseline is exactly the cross-vault confusion this method
+     // exists to prevent — it would tell vault B that vault A's notes moved.
+@@ -747,8 +768,15 @@ export class VaultRegistry {
+     return this.materialized.delete(relPath);
+   }
+ 
+-  /** Record a placeholder this pass created (see {@link materialized}). */
+-  private markMaterialized(relPath: string): void {
++  /**
++   * Record a path THIS device just wrote, so its watcher echo is recognised as
++   * ours (see {@link materialized}).
++   *
++   * Public because the binary sync materializes too: a tree binary a teammate
++   * dropped lands here as a blob written straight to disk, and its echo must
++   * not be mistaken for an external edit any more than a note placeholder's is.
++   */
++  markMaterialized(relPath: string): void {
+     // Bounded: an echo that never arrives (the write was outside the watcher's
+     // window, the vault was closed) would otherwise pin the entry forever. A
+     // vault's worth of placeholders is the natural high-water mark, so a set an
+@@ -757,6 +785,34 @@ export class VaultRegistry {
+     this.materialized.add(relPath);
+   }
+ 
++  // ---- Tree binaries (PR3 Stage A) ---------------------------------------
++  //
++  // A `files` row is NOT a note: no Y.Doc, no bridge, no content upload. The
++  // only thing this map buys is the doc_id the blob store stamps on the bytes,
++  // which is what makes a binary obey its folder's share instead of the path
++  // heuristic. Kept beside the note map only because both belong to the vault
++  // and both travel in `.context/config.json`.
++
++  /** The server `files` id this device registered for a tree binary, if any. */
++  getFileId(relPath: string): string | null {
++    return this.fileByPath.get(relPath) ?? null;
++  }
++
++  /** Remember a registered tree binary and queue the config write. */
++  setFileId(relPath: string, id: string): void {
++    if (this.stale()) return;
++    if (this.fileByPath.get(relPath) === id) return;
++    this.fileByPath.set(relPath, id);
++    this.persist();
++  }
++
++  /** Adopt a `files` map read from `.context/config.json`. */
++  private adoptConfigFiles(files: Record<string, string>): void {
++    for (const [rp, id] of Object.entries(files)) {
++      if (typeof id === "string" && id) this.fileByPath.set(rp, id);
++    }
++  }
++
+   /** All mapped doc ids (for the vault sync engine's initial doc set). */
+   allDocIds(): string[] {
+     return [...this.byDocId.keys()];
+@@ -905,6 +961,8 @@ export class VaultRegistry {
+     for (const [rp, m] of this.byPath) docs[rp] = m.docId;
+     const folders: Record<string, string> = {};
+     for (const [rp, id] of this.folderByPath) folders[rp] = id;
++    const files: Record<string, string> = {};
++    for (const [rp, id] of this.fileByPath) files[rp] = id;
+     const baseline: Record<string, string> = {};
+     for (const [docId, rp] of this.baselineDocs) baseline[docId] = rp;
+     return {
+@@ -912,6 +970,7 @@ export class VaultRegistry {
+       serverVaultId: this.serverVaultId ?? undefined,
+       docs,
+       folders,
++      files,
+       pushed: [...this.pushed],
+       baseline,
+       // Written only when we know whose it is; an unattributed list is worse
+@@ -1586,6 +1645,7 @@ export class VaultRegistry {
+     for (const [rp, id] of Object.entries(cfg.folders ?? {})) {
+       if (typeof id === "string" && id) this.folderByPath.set(rp, id);
+     }
++    this.adoptConfigFiles(cfg.files ?? {});
+     this.pushed = new Set(cfg.pushed ?? []);
+     // Same collection guard as `reconcile`'s: the baseline describes the
+     // collection the config names, which is the one we just adopted.
+@@ -1731,6 +1791,9 @@ export class VaultRegistry {
+         if (typeof id === "string" && id) this.folderByPath.set(rp, id);
+       }
+     }
++    // Same guard for the tree-binary map: an id minted against another
++    // collection names nothing here.
++    if (cfg.serverVaultId === vaultId && cfg.files) this.adoptConfigFiles(cfg.files);
+ 
+     // 1b. First-run seeding. A vault the user JUST created (`seedIfEmpty`) —
+     //     with nothing on the server AND an empty local folder — gets
+diff --git a/docs/RELEASE_NOTES.md b/docs/RELEASE_NOTES.md
+index 8b696056..90117f41 100644
+--- a/docs/RELEASE_NOTES.md
++++ b/docs/RELEASE_NOTES.md
+@@ -20,6 +20,7 @@
+ 
+ ## 0.1.62
+ 
++- Files you keep in folders, not just images pasted into notes, now sync between your devices and to teammates with their real names and locations, so a PDF in Team/ shows up in Team/ everywhere. Renaming a synced file does not yet propagate; that is next.
+ - Attachments now upload and download through a streaming path that keeps large files out of memory, skips files the server already holds without sending a byte, and sends very large files in parts so a dropped connection does not start over.
+ - Search now looks inside Word, Excel, PowerPoint, CSV, code and zip files in your vault, not just notes. Hits show a file badge and open the right viewer, and the Health page reports how much extracted text the index holds.
+ - More kinds of files open inside Baalda: Word documents, spreadsheets, CSV, audio, video, code and JSON files, with PowerPoint and zip files showing a card with "Open externally". Plain-text and Markdown-variant notes that used to do nothing when clicked now open in the editor and appear in search.

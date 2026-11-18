@@ -1,0 +1,369 @@
+diff --git a/src/stream_outlet_impl.cpp b/src/stream_outlet_impl.cpp
+index 04e0635f..9cb63b7e 100644
+--- a/src/stream_outlet_impl.cpp
++++ b/src/stream_outlet_impl.cpp
+@@ -54,7 +54,7 @@ stream_outlet_impl::stream_outlet_impl(const stream_info_impl &info, int32_t chu
+ 		}
+ 
+ 	// create TCP data server
+-	tcp_server_ = std::make_shared<tcp_server>(info_, io_ctx_data_, send_buffer_, sample_factory_,
++	tcp_server_ = std::make_shared<tcp_server>(info_, *io_ctx_data_, send_buffer_, sample_factory_,
+ 		chunk_size_, cfg->allow_ipv4(), cfg->allow_ipv6(), sync_mode_);
+ 
+ 	// fail if both stacks failed to instantiate
+@@ -107,11 +107,22 @@ void stream_outlet_impl::instantiate_stack(udp udp_protocol) {
+ }
+ 
+ stream_outlet_impl::~stream_outlet_impl() {
++	// ponytail: only if an IO or transfer thread hangs for seconds. It may still use the data
++	// context or release queued samples, so leak them rather than free them under it.
++	const auto leak_shared_state = [this]() {
++		new factory_p(sample_factory_);
++		new io_context_p(io_ctx_data_);
++	};
+ 	try {
+ 		// cancel all request chains
+ 		tcp_server_->end_serving();
+ 		for (auto &udp_server : udp_servers_) udp_server->end_serving();
+ 		for (auto &responder : responders_) responder->end_serving();
++		// transfer threads need the IO threads to finish their last write, so wait before stopping
++		if (!tcp_server_->wait_for_transfer_threads(2.0)) {
++			LOG_F(WARNING, "Transfer threads for %s did not exit in time", info().name().c_str());
++			leak_shared_state();
++		}
+ 
+ 		// In theory, an io context should end quickly, but in practice it
+ 		// might take a while. So we
+@@ -121,8 +132,8 @@ stream_outlet_impl::~stream_outlet_impl() {
+ 		// 4. waiting a bit and
+ 		// 5. detaching thread, i.e. letting it hang and continue tearing down
+ 		//    the outlet
+-		asio::post(*io_ctx_data_, [io = io_ctx_data_]() { io->stop(); });
+-		asio::post(*io_ctx_service_, [io = io_ctx_service_]() { io->stop(); });
++		asio::post(*io_ctx_data_, [&io = *io_ctx_data_]() { io.stop(); });
++		asio::post(*io_ctx_service_, [&io = *io_ctx_service_]() { io.stop(); });
+ 		const char *name = this->info().name().c_str();
+ 		for (int try_nr = 0; try_nr <= 100; ++try_nr) {
+ 			switch (try_nr) {
+@@ -141,6 +152,7 @@ stream_outlet_impl::~stream_outlet_impl() {
+ 			case 100:
+ 				LOG_F(ERROR, "Detaching io_threads for %s", name);
+ 				for (auto &thread : io_threads_) thread->detach();
++				leak_shared_state();
+ 				return;
+ 			default: break;
+ 			}
+@@ -150,12 +162,6 @@ stream_outlet_impl::~stream_outlet_impl() {
+ 					[](const thread_p &thread) { return thread->joinable(); })) {
+ 				for (auto &thread : io_threads_) thread->join();
+ 				DLOG_F(INFO, "All of %s's IO threads were joined succesfully", name);
+-				// stop() strands handlers (e.g. aborted async_accept) holding servers that own
+-				// their io_context; run them or the outlet's resources leak (#312)
+-				for (const auto &io : {io_ctx_data_, io_ctx_service_}) {
+-					io->restart();
+-					io->poll();
+-				}
+ 				break;
+ 			}
+ 		}
+diff --git a/src/stream_outlet_impl.h b/src/stream_outlet_impl.h
+index 671f6790..6b4e22b7 100644
+--- a/src/stream_outlet_impl.h
++++ b/src/stream_outlet_impl.h
+@@ -363,7 +363,8 @@ class stream_outlet_impl {
+ 	stream_info_impl_p info_;
+ 	/// the single-producer, multiple-receiver send buffer
+ 	send_buffer_p send_buffer_;
+-	/// the IO service objects
++	/// the IO service objects. Destroyed after the servers and before the factory: destroying a
++	/// context destroys handlers stop() stranded, freeing the servers and sessions they hold (#312)
+ 	io_context_p io_ctx_data_, io_ctx_service_;
+ 
+ 	/// the threaded TCP data server
+diff --git a/src/tcp_server.cpp b/src/tcp_server.cpp
+index f6012b54..10b3fe33 100644
+--- a/src/tcp_server.cpp
++++ b/src/tcp_server.cpp
+@@ -267,8 +267,7 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ public:
+ 	/// Instantiate a new session & its socket.
+ 	client_session(const tcp_server_p &serv, tcp_socket &&sock)
+-		: io_(serv->io_), factory_(serv->factory_), serv_(serv), sock_(std::move(sock)),
+-		  requeststream_(&requestbuf_) {}
++		: io_(serv->io_), serv_(serv), sock_(std::move(sock)), requeststream_(&requestbuf_) {}
+ 
+ 	/// Destructor.
+ 	~client_session();
+@@ -276,6 +275,9 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ 	/// Get the socket of this session.
+ 	tcp_socket &socket() { return sock_; }
+ 
++	/// Ask the transfer thread to exit at its next wakeup.
++	void abort_transfer() { abort_transfer_.store(true, std::memory_order_release); }
++
+ 	/// Begin processing this session (i.e., data transmission over the socket).
+ 	void begin_processing();
+ 
+@@ -308,12 +310,8 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ 	/// Handler that gets called when a sample transfer has been completed.
+ 	void handle_chunk_transfer_outcome(err_t err, std::size_t len);
+ 
+-	/// shared pointer to IO service; ensures that the IO is still around by the time the serv_ and
+-	/// sock_ need to be destroyed
+-	io_context_p io_;
+-	/// keeps the sample factory alive while the transfer thread or a handler still holds queued
+-	/// samples, which can outlive the server and the outlet (#312)
+-	factory_p factory_;
++	/// the IO context (not owned, see tcp_server::io_)
++	asio::io_context &io_;
+ 	/// the server that is associated with this connection
+ 	std::weak_ptr<tcp_server> serv_;
+ 	/// connection socket
+@@ -356,10 +354,10 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ 	std::condition_variable completion_cond_;
+ };
+ 
+-tcp_server::tcp_server(stream_info_impl_p info, io_context_p io, send_buffer_p sendbuf,
++tcp_server::tcp_server(stream_info_impl_p info, asio::io_context &io, send_buffer_p sendbuf,
+ 	factory_p factory, int chunk_size, bool allow_v4, bool allow_v6, bool do_sync)
+-	: chunk_size_(chunk_size), info_(std::move(info)), io_(std::move(io)),
+-	  factory_(std::move(factory)), send_buffer_(std::move(sendbuf)) {
++	: chunk_size_(chunk_size), info_(std::move(info)), io_(io), factory_(std::move(factory)),
++	  send_buffer_(std::move(sendbuf)) {
+ 	// Create sync handler if sync mode is requested
+ 	if (do_sync) {
+ 		std::size_t sample_bytes = factory_->datasize();
+@@ -379,7 +377,7 @@ tcp_server::tcp_server(stream_info_impl_p info, io_context_p io, send_buffer_p s
+ 
+ 	if (allow_v4) {
+ 		try {
+-			acceptor_v4_ = std::make_unique<tcp_acceptor>(*io_, asio::ip::tcp::v4());
++			acceptor_v4_ = std::make_unique<tcp_acceptor>(io_, asio::ip::tcp::v4());
+ 			auto port = bind_and_listen_to_port_in_range(*acceptor_v4_, asio::ip::tcp::v4(), 10);
+ 			info_->v4data_port(port);
+ 			LOG_F(1, "Created IPv%d TCP acceptor for %s @ port %d", 4, info_->name().c_str(), port);
+@@ -390,7 +388,7 @@ tcp_server::tcp_server(stream_info_impl_p info, io_context_p io, send_buffer_p s
+ 	}
+ 	if (allow_v6) {
+ 		try {
+-			acceptor_v6_ = std::make_unique<tcp_acceptor>(*io_, asio::ip::tcp::v6());
++			acceptor_v6_ = std::make_unique<tcp_acceptor>(io_, asio::ip::tcp::v6());
+ 			auto port = bind_and_listen_to_port_in_range(*acceptor_v6_, asio::ip::tcp::v6(), 10);
+ 			info_->v6data_port(port);
+ 			LOG_F(1, "Created IPv%d TCP acceptor for %s @ port %d", 6, info_->name().c_str(), port);
+@@ -413,6 +411,12 @@ void tcp_server::write_all_blocking(const std::vector<asio::const_buffer> &bufs)
+ 	}
+ }
+ 
++bool tcp_server::wait_for_transfer_threads(double timeout) {
++	std::unique_lock<std::mutex> lock(transfer_mut_);
++	return transfer_cv_.wait_for(
++		lock, std::chrono::duration<double>(timeout), [this]() { return transfer_threads_ == 0; });
++}
++
+ bool tcp_server::have_sync_consumers() const {
+ 	return sync_handler_ && sync_handler_->have_consumers();
+ }
+@@ -431,7 +435,7 @@ void tcp_server::begin_serving() {
+ void tcp_server::end_serving() {
+ 	// issue closure of the server socket; this will result in a cancellation of the associated IO
+ 	// operations
+-	post(*io_, [this, shared_this = shared_from_this()]() {
++	post(io_, [this, shared_this = shared_from_this()]() {
+ 		if (acceptor_v4_) acceptor_v4_->close();
+ 		if (acceptor_v6_) acceptor_v6_->close();
+ 	});
+@@ -450,7 +454,7 @@ void tcp_server::accept_next_connection(tcp_acceptor_p &acceptor) {
+ 		if (!acceptor || !acceptor->is_open()) return;
+ 
+ 		// Select the IO context for handling the socket
+-		auto &sock_io_ctx = *io_;
++		auto &sock_io_ctx = io_;
+ 
+ 		// accept a connection on the session's socket
+ 		acceptor->async_accept(sock_io_ctx, [shared_this = shared_from_this(), &acceptor](
+@@ -492,6 +496,7 @@ void tcp_server::close_inflight_sessions() {
+ 		auto session = pair.second.lock();
+ 		// session has already expired on its own
+ 		if (!session) continue;
++		session->abort_transfer();
+ 		post(session->socket().get_executor(), [session]() {
+ 			asio::error_code ec;
+ 			auto &sock = session->socket();
+@@ -800,6 +805,8 @@ void client_session::handle_send_feedheader_outcome(
+ 		// quit if max_buffered_ is 0. This is a bit unexpected, but backwards compatible and quite
+ 		// convenient for unit tests
+ 		if (max_buffered_ <= 0) return;
++		// teardown already began (handler ran during the outlet's final drain)
++		if (abort_transfer_.load(std::memory_order_acquire)) return;
+ 
+ 		abort_on_peer_close(queue);
+ 
+@@ -811,6 +818,10 @@ void client_session::handle_send_feedheader_outcome(
+ 			max_samples_per_chunk = serv->chunk_size_;
+ 
+ 		// spawn a sample transfer thread.
++		{
++			std::lock_guard<std::mutex> lock(serv->transfer_mut_);
++			serv->transfer_threads_++;
++		}
+ 		std::thread(&client_session::transfer_samples_thread, this, shared_from_this(),
+ 			std::move(queue), max_samples_per_chunk)
+ 			.detach();
+@@ -878,10 +889,15 @@ void client_session::transfer_samples_thread(std::shared_ptr<client_session> kee
+ 	}
+ 	// Unregister immediately; cancel the peer-close read so the session can be destroyed.
+ 	queue.reset();
+-	post(*io_, [keepalive]() {
++	post(io_, [keepalive]() {
+ 		asio::error_code ec;
+ 		keepalive->sock_.cancel(ec);
+ 	});
++	// only after posting the cancel, so the outlet's final drain runs it
++	if (auto serv = serv_.lock()) {
++		std::lock_guard<std::mutex> lock(serv->transfer_mut_);
++		if (--serv->transfer_threads_ == 0) serv->transfer_cv_.notify_all();
++	}
+ }
+ 
+ void client_session::handle_chunk_transfer_outcome(err_t err, std::size_t len) {
+diff --git a/src/tcp_server.h b/src/tcp_server.h
+index efe13762..24ea408f 100644
+--- a/src/tcp_server.h
++++ b/src/tcp_server.h
+@@ -5,6 +5,7 @@
+ #include "socket_utils.h"
+ #include <asio/buffer.hpp>
+ #include <atomic>
++#include <condition_variable>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -54,8 +55,8 @@ class tcp_server : public std::enable_shared_from_this<tcp_server> {
+ 	 * the effective chunking.
+ 	 * @param do_sync If true, use synchronous (blocking) socket writes for zero-copy transfer.
+ 	 */
+-	tcp_server(stream_info_impl_p info, io_context_p io, send_buffer_p sendbuf, factory_p factory,
+-		int chunk_size, bool allow_v4, bool allow_v6, bool do_sync = false);
++	tcp_server(stream_info_impl_p info, asio::io_context &io, send_buffer_p sendbuf,
++		factory_p factory, int chunk_size, bool allow_v4, bool allow_v6, bool do_sync = false);
+ 
+ 	/// Destructor (must be defined in .cpp due to unique_ptr to incomplete type)
+ 	~tcp_server();
+@@ -91,6 +92,9 @@ class tcp_server : public std::enable_shared_from_this<tcp_server> {
+ 	/// fails to reach them, so this may briefly keep reporting a consumer that has gone away.
+ 	bool have_sync_consumers() const;
+ 
++	/// Wait until all sample transfer threads have exited. Returns false on timeout.
++	bool wait_for_transfer_threads(double timeout);
++
+ private:
+ 	friend class client_session;
+ 
+@@ -111,8 +115,8 @@ class tcp_server : public std::enable_shared_from_this<tcp_server> {
+ 
+ 	// data shared with the outlet
+ 	stream_info_impl_p info_; // shared stream_info object
+-	io_context_p io_;	// shared ptr to IO service; ensures that the IO is still around by the time
+-						// the acceptor needs to be destroyed
++	asio::io_context
++		&io_; // not owned: handlers queued in it hold this server, so owning it is a cycle
+ 	factory_p factory_; // reference to the sample factory (which owns the samples)
+ 	send_buffer_p send_buffer_; // the send buffer, shared with other TCP's and the outlet
+ 
+@@ -123,6 +127,11 @@ class tcp_server : public std::enable_shared_from_this<tcp_server> {
+ 	std::map<void *, std::weak_ptr<client_session>> inflight_;
+ 	std::recursive_mutex inflight_mut_; // mutex protecting the registry from concurrent access
+ 
++	// number of running transfer threads, so teardown can wait for them
++	int transfer_threads_{0};
++	std::mutex transfer_mut_;
++	std::condition_variable transfer_cv_;
++
+ 	// some cached data
+ 	std::string shortinfo_msg_; // pre-computed short-info server response
+ 	std::string fullinfo_msg_;	// pre-computed full-info server response
+diff --git a/testing/ext/outlet.cpp b/testing/ext/outlet.cpp
+index 1d0a2feb..8669d282 100644
+--- a/testing/ext/outlet.cpp
++++ b/testing/ext/outlet.cpp
+@@ -2,6 +2,7 @@
+ #include <catch2/catch_all.hpp>
+ #include <chrono>
+ #include <lsl_cpp.h>
++#include <memory>
+ #include <thread>
+ 
+ #ifndef _WIN32
+@@ -141,12 +142,13 @@ TEST_CASE("have_consumers stays true when one of two inlets disconnects", "[outl
+ }
+ 
+ #ifndef _WIN32
++int open_fds() {
++	int n = 0;
++	for (int fd = 0; fd < 4096; ++fd) n += fcntl(fd, F_GETFD) != -1;
++	return n;
++}
++
+ TEST_CASE("destroying an outlet releases its io_context (#312)", "[outlet][basic]") {
+-	const auto open_fds = []() {
+-		int n = 0;
+-		for (int fd = 0; fd < 4096; ++fd) n += fcntl(fd, F_GETFD) != -1;
+-		return n;
+-	};
+ 	lsl::stream_info info("teardown_leak", "EEG", 1, 100., lsl::cf_float32, "teardown_leak");
+ 	const auto cycle = [&info]() { lsl::stream_outlet outlet(info); };
+ 	cycle(); // warm up lazily created singletons
+@@ -155,6 +157,28 @@ TEST_CASE("destroying an outlet releases its io_context (#312)", "[outlet][basic
+ 	// each leaked data io_context keeps ~3 fds (reactor + interrupter) open
+ 	CHECK(open_fds() < before + 10);
+ }
++
++TEST_CASE("destroying an outlet with a connected inlet releases its io_context (#312)",
++	"[outlet][basic]") {
++	lsl::stream_info info(
++		"teardown_leak_connected", "EEG", 1, 100., lsl::cf_float32, "teardown_leak_connected");
++	const auto cycle = [&info]() {
++		auto outlet = std::make_unique<lsl::stream_outlet>(info);
++		auto found = lsl::resolve_stream("source_id", info.source_id(), 1, 2.0);
++		REQUIRE(found.size() == 1);
++		lsl::stream_inlet inlet(found[0]);
++		inlet.open_stream(2);
++		float sample = 1.f;
++		outlet->push_sample(&sample);
++		REQUIRE(inlet.pull_sample(&sample, 1, 2.0) != 0.0);
++		// destroy the outlet while its transfer thread is still serving the inlet
++		outlet.reset();
++	};
++	cycle(); // warm up lazily created singletons
++	const int before = open_fds();
++	for (int i = 0; i < 10; ++i) cycle();
++	CHECK(open_fds() < before + 10);
++}
+ #endif
+ 
+ } // namespace
+diff --git a/testing/int/tcpserver.cpp b/testing/int/tcpserver.cpp
+index f5b9271e..13e148e8 100644
+--- a/testing/int/tcpserver.cpp
++++ b/testing/int/tcpserver.cpp
+@@ -23,8 +23,9 @@ using sock_p = std::shared_ptr<sock_t>;
+ 
+ /// RAII wrapper that takes care of shutting down the IO thread when an exception happens
+ class tcp_server_wrapper {
+-	std::shared_ptr<lsl::tcp_server> srv;
++	// srv_ctx is declared first so it outlives srv, which only borrows it
+ 	std::shared_ptr<asio::io_context> srv_ctx;
++	std::shared_ptr<lsl::tcp_server> srv;
+ 	std::unique_ptr<std::thread> thread;
+ public:
+ 	tcp_server_wrapper(std::shared_ptr<lsl::stream_info_impl> info) {
+@@ -32,7 +33,7 @@ class tcp_server_wrapper {
+ 		srv_ctx = std::make_shared<asio::io_context>(1);
+ 		auto factory =
+ 			std::make_shared<lsl::factory>(info->channel_format(), info->channel_count(), 10);
+-		srv = std::make_shared<lsl::tcp_server>(info, srv_ctx, sendbuf, factory, 5, true, true);
++		srv = std::make_shared<lsl::tcp_server>(info, *srv_ctx, sendbuf, factory, 5, true, true);
+ 		srv->begin_serving();
+ 	}
+ 	~tcp_server_wrapper() noexcept {

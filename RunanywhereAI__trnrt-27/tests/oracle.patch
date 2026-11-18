@@ -1,0 +1,536 @@
+diff --git a/tests/test_api_engine_health.py b/tests/test_api_engine_health.py
+index b1c997e..4f9b6cb 100644
+--- a/tests/test_api_engine_health.py
++++ b/tests/test_api_engine_health.py
+@@ -137,3 +137,69 @@ def step():  # from inside the step: the TestClient hands a stream over only onc
+         assert "error" in events[-1], events[-1]
+         assert "rank(s) [1] exited" in _failed(c, loop, eng, thread_ends=False)
+         assert aborted == []
++
++
++def _spy_dead_ranks(eng):
++    """Which threads call dead_ranks(): the engine thread must not (the loop does not poll its workers between steps)."""
++    import threading
++
++    real, callers = eng.dead_ranks, set()
++
++    def spy():
++        callers.add(threading.current_thread().name)
++        return real()
++
++    eng.dead_ranks = spy
++    return callers
++
++
++def test_an_idle_death_turns_health_503_within_a_second_from_the_rank_watch_alone(tmp_path, monkeypatch):
++    """The engine loop does not poll its workers between steps; the rank-watch thread alone must turn /health 503 within
++    1.0 s of a worker's death. The served request before it went through the incremental detokenize and its self-check."""
++    from trnrt.serve import api
++
++    check = {"checked": 0, "mismatch": 0}
++    monkeypatch.setattr(api, "DETOK_CHECK", check)
++    with _server(tmp_path) as (c, eng, loop, aborted):
++        callers = _spy_dead_ranks(eng)
++        assert _completion(c).status_code == 200
++        assert check == {"checked": 1, "mismatch": 0}  # the handler's _Detok is incremental (only that mode checks)
++        assert "trnrt-engine" not in callers, callers
++        callers.clear()
++        t0 = time.monotonic()
++        eng._workers[0].kill()
++        eng._workers[0].join(10)  # gone before anything broadcasts to it, so the reason names the dead rank
++        while (
++            loop.failed is None
++        ):  # no HTTP call meanwhile: /health checks the workers itself, so only the watch can see it
++            assert time.monotonic() - t0 < 5.0, "no thread noticed the dead rank"
++            time.sleep(0.01)
++        took = time.monotonic() - t0
++        assert callers == {"trnrt-rank-watch"}, callers  # the rank-watch thread alone
++        assert took <= 1.0, f"the dead rank was noticed {took:.2f} s after the kill"
++        print(f"idle death noticed in {took:.3f} s")
++        assert "rank(s) [1] exited" in _failed(c, loop, eng)
++        assert aborted == []
++
++
++def test_a_death_mid_request_ends_it_within_a_second(tmp_path):
++    """Mid-request: SIGKILL a worker between two steps of a 200-token request; the request ends with the error within
++    1.0 s of the kill (the rank-watch thread when the step blocks in gloo on macOS, the step's own raise on Linux)."""
++    with _server(tmp_path) as (c, eng, loop, aborted):
++        real, calls, t0 = eng.step, [0], []
++
++        def step():
++            calls[0] += 1
++            if calls[0] == 5:
++                eng._workers[0].kill()
++                t0.append(time.monotonic())
++            return real()
++
++        eng.step = step
++        events = _stream_events(c)
++        took = time.monotonic() - t0[0]
++        assert "error" in events[-1], events[-1]
++        assert took <= 1.0, f"the request ended {took:.2f} s after the kill"
++        print(f"mid-request death ended the request in {took:.3f} s")
++        assert "rank(s) [1] exited" in _failed(c, loop, eng, thread_ends=False)
++        assert aborted == []
+diff --git a/tests/test_detok_incremental.py b/tests/test_detok_incremental.py
+new file mode 100644
+index 0000000..befcaf4
+--- /dev/null
++++ b/tests/test_detok_incremental.py
+@@ -0,0 +1,148 @@
++"""trnrt/serve/api.py's _Detok: the incremental mode (TGI's prefix / read offsets, the server's streams) emits exactly
++what the full decode emits, push by push, with stop strings, on byte-level tokens that split multi-byte characters. A
++byte-level tokenizer stub (each token a byte string, decoded with errors="replace", as a byte-level BPE decoder replaces an
++incomplete character) stands in for the served one.
++
++GLM-5.3-Flash's own split below is the case an earlier form failed: a window ending inside a character returned only the
++committed text, so a stop string before that character was found one push late. The control re-runs that form."""
++
++from __future__ import annotations
++
++import random
++
++import pytest
++
++
++class ByteTok:
++    def __init__(self, vocab: list[bytes], special=()):
++        self.vocab, self.special = vocab, set(special)
++
++    def decode(self, ids, skip_special_tokens=True):
++        return b"".join(self.vocab[i] for i in ids if not (skip_special_tokens and i in self.special)).decode(
++            "utf-8", "replace"
++        )
++
++
++# GLM-5.3-Flash's own split of "mixed 中文 English 日本語 한국어 العربية עברית" (token bytes from the served tokenizer)
++GLM = [
++    b"mixed",
++    b" \xe4\xb8\xad\xe6\x96\x87",
++    b" English",
++    b" \xe6\x97\xa5\xe6\x9c\xac",
++    b"\xe8\xaa\x9e",
++    b" \xed\x95\x9c\xea\xb5\xad",
++    b"\xec\x96\xb4",
++    b" \xd8\xa7\xd9\x84\xd8\xb9\xd8\xb1\xd8\xa8\xd9\x8a\xd8\xa9",
++    b" \xd7",
++    b"\xa2",
++    b"\xd7\x91",
++    b"\xd7\xa8",
++    b"\xd7\x99\xd7",
++    b"\xaa",
++]
++
++
++def _run(D, tok, ids, stops, chunks, incremental):
++    d, pos, out = D(tok, stops, incremental=incremental), 0, []
++    for j, k in enumerate(chunks):
++        out.append(d.push(ids[pos : pos + k], j == len(chunks) - 1))
++        pos += k
++    return out, d.stopped
++
++
++def _old_branch(D):
++    """The pre-fix _decoded (the control): an uncommitted window returns only the committed text + U+FFFD."""
++
++    class Old(D):
++        def _decoded(self, final):
++            if final or not self.incremental:
++                return self.tok.decode(self.ids, skip_special_tokens=True)
++            prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
++            new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
++            if len(new) > len(prefix) and not new.endswith("\ufffd"):
++                self._text += new[len(prefix) :]
++                self._po, self._ro = self._ro, len(self.ids)
++                return self._text
++            return self._text + "\ufffd"
++
++    return Old
++
++
++def test_glms_split_stop_case_now_matches_and_the_old_branch_does_not():
++    from trnrt.serve.api import _Detok
++
++    tok, ids, stops, ch = ByteTok(GLM), list(range(len(GLM))), ("本語 한국어 ",), (3, 6, 1, 4)
++    full = _run(_Detok, tok, ids, stops, ch, False)
++    assert full == (["mixed 中文 E", "nglish 日", "", ""], True)
++    assert _run(_Detok, tok, ids, stops, ch, True) == full
++    assert _run(_old_branch(_Detok), tok, ids, stops, ch, True) == (["mixed 中文 E", "", "nglish 日", ""], True)
++
++
++TEXTS = [
++    "mixed 中文 English 日本語 한국어 العربية עברית",
++    "emoji 👩‍💻🚀🇮🇳 then ascii",
++    "µs × — … “q” ½ °C 數據",  # noqa: RUF001  the ambiguous characters are the test data
++    "def f(x):\n    return {'a': [1, 2]}  # 注释",
++    "é ñ ﬁ 𝕏𝔸𝔹 𓀀 ꙮ 🫠",  # noqa: RUF001  the ambiguous characters are the test data
++]
++
++
++@pytest.mark.parametrize("seed", range(4))
++def test_random_byte_splits_chunkings_and_stops_match_push_by_push(seed):
++    """Random byte-level tokenizations (cut anywhere, inside characters too), special tokens that decode to nothing, random
++    chunkings, and stop strings from the text: every push equal. The old branch must differ somewhere (the control)."""
++    from trnrt.serve.api import _Detok
++
++    rng, old_diffs, runs = random.Random(seed), 0, 0
++    for _ in range(100):
++        b = rng.choice(TEXTS).encode()
++        cuts = sorted(rng.sample(range(1, len(b)), k=min(len(b) - 1, rng.randint(3, 20))))
++        vocab = [b[a:z] for a, z in zip([0, *cuts], [*cuts, len(b)])] + [b"<SPECIAL>"]
++        sp = len(vocab) - 1
++        ids = list(range(len(vocab) - 1))
++        for _ in range(rng.randint(0, 3)):
++            ids.insert(rng.randrange(len(ids) + 1), sp)
++        tok = ByteTok(vocab, special=(sp,))
++        full_text = tok.decode(ids)
++        i = rng.randrange(len(full_text))
++        stop_sets = [(), (full_text[i : i + rng.randint(1, 6)],)]
++        if rng.random() < 0.3:
++            ids = ids[: rng.randint(1, len(ids))]  # a stream cut by max_tokens, possibly inside a character
++        for stops in stop_sets:
++            ch, left = [], len(ids)
++            while left:
++                k = min(left, rng.randint(1, 5))
++                ch.append(k)
++                left -= k
++            runs += 1
++            want = _run(_Detok, tok, ids, stops, ch, False)
++            assert _run(_Detok, tok, ids, stops, ch, True) == want, (vocab, ids, stops, ch)
++            old_diffs += _run(_old_branch(_Detok), tok, ids, stops, ch, True) != want
++    assert runs == 200 and old_diffs > 0, (
++        f"the control never differed in {runs} runs: this test can't see the bug class"
++    )
++
++
++@pytest.mark.parametrize("incremental", [True, False])
++def test_each_push_of_an_incremental_stream_decodes_a_window_not_the_whole_output(incremental):
++    # The point of the incremental mode: a push decodes a few of the newest ids, so a stream's decoding work grows with
++    # its length, not with its square; only the final push decodes the whole output, once.
++    from trnrt.serve.api import _Detok
++
++    calls: list[int] = []
++
++    class Counting(ByteTok):
++        def decode(self, ids, skip_special_tokens=True):
++            calls.append(len(ids))
++            return super().decode(ids, skip_special_tokens)
++
++    tok = Counting([bytes([97 + i]) for i in range(26)])  # one ASCII character per id: every push completes its text
++    d, n = _Detok(tok, (), incremental=incremental), 2000
++    for i in range(n):
++        d.push([i % 26], final=False)
++    if incremental:
++        assert max(calls) <= 4, max(calls)
++    else:
++        assert max(calls) == n  # the reference mode decodes everything on every push
++    d.push([], final=True)
++    assert calls[-1] == n
+diff --git a/tests/test_detok_selfcheck.py b/tests/test_detok_selfcheck.py
+new file mode 100644
+index 0000000..4c7db86
+--- /dev/null
++++ b/tests/test_detok_selfcheck.py
+@@ -0,0 +1,93 @@
++"""The streaming self-check (trnrt/serve/api.py DETOK_CHECK): an incremental stream, when it ends, checks that what it
++streamed is a prefix of the full decode of its ids (all of it when no stop string cut it), counts each check, and prints
++the rid and offset of a mismatch. A corrupted delta must be counted; a stop-string cut must not count as one; the reference
++(non-incremental) mode never checks. A WordLevel tokenizer whose word t<i> is token i."""
++
++from __future__ import annotations
++
++import logging
++
++import pytest
++
++from tests.test_api_prompt_thread import _save_tokenizer
++
++
++@pytest.fixture(scope="module")
++def tok(tmp_path_factory):
++    from transformers import AutoTokenizer
++
++    d = tmp_path_factory.mktemp("detok_check")
++    _save_tokenizer(d, 64)
++    return AutoTokenizer.from_pretrained(str(d))
++
++
++@pytest.fixture
++def check(monkeypatch, caplog):
++    caplog.set_level(logging.INFO, logger="trnrt")  # the self-check logs its mismatches
++    from trnrt.serve import api
++
++    c = {"checked": 0, "mismatch": 0}
++    monkeypatch.setattr(api, "DETOK_CHECK", c)
++    return c
++
++
++def _stream(D, tok, ids, stops=(), chunk=2, **kw):
++    d = D(tok, stops, **kw)
++    out = [d.push(ids[i : i + chunk], i + chunk >= len(ids)) for i in range(0, len(ids), chunk)]
++    return d, "".join(out)
++
++
++IDS = [5, 17, 42, 9, 3, 25, 11, 7, 30, 12]
++
++
++def test_a_clean_stream_checks_once_and_matches(tok, check, caplog):
++    from trnrt.serve.api import _Detok
++
++    _, text = _stream(_Detok, tok, IDS, incremental=True, rid="r-clean")
++    assert text == tok.decode(IDS, skip_special_tokens=True)
++    assert check == {"checked": 1, "mismatch": 0}
++    assert "mismatch" not in caplog.text
++
++
++def test_a_stop_string_cut_compares_the_stopped_prefix(tok, check, caplog):
++    from trnrt.serve.api import _Detok
++
++    full = tok.decode(IDS, skip_special_tokens=True)
++    stop = "t25"
++    assert stop in full
++    d, text = _stream(_Detok, tok, IDS, stops=(stop,), incremental=True, rid="r-stop")
++    assert d.stopped and text == full[: full.index(stop)]
++    assert check == {"checked": 1, "mismatch": 0}  # one check, at the stop push; no false mismatch
++    assert "mismatch" not in caplog.text
++
++
++def test_a_corrupted_delta_is_counted_with_its_rid_and_offset(tok, check, caplog):
++    from trnrt.serve.api import _Detok
++
++    class Corrupt(
++        _Detok
++    ):  # the planted fault: the newest character of the second push's text changed before it is streamed
++        n = 0
++
++        def _decoded(self, final):
++            t = super()._decoded(final)
++            if not final:
++                self.n += 1
++                if self.n == 2:
++                    t = t[:-1] + "X"
++            return t
++
++    at = len(tok.decode(IDS[:4], skip_special_tokens=True)) - 1  # the second push (2 tokens a push) ends at IDS[:4]
++    _, text = _stream(Corrupt, tok, IDS, incremental=True, rid="r-planted")
++    assert text[at] == "X"
++    assert check == {"checked": 1, "mismatch": 1}
++    out = caplog.text
++    assert "detok self-check mismatch 1 of 1: rid r-planted" in out and f"first difference at offset {at}" in out, out
++
++
++def test_the_reference_mode_never_checks(tok, check):
++    from trnrt.serve.api import _Detok
++
++    _stream(_Detok, tok, IDS, incremental=False, rid="r-default")
++    _stream(_Detok, tok, IDS, stops=("t25",), incremental=False)
++    assert check == {"checked": 0, "mismatch": 0}
+diff --git a/tests/test_serve_api.py b/tests/test_serve_api.py
+index 98b459d..06d2eb3 100644
+--- a/tests/test_serve_api.py
++++ b/tests/test_serve_api.py
+@@ -161,8 +161,9 @@ def serve():
+ 
+     started = []
+ 
+-    def start(script):
++    def start(script, tp=1):
+         eng = ScriptedEngine(script)
++        eng.cfg.tp = tp  # tp > 1 starts the rank watch (EngineLoop._watch_ranks), the only background dead-rank check
+         client = TestClient(api.build_app(eng, "glm"))
+         client.__enter__()
+         started.append((client, eng))
+@@ -375,13 +376,13 @@ def test_health_stats_models_and_metrics(serve):
+ def test_a_dead_rank_turns_health_503_and_refuses_new_requests(serve):
+     from trnrt.serve import api
+ 
+-    client, eng = serve(PLAIN)
++    client, eng = serve(PLAIN, tp=2)
+     loop = next(lp for lp in api._LOOPS if lp.engine is eng)
+     eng.dead = [1]
+     h = client.get("/health")  # at once: /health asks the engine itself
+     assert h.status_code == 503 and "rank(s) [1] exited" in h.json()["error"]
+     assert client.post("/v1/completions", json={"prompt": [1]}).status_code == 503
+-    loop.thread.join(10)  # the loop's own check between steps fails the engine and ends the thread
++    loop.thread.join(10)  # the rank watch fails the engine and the loop's thread ends
+     assert not loop.thread.is_alive() and loop.failed == "tensor-parallel rank(s) [1] exited"
+     assert eng.closed and eng.aborted == []
+ 
+diff --git a/trnrt/serve/api.py b/trnrt/serve/api.py
+index cfbc851..aba1d63 100644
+--- a/trnrt/serve/api.py
++++ b/trnrt/serve/api.py
+@@ -86,6 +86,12 @@ class _Submit:
+ 
+ @atexit.register
+ def _stop_loops() -> None:
++    if DETOK_CHECK["checked"]:  # the streaming self-check's total (_Detok._check), for the engine log
++        logger.info(
++            "detok self-check at exit: %d streams checked, %d mismatches",
++            DETOK_CHECK["checked"],
++            DETOK_CHECK["mismatch"],
++        )
+     for lp in list(_LOOPS):
+         lp.stop()
+         lp.engine.close()
+@@ -213,16 +219,13 @@ def _run(self) -> None:
+ 
+     def _watch_ranks(self) -> None:
+         """A rank that dies while the loop waits in a step leaves no thread to notice it: a collective with a dead peer
+-        can block instead of raising (gloo on macOS does until its timeout; a device collective too). The loop's own
+-        check between steps gets the first second."""
+-        seen = None
+-        while not self._stopping.wait(0.5) and self.failed is None:
++        can block instead of raising (gloo on macOS does until its timeout; a device collective too). This thread is the
++        only check: the loop does not poll its workers between steps (each poll's waitpid calls release the GIL early in
++        the step's gap, and the engine thread then waits behind the streams' detokenize). So it polls every 0.25 s and
++        fails at first sight: a dead rank does not come back."""
++        while not self._stopping.wait(0.25) and self.failed is None:
+             dead = self.engine.dead_ranks()
+-            if not dead:
+-                seen = None
+-            elif seen is None:
+-                seen = time.monotonic()
+-            elif time.monotonic() - seen > 1.0:
++            if dead:
+                 self._fail(f"tensor-parallel rank(s) {dead} exited")
+                 return
+ 
+@@ -270,10 +273,6 @@ def _fail(self, reason: str) -> None:
+ 
+     def _loop(self) -> None:
+         while not self._stopping.is_set() and self.failed is None:
+-            dead = self.engine.dead_ranks()
+-            if dead:
+-                self._fail(f"tensor-parallel rank(s) {dead} exited")
+-                return
+             self._drain(block=not self.engine.has_work())
+             if not self.engine.has_work():
+                 self._read_local_k()
+@@ -294,6 +293,7 @@ def _loop(self) -> None:
+                         self.engine.abort(st.req)
+                 self.streams.clear()
+                 continue
++            batch: dict = {}  # one cross-thread call per event loop and step, not one per stream
+             for rid, st in list(self.streams.items()):
+                 req = st.req
+                 out = req.output_ids
+@@ -305,12 +305,24 @@ def _loop(self) -> None:
+                     new = out[st.sent : ready]
+                     lps = req.logprobs[st.sent : ready] if with_lp else None
+                     st.sent = ready
+-                    st.loop.call_soon_threadsafe(
+-                        st.out.put_nowait, ("tokens", new, req.finish_reason if finished else None, lps)
++                    batch.setdefault(st.loop, []).append(
++                        (st.out, ("tokens", new, req.finish_reason if finished else None, lps))
+                     )
+                 if finished:
+                     del self.streams[rid]
+                     self.metrics.on_finish(req)
++            for loop, items in batch.items():
++                loop.call_soon_threadsafe(_deliver, items)
++
++
++def _deliver(items) -> None:
++    for q, item in items:
++        q.put_nowait(item)
++
++
++# The streaming self-check: every stream checks, when it ends, that what it streamed is a prefix of the full decode of its
++# ids, and all of it when no stop string cut it. Counted here, one warning logged per mismatch, the total at exit.
++DETOK_CHECK = {"checked": 0, "mismatch": 0}
+ 
+ 
+ class _Detok:
+@@ -324,19 +336,69 @@ class _Detok:
+     the OpenAI API specifies.
+     """
+ 
+-    def __init__(self, tokenizer, stops: tuple[str, ...] = ()):
++    def __init__(self, tokenizer, stops: tuple[str, ...] = (), incremental: bool = False, rid: str = ""):
+         self.tok = tokenizer
++        self.rid = rid
+         self.stops = stops
+         self.hold = max((len(x) for x in stops), default=1) - 1
+         self.ids: list[int] = []
+         self.emitted = 0
+         self.stopped = False
++        # incremental (the server's streams): the text so far is kept and extended by decoding a window of the newest ids
++        # (from the last point where the text was complete, TGI's prefix / read offsets), instead of decoding every id on
++        # every push, which is O(n^2) per stream and holds the GIL while the engine thread waits. The final push decodes
++        # the whole output once, so the complete text is the full decode. incremental=False (decode it all, every push) is
++        # the reference the tests compare against.
++        self.incremental = incremental
++        self._text = ""
++        self._po = self._ro = 0
++        self._streamed: list[str] | None = [] if incremental else None  # the self-check's record (DETOK_CHECK)
++
++    def _check(self, full: str | None) -> None:
++        """DETOK_CHECK: everything this stream emitted is a prefix of the full decode of its ids, and all of it if the
++        stream ended without a stop string. `full`: that decode when the caller has it (the final push), else decoded
++        here."""
++        if full is None:
++            full = self.tok.decode(self.ids, skip_special_tokens=True)
++        got = "".join(self._streamed or ())  # set for an incremental stream, the only caller (push)
++        DETOK_CHECK["checked"] += 1
++        if full.startswith(got) and (self.stopped or got == full):
++            return
++        DETOK_CHECK["mismatch"] += 1
++        i = next((k for k, (a, b) in enumerate(zip(got, full)) if a != b), min(len(got), len(full)))
++        logger.warning(
++            "detok self-check mismatch %d of %d: rid %s, streamed %d chars, the full decode %d, first difference at "
++            "offset %d",
++            DETOK_CHECK["mismatch"],
++            DETOK_CHECK["checked"],
++            self.rid,
++            len(got),
++            len(full),
++            i,
++        )
++
++    def _decoded(self, final: bool) -> str:
++        if final or not self.incremental:
++            return self.tok.decode(self.ids, skip_special_tokens=True)
++        prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
++        new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
++        if new.startswith(prefix) and len(new) > len(prefix) and not new.endswith("\ufffd"):
++            self._text += new[len(prefix) :]
++            self._po, self._ro = self._ro, len(self.ids)
++            return self._text
++        # Not committed (the newest character is incomplete, or the window added no text): the text as the full decode
++        # reads it now, the incomplete character's U+FFFD included, so a stop string before that character is found at
++        # this push, as the full decode finds it (returning only the committed text + U+FFFD finds it one push late).
++        # The offsets stay, so the next push re-decodes the window from the same complete point.
++        if new.startswith(prefix):
++            return self._text + new[len(prefix) :]
++        return self._text + "\ufffd"  # an incomplete character: held back below, as the full decode's would be
+ 
+     def push(self, ids: list[int], final: bool) -> str:
+         if self.stopped:
+             return ""
+         self.ids.extend(ids)
+-        text = self.tok.decode(self.ids, skip_special_tokens=True)
++        text = self._decoded(final)
+         cut = min((i for i in (text.find(x) for x in self.stops) if i >= 0), default=-1)
+         if cut >= 0:
+             self.stopped = True
+@@ -349,6 +411,10 @@ def push(self, ids: list[int], final: bool) -> str:
+             end = max(self.emitted, len(text) - self.hold)
+         delta = text[self.emitted : end]
+         self.emitted = end
++        if self._streamed is not None:
++            self._streamed.append(delta)
++            if final or self.stopped:
++                self._check(text if final else None)  # the final push's text is already the full decode
+         return delta
+ 
+ 
+@@ -723,7 +789,7 @@ async def _generate(
+         created = int(time.time())
+         oid = ("chatcmpl-" if chat else "cmpl-") + sub.rid
+         obj = "chat.completion" if chat else "text_completion"
+-        detok = _Detok(tok, params.stop)
++        detok = _Detok(tok, params.stop, incremental=True, rid=sub.rid)
+ 
+         def usage_of(n_out: int) -> dict:
+             """OpenAI usage, with prompt_tokens_details.cached_tokens: the prompt tokens this request resumed from the

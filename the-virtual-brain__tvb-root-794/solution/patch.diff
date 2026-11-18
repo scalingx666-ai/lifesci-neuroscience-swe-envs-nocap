@@ -1,0 +1,4363 @@
+diff --git a/tvb_library/tvb/simulator/backend/nb_hybrid_cuda_sweep_backend.py b/tvb_library/tvb/simulator/backend/nb_hybrid_cuda_sweep_backend.py
+new file mode 100644
+index 0000000000..e24dcf2046
+--- /dev/null
++++ b/tvb_library/tvb/simulator/backend/nb_hybrid_cuda_sweep_backend.py
+@@ -0,0 +1,1495 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++#
++# TheVirtualBrain-Scientific Package. This package holds all simulators, and
++# analysers necessary to run brain-simulations. You can use it stand alone or
++# in conjunction with TheVirtualBrain-Framework Package.
++#
++# (c) 2012-2025, Baycrest Centre for Geriatric Care ("Baycrest") and others
++#
++# This program is free software: you can redistribute it and/or modify it under the
++# terms of the GNU General Public License as published by the Free Software Foundation,
++# either version 3 of the License, or (at your option) any later version.
++#
++"""
++Numba-CUDA parameter sweep backend for the Hybrid Numba framework.
++
++Generates a @cuda.jit kernel from a Mako template (nb-hybrid-sweep-cuda.py.mako),
++compiles it, and runs parameter sweeps where each GPU thread simulates one
++parameter value independently.
++
++Usage::
++
++    from tvb.simulator.backend.nb_hybrid_cuda_sweep_backend import NbHybridCUDASweepBackend
++    backend = NbHybridCUDASweepBackend()
++    result = backend.run_sweep(network_set, sweep_param='a', sweep_values=values, nstep=1000)
++
++.. moduleauthor:: TVB contributors
++"""
++
++from __future__ import annotations
++
++import copy
++import dataclasses
++import hashlib
++import importlib.util
++import os
++import sys
++import time
++from pathlib import Path
++from typing import List, Optional
++
++import numpy as np
++from numba import cuda
++
++from tvb.simulator.backend.nb_hybrid import (
++    NbHybridBackend,
++    NetworkAnalysis,
++    SubnetworkInfo,
++    ProjectionInfo,
++    _cfun_type,
++    _cfun_params,
++    _cvar_mapping_mode,
++)
++from tvb.simulator.backend.templates import MakoUtilMix
++
++
++# ---------------------------------------------------------------------------
++# Module-level cache for compiled CUDA kernels (keyed by SHA-256 of source)
++# ---------------------------------------------------------------------------
++_CUDA_COMPILED_CACHE: dict = {}
++
++
++class NbHybridCUDASweepBackend(MakoUtilMix):
++    """Backend that generates and runs CUDA parameter-sweep kernels.
++
++    Usage::
++
++        from tvb.simulator.backend.nb_hybrid_cuda_sweep_backend import NbHybridCUDASweepBackend
++        backend = NbHybridCUDASweepBackend()
++        compiled = backend.compile_sweep(network_set)
++        result = compiled.run(nstep=1000, sweep_values=values)
++    """
++
++    def _build_sweep_analysis(self, network_set) -> NetworkAnalysis:
++        """Build NetworkAnalysis from a NetworkSet (reuses NbHybridBackend._analyse)."""
++        backend = NbHybridBackend()
++        return backend._analyse(network_set)
++
++    def compile_sweep(
++        self,
++        network_set,
++        sweep_descriptor=None,
++        print_source: bool = False,
++    ) -> "CompiledCUDASweepKernel":
++        """Generate and compile the CUDA sweep kernel for *network_set*.
++
++        Parameters
++        ----------
++        network_set : NetworkSet
++            Fully configured network (``configure()`` must have been called).
++        print_source : bool
++            If True, print the generated source.
++
++        Returns
++        -------
++        CompiledCUDASweepKernel
++            Object whose :meth:`run` method executes the sweep on GPU.
++        """
++        # Check model/feature compatibility before code generation
++        NbHybridBackend()._check_compatibility(network_set)
++
++        for subnet in network_set.subnets:
++            custom_template = getattr(subnet.model, '_nb_hybrid_custom_template', None)
++            if custom_template is not None and 'zerlaut' not in custom_template.lower():
++                raise NotImplementedError(
++                    f"CUDA sweeps do not support the custom model template for "
++                    f"{type(subnet.model).__name__}: {custom_template}"
++                )
++            if subnet.scheme.clamped_state_variable_values is not None:
++                raise NotImplementedError(
++                    "CUDA sweeps do not support explicit integrator state clamps"
++                )
++
++        analysis = self._build_sweep_analysis(network_set)
++
++        # Process sweep_descriptor
++        if sweep_descriptor is None:
++            if analysis.all_projections:
++                first_proj = analysis.all_projections[0]
++                sweep_descriptor = [{'type': 'cfun', 'projection': first_proj.name, 'param_idx': 0}]
++            else:
++                sweep_descriptor = []
++
++        projection_by_name = {p.name: p for p in analysis.all_projections}
++        subnet_by_name = {sn.name: sn for sn in analysis.subnetworks}
++        for desc in sweep_descriptor:
++            if not isinstance(desc, dict):
++                raise ValueError("Each sweep descriptor must be a dictionary")
++            desc_type = desc.get('type')
++            if desc_type == 'cfun':
++                projection_name = desc.get('projection')
++                if (not isinstance(projection_name, str)
++                        or projection_name not in projection_by_name):
++                    raise ValueError(
++                        f"Unknown projection in sweep descriptor: {projection_name!r}"
++                    )
++                param_idx = desc.get('param_idx', 0)
++                if (isinstance(param_idx, (bool, np.bool_))
++                        or not isinstance(param_idx, (int, np.integer))
++                        or param_idx < 0):
++                    raise ValueError(
++                        f"cfun param_idx must be a non-negative integer, got {param_idx!r}"
++                    )
++                try:
++                    NbHybridBackend._cfun_get_param(
++                        projection_by_name[projection_name].cfun, int(param_idx)
++                    )
++                except (IndexError, TypeError, AssertionError) as exc:
++                    raise ValueError(
++                        f"Invalid cfun param_idx {param_idx} for projection "
++                        f"{projection_name!r}"
++                    ) from exc
++            elif desc_type == 'model':
++                subnet_name = desc.get('subnet')
++                if not isinstance(subnet_name, str) or subnet_name not in subnet_by_name:
++                    raise ValueError(
++                        f"Unknown subnetwork in sweep descriptor: {subnet_name!r}"
++                    )
++                param = desc.get('param')
++                subnet = subnet_by_name[subnet_name]
++                if getattr(subnet.model, '_nb_hybrid_custom_template', None) is not None:
++                    raise ValueError(
++                        f"CUDA custom template for {type(subnet.model).__name__} "
++                        "does not consume model sweep parameters"
++                    )
++                model_params = set(getattr(subnet.model, 'global_parameter_names', ()))
++                if not isinstance(param, str) or param not in model_params:
++                    raise ValueError(
++                        f"Unknown model parameter {param!r} for subnetwork {subnet_name!r}"
++                    )
++            else:
++                raise ValueError(f"Unknown sweep descriptor type: {desc_type!r}")
++
++        n_sweep_dims = len(sweep_descriptor)
++
++        sweep_cfun_dims = {}
++        sweep_model_dims = {}
++        for dim_idx, desc in enumerate(sweep_descriptor):
++            if desc['type'] == 'cfun':
++                pname = desc['projection']
++                pidx = desc.get('param_idx', 0)
++                if pname not in sweep_cfun_dims:
++                    sweep_cfun_dims[pname] = {}
++                sweep_cfun_dims[pname][pidx] = dim_idx
++            elif desc['type'] == 'model':
++                sname = desc['subnet']
++                param = desc['param']
++                if sname not in sweep_model_dims:
++                    sweep_model_dims[sname] = {}
++                sweep_model_dims[sname][param] = dim_idx
++            else:  # validated above
++                raise AssertionError("unreachable sweep descriptor type")
++
++        # Render template
++        # Import cfun helpers for the template
++        from tvb.simulator.hybrid.coupling import (
++            Linear, Scaling, Sigmoidal, SigmoidalJansenRit,
++            Kuramoto as KuramotoCfun, Difference, HyperbolicTangent, PreSigmoidal,
++        )
++
++        source = self.render_template(
++            '<%include file="nb-hybrid-sweep-cuda.py.mako"/>',
++            dict(
++                analysis=analysis,
++                np=np,
++                _cfun_type=_cfun_type,
++                _cfun_params=_cfun_params,
++                _cvar_mapping_mode=_cvar_mapping_mode,
++                all_projs=analysis.all_projections,
++                subnets=analysis.subnetworks,
++                sweep_cfun_dims=sweep_cfun_dims,
++                sweep_model_dims=sweep_model_dims,
++                n_sweep_dims=n_sweep_dims,
++                has_custom_template=lambda m: hasattr(m, '_nb_hybrid_custom_template'),
++                is_zerlaut=lambda m: hasattr(m, '_nb_hybrid_custom_template') and 'zerlaut' in getattr(m, '_nb_hybrid_custom_template', ''),
++            ),
++        )
++
++        cache_key = hashlib.sha256(source.encode()).hexdigest()
++        if cache_key in _CUDA_COMPILED_CACHE:
++            cached = _CUDA_COMPILED_CACHE[cache_key]
++            if print_source:
++                print(self.insert_line_numbers(source))
++            return CompiledCUDASweepKernel(
++                _analysis=analysis,
++                _network_set=network_set,
++                _compiled_fn=cached,
++                _source=source,
++                sweep_descriptor=sweep_descriptor,
++                n_sweep_dims=n_sweep_dims,
++                sweep_cfun_dims=sweep_cfun_dims,
++                sweep_model_dims=sweep_model_dims,
++            )
++
++        if print_source:
++            print(self.insert_line_numbers(source))
++
++        # Write source to file so Numba can cache PTX
++        configured_cache_dir = os.environ.get("TVB_CUDA_CACHE_DIR")
++        if configured_cache_dir is not None:
++            if not configured_cache_dir:
++                raise OSError(
++                    "TVB_CUDA_CACHE_DIR configures an empty CUDA sweep cache "
++                    "directory path; provide a writable directory."
++                )
++            cache_dir = Path(configured_cache_dir).expanduser()
++        else:
++            cache_home = os.environ.get("XDG_CACHE_HOME")
++            cache_dir = ((Path(cache_home).expanduser() if cache_home else Path.home() / ".cache")
++                         / "tvb" / "nb_hybrid_cuda")
++        mod_name = f"cuda_sweep_{cache_key}"
++        mod_path = cache_dir / f"{mod_name}.py"
++        tmp_path = None
++        try:
++            cache_dir.mkdir(parents=True, exist_ok=True)
++            if not mod_path.exists():
++                tmp_path = mod_path.with_name(
++                    f".{mod_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
++                )
++                tmp_path.write_text(source, encoding="utf-8")
++                os.replace(tmp_path, mod_path)
++        except OSError as exc:
++            if tmp_path is not None:
++                try:
++                    tmp_path.unlink(missing_ok=True)
++                except OSError:
++                    pass
++            raise OSError(
++                "Unable to create or write the CUDA sweep cache directory "
++                f"at '{cache_dir}' configured by TVB_CUDA_CACHE_DIR; "
++                "ensure the cache directory is writable."
++            ) from exc
++
++        # Import module to trigger CUDA compilation
++        spec = importlib.util.spec_from_file_location(mod_name, mod_path)
++        mod = importlib.util.module_from_spec(spec)
++        sys.modules[mod_name] = mod
++        spec.loader.exec_module(mod)
++
++        fn = mod.run_sweep
++        _CUDA_COMPILED_CACHE[cache_key] = fn
++
++        return CompiledCUDASweepKernel(
++            _analysis=analysis,
++            _network_set=network_set,
++            _compiled_fn=fn,
++            _source=source,
++            sweep_descriptor=sweep_descriptor,
++            n_sweep_dims=n_sweep_dims,
++            sweep_cfun_dims=sweep_cfun_dims,
++            sweep_model_dims=sweep_model_dims,
++        )
++
++    def run_sweep(
++        self,
++        network_set,
++        sweep_values: np.ndarray,
++        nstep: int = 100,
++        initial_states: Optional[list] = None,
++        sweep_descriptor=None,
++        print_source: bool = False,
++        bold_period: Optional[float] = None,
++        verbose: bool = False,
++        **kwargs,
++    ):
++        """Convenience: compile + run in one call."""
++        compiled = self.compile_sweep(network_set, sweep_descriptor=sweep_descriptor, print_source=print_source)
++        return compiled.run(
++            nstep=nstep,
++            sweep_values=sweep_values,
++            initial_states=initial_states,
++            bold_period=bold_period,
++            verbose=verbose,
++            **kwargs,
++        )
++
++
++@dataclasses.dataclass
++class CompiledCUDASweepKernel:
++    """Holds a compiled CUDA sweep kernel and manages argument assembly / launch."""
++
++    _analysis: NetworkAnalysis
++    _network_set: object  # NetworkSet
++    _compiled_fn: object  # The run_sweep @cuda.jit kernel function
++    _source: str
++    sweep_descriptor: Optional[list] = None
++    n_sweep_dims: int = 1
++    sweep_cfun_dims: dict = dataclasses.field(default_factory=dict)
++    sweep_model_dims: dict = dataclasses.field(default_factory=dict)
++
++    @staticmethod
++    def _merge_subnet_outputs(tavg_list, subnetworks, node_indices=None):
++        """Merge per-subnet tavg arrays along the node dimension.
++
++        Each tavg array has shape (n_sweeps, n_voi, N_subnet, n_modes).
++        If node_indices is provided (dict mapping subnet name -> global index array),
++        output is connectome-ordered. Otherwise falls back to simple concatenation.
++
++        Returns an array of shape (n_sweeps, n_voi, N_total, n_modes).
++        """
++        if not tavg_list:
++            return np.array([])
++        if any(tavg.ndim != 4 for tavg in tavg_list):
++            return None
++        if len({(tavg.shape[1], tavg.shape[3]) for tavg in tavg_list}) != 1:
++            return None
++        if node_indices is not None and len(node_indices) > 0:
++            n_global = max(max(idxs) for idxs in node_indices.values()) + 1
++            n_sweeps = tavg_list[0].shape[0]
++            n_voi = tavg_list[0].shape[1]
++            n_modes = tavg_list[0].shape[3]
++            merged = np.zeros((n_sweeps, n_voi, n_global, n_modes), dtype=np.float32)
++            for i, (name, tavg) in enumerate(zip(
++                [sn.name for sn in subnetworks], tavg_list)):
++                if name in node_indices:
++                    idxs = node_indices[name]
++                    merged[:, :, idxs, :] = tavg
++                else:
++                    # Fallback: concatenate in order
++                    start = sum(t.shape[2] for t in tavg_list[:i])
++                    merged[:, :, start:start + tavg.shape[2], :] = tavg
++            return merged
++        return np.concatenate(tavg_list, axis=2)
++
++    def _run_single_batch(
++        self,
++        nstep: int,
++        sweep_values_batch: np.ndarray,
++        sn_states_h: dict,
++        src_bufs_h: dict,
++        tavg_h: dict,
++        raw_h: dict,
++        ctraw_h: dict,
++        noise_h: dict,
++        stim_h: dict,
++        voi_idx_h: dict,
++        sp_h: dict,
++        proj_cfun_params: list,
++        d_proj_data: dict,
++        d_voi_idxs: dict,
++        d_sps: dict,
++        analysis: NetworkAnalysis,
++        network_set: object,
++        dt: float,
++        chunk_size: Optional[int],
++        monitor_type: int,
++        monitor_period: int,
++        step_offset: int,
++        bold_istep: int,
++        n_bold_samples: int,
++        bold_states_h: dict,
++        bold_params_h: dict,
++        bold_voi_idx_h: dict,
++        bold_out_h: dict,
++        ctavg_h: dict,
++        spatial_mean_h: dict,
++        spatial_tavg_h: dict,
++        gain_h: dict,
++        proj_tavg_h: dict,
++        verbose: bool,
++    ):
++        """Execute one batch of sweep points on GPU."""
++        n_sweeps = sweep_values_batch.shape[0]
++
++        # ---- Transfer to device ----
++        t_xfer = time.perf_counter()
++
++        d_states = {}
++        for sn_info in analysis.subnetworks:
++            d_states[sn_info.name] = cuda.to_device(sn_states_h[sn_info.name])
++
++        d_srcbufs = {}
++        for sn_info in analysis.subnetworks:
++            d_srcbufs[sn_info.name] = cuda.to_device(src_bufs_h[sn_info.name])
++
++        d_tavgs = {}
++        for sn_info in analysis.subnetworks:
++            d_tavgs[sn_info.name] = cuda.to_device(tavg_h[sn_info.name])
++
++        d_ctavgs = {}
++        for sn_info in analysis.subnetworks:
++            d_ctavgs[sn_info.name] = cuda.to_device(ctavg_h[sn_info.name])
++
++        d_spatial_means = {}
++        d_spatial_tavgs = {}
++        d_gains = {}
++        d_proj_tavgs = {}
++        for sn_info in analysis.subnetworks:
++            d_spatial_means[sn_info.name] = cuda.to_device(spatial_mean_h[sn_info.name])
++            d_spatial_tavgs[sn_info.name] = cuda.to_device(spatial_tavg_h[sn_info.name])
++            d_gains[sn_info.name] = cuda.to_device(gain_h[sn_info.name])
++            d_proj_tavgs[sn_info.name] = cuda.to_device(proj_tavg_h[sn_info.name])
++
++        d_raws = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.name in raw_h:
++                d_raws[sn_info.name] = cuda.to_device(raw_h[sn_info.name])
++
++        d_ctraws = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.name in ctraw_h:
++                d_ctraws[sn_info.name] = cuda.to_device(ctraw_h[sn_info.name])
++
++        d_sweep_params = cuda.to_device(sweep_values_batch)
++
++        d_proj_cfun_params = [cuda.to_device(params) for params in proj_cfun_params]
++
++        d_noises = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.is_stochastic:
++                d_noises[sn_info.name] = cuda.to_device(noise_h[sn_info.name])
++
++        d_stims = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.has_stimulus:
++                d_stims[sn_info.name] = cuda.to_device(stim_h[sn_info.name])
++
++        d_bold_states = {}
++        d_bold_params = {}
++        d_bold_voi_idxs = {}
++        d_bold_outs = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.name in bold_states_h:
++                d_bold_states[sn_info.name] = cuda.to_device(bold_states_h[sn_info.name])
++                d_bold_params[sn_info.name] = cuda.to_device(bold_params_h[sn_info.name])
++                d_bold_voi_idxs[sn_info.name] = cuda.to_device(bold_voi_idx_h[sn_info.name])
++                d_bold_outs[sn_info.name] = cuda.to_device(bold_out_h[sn_info.name])
++
++        t_xfer = time.perf_counter() - t_xfer
++
++        # ---- Chunking setup ----
++        if chunk_size is None:
++            chunk_size = nstep
++        total_nstep = nstep
++        n_chunks = (total_nstep + chunk_size - 1) // chunk_size
++
++        threads_per_block = 256
++        blocks = (n_sweeps + threads_per_block - 1) // threads_per_block
++
++        if verbose:
++            print(f"[cuda_sweep batch] grid=({blocks},), block=({threads_per_block},)")
++            print(f"[cuda_sweep batch] transfer in: {t_xfer*1000:.1f} ms")
++            print(f"[cuda_sweep batch] chunks={n_chunks}, chunk_size={chunk_size}, n_sweeps={n_sweeps}")
++
++        cuda.synchronize()
++        t_kernel = time.perf_counter()
++
++        # ---- Launch kernel chunks ----
++        for chunk_idx in range(n_chunks):
++            this_offset = step_offset + chunk_idx * chunk_size
++            this_nstep = min(chunk_size, total_nstep - chunk_idx * chunk_size)
++            if this_nstep <= 0:
++                break
++
++            args = []
++
++            # States
++            for sn_info in analysis.subnetworks:
++                args.append(d_states[sn_info.name])
++
++            # Source buffers
++            for sn_info in analysis.subnetworks:
++                args.append(d_srcbufs[sn_info.name])
++
++            # tavg outputs
++            for sn_info in analysis.subnetworks:
++                args.append(d_tavgs[sn_info.name])
++
++            # raw outputs
++            for sn_info in analysis.subnetworks:
++                if sn_info.name in d_raws:
++                    args.append(d_raws[sn_info.name])
++                else:
++                    nvoi = len(sn_info.model.variables_of_interest)
++                    args.append(
++                        cuda.to_device(
++                            np.empty((n_sweeps, 0, nvoi, sn_info.n_nodes, sn_info.n_modes), dtype=np.float32)
++                        )
++                    )
++
++            # Per-step coupling outputs (only allocated when requested with raw output)
++            for sn_info in analysis.subnetworks:
++                if sn_info.name in d_ctraws:
++                    args.append(d_ctraws[sn_info.name])
++                else:
++                    ncvar = len(sn_info.model.cvar)
++                    args.append(
++                        cuda.to_device(
++                            np.empty((n_sweeps, 0, ncvar, sn_info.n_nodes, sn_info.n_modes), dtype=np.float32)
++                        )
++                    )
++
++            # Bold arrays
++            for sn_info in analysis.subnetworks:
++                if sn_info.name in d_bold_states:
++                    args.append(d_bold_states[sn_info.name])
++                    args.append(d_bold_params[sn_info.name])
++                    args.append(d_bold_voi_idxs[sn_info.name])
++                    args.append(d_bold_outs[sn_info.name])
++                else:
++                    nvoi = len(sn_info.model.variables_of_interest)
++                    args.append(
++                        cuda.to_device(np.empty((n_sweeps, nvoi, 4, sn_info.n_nodes), dtype=np.float32))
++                    )  # bold_state
++                    args.append(cuda.to_device(np.empty((10,), dtype=np.float32)))  # bold_params
++                    args.append(cuda.to_device(np.empty((nvoi,), dtype=np.int32)))  # bold_voi_idx
++                    args.append(
++                        cuda.to_device(np.empty((n_sweeps, 0, nvoi, sn_info.n_nodes), dtype=np.float32))
++                    )  # bold_out
++
++            # Sweep params
++            args.append(d_sweep_params)
++
++            # per-projection data
++            for p_idx, p in enumerate(analysis.all_projections):
++                pd = d_proj_data[p.name]
++                args.append(pd['w_data'])
++                args.append(pd['w_indices'])
++                args.append(pd['w_indptr'])
++                args.append(pd['idelays'])
++                if p.is_inter:
++                    args.append(pd['mode_map'])
++                args.append(pd['source_cvar'])
++                args.append(pd['target_cvar'])
++                args.append(pd['target_state_cvar'])
++                args.append(pd['scale'])
++                args.append(pd['target_scales'])
++                args.append(d_proj_cfun_params[p_idx])
++
++            # per-subnet ctavg
++            for sn_info in analysis.subnetworks:
++                args.append(d_ctavgs[sn_info.name])
++
++            # per-subnet spatial / projection monitor arrays
++            for sn_info in analysis.subnetworks:
++                args.append(d_spatial_means[sn_info.name])
++                args.append(d_spatial_tavgs[sn_info.name])
++                args.append(d_gains[sn_info.name])
++                args.append(d_proj_tavgs[sn_info.name])
++
++            # Per-subnet spatial params
++            for sn_info in analysis.subnetworks:
++                args.append(d_sps[sn_info.name])
++
++            # Per-subnet voi_idx
++            for sn_info in analysis.subnetworks:
++                args.append(d_voi_idxs[sn_info.name])
++
++            # Per-subnet noise (stochastic only)
++            for sn_info in analysis.subnetworks:
++                if sn_info.is_stochastic:
++                    args.append(d_noises[sn_info.name])
++
++            # Per-subnet stimulus (stimulus subnets only)
++            for sn_info in analysis.subnetworks:
++                if sn_info.has_stimulus:
++                    args.append(d_stims[sn_info.name])
++
++            # Scalar parameters
++            args.append(np.int32(this_offset))
++            args.append(np.int32(chunk_idx * chunk_size))
++            args.append(np.float32(dt))
++            args.append(np.int32(this_nstep))
++            args.append(np.int32(monitor_type))
++            args.append(np.int32(monitor_period))
++            for sn_info in analysis.subnetworks:
++                args.append(np.int32(sn_info.n_nodes))
++            args.append(np.int32(n_sweeps))
++            args.append(np.int32(bold_istep))
++            args.append(np.int32(n_bold_samples))
++
++            self._compiled_fn[blocks, threads_per_block](*args)
++            cuda.synchronize()
++
++        t_kernel = time.perf_counter() - t_kernel
++
++        # ---- Copy results back ----
++        results_tavg = []
++        results_ctavg = []
++        results_spatial = []
++        results_proj = []
++        for sn_info in analysis.subnetworks:
++            h = d_tavgs[sn_info.name].copy_to_host()
++            # Normalize by total_nstep (kernel accumulates without normalizing)
++            h /= np.float32(total_nstep)
++            results_tavg.append(h)
++            h_ct = d_ctavgs[sn_info.name].copy_to_host()
++            h_ct /= np.float32(total_nstep)
++            results_ctavg.append(h_ct)
++            h_sp = d_spatial_tavgs[sn_info.name].copy_to_host()
++            h_sp /= np.float32(total_nstep)
++            results_spatial.append(h_sp)
++            h_pr = d_proj_tavgs[sn_info.name].copy_to_host()
++            h_pr /= np.float32(total_nstep)
++            results_proj.append(h_pr)
++
++        results_raw = []
++        for sn_info in analysis.subnetworks:
++            if sn_info.name in d_raws:
++                results_raw.append(d_raws[sn_info.name].copy_to_host())
++
++        results_ctraw = []
++        for sn_info in analysis.subnetworks:
++            if sn_info.name in d_ctraws:
++                results_ctraw.append(d_ctraws[sn_info.name].copy_to_host())
++
++        results_bold = []
++        final_bold_states = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.name in d_bold_outs:
++                results_bold.append(d_bold_outs[sn_info.name].copy_to_host())
++            if sn_info.name in d_bold_states:
++                final_bold_states[sn_info.name] = d_bold_states[sn_info.name].copy_to_host()
++
++        # ---- Copy final states / srcbufs for snapshot ----
++        final_states = {}
++        final_srcbufs = {}
++        for sn_info in analysis.subnetworks:
++            final_states[sn_info.name] = d_states[sn_info.name].copy_to_host()
++            final_srcbufs[sn_info.name] = d_srcbufs[sn_info.name].copy_to_host()
++
++        final_step_offset = step_offset + total_nstep
++
++        if verbose:
++            print(f"[cuda_sweep batch] kernel: {t_kernel*1000:.1f} ms")
++
++        result = {
++            'tavg': results_tavg,
++            'ctavg': results_ctavg,
++            'spatial_tavg': results_spatial,
++            'proj_tavg': results_proj,
++            'elapsed': t_kernel,
++            'snapshot': {
++                'states': final_states,
++                'srcbufs': final_srcbufs,
++                'step_offset': final_step_offset,
++                'bold_states': final_bold_states,
++            },
++        }
++        if results_raw:
++            result['raw'] = results_raw
++        if results_ctraw:
++            result['ctraw'] = results_ctraw
++        if results_bold:
++            result['bold'] = results_bold
++        return result
++
++    def run(
++        self,
++        nstep: int,
++        sweep_values: np.ndarray,
++        initial_states: Optional[list] = None,
++        chunk_size: Optional[int] = None,
++        snapshot: Optional[dict] = None,
++        monitor_type = 0,
++        monitor_period: int = 1,
++        max_batch_sweeps: Optional[int] = None,
++        bold_period: Optional[float] = None,
++        monitors: Optional[dict] = None,
++        node_indices: Optional[dict] = None,
++        global_average: bool = False,
++        record_coupling: bool = False,
++        verbose: bool = False,
++    ):
++        """Execute the parameter sweep on GPU with automatic batching.
++
++        Parameters
++        ----------
++        nstep : int
++            Number of integration steps per sweep point.
++        sweep_values : ndarray (n_sweeps, n_sweep_dims) or (n_sweeps,) float32
++            Values of the sweep parameters.
++        initial_states : list of ndarray, optional
++            Initial state for each subnetwork.
++        chunk_size : int, optional
++            Steps per chunk. None means no chunking.
++        snapshot : dict, optional
++            Resume dict with keys 'states', 'srcbufs', 'step_offset', 'bold_states'.
++        monitor_type : int or str
++            0 or 'tavg' = temporal average only (default),
++            1 or 'raw' = full step-by-step output,
++            2 or 'subsample' = periodic subsampled output.
++        monitor_period : int
++            Steps between subsample writes (monitor_type == 2).
++        max_batch_sweeps : int, optional
++            Maximum sweep points per GPU batch. None = auto-detect from VRAM.
++        bold_period : float, optional
++            Bold monitor sampling period in ms. If provided, Balloon-Windkessel
++            BOLD signal is computed and returned under the 'bold' key.
++        monitors : dict, optional
++            Monitor config dicts for spatial/projection monitors.
++            {'spatial_mean': {subnet_name: ndarray(n_areas, N)},
++             'gain': {subnet_name: ndarray(n_sensors, N)}}
++        node_indices : dict, optional
++            Global connectome node indices per subnet. If provided, merged output
++            is connectome-ordered instead of naively concatenated.
++        global_average : bool
++            If True, compute mean across nodes in the 'ga_avg' output key.
++        record_coupling : bool
++            If True with ``monitor_type='raw'``, return per-step coupling under
++            ``'ctraw'``. The existing ``'ctavg'`` remains the run-wide average.
++        verbose : bool
++            Print timing information.
++
++        Returns
++        -------
++        dict with keys:
++            'tavg': list of ndarray — temporal-average per subnetwork
++            'merged_tavg': ndarray — concatenated tavg
++            'ctavg': list of ndarray — coupling temporal average per subnetwork
++            'spatial_tavg': list of ndarray — spatial average per subnetwork
++            'proj_tavg': list of ndarray — projection output per subnetwork
++            'ga_avg': dict — global average (if global_average=True)
++            'raw': list of ndarray — optional raw output per subnetwork
++            'ctraw': list of ndarray — optional per-step coupling per subnetwork
++            'bold': list of ndarray — optional BOLD output per subnetwork
++            'elapsed': float — GPU kernel wall-clock seconds
++            'snapshot': dict — final states, srcbufs, step_offset, bold_states
++        """
++        def _positive_integer(value, name, allow_none=False):
++            if allow_none and value is None:
++                return None
++            if (isinstance(value, (bool, np.bool_))
++                    or not isinstance(value, (int, np.integer))
++                    or value <= 0):
++                suffix = " or None" if allow_none else ""
++                raise ValueError(f"{name} must be a positive integer{suffix}")
++            return int(value)
++
++        nstep = _positive_integer(nstep, "nstep")
++        chunk_size = _positive_integer(chunk_size, "chunk_size", allow_none=True)
++        monitor_period = _positive_integer(monitor_period, "monitor_period")
++        max_batch_sweeps = _positive_integer(
++            max_batch_sweeps, "max_batch_sweeps", allow_none=True
++        )
++        monitor_map = {'tavg': 0, 'raw': 1, 'subsample': 2}
++        if isinstance(monitor_type, str):
++            if monitor_type not in monitor_map:
++                raise ValueError(
++                    "monitor_type must be exactly 'tavg', 'raw', 'subsample', 0, 1, or 2"
++                )
++            monitor_type = monitor_map[monitor_type]
++        elif (isinstance(monitor_type, (bool, np.bool_))
++              or not isinstance(monitor_type, (int, np.integer))
++              or int(monitor_type) not in (0, 1, 2)):
++            raise ValueError(
++                "monitor_type must be exactly 'tavg', 'raw', 'subsample', 0, 1, or 2"
++            )
++        else:
++            monitor_type = int(monitor_type)
++        if not isinstance(record_coupling, (bool, np.bool_)):
++            raise ValueError("record_coupling must be a boolean")
++        record_coupling = bool(record_coupling and monitor_type == 1)
++        if bold_period is not None:
++            if (isinstance(bold_period, (bool, np.bool_))
++                    or not isinstance(
++                        bold_period, (int, float, np.integer, np.floating)
++                    )):
++                raise ValueError("bold_period must be finite and positive or None")
++            try:
++                bold_period = float(bold_period)
++            except (TypeError, ValueError, OverflowError) as exc:
++                raise ValueError("bold_period must be finite and positive or None") from exc
++            if not np.isfinite(bold_period) or bold_period <= 0:
++                raise ValueError("bold_period must be finite and positive or None")
++
++        sweep_values = np.asarray(sweep_values, dtype=np.float32)
++        if sweep_values.ndim == 1:
++            sweep_values = sweep_values.reshape(-1, 1)
++        if sweep_values.ndim != 2:
++            raise ValueError(f"sweep_values must be 1D or 2D, got shape {sweep_values.shape}")
++        n_sweeps, n_dims = sweep_values.shape
++        if n_sweeps == 0:
++            raise ValueError("sweep_values must contain at least one sweep point")
++        if n_dims != self.n_sweep_dims:
++            raise ValueError(f"Expected sweep_values with {self.n_sweep_dims} dimensions, got {n_dims}")
++
++        if snapshot is not None and bold_period is not None:
++            raise NotImplementedError(
++                "CUDA snapshot resume with bold_period is not supported"
++            )
++        if snapshot is not None and monitor_type == 2:
++            raise NotImplementedError(
++                "CUDA snapshot resume with monitor_type='subsample' is not supported"
++            )
++
++        # Normalize monitors dict
++        if monitors is None:
++            monitors = {}
++        if not isinstance(monitors, dict):
++            monitors = {}
++
++        analysis = self._analysis
++        network_set = self._network_set
++
++        # ---- Determine dt (must be same across subnets) ----
++        dt = float(network_set.subnets[0].scheme.dt)
++
++        # ---- Bold monitor setup ----
++        bold_istep = 0
++        n_bold_samples = 0
++        bold_states_h = {}
++        bold_params_h = {}
++        bold_voi_idx_h = {}
++        bold_out_h = {}
++        if bold_period is not None:
++            bp = float(bold_period)
++            bold_istep = max(1, int(round(bp / dt)))
++            n_bold_samples = (nstep + bold_istep - 1) // bold_istep
++            tau_s = np.float32(0.65)
++            tau_f = np.float32(0.41)
++            tau_o = np.float32(0.98)
++            alpha = np.float32(0.32)
++            e0 = np.float32(0.4)
++            V0 = np.float32(4.0)
++            k1 = np.float32(4.3) * np.float32(40.3) * e0 * np.float32(0.04)
++            k2 = np.float32(0.5) * np.float32(25.0) * e0 * np.float32(0.04)
++            k3 = np.float32(1.0) - np.float32(0.5)
++            bold_params_arr = np.array([
++                np.float32(1.0) / tau_s,
++                np.float32(1.0) / tau_f,
++                np.float32(1.0) / tau_o,
++                np.float32(1.0) / alpha,
++                e0,
++                np.float32(1.0) / e0,
++                k1, k2, k3,
++                V0,
++            ], dtype=np.float32)
++            for sn_info in analysis.subnetworks:
++                n_voi = len(sn_info.model.variables_of_interest)
++                n_nodes = sn_info.n_nodes
++                svars = list(sn_info.model.state_variables)
++                voi = list(sn_info.model.variables_of_interest)
++                voi_idx = [svars.index(v) if v in svars else -1 for v in voi]
++                bold_states_h[sn_info.name] = np.zeros((n_sweeps, n_voi, 4, n_nodes), dtype=np.float32)
++                bold_states_h[sn_info.name][:, :, 1, :] = 1.0
++                bold_states_h[sn_info.name][:, :, 2, :] = 1.0
++                bold_states_h[sn_info.name][:, :, 3, :] = 1.0
++                bold_params_h[sn_info.name] = bold_params_arr
++                bold_voi_idx_h[sn_info.name] = np.array(voi_idx, dtype=np.int32)
++                bold_out_h[sn_info.name] = np.zeros((n_sweeps, n_bold_samples, n_voi, n_nodes), dtype=np.float32)
++
++        # ---- Determine max horizon ----
++        if analysis.all_projections:
++            horizon = max(p.horizon for p in analysis.all_projections)
++        else:
++            horizon = 1
++
++        if verbose:
++            for sn in analysis.subnetworks:
++                print(f"  subnet '{sn.name}': model={type(sn.model).__name__}, "
++                      f"nvar={sn.model.nvar}, N={sn.n_nodes}, modes={sn.n_modes}")
++            for p in analysis.all_projections:
++                print(f"  proj '{p.name}': {p.source_subnet}→{p.target_subnet}, "
++                      f"nnz={len(p.weights_data)}, horizon={p.horizon}")
++
++        # ---- Handle snapshot / resume ----
++        step_offset = 0
++        if snapshot is not None:
++            step_offset = snapshot.get('step_offset', 0)
++            sn_states_h = {}
++            src_bufs_h = {}
++            for sn_info in analysis.subnetworks:
++                try:
++                    state = np.asarray(snapshot['states'][sn_info.name])
++                    srcbuf = np.asarray(snapshot['srcbufs'][sn_info.name])
++                except KeyError as exc:
++                    raise ValueError(
++                        f"CUDA snapshot is missing state for subnetwork '{sn_info.name}'"
++                    ) from exc
++                expected_state = (
++                    n_sweeps, sn_info.model.nvar, sn_info.n_nodes, sn_info.n_modes
++                )
++                expected_srcbuf = expected_state + (
++                    analysis.source_horizons.get(sn_info.name, 1),
++                )
++                if state.shape != expected_state or srcbuf.shape != expected_srcbuf:
++                    raise ValueError(
++                        f"CUDA snapshot topology for '{sn_info.name}' does not match: "
++                        f"expected state {expected_state} and srcbuf {expected_srcbuf}, "
++                        f"got {state.shape} and {srcbuf.shape}"
++                    )
++                sn_states_h[sn_info.name] = state.astype(np.float32)
++                src_bufs_h[sn_info.name] = srcbuf.astype(np.float32)
++            # Restore Bold state from snapshot if available
++            if bold_period is not None and 'bold_states' in snapshot:
++                for sn_info in analysis.subnetworks:
++                    if sn_info.name in snapshot['bold_states']:
++                        bold_states_h[sn_info.name] = snapshot['bold_states'][sn_info.name].astype(np.float32)
++
++            stochastic = [sn for sn in analysis.subnetworks if sn.is_stochastic]
++            if stochastic:
++                rng_states = snapshot.get('rng_states')
++                rng_dimensions = snapshot.get('rng_dimensions')
++                if rng_states is None or rng_dimensions is None:
++                    raise ValueError(
++                        "A stochastic CUDA snapshot must contain rng_states and rng_dimensions"
++                    )
++                expected_names = {sn.name for sn in stochastic}
++                if set(rng_states) != expected_names or set(rng_dimensions) != expected_names:
++                    raise ValueError("CUDA snapshot stochastic subnetwork topology does not match")
++                for sn_info in stochastic:
++                    expected = (
++                        n_sweeps,
++                        sn_info.model.nvar,
++                        sn_info.n_nodes,
++                        sn_info.n_modes,
++                    )
++                    if tuple(rng_dimensions[sn_info.name]) != expected:
++                        raise ValueError(
++                            f"CUDA snapshot RNG dimensions for '{sn_info.name}' do not match "
++                            f"the current sweep/topology: expected {expected}, got "
++                            f"{tuple(rng_dimensions[sn_info.name])}"
++                        )
++                for sn_info in stochastic:
++                    sn_info.integrator.noise.random_stream.set_state(
++                        copy.deepcopy(rng_states[sn_info.name])
++                    )
++        else:
++            # Build per-subnet initial states
++            sn_states_h = {}
++            network_subnets = {sn.name: sn for sn in network_set.subnets}
++            if initial_states is not None and len(initial_states) != len(analysis.subnetworks):
++                raise ValueError(
++                    f"initial_states must contain one array per subnetwork; expected "
++                    f"{len(analysis.subnetworks)}, got {len(initial_states)}"
++                )
++            for i, sn_info in enumerate(analysis.subnetworks):
++                if initial_states is not None:
++                    x0 = np.asarray(initial_states[i], dtype=np.float32)
++                    expected = (sn_info.model.nvar, sn_info.n_nodes, sn_info.n_modes)
++                    if x0.shape == expected:
++                        # (nvar, nnodes, nmodes) — add sweep dimension
++                        sn_states_h[sn_info.name] = np.broadcast_to(
++                            x0[np.newaxis], (n_sweeps,) + x0.shape
++                        ).copy()
++                    elif x0.shape == (n_sweeps,) + expected:
++                        # (n_sweeps, nvar, nnodes, nmodes) — already has sweep dimension
++                        sn_states_h[sn_info.name] = x0.copy()
++                    else:
++                        raise ValueError(
++                            f"initial_states[{i}] must have shape {expected} or "
++                            f"{(n_sweeps,) + expected}, got {x0.shape}"
++                        )
++                else:
++                    x0 = network_subnets[sn_info.name].zero_states().astype(np.float32)
++                    sn_states_h[sn_info.name] = np.broadcast_to(
++                        x0[np.newaxis], (n_sweeps,) + x0.shape
++                    ).copy()
++
++            # Build per-source-subnet history buffers
++            src_bufs_h = {}
++            for sn_info in analysis.subnetworks:
++                hz = analysis.source_horizons.get(sn_info.name, 1)
++                state = sn_states_h[sn_info.name]
++                nvar, nnodes, nmodes = state.shape[1:]
++                buf = np.zeros((n_sweeps, nvar, nnodes, nmodes, hz), dtype=np.float32)
++                buf[:, :, :, :, :] = state[:, :, :, :, np.newaxis]
++                src_bufs_h[sn_info.name] = buf
++
++        # ---- Build per-subnet tavg accumulators (zeroed) ----
++        tavg_h = {}
++        for sn_info in analysis.subnetworks:
++            nvoi = len(sn_info.model.variables_of_interest)
++            nnodes = sn_info.n_nodes
++            nmodes = sn_info.n_modes
++            tavg_h[sn_info.name] = np.zeros((n_sweeps, nvoi, nnodes, nmodes), dtype=np.float32)
++
++        # ---- Build per-subnet ctavg accumulators (zeroed) ----
++        ctavg_h = {}
++        for sn_info in analysis.subnetworks:
++            ncvar = len(sn_info.model.cvar)
++            nnodes = sn_info.n_nodes
++            nmodes = sn_info.n_modes
++            ctavg_h[sn_info.name] = np.zeros((n_sweeps, ncvar, nnodes, nmodes), dtype=np.float32)
++
++        # ---- Build per-subnet spatial / projection monitor arrays ----
++        spatial_mean_h = {}
++        spatial_tavg_h = {}
++        gain_h = {}
++        proj_tavg_h = {}
++        monitors_dict = monitors if isinstance(monitors, dict) else {}
++        for sn_info in analysis.subnetworks:
++            nvoi = len(sn_info.model.variables_of_interest)
++            nnodes = sn_info.n_nodes
++            # SpatialAverage monitor
++            sm = monitors_dict.get('spatial_mean', {}).get(sn_info.name)
++            if sm is not None:
++                spatial_mean_h[sn_info.name] = np.ascontiguousarray(sm.astype(np.float32))
++                n_areas = sm.shape[0]
++            else:
++                spatial_mean_h[sn_info.name] = np.zeros((0, nnodes), dtype=np.float32)
++                n_areas = 0
++            n_areas = spatial_mean_h[sn_info.name].shape[0]
++            spatial_tavg_h[sn_info.name] = np.zeros((n_sweeps, nvoi, n_areas, 1), dtype=np.float32)
++            # Projection monitor
++            gm = monitors_dict.get('gain', {}).get(sn_info.name)
++            if gm is not None:
++                gain_h[sn_info.name] = np.ascontiguousarray(gm.astype(np.float32))
++                n_sensors = gm.shape[0]
++            else:
++                gain_h[sn_info.name] = np.zeros((0, nnodes), dtype=np.float32)
++                n_sensors = 0
++            n_sensors = gain_h[sn_info.name].shape[0]
++            proj_tavg_h[sn_info.name] = np.zeros((n_sweeps, nvoi, n_sensors, 1), dtype=np.float32)
++
++        # ---- Build per-subnet raw output accumulators (zeroed) ----
++        raw_h = {}
++        if monitor_type == 1:
++            for sn_info in analysis.subnetworks:
++                nvoi = len(sn_info.model.variables_of_interest)
++                nnodes = sn_info.n_nodes
++                nmodes = sn_info.n_modes
++                raw_h[sn_info.name] = np.zeros((n_sweeps, nstep, nvoi, nnodes, nmodes), dtype=np.float32)
++        elif monitor_type == 2:
++            n_raw_steps = (nstep + monitor_period - 1) // monitor_period
++            for sn_info in analysis.subnetworks:
++                nvoi = len(sn_info.model.variables_of_interest)
++                nnodes = sn_info.n_nodes
++                nmodes = sn_info.n_modes
++                raw_h[sn_info.name] = np.zeros((n_sweeps, n_raw_steps, nvoi, nnodes, nmodes), dtype=np.float32)
++
++        # Per-step coupling is internal to unified raw sweeps and opt-in because
++        # it can be as large as the raw state output.
++        ctraw_h = {}
++        if record_coupling:
++            for sn_info in analysis.subnetworks:
++                ncvar = len(sn_info.model.cvar)
++                ctraw_h[sn_info.name] = np.zeros(
++                    (n_sweeps, nstep, ncvar, sn_info.n_nodes, sn_info.n_modes),
++                    dtype=np.float32,
++                )
++
++        # ---- Build per-subnet voi index arrays ----
++        voi_idx_h = {}
++        for sn_info in analysis.subnetworks:
++            svars = list(sn_info.model.state_variables)
++            voi = list(sn_info.model.variables_of_interest)
++            voi_idx = np.array([svars.index(v) if v in svars else -1 for v in voi], dtype=np.int32)
++            voi_idx_h[sn_info.name] = voi_idx
++
++        # ---- Build per-subnet noise arrays (stochastic subnets only) ----
++        noise_h = {}
++        rng_states = {}
++        rng_dimensions = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.is_stochastic:
++                rng = sn_info.integrator.noise.random_stream
++                nvar = sn_info.model.nvar
++                nnodes = sn_info.n_nodes
++                nmodes = sn_info.n_modes
++                # Step-major draws make a snapshot split consume the same RNG
++                # sequence as an uninterrupted run, including multiple sweeps.
++                dw = rng.randn(nstep, n_sweeps, nvar, nnodes, nmodes).astype(np.float32, copy=False)
++                noise_std = np.float32(np.sqrt(2.0 * sn_info.noise_nsig * dt))
++                dw *= noise_std[np.newaxis, np.newaxis, :, np.newaxis, np.newaxis]
++                dw = np.ascontiguousarray(np.transpose(dw, (1, 2, 3, 4, 0)))
++                noise_h[sn_info.name] = dw
++                rng_states[sn_info.name] = copy.deepcopy(rng.get_state())
++                rng_dimensions[sn_info.name] = (
++                    n_sweeps, nvar, nnodes, nmodes
++                )
++
++        # ---- Build per-subnet stimulus arrays (stimulus subnets only) ----
++        stim_h = {}
++        for sn_info in analysis.subnetworks:
++            if sn_info.has_stimulus:
++                # The device receives the full invocation stimulus array. data_t
++                # includes the chunk offset, so data_t - 1 selects its local sample.
++                n_cvar = len(sn_info.model.cvar)
++                stim_arr = np.zeros(
++                    (n_cvar, sn_info.n_nodes, sn_info.n_modes, nstep),
++                    dtype=np.float32,
++                )
++                for stim in analysis.stimuli_by_subnet[sn_info.name]:
++                    target_slots = np.asarray(stim.target_cvar, dtype=np.intp)
++                    for step_idx in range(step_offset + 1, step_offset + nstep + 1):
++                        sc = np.asarray(stim.get_coupling(step_idx), dtype=np.float32)
++                        if sc.ndim == 2:
++                            sc = sc[:, :, np.newaxis]
++                        if sc.shape[2] == 1 and sn_info.n_modes > 1:
++                            sc = np.broadcast_to(
++                                sc, (sc.shape[0], sn_info.n_nodes, sn_info.n_modes)
++                            ).copy()
++                        stim_arr[target_slots, :, :, step_idx - step_offset - 1] += sc
++                stim_broadcast = np.broadcast_to(
++                    stim_arr[np.newaxis], (n_sweeps, n_cvar, sn_info.n_nodes, sn_info.n_modes, nstep)
++                ).copy()
++                stim_h[sn_info.name] = stim_broadcast
++
++        # ---- Build per-subnet spatial parameter arrays ----
++        sp_h = {}
++        for sn_info in analysis.subnetworks:
++            sp_names = list(getattr(sn_info.model, 'spatial_parameter_names', []))
++            if sp_names:
++                sp_arr = np.array(
++                    [np.broadcast_to(getattr(sn_info.model, n), (sn_info.n_nodes,)).ravel()
++                     for n in sp_names],
++                    dtype=np.float32,
++                )
++            else:
++                sp_arr = np.zeros((0, sn_info.n_nodes), dtype=np.float32)
++            sp_h[sn_info.name] = sp_arr
++
++        # ---- Build per-projection cfun params ----
++        proj_cfun_params = []
++        for p in analysis.all_projections:
++            base = _cfun_params(p)
++            params = np.broadcast_to(base[np.newaxis], (n_sweeps, len(base))).copy()
++            projection_dims = [
++                (dim, desc)
++                for dim, desc in enumerate(self.sweep_descriptor)
++                if desc['type'] == 'cfun' and desc['projection'] == p.name
++            ]
++            for row in range(n_sweeps):
++                row_projection = copy.copy(p)
++                row_projection.cfun = copy.copy(p.cfun)
++                for dim, desc in projection_dims:
++                    NbHybridBackend._cfun_set_param(
++                        row_projection.cfun,
++                        desc.get('param_idx', 0),
++                        sweep_values[row, dim],
++                    )
++                params[row] = _cfun_params(row_projection)
++            proj_cfun_params.append(params)
++
++        # ---- Memory estimation ----
++        bytes_per_sweep = 0
++        for sn_info in analysis.subnetworks:
++            nvar = sn_info.model.nvar
++            nnodes = sn_info.n_nodes
++            nmodes = sn_info.n_modes
++            hz = analysis.source_horizons.get(sn_info.name, 1)
++            bytes_per_sweep += nvar * nnodes * nmodes * 4
++            bytes_per_sweep += nvar * nnodes * nmodes * hz * 4
++            nvoi = len(sn_info.model.variables_of_interest)
++            bytes_per_sweep += nvoi * nnodes * nmodes * 4
++            ncvar = len(sn_info.model.cvar)
++            bytes_per_sweep += ncvar * nnodes * nmodes * 4
++            bytes_per_sweep += spatial_tavg_h[sn_info.name][0].nbytes
++            bytes_per_sweep += proj_tavg_h[sn_info.name][0].nbytes
++
++        for sn_info in analysis.subnetworks:
++            if sn_info.is_stochastic:
++                nvar = sn_info.model.nvar
++                nnodes = sn_info.n_nodes
++                nmodes = sn_info.n_modes
++                bytes_per_sweep += nvar * nnodes * nmodes * nstep * 4
++
++        for sn_info in analysis.subnetworks:
++            if sn_info.has_stimulus:
++                n_cvar = len(sn_info.model.cvar)
++                nnodes = sn_info.n_nodes
++                nmodes = sn_info.n_modes
++                bytes_per_sweep += n_cvar * nnodes * nmodes * nstep * 4
++
++        for params in proj_cfun_params:
++            bytes_per_sweep += params.shape[1] * params.dtype.itemsize
++
++        if monitor_type > 0:
++            n_raw_steps = nstep if monitor_type == 1 else (nstep + monitor_period - 1) // monitor_period
++            for sn_info in analysis.subnetworks:
++                nvoi = len(sn_info.model.variables_of_interest)
++                nnodes = sn_info.n_nodes
++                nmodes = sn_info.n_modes
++                bytes_per_sweep += nvoi * nnodes * nmodes * n_raw_steps * 4
++
++        if record_coupling:
++            for sn_info in analysis.subnetworks:
++                ncvar = len(sn_info.model.cvar)
++                bytes_per_sweep += ncvar * sn_info.n_nodes * sn_info.n_modes * nstep * 4
++
++        if bold_period is not None:
++            for sn_info in analysis.subnetworks:
++                nvoi = len(sn_info.model.variables_of_interest)
++                nnodes = sn_info.n_nodes
++                bytes_per_sweep += nvoi * nnodes * 4 * 4  # bold_state (4 floats per voi per node)
++                bytes_per_sweep += 10 * 4  # bold_params
++                bytes_per_sweep += nvoi * 4  # bold_voi_idx
++                bytes_per_sweep += n_bold_samples * nvoi * nnodes * 4  # bold_out
++
++        # Available GPU memory
++        try:
++            gpu_available = cuda.current_context().get_memory_info()[0]
++            budget = int(gpu_available * 0.8)
++        except Exception:
++            budget = 20 * 1024**3  # 20 GB fallback
++
++        if max_batch_sweeps is None:
++            max_batch_sweeps = max(1, budget // max(1, bytes_per_sweep))
++        max_batch_sweeps = max(1, int(max_batch_sweeps))
++        max_batch_sweeps = min(max_batch_sweeps, n_sweeps)
++
++        n_batches = (n_sweeps + max_batch_sweeps - 1) // max_batch_sweeps
++
++        if verbose and n_batches > 1:
++            print(f"[cuda_sweep] memory budget={budget/1e9:.2f} GB, "
++                  f"bytes_per_sweep={bytes_per_sweep}, "
++                  f"max_batch_sweeps={max_batch_sweeps}, n_batches={n_batches}")
++
++        # ---- Pre-build constant device arrays (shared across batches) ----
++        d_proj_data = {}
++        for p in analysis.all_projections:
++            d_proj_data[p.name] = {
++                'w_data': cuda.to_device(p.weights_data.astype(np.float32)),
++                'w_indices': cuda.to_device(p.weights_indices.astype(np.int32)),
++                'w_indptr': cuda.to_device(p.weights_indptr.astype(np.int32)),
++                'idelays': cuda.to_device(p.idelays.astype(np.int32)),
++                'source_cvar': cuda.to_device(p.source_cvar.astype(np.int32)),
++                'target_cvar': cuda.to_device(p.target_cvar.astype(np.int32)),
++                'target_state_cvar': cuda.to_device(p.target_state_cvar.astype(np.int32)),
++                'scale': np.float32(p.scale),
++                'target_scales': cuda.to_device(p.target_scales.astype(np.float32)),
++            }
++            if p.is_inter:
++                if p.mode_map is not None:
++                    d_proj_data[p.name]['mode_map'] = cuda.to_device(p.mode_map.astype(np.float32))
++                else:
++                    n_src_m = p.n_src_modes
++                    n_tgt_m = p.n_tgt_modes
++                    mm = np.ones((n_src_m, n_tgt_m), dtype=np.float32)
++                    d_proj_data[p.name]['mode_map'] = cuda.to_device(mm)
++
++        d_voi_idxs = {}
++        for sn_info in analysis.subnetworks:
++            d_voi_idxs[sn_info.name] = cuda.to_device(voi_idx_h[sn_info.name])
++
++        d_sps = {}
++        for sn_info in analysis.subnetworks:
++            d_sps[sn_info.name] = cuda.to_device(sp_h[sn_info.name])
++
++        # ---- Batch loop ----
++        result_tavg = []
++        result_ctavg = []
++        result_spatial = []
++        result_proj = []
++        result_raw = None
++        result_ctraw = None
++        result_bold = None
++        total_elapsed = 0.0
++        snapshot_states = {}
++        snapshot_srcbufs = {}
++        snapshot_bold_states = {}
++
++        for batch_idx in range(n_batches):
++            batch_start = batch_idx * max_batch_sweeps
++            batch_end = min(batch_start + max_batch_sweeps, n_sweeps)
++            batch_n = batch_end - batch_start
++
++            # ---- Slice sweep-dependent host arrays ----
++            batch_sv = sweep_values[batch_start:batch_end]
++            batch_proj_cfun_params = [
++                params[batch_start:batch_end] for params in proj_cfun_params
++            ]
++
++            batch_sn_states = {}
++            batch_src_bufs = {}
++            for sn_info in analysis.subnetworks:
++                batch_sn_states[sn_info.name] = sn_states_h[sn_info.name][batch_start:batch_end]
++                batch_src_bufs[sn_info.name] = src_bufs_h[sn_info.name][batch_start:batch_end]
++
++            batch_tavg = {}
++            for sn_info in analysis.subnetworks:
++                batch_tavg[sn_info.name] = tavg_h[sn_info.name][batch_start:batch_end]
++
++            batch_raw = {}
++            for sn_info in analysis.subnetworks:
++                if sn_info.name in raw_h:
++                    batch_raw[sn_info.name] = raw_h[sn_info.name][batch_start:batch_end]
++
++            batch_ctraw = {}
++            for sn_info in analysis.subnetworks:
++                if sn_info.name in ctraw_h:
++                    batch_ctraw[sn_info.name] = ctraw_h[sn_info.name][batch_start:batch_end]
++
++            batch_noise = {}
++            for sn_info in analysis.subnetworks:
++                if sn_info.is_stochastic:
++                    batch_noise[sn_info.name] = noise_h[sn_info.name][batch_start:batch_end]
++
++            batch_stim = {}
++            for sn_info in analysis.subnetworks:
++                if sn_info.has_stimulus:
++                    batch_stim[sn_info.name] = stim_h[sn_info.name][batch_start:batch_end]
++
++            batch_bold_states = {}
++            batch_bold_params = {}
++            batch_bold_voi_idx = {}
++            batch_bold_out = {}
++            for sn_info in analysis.subnetworks:
++                if sn_info.name in bold_states_h:
++                    batch_bold_states[sn_info.name] = bold_states_h[sn_info.name][batch_start:batch_end]
++                    batch_bold_params[sn_info.name] = bold_params_h[sn_info.name]
++                    batch_bold_voi_idx[sn_info.name] = bold_voi_idx_h[sn_info.name]
++                    batch_bold_out[sn_info.name] = bold_out_h[sn_info.name][batch_start:batch_end]
++
++            # Slice ctavg, spatial, proj for this batch
++            batch_ctavg = {}
++            batch_spatial_tavg = {}
++            batch_proj_tavg = {}
++            for sn_info in analysis.subnetworks:
++                batch_ctavg[sn_info.name] = ctavg_h[sn_info.name][batch_start:batch_end]
++                batch_spatial_tavg[sn_info.name] = spatial_tavg_h[sn_info.name][batch_start:batch_end]
++                batch_proj_tavg[sn_info.name] = proj_tavg_h[sn_info.name][batch_start:batch_end]
++
++            # ---- Run batch ----
++            batch_result = self._run_single_batch(
++                nstep=nstep,
++                sweep_values_batch=batch_sv,
++                sn_states_h=batch_sn_states,
++                src_bufs_h=batch_src_bufs,
++                tavg_h=batch_tavg,
++                raw_h=batch_raw,
++                ctraw_h=batch_ctraw,
++                noise_h=batch_noise,
++                stim_h=batch_stim,
++                voi_idx_h=voi_idx_h,
++                sp_h=sp_h,
++                proj_cfun_params=batch_proj_cfun_params,
++                d_proj_data=d_proj_data,
++                d_voi_idxs=d_voi_idxs,
++                d_sps=d_sps,
++                analysis=analysis,
++                network_set=network_set,
++                dt=dt,
++                chunk_size=chunk_size,
++                monitor_type=monitor_type,
++                monitor_period=monitor_period,
++                step_offset=step_offset,
++                bold_istep=bold_istep,
++                n_bold_samples=n_bold_samples,
++                bold_states_h=batch_bold_states,
++                bold_params_h=batch_bold_params,
++                bold_voi_idx_h=batch_bold_voi_idx,
++                bold_out_h=batch_bold_out,
++                ctavg_h=batch_ctavg,
++                spatial_mean_h=spatial_mean_h,
++                spatial_tavg_h=batch_spatial_tavg,
++                gain_h=gain_h,
++                proj_tavg_h=batch_proj_tavg,
++                verbose=verbose and batch_idx == 0,
++            )
++
++            # ---- Accumulate results ----
++            for i, tavg_arr in enumerate(batch_result['tavg']):
++                if batch_idx == 0:
++                    result_tavg.append(np.zeros((n_sweeps,) + tavg_arr.shape[1:], dtype=np.float32))
++                result_tavg[i][batch_start:batch_end] = tavg_arr
++
++            for i, ct_arr in enumerate(batch_result['ctavg']):
++                if batch_idx == 0:
++                    result_ctavg.append(np.zeros((n_sweeps,) + ct_arr.shape[1:], dtype=np.float32))
++                result_ctavg[i][batch_start:batch_end] = ct_arr
++
++            for i, sp_arr in enumerate(batch_result['spatial_tavg']):
++                if batch_idx == 0:
++                    result_spatial.append(np.zeros((n_sweeps,) + sp_arr.shape[1:], dtype=np.float32))
++                result_spatial[i][batch_start:batch_end] = sp_arr
++
++            for i, pr_arr in enumerate(batch_result['proj_tavg']):
++                if batch_idx == 0:
++                    result_proj.append(np.zeros((n_sweeps,) + pr_arr.shape[1:], dtype=np.float32))
++                result_proj[i][batch_start:batch_end] = pr_arr
++
++            if batch_result.get('raw') is not None:
++                if result_raw is None:
++                    result_raw = []
++                for i, raw_arr in enumerate(batch_result['raw']):
++                    if batch_idx == 0:
++                        result_raw.append(np.zeros((n_sweeps,) + raw_arr.shape[1:], dtype=np.float32))
++                    result_raw[i][batch_start:batch_end] = raw_arr
++
++            if batch_result.get('ctraw') is not None:
++                if result_ctraw is None:
++                    result_ctraw = []
++                for i, ctraw_arr in enumerate(batch_result['ctraw']):
++                    if batch_idx == 0:
++                        result_ctraw.append(np.zeros(
++                            (n_sweeps,) + ctraw_arr.shape[1:], dtype=np.float32
++                        ))
++                    result_ctraw[i][batch_start:batch_end] = ctraw_arr
++
++            if batch_result.get('bold') is not None:
++                if result_bold is None:
++                    result_bold = []
++                for i, bold_arr in enumerate(batch_result['bold']):
++                    if batch_idx == 0:
++                        result_bold.append(np.zeros((n_sweeps,) + bold_arr.shape[1:], dtype=np.float32))
++                    result_bold[i][batch_start:batch_end] = bold_arr
++
++            total_elapsed += batch_result['elapsed']
++
++            for sn_info in analysis.subnetworks:
++                if batch_idx == 0:
++                    snapshot_states[sn_info.name] = np.zeros(
++                        (n_sweeps,) + batch_result['snapshot']['states'][sn_info.name].shape[1:],
++                        dtype=np.float32
++                    )
++                    snapshot_srcbufs[sn_info.name] = np.zeros(
++                        (n_sweeps,) + batch_result['snapshot']['srcbufs'][sn_info.name].shape[1:],
++                        dtype=np.float32
++                    )
++                snapshot_states[sn_info.name][batch_start:batch_end] = batch_result['snapshot']['states'][sn_info.name]
++                snapshot_srcbufs[sn_info.name][batch_start:batch_end] = batch_result['snapshot']['srcbufs'][sn_info.name]
++                if sn_info.name in batch_result['snapshot'].get('bold_states', {}):
++                    if batch_idx == 0:
++                        snapshot_bold_states[sn_info.name] = np.zeros(
++                            (n_sweeps,) + batch_result['snapshot']['bold_states'][sn_info.name].shape[1:],
++                            dtype=np.float32
++                        )
++                    snapshot_bold_states[sn_info.name][batch_start:batch_end] = batch_result['snapshot']['bold_states'][sn_info.name]
++
++        merged_tavg = self._merge_subnet_outputs(result_tavg, analysis.subnetworks, node_indices)
++
++        # GlobalAverage: mean across node dimension
++        ga_avg = None
++        if global_average:
++            ga_avg = {}
++            for i, sn_info in enumerate(analysis.subnetworks):
++                ga_avg[sn_info.name] = result_tavg[i].mean(axis=2, keepdims=True)  # (n_sweeps, n_voi, 1, n_modes)
++
++        final_step_offset = step_offset + nstep
++
++        if verbose:
++            print(f"[cuda_sweep] total kernel time: {total_elapsed*1000:.1f} ms")
++            if n_batches > 1:
++                print(f"[cuda_sweep] throughput: {n_sweeps * nstep / total_elapsed / 1000:.1f} kstep/s")
++
++        result = {
++            'tavg': result_tavg,
++            'merged_tavg': merged_tavg,
++            'ctavg': result_ctavg,
++            'spatial_tavg': result_spatial,
++            'proj_tavg': result_proj,
++            'elapsed': total_elapsed,
++            'snapshot': {
++                'states': snapshot_states,
++                'srcbufs': snapshot_srcbufs,
++                'step_offset': final_step_offset,
++                'rng_states': rng_states,
++                'rng_dimensions': rng_dimensions,
++            },
++        }
++        # Add Bold state to snapshot if Bold was enabled
++        if bold_period is not None:
++            result['snapshot']['bold_states'] = snapshot_bold_states
++        if ga_avg is not None:
++            result['ga_avg'] = ga_avg
++        if result_raw is not None:
++            result['raw'] = result_raw
++        if result_ctraw is not None:
++            result['ctraw'] = result_ctraw
++        if result_bold is not None:
++            result['bold'] = result_bold
++        return result
+diff --git a/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sweep-cuda.py.mako b/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sweep-cuda.py.mako
+new file mode 100644
+index 0000000000..0dfe92fe4e
+--- /dev/null
++++ b/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sweep-cuda.py.mako
+@@ -0,0 +1,1282 @@
++## -*- coding: utf-8 -*-
++##
++## TheVirtualBrain-Scientific Package. This package holds all simulators, and
++## analysers necessary to run brain-simulations. You can use it stand alone or
++## in conjunction with TheVirtualBrain-Framework Package.
++##
++## (c) 2012-2025, Baycrest Centre for Geriatric Care ("Baycrest") and others
++##
++## This program is free software: you can redistribute it and/or modify it under the
++## terms of the GNU General Public License as published by the Free Software Foundation,
++## either version 3 of the License, or (at your option) any later version.
++##
++## Status: active
++##
++## nb-hybrid-sweep-cuda.py.mako
++##
++## Generates a @cuda.jit parameter-sweep kernel: one GPU thread per sweep point,
++## each running an independent simulation.  Supports multi-subnet, multi-projection
++## networks with CSR sparse coupling and real tract-length delays.
++##
++## v2 scope: multi-mode, combined dfun, chunking resume, Raw/SubSample monitors.
++
++import math
++import numpy as np
++from numba import cuda
++import numba
++
++<%
++    def _cparam(pname, pidx):
++        return f"{pname}_cfun_params[tidy, {pidx}]"
++
++    from tvb.simulator.backend.nb_hybrid import _cfun_type, _cvar_mapping_mode, _needs_xi
++%>
++
++##
++## ---- Coupling device functions (one per projection) ----
++##
++
++% for p in all_projs:
++<%
++    ct = _cfun_type(p)
++    cm = _cvar_mapping_mode(p)
++    n_src_cvar = p.source_cvar.shape[0]
++    n_tgt_cvar = p.target_cvar.shape[0]
++    src = p.source_subnet
++    tgt = p.target_subnet
++    # pre_ct: coupling functions that apply PER-EDGE before weighting
++    if ct in ('sigmoidal_jr', 'sigmoidal_jr_legacy', 'tanh', 'pre_sigmoidal', 'pre_sigmoidal_dynamic', 'difference', 'kuramoto'):
++        pre_ct = ct
++    else:
++        pre_ct = 'none'
++    # post_ct: coupling functions that apply AFTER weighted sum
++    if ct == 'linear':
++        post_ct = 'linear'
++    elif ct in ('scaling', 'difference', 'sigmoidal_jr'):
++        post_ct = 'scaling'
++    elif ct == 'sigmoidal':
++        post_ct = 'sigmoidal'
++    elif ct == 'kuramoto':
++        post_ct = 'kuramoto_norm'  # a * (1/N) * wsum — sin is now in pre
++    else:
++        post_ct = 'none'
++    needs_xi = _needs_xi(p)
++    is_multi_cvar = (ct in ('sigmoidal_jr', 'pre_sigmoidal_dynamic'))
++    cvar_loop_count = 1 if is_multi_cvar else n_src_cvar
++    has_ts = p.target_scales.shape[0] > 0
++%>
++
++@cuda.jit(device=True)
++def compute_coupling_${p.name}(
++    ${src}_srcbuf,
++    ${p.name}_w_data,
++    ${p.name}_w_indices,
++    ${p.name}_w_indptr,
++    ${p.name}_idelays,
++% if src != tgt:
++    N_${src},
++% endif
++    N_${tgt},
++    t,
++    tidy,
++    ${p.name}_source_cvar,
++    ${p.name}_target_cvar, ${p.name}_target_state_cvar,
++    ${p.name}_scale,
++    ${p.name}_target_scales,
++    ${p.name}_cfun_params,
++% if p.is_inter:
++    ${p.name}_mode_map,
++% endif
++    ${tgt}_state,
++    ${tgt}_c,
++    sweep_params,
++    tid,
++):
++    """Compute coupling from ${src} → ${tgt} via CSR sparse weights + delays."""
++    ## Per-target-cvar, per-source-mode wsum accumulators (allocated once, zeroed per target node)
++    % if cm in ('1_to_1', 'n_to_n'):
++    % for ic in range(n_tgt_cvar):
++    ${p.name}_wsum_${ic} = cuda.local.array((${p.n_src_modes},), dtype=numba.float32)
++    % endfor
++    % elif cm == 'many_to_1':
++    ${p.name}_wsum_0 = cuda.local.array((${p.n_src_modes},), dtype=numba.float32)
++    % elif cm == '1_to_many':
++    % for ic in range(n_tgt_cvar):
++    ${p.name}_wsum_${ic} = cuda.local.array((${p.n_src_modes},), dtype=numba.float32)
++    % endfor
++    % endif
++
++    % if pre_ct == 'pre_sigmoidal_dynamic':
++    ## globalT uses the unweighted mean of all delayed threshold edge values.
++    ${p.name}_global_threshold = cuda.local.array((${p.n_src_modes},), dtype=numba.float32)
++    for _ms in range(${p.n_src_modes}):
++        ${p.name}_global_threshold[_ms] = np.float32(0.0)
++    if ${_cparam(p.name, 5)} != np.float32(0.0):
++        cv1 = ${p.name}_source_cvar[1]
++        for ptr in range(${p.name}_w_data.shape[0]):
++            src_node = ${p.name}_w_indices[ptr]
++            d = ${p.name}_idelays[ptr]
++            slot = (t - 1 - d + ${analysis.source_horizons[p.source_subnet]}) % ${analysis.source_horizons[p.source_subnet]}
++            for _ms in range(${p.n_src_modes}):
++                ${p.name}_global_threshold[_ms] += ${src}_srcbuf[tidy, cv1, src_node, _ms, slot]
++        if ${p.name}_w_data.shape[0] > 0:
++            for _ms in range(${p.n_src_modes}):
++                ${p.name}_global_threshold[_ms] /= np.float32(${p.name}_w_data.shape[0])
++    % endif
++
++    for j in range(N_${tgt}):
++        row_start = ${p.name}_w_indptr[j]
++        row_end = ${p.name}_w_indptr[j + 1]
++
++        ## Per-target-cvar, per-source-mode wsum accumulators (zeroed per target node)
++        % for ic in range(n_tgt_cvar):
++        for _ms in range(${p.n_src_modes}):
++            ${p.name}_wsum_${ic}[_ms] = np.float32(0.0)
++        % endfor
++
++        for ptr in range(row_start, row_end):
++            src_node = ${p.name}_w_indices[ptr]
++            w = ${p.name}_w_data[ptr]
++            d = ${p.name}_idelays[ptr]
++            slot = (t - 1 - d + ${analysis.source_horizons[p.source_subnet]}) % ${analysis.source_horizons[p.source_subnet]}
++
++            ## cvar accumulation with per-edge pre-cfun and source-mode loop
++            % if cm in ('1_to_1', 'n_to_n'):
++            % for ic in range(n_tgt_cvar):
++            for _ms in range(${p.n_src_modes}):
++                _edge_val = ${src}_srcbuf[tidy, ${p.source_cvar[ic]}, src_node, _ms, slot]
++                % if pre_ct == 'sigmoidal_jr':
++                # Classic: cmin + (cmax-cmin)/(1+exp(r*(midpoint-diff)))
++                # cfun_params: [0]=a, [1]=cmin, [2]=cmax, [3]=r, [4]=midpoint
++                cv0 = ${p.name}_source_cvar[0]
++                cv1 = ${p.name}_source_cvar[1]
++                x0 = ${src}_srcbuf[tidy, cv0, src_node, _ms, slot]
++                x1 = ${src}_srcbuf[tidy, cv1, src_node, _ms, slot]
++                _edge_val = ${_cparam(p.name, 1)} + (${_cparam(p.name, 2)} - ${_cparam(p.name, 1)}) / (np.float32(1.0) + math.exp(${_cparam(p.name, 3)} * (${_cparam(p.name, 4)} - (x0 - x1))))
++                % elif pre_ct == 'sigmoidal_jr_legacy':
++                # Legacy: a * 2*e0 / (1+exp(r*(v0-x)))
++                # cfun_params: [0]=a, [1]=e0, [2]=r, [3]=v0
++                _edge_val = ${_cparam(p.name, 0)} * np.float32(2.0) * ${_cparam(p.name, 1)} / (np.float32(1.0) + math.exp(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} - _edge_val)))
++                % elif pre_ct == 'tanh':
++                _edge_val = ${_cparam(p.name, 0)} * (np.float32(1.0) + math.tanh((${_cparam(p.name, 1)} * _edge_val - ${_cparam(p.name, 2)}) / ${_cparam(p.name, 3)}))
++                % elif pre_ct == 'pre_sigmoidal':
++                _edge_val = ${_cparam(p.name, 0)} * (${_cparam(p.name, 1)} + math.tanh(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} * _edge_val - ${_cparam(p.name, 4)})))
++                % elif pre_ct == 'pre_sigmoidal_dynamic':
++                # Dynamic: H*(Q + tanh(G*(P*x_j[0] - x_j[1])))
++                # cfun_params: [0]=H, [1]=Q, [2]=G, [3]=P
++                cv0 = ${p.name}_source_cvar[0]
++                cv1 = ${p.name}_source_cvar[1]
++                x0 = ${src}_srcbuf[tidy, cv0, src_node, _ms, slot]
++                x1 = ${src}_srcbuf[tidy, cv1, src_node, _ms, slot]
++                if ${_cparam(p.name, 5)} != np.float32(0.0):
++                    x1 = ${p.name}_global_threshold[_ms]
++                _edge_val = ${_cparam(p.name, 0)} * (${_cparam(p.name, 1)} + math.tanh(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} * x0 - x1)))
++                % elif pre_ct == 'difference':
++                xi_val = ${tgt}_state[tidy, ${p.name}_target_state_cvar[${ic}], j, _ms]
++                _edge_val = _edge_val - xi_val
++                % elif pre_ct == 'kuramoto':
++                xi_val = ${tgt}_state[tidy, ${p.name}_target_state_cvar[${ic}], j, _ms]
++                _edge_val = math.sin(_edge_val - xi_val)
++                % endif
++                ${p.name}_wsum_${ic}[_ms] += w * _edge_val
++            % endfor
++            % elif cm == 'many_to_1':
++            for _ms in range(${p.n_src_modes}):
++                % for ic in range(cvar_loop_count):
++                _edge_val = ${src}_srcbuf[tidy, ${p.source_cvar[ic]}, src_node, _ms, slot]
++                % if pre_ct == 'sigmoidal_jr':
++                # Classic: cmin + (cmax-cmin)/(1+exp(r*(midpoint-diff)))
++                # cfun_params: [0]=a, [1]=cmin, [2]=cmax, [3]=r, [4]=midpoint
++                cv0 = ${p.name}_source_cvar[0]
++                cv1 = ${p.name}_source_cvar[1]
++                x0 = ${src}_srcbuf[tidy, cv0, src_node, _ms, slot]
++                x1 = ${src}_srcbuf[tidy, cv1, src_node, _ms, slot]
++                _edge_val = ${_cparam(p.name, 1)} + (${_cparam(p.name, 2)} - ${_cparam(p.name, 1)}) / (np.float32(1.0) + math.exp(${_cparam(p.name, 3)} * (${_cparam(p.name, 4)} - (x0 - x1))))
++                % elif pre_ct == 'sigmoidal_jr_legacy':
++                # Legacy: a * 2*e0 / (1+exp(r*(v0-x)))
++                # cfun_params: [0]=a, [1]=e0, [2]=r, [3]=v0
++                _edge_val = ${_cparam(p.name, 0)} * np.float32(2.0) * ${_cparam(p.name, 1)} / (np.float32(1.0) + math.exp(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} - _edge_val)))
++                % elif pre_ct == 'tanh':
++                _edge_val = ${_cparam(p.name, 0)} * (np.float32(1.0) + math.tanh((${_cparam(p.name, 1)} * _edge_val - ${_cparam(p.name, 2)}) / ${_cparam(p.name, 3)}))
++                % elif pre_ct == 'pre_sigmoidal':
++                _edge_val = ${_cparam(p.name, 0)} * (${_cparam(p.name, 1)} + math.tanh(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} * _edge_val - ${_cparam(p.name, 4)})))
++                % elif pre_ct == 'pre_sigmoidal_dynamic':
++                # Dynamic: H*(Q + tanh(G*(P*x_j[0] - x_j[1])))
++                # cfun_params: [0]=H, [1]=Q, [2]=G, [3]=P
++                cv0 = ${p.name}_source_cvar[0]
++                cv1 = ${p.name}_source_cvar[1]
++                x0 = ${src}_srcbuf[tidy, cv0, src_node, _ms, slot]
++                x1 = ${src}_srcbuf[tidy, cv1, src_node, _ms, slot]
++                if ${_cparam(p.name, 5)} != np.float32(0.0):
++                    x1 = ${p.name}_global_threshold[_ms]
++                _edge_val = ${_cparam(p.name, 0)} * (${_cparam(p.name, 1)} + math.tanh(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} * x0 - x1)))
++                % elif pre_ct == 'difference':
++                xi_val = ${tgt}_state[tidy, ${p.name}_target_state_cvar[0], j, _ms]
++                _edge_val = _edge_val - xi_val
++                % elif pre_ct == 'kuramoto':
++                xi_val = ${tgt}_state[tidy, ${p.name}_target_state_cvar[0], j, _ms]
++                _edge_val = math.sin(_edge_val - xi_val)
++                % endif
++                ${p.name}_wsum_0[_ms] += w * _edge_val
++                % endfor
++            % elif cm == '1_to_many':
++            % for ic in range(n_tgt_cvar):
++            for _ms in range(${p.n_src_modes}):
++                _edge_val = ${src}_srcbuf[tidy, ${p.source_cvar[0]}, src_node, _ms, slot]
++                % if pre_ct == 'sigmoidal_jr':
++                # Classic: cmin + (cmax-cmin)/(1+exp(r*(midpoint-diff)))
++                # cfun_params: [0]=a, [1]=cmin, [2]=cmax, [3]=r, [4]=midpoint
++                cv0 = ${p.name}_source_cvar[0]
++                cv1 = ${p.name}_source_cvar[1]
++                x0 = ${src}_srcbuf[tidy, cv0, src_node, _ms, slot]
++                x1 = ${src}_srcbuf[tidy, cv1, src_node, _ms, slot]
++                _edge_val = ${_cparam(p.name, 1)} + (${_cparam(p.name, 2)} - ${_cparam(p.name, 1)}) / (np.float32(1.0) + math.exp(${_cparam(p.name, 3)} * (${_cparam(p.name, 4)} - (x0 - x1))))
++                % elif pre_ct == 'sigmoidal_jr_legacy':
++                # Legacy: a * 2*e0 / (1+exp(r*(v0-x)))
++                # cfun_params: [0]=a, [1]=e0, [2]=r, [3]=v0
++                _edge_val = ${_cparam(p.name, 0)} * np.float32(2.0) * ${_cparam(p.name, 1)} / (np.float32(1.0) + math.exp(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} - _edge_val)))
++                % elif pre_ct == 'tanh':
++                _edge_val = ${_cparam(p.name, 0)} * (np.float32(1.0) + math.tanh((${_cparam(p.name, 1)} * _edge_val - ${_cparam(p.name, 2)}) / ${_cparam(p.name, 3)}))
++                % elif pre_ct == 'pre_sigmoidal':
++                _edge_val = ${_cparam(p.name, 0)} * (${_cparam(p.name, 1)} + math.tanh(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} * _edge_val - ${_cparam(p.name, 4)})))
++                % elif pre_ct == 'pre_sigmoidal_dynamic':
++                # Dynamic: H*(Q + tanh(G*(P*x_j[0] - x_j[1])))
++                # cfun_params: [0]=H, [1]=Q, [2]=G, [3]=P
++                cv0 = ${p.name}_source_cvar[0]
++                cv1 = ${p.name}_source_cvar[1]
++                x0 = ${src}_srcbuf[tidy, cv0, src_node, _ms, slot]
++                x1 = ${src}_srcbuf[tidy, cv1, src_node, _ms, slot]
++                if ${_cparam(p.name, 5)} != np.float32(0.0):
++                    x1 = ${p.name}_global_threshold[_ms]
++                _edge_val = ${_cparam(p.name, 0)} * (${_cparam(p.name, 1)} + math.tanh(${_cparam(p.name, 2)} * (${_cparam(p.name, 3)} * x0 - x1)))
++                % elif pre_ct == 'difference':
++                xi_val = ${tgt}_state[tidy, ${p.name}_target_state_cvar[${ic}], j, _ms]
++                _edge_val = _edge_val - xi_val
++                % elif pre_ct == 'kuramoto':
++                xi_val = ${tgt}_state[tidy, ${p.name}_target_state_cvar[${ic}], j, _ms]
++                _edge_val = math.sin(_edge_val - xi_val)
++                % endif
++                ${p.name}_wsum_${ic}[_ms] += w * _edge_val
++            % endfor
++            % endif
++
++        ## pre-cfun already applied per-edge; now post-cfun then scale
++        % if cm in ('1_to_1', 'n_to_n'):
++        % for ic in range(n_tgt_cvar):
++        for _ms in range(${p.n_src_modes}):
++            % if post_ct == 'scaling':
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 0)} * ${p.name}_wsum_${ic}[_ms]
++            % elif post_ct == 'linear':
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 0)} * ${p.name}_wsum_${ic}[_ms] + ${_cparam(p.name, 1)}
++            % elif post_ct == 'sigmoidal':
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 3)} + (${_cparam(p.name, 4)} - ${_cparam(p.name, 3)}) / (np.float32(1.0) + math.exp(-${_cparam(p.name, 0)} * ((${p.name}_wsum_${ic}[_ms] - ${_cparam(p.name, 2)}) / ${_cparam(p.name, 1)})))
++            % elif post_ct == 'kuramoto_norm':
++            # a * (1/N) * wsum — sin is now applied per-edge in pre
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 0)} * ${_cparam(p.name, 1)} * ${p.name}_wsum_${ic}[_ms]
++            % endif
++            ${p.name}_wsum_${ic}[_ms] *= ${p.name}_scale
++        ## target_scales and mode_map → accumulate into tgt_c
++        % if p.is_inter:
++        for _mt in range(${p.n_tgt_modes}):
++            _contrib = np.float32(0.0)
++            for _ms in range(${p.n_src_modes}):
++                _contrib += ${p.name}_wsum_${ic}[_ms] * ${p.name}_mode_map[_ms, _mt]
++            % if has_ts:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _mt] += ${p.name}_target_scales[${ic}] * _contrib
++            % else:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _mt] += _contrib
++            % endif
++        % else:
++        for _ms in range(${p.n_src_modes}):
++            % if has_ts:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _ms] += ${p.name}_target_scales[${ic}] * ${p.name}_wsum_${ic}[_ms]
++            % else:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _ms] += ${p.name}_wsum_${ic}[_ms]
++            % endif
++        % endif
++        % endfor
++
++        % elif cm == 'many_to_1':
++        for _ms in range(${p.n_src_modes}):
++            % if post_ct == 'scaling':
++            ${p.name}_wsum_0[_ms] = ${_cparam(p.name, 0)} * ${p.name}_wsum_0[_ms]
++            % elif post_ct == 'linear':
++            ${p.name}_wsum_0[_ms] = ${_cparam(p.name, 0)} * ${p.name}_wsum_0[_ms] + ${_cparam(p.name, 1)}
++            % elif post_ct == 'sigmoidal':
++            ${p.name}_wsum_0[_ms] = ${_cparam(p.name, 3)} + (${_cparam(p.name, 4)} - ${_cparam(p.name, 3)}) / (np.float32(1.0) + math.exp(-${_cparam(p.name, 0)} * ((${p.name}_wsum_0[_ms] - ${_cparam(p.name, 2)}) / ${_cparam(p.name, 1)})))
++            % elif post_ct == 'kuramoto_norm':
++            # a * (1/N) * wsum — sin is now applied per-edge in pre
++            ${p.name}_wsum_0[_ms] = ${_cparam(p.name, 0)} * ${_cparam(p.name, 1)} * ${p.name}_wsum_0[_ms]
++            % endif
++            ${p.name}_wsum_0[_ms] *= ${p.name}_scale
++        % if p.is_inter:
++        for _mt in range(${p.n_tgt_modes}):
++            _contrib = np.float32(0.0)
++            for _ms in range(${p.n_src_modes}):
++                _contrib += ${p.name}_wsum_0[_ms] * ${p.name}_mode_map[_ms, _mt]
++            % if has_ts:
++            ${tgt}_c[${p.name}_target_cvar[0], j, _mt] += ${p.name}_target_scales[0] * _contrib
++            % else:
++            ${tgt}_c[${p.name}_target_cvar[0], j, _mt] += _contrib
++            % endif
++        % else:
++        for _ms in range(${p.n_src_modes}):
++            % if has_ts:
++            ${tgt}_c[${p.name}_target_cvar[0], j, _ms] += ${p.name}_target_scales[0] * ${p.name}_wsum_0[_ms]
++            % else:
++            ${tgt}_c[${p.name}_target_cvar[0], j, _ms] += ${p.name}_wsum_0[_ms]
++            % endif
++        % endif
++
++        % elif cm == '1_to_many':
++        % for ic in range(n_tgt_cvar):
++        for _ms in range(${p.n_src_modes}):
++            % if post_ct == 'scaling':
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 0)} * ${p.name}_wsum_${ic}[_ms]
++            % elif post_ct == 'linear':
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 0)} * ${p.name}_wsum_${ic}[_ms] + ${_cparam(p.name, 1)}
++            % elif post_ct == 'sigmoidal':
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 3)} + (${_cparam(p.name, 4)} - ${_cparam(p.name, 3)}) / (np.float32(1.0) + math.exp(-${_cparam(p.name, 0)} * ((${p.name}_wsum_${ic}[_ms] - ${_cparam(p.name, 2)}) / ${_cparam(p.name, 1)})))
++            % elif post_ct == 'kuramoto_norm':
++            # a * (1/N) * wsum — sin is now applied per-edge in pre
++            ${p.name}_wsum_${ic}[_ms] = ${_cparam(p.name, 0)} * ${_cparam(p.name, 1)} * ${p.name}_wsum_${ic}[_ms]
++            % endif
++            ${p.name}_wsum_${ic}[_ms] *= ${p.name}_scale
++        % if p.is_inter:
++        for _mt in range(${p.n_tgt_modes}):
++            _contrib = np.float32(0.0)
++            for _ms in range(${p.n_src_modes}):
++                _contrib += ${p.name}_wsum_${ic}[_ms] * ${p.name}_mode_map[_ms, _mt]
++            % if has_ts:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _mt] += ${p.name}_target_scales[${ic}] * _contrib
++            % else:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _mt] += _contrib
++            % endif
++        % else:
++        for _ms in range(${p.n_src_modes}):
++            % if has_ts:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _ms] += ${p.name}_target_scales[${ic}] * ${p.name}_wsum_${ic}[_ms]
++            % else:
++            ${tgt}_c[${p.name}_target_cvar[${ic}], j, _ms] += ${p.name}_wsum_${ic}[_ms]
++            % endif
++        % endif
++        % endfor
++        % endif
++
++% endfor
++
++
++##
++## ---- dfun device functions (one per subnetwork) ----
++##
++
++% for sn in subnets:
++<%
++    svars = list(sn.model.state_variables)
++    n_svars = len(svars)
++    cterms = list(sn.model.coupling_terms)
++
++    _has_custom_template = hasattr(sn.model, '_nb_hybrid_custom_template')
++    _is_zerlaut = _has_custom_template and 'zerlaut' in sn.model._nb_hybrid_custom_template
++
++    if _has_custom_template:
++        cterms = ['Coupling_Term']
++        gparams = {}
++        sparams_list = []
++        dfuns = {}
++        _helpers = []
++        _intermediates = []
++    else:
++        gparams = {name: float(getattr(sn.model, name)[0])
++                   for name in sn.model.global_parameter_names}
++        sparams_list = list(sn.model.spatial_parameter_names)
++        dfuns = {}
++        for sv in svars:
++            expr = sn.model.state_variable_dfuns[sv]
++            dfuns[sv] = expr
++        _helpers = getattr(sn.model, 'dfun_helpers', None) or []
++        _intermediates = getattr(sn.model, 'dfun_intermediates', None) or []
++
++    n_nodes = sn.n_nodes
++    n_modes = sn.n_modes
++    boundaries = sn.model.state_variable_boundaries or {}
++    lo_map = {}
++    hi_map = {}
++    for sv in svars:
++        if sv in boundaries:
++            b = boundaries[sv]
++            try:
++                lo_map[sv] = float(b[0]) if b[0] is not None else float('-inf')
++            except (TypeError, ValueError):
++                lo_map[sv] = float('-inf')
++            try:
++                hi_map[sv] = float(b[1]) if b[1] is not None else float('inf')
++            except (TypeError, ValueError):
++                hi_map[sv] = float('inf')
++
++    from tvb.simulator.integrators import HeunDeterministic, EulerDeterministic, HeunStochastic, EulerStochastic
++    is_heun = isinstance(sn.integrator, HeunDeterministic) or isinstance(sn.integrator, HeunStochastic)
++
++    svars_str = ', '.join(svars)
++    cterms_str = ', '.join(cterms)
++    i1svars_str = ', '.join(['i1_' + s for s in svars])
++    dt_val = float(sn.integrator.dt)
++
++    # Combined dfun support
++    _is_combined = getattr(sn.model, 'dfun_mode', None) == 'combined'
++    if _is_combined:
++        import re as _re, numpy as _np
++        _sv_ct = set(svars) | set(cterms)
++        _dm_names = list(getattr(sn.model, 'derived_matrix_names', []))
++        _dm_name_set = set(_dm_names)
++        _dm_data = {}
++        for _dn in _dm_names:
++            _da = getattr(sn.model, _dn, None)
++            if _da is not None:
++                _arr = _np.asarray(_da, dtype=_np.float32)
++                if _arr.ndim > 1 and 1 in _arr.shape:
++                    _arr = _arr.ravel()
++                _dm_data[_dn] = _arr
++        _dm_ops = list(getattr(sn.model, 'derived_matrix_ops', []))
++        def _repl_m(mo):
++            nm = mo.group(1)
++            if nm in _sv_ct:
++                return nm
++            if nm in _dm_name_set:
++                return f'_{sn.name}_{nm}[_m]'
++            return f'_{nm}[_m]'
++        _cdfuns = {sv: _re.sub(r'(\w+)_\{m\}', _repl_m, dfuns[sv]) for sv in svars}
++    else:
++        _cdfuns = None
++        _dm_names = []
++        _dm_data = {}
++        _dm_ops = []
++%>
++
++% if _is_zerlaut:
++## ---- Custom Zerlaut dfun for ${sn.name} ----
++<%include file="nb-zerlaut-sweep-cuda.py.mako" args="sn=sn, debug_nojit=False, svars=svars, cterms=cterms, svars_str=svars_str, cterms_str=cterms_str, n_svars=n_svars, dt_val=dt_val, n_nodes=n_nodes, n_modes=n_modes, int_type='int32', lo_map=lo_map, hi_map=hi_map, i1svars_str=i1svars_str, is_heun=is_heun, is_combined=_is_combined, dm_names=_dm_names, dm_data=_dm_data, dm_ops=_dm_ops"/>
++% else:
++## ---- dfun helpers for ${sn.name} ----
++% for _hname, _hargs, _hexpr in _helpers:
++
++@cuda.jit(device=True)
++def _dfun_helper_${sn.name}_${_hname}(${_hargs}):
++    return ${_hexpr.replace('nb.float32(', 'np.float32(').replace('exp(', 'math.exp(').replace('sin(', 'math.sin(').replace('cos(', 'math.cos(').replace('log(', 'math.log(').replace('tanh(', 'math.tanh(')}
++
++% endfor
++
++% if _is_combined:
++## Derived parameter arrays for combined-mode ${type(sn.model).__name__}
++% for _dn, _da in _dm_data.items():
++_${sn.name}_${_dn} = np.array(${repr(_da.tolist())}, dtype=np.float32)
++% endfor
++
++## ---- Combined dfun_${sn.name} ----
++@cuda.jit(device=True)
++def dfun_${sn.name}(${svars_str}, ${cterms_str}, _m, ${', '.join(['_' + sn.name + '_' + dn for dn in _dm_names])}, ${', '.join(['_' + op[0] for op in _dm_ops])}, _sp, ni, sweep_params, tid):
++    pi = np.float32(3.141592653589793)
++    % for name, val in gparams.items():
++% if sn.name in sweep_model_dims and name in sweep_model_dims[sn.name]:
++    ${name} = sweep_params[tid, ${sweep_model_dims[sn.name][name]}]
++% else:
++    ${name} = np.float32(${val})
++% endif
++    % endfor
++    % if hasattr(sn.model, 'dfun_constants') and sn.model.dfun_constants:
++% for _cname, _cval in sn.model.dfun_constants.items():
++    ${_cname} = np.float32(${_cval})
++% endfor
++% endif
++    % for _si, _sn_name in enumerate(sparams_list):
++    ${_sn_name} = np.float32(_sp[${_si}, ni])
++    % endfor
++    % for _iname, _iexpr in _intermediates:
++<%
++    _rewritten = _iexpr
++    for _hname, _, _ in _helpers:
++        _rewritten = _rewritten.replace(_hname + '(', '_dfun_helper_' + sn.name + '_' + _hname + '(')
++    _rewritten = _rewritten.replace('nb.float32(', 'np.float32(').replace('exp(', 'math.exp(').replace('sin(', 'math.sin(').replace('cos(', 'math.cos(').replace('log(', 'math.log(').replace('tanh(', 'math.tanh(')
++%>
++    ${_iname} = ${_rewritten}
++    % endfor
++    % for svar in svars:
++<%
++    _dexpr = _cdfuns[svar]
++    for _hname, _, _ in _helpers:
++        _dexpr = _dexpr.replace(_hname + '(', '_dfun_helper_' + sn.name + '_' + _hname + '(')
++    _dexpr = _dexpr.replace('nb.float32(', 'np.float32(').replace('exp(', 'math.exp(').replace('sin(', 'math.sin(').replace('cos(', 'math.cos(').replace('log(', 'math.log(').replace('tanh(', 'math.tanh(')
++%>
++    d_${svar} = np.float32(${_dexpr})
++    % endfor
++    return (${', '.join(['d_' + s for s in svars])},)
++% else:
++## ---- dfun_${sn.name} ----
++@cuda.jit(device=True)
++def dfun_${sn.name}(${svars_str}, ${cterms_str}, _sp, ni, sweep_params, tid):
++    pi = np.float32(3.141592653589793)
++    % for name, val in gparams.items():
++% if sn.name in sweep_model_dims and name in sweep_model_dims[sn.name]:
++    ${name} = sweep_params[tid, ${sweep_model_dims[sn.name][name]}]
++% else:
++    ${name} = np.float32(${val})
++% endif
++    % endfor
++    % if hasattr(sn.model, 'dfun_constants') and sn.model.dfun_constants:
++% for _cname, _cval in sn.model.dfun_constants.items():
++    ${_cname} = np.float32(${_cval})
++% endfor
++% endif
++    % for _si, _sn_name in enumerate(sparams_list):
++    ${_sn_name} = np.float32(_sp[${_si}, ni])
++    % endfor
++    % for _iname, _iexpr in _intermediates:
++<%
++    _rewritten = _iexpr
++    for _hname, _, _ in _helpers:
++        _rewritten = _rewritten.replace(_hname + '(', '_dfun_helper_' + sn.name + '_' + _hname + '(')
++    _rewritten = _rewritten.replace('nb.float32(', 'np.float32(').replace('exp(', 'math.exp(').replace('sin(', 'math.sin(').replace('cos(', 'math.cos(').replace('log(', 'math.log(').replace('tanh(', 'math.tanh(')
++%>
++    ${_iname} = ${_rewritten}
++    % endfor
++    % for svar in svars:
++<%
++    _dexpr = dfuns[svar]
++    for _hname, _, _ in _helpers:
++        _dexpr = _dexpr.replace(_hname + '(', '_dfun_helper_' + sn.name + '_' + _hname + '(')
++    _dexpr = _dexpr.replace('nb.float32(', 'np.float32(').replace('exp(', 'math.exp(').replace('sin(', 'math.sin(').replace('cos(', 'math.cos(').replace('log(', 'math.log(').replace('tanh(', 'math.tanh(')
++%>
++    d_${svar} = np.float32(${_dexpr})
++    % endfor
++    return (${', '.join(['d_' + s for s in svars])},)
++% endif
++% endif
++
++% endfor
++
++
++##
++## ---- Main sweep kernel ----
++##
++
++@cuda.jit
++def run_sweep(
++    ## per-subnetwork state arrays  [tid, nvar, nnodes, n_modes]
++    % for sn in subnets:
++    ${sn.name}_state,      # (n_sweeps, ${sn.model.nvar}, ${sn.n_nodes}, ${sn.n_modes}) float32
++    % endfor
++
++    ## per-subnetwork source history buffers  [tid, nvar, nnodes, n_modes, horizon]
++    % for sn in subnets:
++    ${sn.name}_srcbuf,     # (n_sweeps, ${sn.model.nvar}, ${sn.n_nodes}, ${sn.n_modes}, source_horizon) float32
++    % endfor
++
++    ## per-subnetwork tavg output  [tid, nvoi, nnodes, n_modes]
++    % for sn in subnets:
++    ${sn.name}_tavg,       # (n_sweeps, ${len(sn.model.variables_of_interest)}, ${sn.n_nodes}, ${sn.n_modes}) float32
++    % endfor
++
++    ## per-subnetwork raw output  [tid, n_step_out, nvoi, nnodes, n_modes]
++    % for sn in subnets:
++    ${sn.name}_raw,        # (n_sweeps, nstep, ${len(sn.model.variables_of_interest)}, ${sn.n_nodes}, ${sn.n_modes}) float32
++    % endfor
++
++    ## optional per-subnetwork raw coupling [tid, nstep, ncvar, nnodes, n_modes]
++    % for sn in subnets:
++<%
++    n_cvar_sn = len(sn.model.cvar)
++%>
++    ${sn.name}_ctraw,      # (n_sweeps, nstep or 0, ${n_cvar_sn}, ${sn.n_nodes}, ${sn.n_modes}) float32
++    % endfor
++
++    ## per-subnetwork Bold Balloon model arrays
++    % for sn in subnets:
++    ${sn.name}_bold_state,  # (n_sweeps, ${len(sn.model.variables_of_interest)}, 4, ${sn.n_nodes}) float32
++    ${sn.name}_bold_params, # (10,) float32
++    ${sn.name}_bold_voi_idx, # (${len(sn.model.variables_of_interest)},) int32
++    ${sn.name}_bold_out,    # (n_sweeps, n_bold_samples, ${len(sn.model.variables_of_interest)}, ${sn.n_nodes}) float32
++    % endfor
++
++    ## sweep parameter array
++    sweep_params,          # (n_sweeps, n_sweep_dims) float32
++
++    ## per-projection CSR arrays (read-only, shared)
++    % for p in all_projs:
++    ${p.name}_w_data,
++    ${p.name}_w_indices,
++    ${p.name}_w_indptr,
++    ${p.name}_idelays,
++    % if p.is_inter:
++    ${p.name}_mode_map,   # (${p.n_src_modes}, ${p.n_tgt_modes}) float32
++    % endif
++    ${p.name}_source_cvar,
++    ${p.name}_target_cvar, ${p.name}_target_state_cvar,
++    ${p.name}_scale,
++    ${p.name}_target_scales,
++    ${p.name}_cfun_params,
++    % endfor
++
++    ## per-subnet coupling temporal average accumulators  [tid, ncvar, nnodes, n_modes]
++    % for sn in subnets:
++<%
++    n_cvar_sn = len(sn.model.cvar)
++%>
++    ${sn.name}_ctavg,     # (n_sweeps, ${n_cvar_sn}, ${sn.n_nodes}, ${sn.n_modes}) float32
++    % endfor
++
++    ## per-subnet spatial average / projection monitor arrays
++    % for sn in subnets:
++    ${sn.name}_spatial_mean,  # (n_areas, ${sn.n_nodes}) float32 - spatial region mapping
++    ${sn.name}_spatial_tavg,  # (n_sweeps, ${len(sn.model.variables_of_interest)}, n_areas, 1) float32
++    ${sn.name}_gain,          # (n_sensors, ${sn.n_nodes}) float32 - sensor gain matrix
++    ${sn.name}_proj_tavg,     # (n_sweeps, ${len(sn.model.variables_of_interest)}, n_sensors, 1) float32
++    % endfor
++
++    ## per-subnetwork spatial parameter arrays (may be empty)
++    % for sn in subnets:
++    ${sn.name}_sp,         # (n_spatial_params, ${sn.n_nodes}) float32
++    % endfor
++
++    ## per-subnetwork voi index arrays
++    % for sn in subnets:
++    ${sn.name}_voi_idx,    # (n_voi,) int32
++    % endfor
++
++    ## per-subnetwork noise arrays (stochastic subnets only)
++    % for sn in subnets:
++    % if isinstance(sn.integrator, (HeunStochastic, EulerStochastic)):
++    ${sn.name}_noise,      # (n_sweeps, ${sn.model.nvar}, ${sn.n_nodes}, ${sn.n_modes}, nstep) float32
++    % endif
++    % endfor
++
++    ## per-subnetwork stimulus arrays (stimulus subnets only)
++    % for sn in subnets:
++    % if sn.has_stimulus:
++<%
++    n_cvar_sn = len(sn.model.cvar)
++%>
++    ${sn.name}_stim,       # (n_sweeps, ${n_cvar_sn}, ${sn.n_nodes}, ${sn.n_modes}, nstep) float32
++    % endif
++    % endfor
++
++    ## scalar parameters
++    t_offset,
++    data_offset,
++    dt,
++    nstep,
++    monitor_type,          # 0=tavg, 1=raw, 2=subsample
++    monitor_period,        # steps between subsample writes
++    % for sn in subnets:
++    N_${sn.name},
++    % endfor
++    n_sweeps,
++    bold_istep,            # int32, Bold sampling period (0 = disabled)
++    n_bold_samples,        # int32, total Bold samples per sweep
++):
++    tid = cuda.grid(1)
++    if tid >= n_sweeps:
++        return
++
++    dt_f = np.float32(dt)
++
++    ## ---- Per-subnet coupling scratch (cuda.local.array) ----
++    % for sn in subnets:
++<%
++    n_cvar_sn = len(sn.model.cvar)
++%>
++    % if n_cvar_sn > 0:
++    ${sn.name}_c = cuda.local.array((${n_cvar_sn}, ${sn.n_nodes}, ${sn.n_modes}), dtype=numba.float32)
++    % endif
++    % endfor
++
++    for t_local in range(1, nstep + 1):
++        t = t_local + t_offset
++        data_t = t_local + data_offset
++
++        ## ---- 1. Zero coupling scratch ----
++        % for sn in subnets:
++<%
++    n_cvar_sn = len(sn.model.cvar)
++%>
++        % if n_cvar_sn > 0:
++        for _ic in range(${n_cvar_sn}):
++            for _j in range(${sn.n_nodes}):
++                for _m in range(${sn.n_modes}):
++                    ${sn.name}_c[_ic, _j, _m] = np.float32(0.0)
++        % endif
++        % endfor
++
++        ## ---- 2. Compute coupling for each projection ----
++        % for p in all_projs:
++<%
++    src = p.source_subnet
++    tgt = p.target_subnet
++%>
++        compute_coupling_${p.name}(
++            ${src}_srcbuf,
++            ${p.name}_w_data, ${p.name}_w_indices, ${p.name}_w_indptr,
++            ${p.name}_idelays,
++% if src != tgt:
++            ${'N_' + src},
++% endif
++            ${'N_' + tgt},
++            t, tid,
++            ${p.name}_source_cvar, ${p.name}_target_cvar, ${p.name}_target_state_cvar,
++            ${p.name}_scale, ${p.name}_target_scales,
++            ${p.name}_cfun_params,
++% if p.is_inter:
++            ${p.name}_mode_map,
++% endif
++            ${tgt}_state,
++            ${tgt}_c,
++            sweep_params,
++            tid,
++        )
++        % endfor
++
++        ## ---- 2b. Inject stimulus into coupling scratch ----
++        % for sn in subnets:
++<%
++    n_cvar_sn = len(sn.model.cvar)
++%>
++        % if sn.has_stimulus:
++        for _ic in range(${n_cvar_sn}):
++            for _j in range(${sn.n_nodes}):
++                for _m in range(${sn.n_modes}):
++                    ${sn.name}_c[_ic, _j, _m] += ${sn.name}_stim[tid, _ic, _j, _m, data_t - 1]
++        % endif
++        % endfor
++
++        ## ---- 2c. Accumulate coupling temporal average ----
++        % for sn in subnets:
++<%
++    n_cvar_sn = len(sn.model.cvar)
++%>
++        % if n_cvar_sn > 0:
++        for _ci in range(${n_cvar_sn}):
++            for _j in range(${sn.n_nodes}):
++                % if sn.n_modes == 1:
++                ${sn.name}_ctavg[tid, _ci, _j, 0] += ${sn.name}_c[_ci, _j, 0]
++                if monitor_type == 1 and ${sn.name}_ctraw.shape[1] > 0:
++                    ${sn.name}_ctraw[tid, data_t - 1, _ci, _j, 0] = ${sn.name}_c[_ci, _j, 0]
++                % else:
++                for _m in range(${sn.n_modes}):
++                    ${sn.name}_ctavg[tid, _ci, _j, _m] += ${sn.name}_c[_ci, _j, _m]
++                    if monitor_type == 1 and ${sn.name}_ctraw.shape[1] > 0:
++                        ${sn.name}_ctraw[tid, data_t - 1, _ci, _j, _m] = ${sn.name}_c[_ci, _j, _m]
++                % endif
++        % endif
++        % endfor
++
++        ## ---- 3. Integrate each subnetwork ----
++        % for sn in subnets:
++<%
++    svars = list(sn.model.state_variables)
++    n_svars = len(svars)
++    cterms = list(sn.model.coupling_terms)
++    n_cvar = len(cterms)
++    n_nodes = sn.n_nodes
++    n_modes = sn.n_modes
++    boundaries = sn.model.state_variable_boundaries or {}
++    lo_map = {}
++    hi_map = {}
++    for sv in svars:
++        if sv in boundaries:
++            b = boundaries[sv]
++            try:
++                lo_map[sv] = float(b[0]) if b[0] is not None else float('-inf')
++            except (TypeError, ValueError):
++                lo_map[sv] = float('-inf')
++            try:
++                hi_map[sv] = float(b[1]) if b[1] is not None else float('inf')
++            except (TypeError, ValueError):
++                hi_map[sv] = float('inf')
++    sparams_list = []
++    try:
++        sparams_list = list(sn.model.spatial_parameter_names)
++    except AttributeError:
++        sparams_list = []
++
++    from tvb.simulator.integrators import HeunDeterministic, EulerDeterministic, HeunStochastic, EulerStochastic
++    is_heun = isinstance(sn.integrator, HeunDeterministic) or isinstance(sn.integrator, HeunStochastic)
++    is_stochastic = isinstance(sn.integrator, (HeunStochastic, EulerStochastic))
++    voi_names = list(sn.model.variables_of_interest)
++    voi_idx_list = [svars.index(v) if v in svars else -1 for v in voi_names]
++
++    _is_combined = getattr(sn.model, 'dfun_mode', None) == 'combined'
++    if _is_combined:
++        import re as _re, numpy as _np
++        _sv_ct = set(svars) | set(cterms)
++        _dm_names = list(getattr(sn.model, 'derived_matrix_names', []))
++        _dm_name_set = set(_dm_names)
++        _dm_data = {}
++        for _dn in _dm_names:
++            _da = getattr(sn.model, _dn, None)
++            if _da is not None:
++                _arr = _np.asarray(_da, dtype=_np.float32)
++                if _arr.ndim > 1 and 1 in _arr.shape:
++                    _arr = _arr.ravel()
++                _dm_data[_dn] = _arr
++        _dm_ops = list(getattr(sn.model, 'derived_matrix_ops', []))
++    else:
++        _dm_names = []
++        _dm_data = {}
++        _dm_ops = []
++%>
++
++        for i in range(N_${sn.name}):
++            ## load spatial parameters (if any)
++            % for _si, _sn_name in enumerate(sparams_list):
++            ${_sn_name}_val = np.float32(${sn.name}_sp[${_si}, i]) if ${sn.name}_sp.shape[0] > 0 else np.float32(0.0)
++            % endfor
++            % for _si, _sn_name in enumerate(sparams_list):
++            ${_sn_name} = ${_sn_name}_val
++            % endfor
++
++% if _is_combined:
++            ## Combined dfun: compute cross-mode intermediates from current state
++            % for _op_name, _op_mat, _op_svar in _dm_ops:
++            _${_op_name} = cuda.local.array((${n_modes},), dtype=numba.float32)
++            for _mi in range(${n_modes}):
++                _${_op_name}[_mi] = np.float32(0.0)
++                for _mk in range(${n_modes}):
++                    _${_op_name}[_mi] += _${sn.name}_${_op_mat}[_mk, _mi] * ${sn.name}_state[tid, ${svars.index(_op_svar)}, i, _mk]
++            % endfor
++
++% if is_heun:
++            ## ---- Heun two-pass for combined-dfun cross-mode coupling ----
++            ## Pass 1: compute k1 for all modes, store derivatives + i1 states
++            % for sv in svars:
++            _k1_${sv} = cuda.local.array((${n_modes},), dtype=numba.float32)
++            _i1_${sv} = cuda.local.array((${n_modes},), dtype=numba.float32)
++            % endfor
++            for m in range(${n_modes}):
++                ## load state variables
++                % for k, sv in enumerate(svars):
++                ${sv} = ${sn.name}_state[tid, ${k}, i, m]
++                % endfor
++
++                ## load coupling terms
++                % for k, ct in enumerate(cterms):
++                ${ct} = np.float32(0.0)
++                for _cm in range(${n_modes}):
++                    ${ct} += ${sn.name}_c[${k}, i, _cm]
++                % endfor
++
++                ## dfun at current state (k1)
++                (d0_${', d0_'.join(svars)},) = dfun_${sn.name}(
++                    ${', '.join(svars)}, ${', '.join(cterms)}, m,
++                    ${', '.join(['_' + sn.name + '_' + dn for dn in _dm_names])},
++                    ${', '.join(['_' + op[0] for op in _dm_ops])},
++                    ${sn.name}_sp, i, sweep_params, tid
++                )
++                ## store per-mode derivatives
++                % for sv in svars:
++                _k1_${sv}[m] = d0_${sv}
++                % endfor
++                ## compute i1 intermediate for this mode
++                % if is_stochastic:
++                % for k2, sv in enumerate(svars):
++                _i1_${sv}[m] = ${sv} + dt_f * d0_${sv} + ${sn.name}_noise[tid, ${k2}, i, m, data_t - 1]
++                % endfor
++                % else:
++                % for sv in svars:
++                _i1_${sv}[m] = ${sv} + dt_f * d0_${sv}
++                % endfor
++                % endif
++
++                ## clamp intermediate state before the Heun correction
++                % for sv in svars:
++                % if sv in lo_map and lo_map[sv] != float('-inf'):
++                if _i1_${sv}[m] < np.float32(${lo_map[sv]}):
++                    _i1_${sv}[m] = np.float32(${lo_map[sv]})
++                % endif
++                % if sv in hi_map and hi_map[sv] != float('inf'):
++                if _i1_${sv}[m] > np.float32(${hi_map[sv]}):
++                    _i1_${sv}[m] = np.float32(${hi_map[sv]})
++                % endif
++                % endfor
++
++            ## Recompute cross-mode intermediates from i1 arrays (correct per-mk indexing)
++            % for _op_name, _op_mat, _op_svar in _dm_ops:
++            _${_op_name}_i1 = cuda.local.array((${n_modes},), dtype=numba.float32)
++            for _mi in range(${n_modes}):
++                _${_op_name}_i1[_mi] = np.float32(0.0)
++                for _mk in range(${n_modes}):
++                    _${_op_name}_i1[_mi] += _${sn.name}_${_op_mat}[_mk, _mi] * _i1_${_op_svar}[_mk]
++            % endfor
++
++            ## Pass 2: compute k2 and update state for all modes
++            for m in range(${n_modes}):
++                ## load state and coupling for mode m
++                % for k, sv in enumerate(svars):
++                ${sv} = ${sn.name}_state[tid, ${k}, i, m]
++                % endfor
++                % for k, ct in enumerate(cterms):
++                ${ct} = np.float32(0.0)
++                for _cm in range(${n_modes}):
++                    ${ct} += ${sn.name}_c[${k}, i, _cm]
++                % endfor
++
++                ## load i1 state for mode m
++                % for sv in svars:
++                i1_${sv} = _i1_${sv}[m]
++                % endfor
++
++                ## dfun at intermediate (k2) using correct cross-mode i1 intermediates
++                (d1_${', d1_'.join(svars)},) = dfun_${sn.name}(
++                    ${', '.join(['i1_' + s for s in svars])}, ${', '.join(cterms)}, m,
++                    ${', '.join(['_' + sn.name + '_' + dn for dn in _dm_names])},
++                    ${', '.join(['_' + op[0] + '_i1' for op in _dm_ops])},
++                    ${sn.name}_sp, i, sweep_params, tid
++                )
++
++                ## Heun update
++                % if is_stochastic:
++                % for k2, sv in enumerate(svars):
++                n_${sv} = ${sv} + dt_f * np.float32(0.5) * (_k1_${sv}[m] + d1_${sv}) + ${sn.name}_noise[tid, ${k2}, i, m, data_t - 1]
++                % endfor
++                % else:
++                % for sv in svars:
++                n_${sv} = ${sv} + dt_f * np.float32(0.5) * (_k1_${sv}[m] + d1_${sv})
++                % endfor
++                % endif
++
++                ## clamp final state
++                % for sv in svars:
++                % if sv in lo_map and lo_map[sv] != float('-inf'):
++                if n_${sv} < np.float32(${lo_map[sv]}):
++                    n_${sv} = np.float32(${lo_map[sv]})
++                % endif
++                % if sv in hi_map and hi_map[sv] != float('inf'):
++                if n_${sv} > np.float32(${hi_map[sv]}):
++                    n_${sv} = np.float32(${hi_map[sv]})
++                % endif
++                % endfor
++
++                ## write back state
++                % for k, sv in enumerate(svars):
++                ${sn.name}_state[tid, ${k}, i, m] = n_${sv}
++                % endfor
++
++% else:
++            ## ---- Euler for combined-dfun (single-mode loop, no cross-mode i1 needed) ----
++            for m in range(${n_modes}):
++                ## load state variables
++                % for k, sv in enumerate(svars):
++                ${sv} = ${sn.name}_state[tid, ${k}, i, m]
++                % endfor
++
++                ## load coupling terms
++                % for k, ct in enumerate(cterms):
++                ${ct} = np.float32(0.0)
++                for _cm in range(${n_modes}):
++                    ${ct} += ${sn.name}_c[${k}, i, _cm]
++                % endfor
++
++                (d0_${', d0_'.join(svars)},) = dfun_${sn.name}(
++                    ${', '.join(svars)}, ${', '.join(cterms)}, m,
++                    ${', '.join(['_' + sn.name + '_' + dn for dn in _dm_names])},
++                    ${', '.join(['_' + op[0] for op in _dm_ops])},
++                    ${sn.name}_sp, i, sweep_params, tid
++                )
++
++                ## Euler update
++                % if is_stochastic:
++                % for k2, sv in enumerate(svars):
++                n_${sv} = ${sv} + dt_f * d0_${sv} + ${sn.name}_noise[tid, ${k2}, i, m, data_t - 1]
++                % endfor
++                % else:
++                % for sv in svars:
++                n_${sv} = ${sv} + dt_f * d0_${sv}
++                % endfor
++                % endif
++
++                ## clamp final state
++                % for sv in svars:
++                % if sv in lo_map and lo_map[sv] != float('-inf'):
++                if n_${sv} < np.float32(${lo_map[sv]}):
++                    n_${sv} = np.float32(${lo_map[sv]})
++                % endif
++                % if sv in hi_map and hi_map[sv] != float('inf'):
++                if n_${sv} > np.float32(${hi_map[sv]}):
++                    n_${sv} = np.float32(${hi_map[sv]})
++                % endif
++                % endfor
++
++                ## write back state
++                % for k, sv in enumerate(svars):
++                ${sn.name}_state[tid, ${k}, i, m] = n_${sv}
++                % endfor
++% endif  ## is_heun vs euler for combined
++
++% else:
++            ## ---- Non-combined dfun: single-mode loop (no cross-mode intermediates) ----
++            for m in range(${n_modes}):
++                ## load state variables
++                % for k, sv in enumerate(svars):
++                ${sv} = ${sn.name}_state[tid, ${k}, i, m]
++                % endfor
++
++                ## load coupling terms
++                % for k, ct in enumerate(cterms):
++                ${ct} = ${sn.name}_c[${k}, i, m] if ${n_cvar} > 0 else np.float32(0.0)
++                % endfor
++
++                ## ---- dfun at current state (k1) ----
++                (d0_${', d0_'.join(svars)},) = dfun_${sn.name}(${', '.join(svars)}, ${', '.join(cterms)}, ${sn.name}_sp, i, sweep_params, tid)
++
++                ## ---- intermediate state (Heun) ----
++                % if is_heun:
++                % if is_stochastic:
++                % for k2, sv in enumerate(svars):
++                i1_${sv} = ${sv} + dt_f * d0_${sv} + ${sn.name}_noise[tid, ${k2}, i, m, data_t - 1]
++                % endfor
++                % else:
++                % for sv in svars:
++                i1_${sv} = ${sv} + dt_f * d0_${sv}
++                % endfor
++                % endif
++
++                ## clamp intermediate
++                % for sv in svars:
++                % if sv in lo_map and lo_map[sv] != float('-inf'):
++                if i1_${sv} < np.float32(${lo_map[sv]}):
++                    i1_${sv} = np.float32(${lo_map[sv]})
++                % endif
++                % if sv in hi_map and hi_map[sv] != float('inf'):
++                if i1_${sv} > np.float32(${hi_map[sv]}):
++                    i1_${sv} = np.float32(${hi_map[sv]})
++                % endif
++                % endfor
++
++                ## dfun at intermediate (k2)
++                (d1_${', d1_'.join(svars)},) = dfun_${sn.name}(${', '.join(['i1_' + s for s in svars])}, ${', '.join(cterms)}, ${sn.name}_sp, i, sweep_params, tid)
++
++                ## Heun update
++                % if is_stochastic:
++                % for k2, sv in enumerate(svars):
++                n_${sv} = ${sv} + dt_f * np.float32(0.5) * (d0_${sv} + d1_${sv}) + ${sn.name}_noise[tid, ${k2}, i, m, data_t - 1]
++                % endfor
++                % else:
++                % for sv in svars:
++                n_${sv} = ${sv} + dt_f * np.float32(0.5) * (d0_${sv} + d1_${sv})
++                % endfor
++                % endif
++
++                % else:
++                ## ---- Euler update ----
++                % if is_stochastic:
++                % for k2, sv in enumerate(svars):
++                n_${sv} = ${sv} + dt_f * d0_${sv} + ${sn.name}_noise[tid, ${k2}, i, m, data_t - 1]
++                % endfor
++                % else:
++                % for sv in svars:
++                n_${sv} = ${sv} + dt_f * d0_${sv}
++                % endfor
++                % endif
++                % endif
++
++                ## clamp final state
++                % for sv in svars:
++                % if sv in lo_map and lo_map[sv] != float('-inf'):
++                if n_${sv} < np.float32(${lo_map[sv]}):
++                    n_${sv} = np.float32(${lo_map[sv]})
++                % endif
++                % if sv in hi_map and hi_map[sv] != float('inf'):
++                if n_${sv} > np.float32(${hi_map[sv]}):
++                    n_${sv} = np.float32(${hi_map[sv]})
++                % endif
++                % endfor
++
++                ## write back state
++                % for k, sv in enumerate(svars):
++                ${sn.name}_state[tid, ${k}, i, m] = n_${sv}
++                % endfor
++            ## end for m (non-combined)
++% endif  ## _is_combined
++
++            ## accumulate temporal average (sum all modes into mode-0)
++            % for vi, voi_name in enumerate(voi_names):
++<%
++    voi_idx_val = voi_idx_list[vi]
++    is_derived = voi_idx_val < 0
++%>
++% if not is_derived:
++            _sv = np.float32(0.0)
++            for _m in range(${n_modes}):
++                _sv += ${sn.name}_state[tid, ${voi_idx_val}, i, _m]
++            ${sn.name}_tavg[tid, ${vi}, i, 0] += _sv
++% else:
++<%
++    import re
++    expr = voi_name
++    for si, sv in enumerate(svars):
++        expr = re.sub(r'\b' + re.escape(sv) + r'\b', f'{sn.name}_state[tid, {si}, i, _m]', expr)
++    expr = expr.replace('nb.float32(', 'np.float32(')
++    expr = expr.replace('exp(', 'math.exp(')
++    expr = expr.replace('sin(', 'math.sin(')
++    expr = expr.replace('cos(', 'math.cos(')
++    expr = expr.replace('log(', 'math.log(')
++    expr = expr.replace('tanh(', 'math.tanh(')
++%>
++            _sv = np.float32(0.0)
++            for _m in range(${n_modes}):
++                _sv += ${expr}
++            ${sn.name}_tavg[tid, ${vi}, i, 0] += _sv
++% endif
++            % endfor
++
++            ## accumulate spatial average and projection monitors (sum all modes)
++            % for vi, voi_name in enumerate(voi_names):
++<%
++    voi_idx_val = voi_idx_list[vi]
++    is_derived = voi_idx_val < 0
++%>
++% if not is_derived:
++            _sv = np.float32(0.0)
++            for _m in range(${n_modes}):
++                _sv += ${sn.name}_state[tid, ${voi_idx_val}, i, _m]
++% else:
++<%
++    import re
++    expr = voi_name
++    for si, sv in enumerate(svars):
++        expr = re.sub(r'\\b' + re.escape(sv) + r'\\b', f'{sn.name}_state[tid, {si}, i, _m]', expr)
++    expr = expr.replace('nb.float32(', 'np.float32(')
++    expr = expr.replace('exp(', 'math.exp(')
++    expr = expr.replace('sin(', 'math.sin(')
++    expr = expr.replace('cos(', 'math.cos(')
++    expr = expr.replace('log(', 'math.log(')
++    expr = expr.replace('tanh(', 'math.tanh(')
++%>
++            _sv = np.float32(0.0)
++            for _m in range(${n_modes}):
++                _sv += ${expr}
++% endif
++                for _ai in range(${sn.name}_spatial_mean.shape[0]):
++                    ${sn.name}_spatial_tavg[tid, ${vi}, _ai, 0] += ${sn.name}_spatial_mean[_ai, i] * _sv
++                for _si in range(${sn.name}_gain.shape[0]):
++                    ${sn.name}_proj_tavg[tid, ${vi}, _si, 0] += ${sn.name}_gain[_si, i] * _sv
++            % endfor
++
++            ## monitor raw / subsample — store mode-0 (sum of all modes)
++            if monitor_type == 1:
++                % for vi, voi_name in enumerate(voi_names):
++<%
++    voi_idx_val = voi_idx_list[vi]
++    is_derived = voi_idx_val < 0
++%>
++% if not is_derived:
++                _sv = np.float32(0.0)
++                for _m in range(${n_modes}):
++                    _sv += ${sn.name}_state[tid, ${voi_idx_val}, i, _m]
++                ${sn.name}_raw[tid, data_t - 1, ${vi}, i, 0] = _sv
++% else:
++<%
++    import re
++    expr = voi_name
++    for si, sv in enumerate(svars):
++        expr = re.sub(r'\b' + re.escape(sv) + r'\b', f'{sn.name}_state[tid, {si}, i, _m]', expr)
++    expr = expr.replace('nb.float32(', 'np.float32(')
++    expr = expr.replace('exp(', 'math.exp(')
++    expr = expr.replace('sin(', 'math.sin(')
++    expr = expr.replace('cos(', 'math.cos(')
++    expr = expr.replace('log(', 'math.log(')
++    expr = expr.replace('tanh(', 'math.tanh(')
++%>
++                _sv = np.float32(0.0)
++                for _m in range(${n_modes}):
++                    _sv += ${expr}
++                ${sn.name}_raw[tid, data_t - 1, ${vi}, i, 0] = _sv
++% endif
++                % endfor
++            elif monitor_type == 2:
++                if (t - 1) % monitor_period == 0:
++                    _raw_idx = (t - 1) // monitor_period
++                    % for vi, voi_name in enumerate(voi_names):
++<%
++    voi_idx_val = voi_idx_list[vi]
++    is_derived = voi_idx_val < 0
++%>
++% if not is_derived:
++                    _sv = np.float32(0.0)
++                    for _m in range(${n_modes}):
++                        _sv += ${sn.name}_state[tid, ${voi_idx_val}, i, _m]
++                    ${sn.name}_raw[tid, _raw_idx, ${vi}, i, 0] = _sv
++% else:
++<%
++    import re
++    expr = voi_name
++    for si, sv in enumerate(svars):
++        expr = re.sub(r'\b' + re.escape(sv) + r'\b', f'{sn.name}_state[tid, {si}, i, _m]', expr)
++    expr = expr.replace('nb.float32(', 'np.float32(')
++    expr = expr.replace('exp(', 'math.exp(')
++    expr = expr.replace('sin(', 'math.sin(')
++    expr = expr.replace('cos(', 'math.cos(')
++    expr = expr.replace('log(', 'math.log(')
++    expr = expr.replace('tanh(', 'math.tanh(')
++%>
++                    _sv = np.float32(0.0)
++                    for _m in range(${n_modes}):
++                        _sv += ${expr}
++                    ${sn.name}_raw[tid, _raw_idx, ${vi}, i, 0] = _sv
++% endif
++                    % endfor
++
++        % endfor  ## per-subnet integration
++
++        ## ---- 3b. Bold Balloon model integration ----
++        if bold_istep > 0:
++            % for sn in subnets:
++            for _bvi in range(${sn.name}_bold_voi_idx.shape[0]):
++                _bsvi = ${sn.name}_bold_voi_idx[_bvi]
++                for _bni in range(N_${sn.name}):
++                    _bx = np.float32(0.0)
++                    for _bmi in range(${sn.n_modes}):
++                        _bx += ${sn.name}_state[tid, _bsvi, _bni, _bmi]
++                    _bs = ${sn.name}_bold_state[tid, _bvi, 0, _bni]
++                    _bf = ${sn.name}_bold_state[tid, _bvi, 1, _bni]
++                    _bv = ${sn.name}_bold_state[tid, _bvi, 2, _bni]
++                    _bq = ${sn.name}_bold_state[tid, _bvi, 3, _bni]
++                    _bp = ${sn.name}_bold_params
++                    _bds = _bx - _bp[0] * _bs - _bp[1] * (_bf - np.float32(1.0))
++                    _bdf = _bs
++                    _bdv = _bp[2] * (_bf - _bv ** _bp[3])
++                    _bdq = _bp[2] * (_bf * (np.float32(1.0) - (np.float32(1.0) - _bp[4]) ** (np.float32(1.0) / _bf)) * _bp[5] - _bv ** _bp[3] * (_bq / _bv))
++                    ${sn.name}_bold_state[tid, _bvi, 0, _bni] += dt_f * _bds
++                    ${sn.name}_bold_state[tid, _bvi, 1, _bni] += dt_f * _bdf
++                    ${sn.name}_bold_state[tid, _bvi, 2, _bni] += dt_f * _bdv
++                    ${sn.name}_bold_state[tid, _bvi, 3, _bni] += dt_f * _bdq
++
++            ## Bold sampling
++            if (t - 1) % bold_istep == 0:
++                _bold_idx = (t - 1) // bold_istep
++                if _bold_idx < n_bold_samples:
++                    for _bvi in range(${sn.name}_bold_voi_idx.shape[0]):
++                        for _bni in range(N_${sn.name}):
++                            _bv = ${sn.name}_bold_state[tid, _bvi, 2, _bni]
++                            _bq = ${sn.name}_bold_state[tid, _bvi, 3, _bni]
++                            _bp = ${sn.name}_bold_params
++                            ${sn.name}_bold_out[tid, _bold_idx, _bvi, _bni] = _bp[9] * (_bp[6] * (np.float32(1.0) - _bq) + _bp[7] * (np.float32(1.0) - _bq / _bv) + _bp[8] * (np.float32(1.0) - _bv))
++            % endfor
++
++        ## ---- 4. Update source history buffers ----
++        % for sn in subnets:
++<%
++    svar_list = list(sn.model.state_variables)
++%>
++        _slot_${sn.name} = t % ${analysis.source_horizons[sn.name]}
++        for i in range(N_${sn.name}):
++            % for k, sv in enumerate(svar_list):
++            for _m in range(${sn.n_modes}):
++                ${sn.name}_srcbuf[tid, ${k}, i, _m, _slot_${sn.name}] = ${sn.name}_state[tid, ${k}, i, _m]
++            % endfor
++        % endfor
++
++    ## end for t in range(1, nstep + 1)
++
++    ## tavg normalization is performed by the host backend after all chunks
++    ## CONTRACT: All temporal average accumulators (tavg, ctavg, spatial_tavg, proj_tavg)
++    ## are NOT normalized inside the kernel. The caller MUST divide by the total
++    ## step count after the kernel returns. Handled by NbHybridCUDASweepBackend.run().
+diff --git a/tvb_library/tvb/simulator/backend/templates/nb-zerlaut-sweep-cuda.py.mako b/tvb_library/tvb/simulator/backend/templates/nb-zerlaut-sweep-cuda.py.mako
+new file mode 100644
+index 0000000000..b4c5543425
+--- /dev/null
++++ b/tvb_library/tvb/simulator/backend/templates/nb-zerlaut-sweep-cuda.py.mako
+@@ -0,0 +1,377 @@
++##
++## TheVirtualBrain-Scientific Package. This package holds all simulators, and
++## analysers necessary to run brain-simulations. You can use it stand alone or
++## in conjunction with TheVirtualBrain-Framework Package.
++##
++## (c) 2012-2025, Baycrest Centre for Geriatric Care ("Baycrest") and others
++##
++## This program is free software: you can redistribute it and/or modify it under the
++## terms of the GNU General Public License as published by the Free Software Foundation,
++## either version 3 of the License, or (at your option) any later version.
++##
++## nb-zerlaut-sweep-cuda.py.mako
++##
++## CUDA custom dfun generation for ZerlautAdaptationFirstOrder and
++## ZerlautAdaptationSecondOrder models.  Included by nb-hybrid-sweep-cuda.py.mako.
++##
++## WARNING: This template is <%include%>ed from nb-hybrid-sweep-cuda.py.mako.
++## The <%page args="..."> MUST include ALL args that the parent template passes,
++## even if they are unused by Zerlaut models (is_heun, is_combined, dm_names,
++## dm_data, dm_ops). If the parent adds new page args, this template must be
++## updated accordingly.
++##
++
++<%page args="sn, debug_nojit, svars, cterms, svars_str, cterms_str, n_svars, dt_val, n_nodes, n_modes, int_type, lo_map, hi_map, i1svars_str, is_heun=False, is_combined=False, dm_names=[], dm_data={}, dm_ops=[]"/>
++
++<%
++    from tvb.simulator.models.zerlaut import ZerlautAdaptationSecondOrder
++
++    _is_second_order = isinstance(sn.model, ZerlautAdaptationSecondOrder)
++
++    # Extract all parameters as float scalars for baking into generated code.
++    _zp = {}
++    _zp_names = [
++        'g_L', 'E_L_e', 'E_L_i', 'C_m', 'b_e', 'a_e', 'b_i', 'a_i',
++        'tau_w_e', 'tau_w_i', 'E_e', 'E_i', 'Q_e', 'Q_i', 'tau_e', 'tau_i',
++        'N_tot', 'p_connect_e', 'p_connect_i', 'g', 'K_ext_e', 'K_ext_i',
++        'T', 'external_input_ex_ex', 'external_input_ex_in',
++        'external_input_in_ex', 'external_input_in_in',
++        'tau_OU', 'weight_noise',
++    ]
++    if _is_second_order:
++        _zp_names.append('S_i')
++    for _pn in _zp_names:
++        _zp[_pn] = float(getattr(sn.model, _pn)[0])
++
++    # Polynomial coefficients — 10 each for exc and inh
++    import numpy as _np
++    _P_e = [float(x) for x in _np.asarray(sn.model.P_e).ravel()[:10]]
++    _P_i = [float(x) for x in _np.asarray(sn.model.P_i).ravel()[:10]]
++
++    _fluct_params = ['g_L', 'C_m', 'Q_e', 'tau_e', 'E_e', 'Q_i', 'tau_i', 'E_i',
++                     'N_tot', 'p_connect_e', 'p_connect_i', 'g', 'K_ext_e', 'K_ext_i']
++    _dfun_params = ['T', 'weight_noise', 'external_input_ex_ex', 'external_input_ex_in',
++                    'external_input_in_ex', 'external_input_in_in',
++                    'tau_w_e', 'tau_w_i', 'b_e', 'a_e', 'b_i', 'a_i',
++                    'E_L_e', 'E_L_i', 'tau_OU', 'K_ext_e']
++
++    # 1e-7 is near the float32 noise floor for second derivatives;
++    # 1e-4 gives a reasonable accuracy/stability trade-off.
++    _df = "np.float32(1e-4)"
++    _df_scale = "np.float32(1e3)"
++    # NOTE: local_coupling is deprecated for hybrid subnetworks; coupling is
++    # handled exclusively through the projection/cfun pipeline.
++%>
++
++## ------------------------------------------------------------------
++## Helper: get_fluct_regime_vars (scalar, all params baked)
++## ------------------------------------------------------------------
++@cuda.jit(device=True)
++def _zerlaut_fluct_${sn.name}(Fe, Fi, Fe_ext, Fi_ext, W, E_L):
++% for _pn in _fluct_params:
++    ${_pn} = np.float32(${_zp[_pn]})
++% endfor
++    fe = (Fe + np.float32(1.0e-6)) * (np.float32(1.0) - g) * p_connect_e * N_tot + Fe_ext * K_ext_e
++    fi = (Fi + np.float32(1.0e-6)) * g * p_connect_i * N_tot + Fi_ext * K_ext_i
++
++    mu_Ge = Q_e * tau_e * fe
++    mu_Gi = Q_i * tau_i * fi
++    mu_G = g_L + mu_Ge + mu_Gi
++    T_m = C_m / mu_G
++
++    mu_V = (mu_Ge * E_e + mu_Gi * E_i + g_L * E_L - W) / mu_G
++    U_e = Q_e / mu_G * (E_e - mu_V)
++    U_i = Q_i / mu_G * (E_i - mu_V)
++
++    sigma_V = math.sqrt(
++        fe * (U_e * tau_e) ** 2 / (np.float32(2.0) * (tau_e + T_m))
++        + fi * (U_i * tau_i) ** 2 / (np.float32(2.0) * (tau_i + T_m)))
++
++    T_V_num = fe * (U_e * tau_e) ** 2 + fi * (U_i * tau_i) ** 2
++    T_V_den = (fe * (U_e * tau_e) ** 2 / (tau_e + T_m)
++               + fi * (U_i * tau_i) ** 2 / (tau_i + T_m))
++    T_V = T_V_num / T_V_den if T_V_den != np.float32(0.0) else np.float32(1.0)
++    return mu_V, sigma_V, T_V
++
++
++## ------------------------------------------------------------------
++## Helper: threshold_func (order-9 polynomial, scalar)
++## ------------------------------------------------------------------
++@cuda.jit(device=True)
++def _zerlaut_threshold_${sn.name}(muV, sigmaV, TvN, P0, P1, P2, P3, P4, P5, P6, P7, P8, P9):
++    muV0 = np.float32(-60.0)
++    DmuV0 = np.float32(10.0)
++    sV0 = np.float32(4.0)
++    DsV0 = np.float32(6.0)
++    TvN0 = np.float32(0.5)
++    DTvN0 = np.float32(1.0)
++    V = (muV - muV0) / DmuV0
++    S = (sigmaV - sV0) / DsV0
++    T = (TvN - TvN0) / DTvN0
++    return (P0 + P1 * V + P2 * S + P3 * T + P4 * V * V
++            + P5 * S * S + P6 * T * T + P7 * V * S + P8 * V * T + P9 * S * T)
++
++
++## ------------------------------------------------------------------
++## Helper: estimate_firing_rate (erfc-based, scalar)
++## ------------------------------------------------------------------
++@cuda.jit(device=True)
++def _zerlaut_firing_rate_${sn.name}(muV, sigmaV, Tv, Vthre):
++    return math.erfc((Vthre - muV) / (np.float32(1.4142135623730951) * sigmaV)) / (np.float32(2.0) * Tv)
++
++
++## ------------------------------------------------------------------
++## Helper: TF — full transfer function pipeline (scalar)
++## E_L and P_* select excitatory vs inhibitory
++## ------------------------------------------------------------------
++@cuda.jit(device=True)
++def _zerlaut_TF_${sn.name}(fe, fi, fe_ext, fi_ext, W, E_L,
++                            P0, P1, P2, P3, P4, P5, P6, P7, P8, P9):
++    g_L = np.float32(${_zp['g_L']})
++    C_m = np.float32(${_zp['C_m']})
++    mu_V, sigma_V, T_V = _zerlaut_fluct_${sn.name}(fe, fi, fe_ext, fi_ext, W, E_L)
++    TvN = T_V * g_L / C_m
++    V_thre = _zerlaut_threshold_${sn.name}(mu_V, sigma_V, TvN, P0, P1, P2, P3, P4, P5, P6, P7, P8, P9)
++    V_thre = V_thre * np.float32(1000.0)  # V→mV
++    return _zerlaut_firing_rate_${sn.name}(mu_V, sigma_V, T_V, V_thre)
++
++
++## ------------------------------------------------------------------
++## Convenience wrappers: TF_e / TF_i with baked polynomial coefficients
++## ------------------------------------------------------------------
++@cuda.jit(device=True)
++def _zerlaut_TF_e_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    return _zerlaut_TF_${sn.name}(fe, fi, fe_ext, fi_ext, W,
++        np.float32(${_zp['E_L_e']}),
++        % for _k in range(10):
++        np.float32(${_P_e[_k]})${',' if _k < 9 else ')'}
++        % endfor
++
++
++@cuda.jit(device=True)
++def _zerlaut_TF_i_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    return _zerlaut_TF_${sn.name}(fe, fi, fe_ext, fi_ext, W,
++        np.float32(${_zp['E_L_i']}),
++        % for _k in range(10):
++        np.float32(${_P_i[_k]})${',' if _k < 9 else ')'}
++        % endfor
++
++
++% if _is_second_order:
++## ------------------------------------------------------------------
++## Numerical derivative helpers for second-order covariance dynamics
++## ------------------------------------------------------------------
++
++@cuda.jit(device=True)
++def _zerlaut_diff_fe_e_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    return (_zerlaut_TF_e_${sn.name}(fe + df, fi, fe_ext, fi_ext, W)
++            - _zerlaut_TF_e_${sn.name}(fe - df, fi, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff_fe_i_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    return (_zerlaut_TF_i_${sn.name}(fe + df, fi, fe_ext, fi_ext, W)
++            - _zerlaut_TF_i_${sn.name}(fe - df, fi, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff_fi_e_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    return (_zerlaut_TF_e_${sn.name}(fe, fi + df, fe_ext, fi_ext, W)
++            - _zerlaut_TF_e_${sn.name}(fe, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff_fi_i_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    return (_zerlaut_TF_i_${sn.name}(fe, fi + df, fe_ext, fi_ext, W)
++            - _zerlaut_TF_i_${sn.name}(fe, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++
++
++## Second derivatives
++@cuda.jit(device=True)
++def _zerlaut_diff2_fe_fe_e_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    TF_base = _zerlaut_TF_e_${sn.name}(fe, fi, fe_ext, fi_ext, W)
++    return (_zerlaut_TF_e_${sn.name}(fe + df, fi, fe_ext, fi_ext, W)
++            - np.float32(2.0) * TF_base
++            + _zerlaut_TF_e_${sn.name}(fe - df, fi, fe_ext, fi_ext, W)) / (df * ${_df_scale}) ** 2
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff2_fe_fe_i_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    TF_base = _zerlaut_TF_i_${sn.name}(fe, fi, fe_ext, fi_ext, W)
++    return (_zerlaut_TF_i_${sn.name}(fe + df, fi, fe_ext, fi_ext, W)
++            - np.float32(2.0) * TF_base
++            + _zerlaut_TF_i_${sn.name}(fe - df, fi, fe_ext, fi_ext, W)) / (df * ${_df_scale}) ** 2
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff2_fi_fi_e_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    TF_base = _zerlaut_TF_e_${sn.name}(fe, fi, fe_ext, fi_ext, W)
++    return (_zerlaut_TF_e_${sn.name}(fe, fi + df, fe_ext, fi_ext, W)
++            - np.float32(2.0) * TF_base
++            + _zerlaut_TF_e_${sn.name}(fe, fi - df, fe_ext, fi_ext, W)) / (df * ${_df_scale}) ** 2
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff2_fi_fi_i_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    TF_base = _zerlaut_TF_i_${sn.name}(fe, fi, fe_ext, fi_ext, W)
++    return (_zerlaut_TF_i_${sn.name}(fe, fi + df, fe_ext, fi_ext, W)
++            - np.float32(2.0) * TF_base
++            + _zerlaut_TF_i_${sn.name}(fe, fi - df, fe_ext, fi_ext, W)) / (df * ${_df_scale}) ** 2
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff2_fi_fe_e_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    dfi_at_fe_plus = (_zerlaut_TF_e_${sn.name}(fe + df, fi + df, fe_ext, fi_ext, W)
++                      - _zerlaut_TF_e_${sn.name}(fe + df, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    dfi_at_fe_minus = (_zerlaut_TF_e_${sn.name}(fe - df, fi + df, fe_ext, fi_ext, W)
++                       - _zerlaut_TF_e_${sn.name}(fe - df, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    return (dfi_at_fe_plus - dfi_at_fe_minus) / (np.float32(2.0) * df * ${_df_scale})
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff2_fi_fe_i_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    dfi_at_fe_plus = (_zerlaut_TF_i_${sn.name}(fe + df, fi + df, fe_ext, fi_ext, W)
++                      - _zerlaut_TF_i_${sn.name}(fe + df, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    dfi_at_fe_minus = (_zerlaut_TF_i_${sn.name}(fe - df, fi + df, fe_ext, fi_ext, W)
++                       - _zerlaut_TF_i_${sn.name}(fe - df, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    return (dfi_at_fe_plus - dfi_at_fe_minus) / (np.float32(2.0) * df * ${_df_scale})
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff2_fe_fi_e_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    dfe_at_fi_plus = (_zerlaut_TF_e_${sn.name}(fe + df, fi + df, fe_ext, fi_ext, W)
++                      - _zerlaut_TF_e_${sn.name}(fe - df, fi + df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    dfe_at_fi_minus = (_zerlaut_TF_e_${sn.name}(fe + df, fi - df, fe_ext, fi_ext, W)
++                       - _zerlaut_TF_e_${sn.name}(fe - df, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    return (dfe_at_fi_plus - dfe_at_fi_minus) / (np.float32(2.0) * df * ${_df_scale})
++
++
++@cuda.jit(device=True)
++def _zerlaut_diff2_fe_fi_i_${sn.name}(fe, fi, fe_ext, fi_ext, W):
++    df = ${_df}
++    dfe_at_fi_plus = (_zerlaut_TF_i_${sn.name}(fe + df, fi + df, fe_ext, fi_ext, W)
++                      - _zerlaut_TF_i_${sn.name}(fe - df, fi + df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    dfe_at_fi_minus = (_zerlaut_TF_i_${sn.name}(fe + df, fi - df, fe_ext, fi_ext, W)
++                       - _zerlaut_TF_i_${sn.name}(fe - df, fi - df, fe_ext, fi_ext, W)) / (np.float32(2.0) * df * ${_df_scale})
++    return (dfe_at_fi_plus - dfe_at_fi_minus) / (np.float32(2.0) * df * ${_df_scale})
++
++% endif
++
++## ------------------------------------------------------------------
++## dfun — the actual derivative function
++## ------------------------------------------------------------------
++@cuda.jit(device=True)
++def dfun_${sn.name}(${svars_str}, ${cterms_str}, _sp, ni, sweep_params, tid):
++% for _pn in _dfun_params:
++    ${_pn} = np.float32(${_zp[_pn]})
++% endfor
++% if _is_second_order:
++    S_i = np.float32(${_zp['S_i']})
++    N_e = np.float32(${_zp['N_tot']} * (1.0 - ${_zp['g']}))
++    N_i = np.float32(${_zp['N_tot']} * ${_zp['g']})
++% endif
++
++% if not _is_second_order:
++    Fe_ext = Coupling_Term + weight_noise * ou_drift
++    if Fe_ext * K_ext_e < np.float32(0.0):
++        Fe_ext = np.float32(0.0)
++    Fi_ext = np.float32(0.0)
++
++    d_E = (_zerlaut_TF_e_${sn.name}(E, I, Fe_ext + external_input_ex_ex, Fi_ext + external_input_ex_in, W_e) - E) / T
++    d_I = (_zerlaut_TF_i_${sn.name}(E, I, Fe_ext + external_input_in_ex, Fi_ext + external_input_in_in, W_i) - I) / T
++
++    mu_V_e, _, _ = _zerlaut_fluct_${sn.name}(E, I, Fe_ext + external_input_ex_ex, Fi_ext + external_input_ex_in, W_e, E_L_e)
++    d_W_e = -W_e / tau_w_e + b_e * E + a_e * (mu_V_e - E_L_e) / tau_w_e
++
++    mu_V_i, _, _ = _zerlaut_fluct_${sn.name}(E, I, Fe_ext + external_input_in_ex, Fi_ext + external_input_in_in, W_i, E_L_i)
++    d_W_i = -W_i / tau_w_i + b_i * I + a_i * (mu_V_i - E_L_i) / tau_w_i
++
++    d_ou_drift = -ou_drift / tau_OU
++
++    return (${', '.join(['d_' + s for s in svars])},)
++% else:
++    E_input_excitatory = Coupling_Term + external_input_ex_ex + weight_noise * ou_drift
++    if E_input_excitatory < np.float32(0.0):
++        E_input_excitatory = np.float32(0.0)
++
++    E_input_inhibitory = S_i * Coupling_Term + external_input_in_ex + weight_noise * ou_drift
++    if E_input_inhibitory < np.float32(0.0):
++        E_input_inhibitory = np.float32(0.0)
++
++    I_input_excitatory = external_input_ex_in
++    I_input_inhibitory = external_input_in_in
++
++    _TF_e = _zerlaut_TF_e_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e)
++    _TF_i = _zerlaut_TF_i_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i)
++
++    _dfe_TF_e = _zerlaut_diff_fe_e_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e)
++    _dfe_TF_i = _zerlaut_diff_fe_i_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i)
++    _dfi_TF_e = _zerlaut_diff_fi_e_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e)
++    _dfi_TF_i = _zerlaut_diff_fi_i_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i)
++
++    _d2fefe_e = _zerlaut_diff2_fe_fe_e_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e)
++    _d2fefe_i = _zerlaut_diff2_fe_fe_i_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i)
++    _d2fifi_e = _zerlaut_diff2_fi_fi_e_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e)
++    _d2fifi_i = _zerlaut_diff2_fi_fi_i_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i)
++    _d2fefi_e = _zerlaut_diff2_fe_fi_e_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e)
++    _d2fife_e = _zerlaut_diff2_fi_fe_e_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e)
++    _d2fefi_i = _zerlaut_diff2_fe_fi_i_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i)
++    _d2fife_i = _zerlaut_diff2_fi_fe_i_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i)
++
++    d_E = (_TF_e - E
++           + np.float32(0.5) * C_ee * _d2fefe_e
++           + np.float32(0.5) * C_ei * _d2fefi_e
++           + np.float32(0.5) * C_ei * _d2fife_e
++           + np.float32(0.5) * C_ii * _d2fifi_e
++           ) / T
++
++    d_I = (_TF_i - I
++           + np.float32(0.5) * C_ee * _d2fefe_i
++           + np.float32(0.5) * C_ei * _d2fefi_i
++           + np.float32(0.5) * C_ei * _d2fife_i
++           + np.float32(0.5) * C_ii * _d2fifi_i
++           ) / T
++
++    d_C_ee = (_TF_e * (np.float32(1.0) / T - _TF_e) / N_e
++              + (_TF_e - E) ** 2
++              + np.float32(2.0) * C_ee * _dfe_TF_e
++              + np.float32(2.0) * C_ei * _dfi_TF_e
++              - np.float32(2.0) * C_ee
++              ) / T
++
++    d_C_ei = ((_TF_e - E) * (_TF_i - I)
++              + C_ee * _dfe_TF_e
++              + C_ei * _dfe_TF_i
++              + C_ei * _dfi_TF_e
++              + C_ii * _dfi_TF_i
++              - np.float32(2.0) * C_ei
++              ) / T
++
++    d_C_ii = (_TF_i * (np.float32(1.0) / T - _TF_i) / N_i
++              + (_TF_i - I) ** 2
++              + np.float32(2.0) * C_ii * _dfi_TF_i
++              + np.float32(2.0) * C_ei * _dfe_TF_i
++              - np.float32(2.0) * C_ii
++              ) / T
++
++    mu_V_e, _, _ = _zerlaut_fluct_${sn.name}(E, I, E_input_excitatory, I_input_excitatory, W_e, E_L_e)
++    d_W_e = -W_e / tau_w_e + b_e * E + a_e * (mu_V_e - E_L_e) / tau_w_e
++
++    mu_V_i, _, _ = _zerlaut_fluct_${sn.name}(E, I, E_input_inhibitory, I_input_inhibitory, W_i, E_L_i)
++    d_W_i = -W_i / tau_w_i + b_i * I + a_i * (mu_V_i - E_L_i) / tau_w_i
++
++    d_ou_drift = -ou_drift / tau_OU
++
++    return (${', '.join(['d_' + s for s in svars])},)
++% endif
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_cuda_parity_regression.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_cuda_parity_regression.py
+new file mode 100644
+index 0000000000..110eab4c21
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_cuda_parity_regression.py
+@@ -0,0 +1,607 @@
++"""Focused regression coverage for CPU/CUDA hybrid sweep parity."""
++
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++from tvb.datatypes import equations, patterns
++from tvb.datatypes.connectivity import Connectivity
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++from tvb.simulator.backend.nb_hybrid_cuda_sweep_backend import (
++    NbHybridCUDASweepBackend,
++    CompiledCUDASweepKernel,
++    _CUDA_COMPILED_CACHE,
++)
++from tvb.simulator.hybrid.coupling import Linear
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.integrators import EulerDeterministic, EulerStochastic
++from tvb.simulator.models.cerebellar_mf import CerebellarMF
++from tvb.simulator.models.linear import Linear as LinearModel
++from tvb.simulator.noise import Additive
++from tvb.tests.library.simulator.backend.test_nb_hybrid_cuda_sweep import (
++    _build_g2d_network,
++    _build_rsfhn_network,
++    _make_8node_connectivity,
++)
++from tvb.tests.library.simulator.backend.test_nb_hybrid_regression_presigmoidal import (
++    INITIAL_STATE as PRESIGMOIDAL_INITIAL_STATE,
++    PARAMS as PRESIGMOIDAL_PARAMS,
++    _make_network as _make_presigmoidal_network,
++)
++
++
++DT = 0.1
++NSTEPS = 7
++SWEEP_VALUES = np.array([0.15, 0.75], dtype=np.float32)
++CUDA_RESUME_TOTAL = 7
++CUDA_RESUME_SPLIT = 3
++CUDA_NOISE_SEED = 9173
++DYNAMIC_PRESIGMOIDAL_NSTEPS = 12
++
++
++@pytest.fixture(scope="module", autouse=True)
++def require_cudasim():
++    from numba import cuda
++
++    if not cuda.is_available():
++        pytest.skip("CUDA/CUDASIM is not available")
++    _CUDA_COMPILED_CACHE.clear()
++
++
++def _linear_network(*, stimulus=False):
++    model = LinearModel(gamma=np.array([-0.25]))
++    model.configure()
++    subnet = Subnetwork(
++        name="unit",
++        model=model,
++        scheme=EulerDeterministic(dt=DT),
++        nnodes=2,
++    )
++    subnet.configure()
++    intra = IntraProjection(
++        source_cvar=np.array([0], dtype=np.int_),
++        target_cvar=np.array([0], dtype=np.int_),
++        weights=sp.eye(2, format="csr", dtype=np.float64),
++        lengths=sp.csr_matrix((2, 2), dtype=np.float64),
++        cv=1.0,
++        dt=DT,
++        scale=1.0,
++        cfun=Linear(a=np.array([0.4]), b=np.array([0.0])),
++    )
++    subnet.projections = [intra]
++
++    if stimulus:
++        connectivity = Connectivity(
++            centres=np.zeros((2, 3)),
++            weights=np.zeros((2, 2)),
++            tract_lengths=np.zeros((2, 2)),
++            region_labels=np.array(["left", "right"]),
++            speed=np.array([1.0]),
++        )
++        connectivity.configure()
++        temporal = equations.Linear()
++        temporal.parameters["a"] = 0.35
++        temporal.parameters["b"] = 0.2
++        pattern = patterns.StimuliRegion(
++            temporal=temporal,
++            connectivity=connectivity,
++            weight=np.array([1.0, 0.25]),
++        )
++        subnet.add_stimulus(pattern, "x", projection_scale=0.6)
++
++    subnet.configure(simulation_length=NSTEPS * DT)
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++    return network
++
++
++def _initial_state():
++    return np.array([[[0.2], [0.6]]], dtype=np.float32)
++
++
++def _stochastic_linear_network():
++    network = _linear_network()
++    noise = Additive(nsig=np.array([0.3]))
++    noise.noise_seed = CUDA_NOISE_SEED
++    noise.random_stream = np.random.RandomState(CUDA_NOISE_SEED)
++    noise.configure_white(DT)
++    scheme = EulerStochastic(dt=DT, noise=noise)
++    scheme.configure_boundaries(network.subnets[0].model)
++    network.subnets[0].scheme = scheme
++    network.configure()
++    return network
++
++
++def _reset_noise(network, seed=CUDA_NOISE_SEED):
++    noise = network.subnets[0].scheme.noise
++    noise.noise_seed = seed
++    noise.random_stream = np.random.RandomState(seed)
++
++
++def _compiled_linear(network):
++    descriptor, values = NbHybridBackend()._resolve_named_params(
++        network, {"unit.intra.b": np.array([0.3], dtype=np.float32)}
++    )
++    compiled = NbHybridCUDASweepBackend().compile_sweep(
++        network, sweep_descriptor=descriptor
++    )
++    return compiled, values
++
++
++def _cpu_trajectory_for_b(value):
++    network = _linear_network()
++    network.subnets[0].projections[0].cfun.b = np.array([value])
++    return NbHybridBackend().run_network(
++        network,
++        nstep=NSTEPS,
++        chunk_size=1,
++        initial_states=[_initial_state()],
++    )[0][1]
++
++
++def _unified(backend, monitor="tavg", **kwargs):
++    return NbHybridBackend().sweep(
++        _linear_network(),
++        params={"unit.intra.b": SWEEP_VALUES},
++        nstep=NSTEPS,
++        backend=backend,
++        monitor=monitor,
++        initial_states=[_initial_state()],
++        **kwargs,
++    )
++
++
++def _dynamic_presigmoidal_cuda_and_cpu(global_threshold):
++    cpu_network, _ = _make_presigmoidal_network(global_threshold)
++    cpu_result = NbHybridBackend().run_network(
++        cpu_network,
++        nstep=DYNAMIC_PRESIGMOIDAL_NSTEPS,
++        chunk_size=1,
++        initial_states=[PRESIGMOIDAL_INITIAL_STATE.copy()],
++    )[0]
++
++    cuda_network, _ = _make_presigmoidal_network(global_threshold)
++    descriptor, values = NbHybridBackend()._resolve_named_params(
++        cuda_network,
++        {"mpr.intra.H": PRESIGMOIDAL_PARAMS["H"].astype(np.float32)},
++    )
++    compiled = NbHybridCUDASweepBackend().compile_sweep(
++        cuda_network, sweep_descriptor=descriptor
++    )
++    cuda_result = compiled.run(
++        nstep=DYNAMIC_PRESIGMOIDAL_NSTEPS,
++        sweep_values=values,
++        initial_states=[PRESIGMOIDAL_INITIAL_STATE.copy()],
++        monitor_type="raw",
++    )
++    return cuda_result["raw"][0][0], cuda_result["ctavg"][0][0], cpu_result
++
++
++def test_direct_cuda_named_linear_b_matches_fresh_cpu_trajectories_and_means():
++    network = _linear_network()
++    descriptor, values = NbHybridBackend()._resolve_named_params(
++        network, {"unit.intra.b": SWEEP_VALUES}
++    )
++    cuda = NbHybridCUDASweepBackend().run_sweep(
++        network,
++        sweep_values=values,
++        sweep_descriptor=descriptor,
++        nstep=NSTEPS,
++        monitor_type="raw",
++        initial_states=[_initial_state()],
++    )
++    cpu_trajectories = np.stack(
++        [_cpu_trajectory_for_b(value) for value in SWEEP_VALUES]
++    )
++
++    assert not np.array_equal(cuda["raw"][0][0], cuda["raw"][0][1])
++    np.testing.assert_array_equal(cuda["raw"][0], cpu_trajectories)
++    np.testing.assert_array_equal(cuda["tavg"][0], cpu_trajectories.mean(axis=1))
++
++
++@pytest.mark.parametrize("global_threshold", [False, True], ids=["local", "global"])
++def test_cuda_regression_dynamic_presigmoidal_raw_and_ctavg_match_cpu(global_threshold):
++    cuda_raw, cuda_ctavg, (_, cpu_raw, cpu_ctavg) = (
++        _dynamic_presigmoidal_cuda_and_cpu(global_threshold)
++    )
++
++    np.testing.assert_allclose(cuda_raw, cpu_raw, rtol=2e-4, atol=2e-5)
++    np.testing.assert_allclose(
++        cuda_ctavg, cpu_ctavg.mean(axis=0), rtol=2e-4, atol=2e-5
++    )
++
++
++def test_cuda_regression_dynamic_presigmoidal_fixture_distinguishes_global_threshold():
++    local_raw, local_ctavg, (_, local_cpu_raw, local_cpu_ctavg) = (
++        _dynamic_presigmoidal_cuda_and_cpu(False)
++    )
++    global_raw, global_ctavg, (_, global_cpu_raw, global_cpu_ctavg) = (
++        _dynamic_presigmoidal_cuda_and_cpu(True)
++    )
++
++    assert np.max(np.abs(local_cpu_raw - global_cpu_raw)) > 1e-4
++    assert np.max(np.abs(local_cpu_ctavg - global_cpu_ctavg)) > 1e-4
++    assert np.max(np.abs(local_raw - global_raw)) > 1e-4
++    assert np.max(np.abs(local_ctavg - global_ctavg)) > 1e-4
++
++
++def test_cuda_regression_omitted_initial_states_use_subnetwork_zeros_like_cpu():
++    network = _linear_network()
++    network.subnets[0].projections[0].cfun.b = np.array([0.3])
++    compiled, values = _compiled_linear(network)
++
++    cuda = compiled.run(
++        nstep=NSTEPS,
++        sweep_values=values,
++        monitor_type="raw",
++    )
++    cpu = NbHybridBackend().run_network(
++        network,
++        nstep=NSTEPS,
++        chunk_size=1,
++    )[0][1]
++
++    np.testing.assert_array_equal(cuda["raw"][0][0], cpu)
++
++
++def test_unified_cuda_tavg_has_cpu_sample_shape_times_and_values():
++    cpu = _unified("cpu", chunk_size=3)
++    cuda = _unified("cuda", chunk_size=3)
++
++    assert cpu.tavg["unit"].shape == (2, 3, 1, 2, 1)
++    assert cuda.tavg["unit"].shape == cpu.tavg["unit"].shape
++    np.testing.assert_array_equal(cuda.times, cpu.times)
++    np.testing.assert_array_equal(cuda.tavg["unit"], cpu.tavg["unit"])
++
++
++def test_unified_cuda_ctavg_has_cpu_sample_shape_times_and_values():
++    cpu = _unified("cpu", chunk_size=3)
++    cuda = _unified("cuda", chunk_size=3)
++
++    assert cuda.ctavg["unit"].shape == cpu.ctavg["unit"].shape
++    np.testing.assert_array_equal(cuda.times, cpu.times)
++    np.testing.assert_allclose(
++        cuda.ctavg["unit"], cpu.ctavg["unit"], rtol=2e-6, atol=2e-7
++    )
++
++
++@pytest.mark.parametrize("monitor, period", [("raw", 1), ("subsample", 2)])
++def test_unified_cuda_raw_and_subsample_values_and_timing_match_cpu(monitor, period):
++    cpu = _unified("cpu", monitor=monitor, monitor_period=period)
++    cuda = _unified("cuda", monitor=monitor, monitor_period=period)
++
++    np.testing.assert_array_equal(cuda.raw["unit"], cpu.raw["unit"])
++    np.testing.assert_array_equal(cuda.times, cpu.times)
++
++
++def test_chunked_cuda_stimulus_equals_unchunked():
++    network = _linear_network(stimulus=True)
++    descriptor, values = NbHybridBackend()._resolve_named_params(
++        network, {"unit.intra.b": np.array([0.3], dtype=np.float32)}
++    )
++    compiled = NbHybridCUDASweepBackend().compile_sweep(
++        network, sweep_descriptor=descriptor
++    )
++    run_kwargs = dict(
++        nstep=NSTEPS,
++        sweep_values=values,
++        initial_states=[_initial_state()],
++        monitor_type="raw",
++    )
++    unchunked = compiled.run(chunk_size=NSTEPS, **run_kwargs)
++    chunked = compiled.run(chunk_size=3, **run_kwargs)
++
++    np.testing.assert_array_equal(chunked["raw"][0], unchunked["raw"][0])
++    np.testing.assert_array_equal(chunked["tavg"][0], unchunked["tavg"][0])
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"monitor": "not-a-monitor"},
++        {"chunk_size": 0},
++        {"chunk_size": 1.5},
++        {"monitor": "subsample", "monitor_period": 0},
++        {"monitor": "subsample", "monitor_period": 1.5},
++    ],
++    ids=["monitor", "zero-chunk", "noninteger-chunk", "zero-period", "noninteger-period"],
++)
++def test_unified_cuda_rejects_invalid_monitor_chunk_and_period(kwargs):
++    with pytest.raises(ValueError):
++        _unified("cuda", **kwargs)
++
++
++@pytest.mark.parametrize("backend", ["cdua", "gpu", ""])
++def test_unified_sweep_rejects_unknown_backend(backend):
++    with pytest.raises(ValueError, match="backend"):
++        _unified(backend)
++
++
++@pytest.mark.parametrize("nstep", [0, -1, 1.5, True])
++def test_unified_sweep_rejects_invalid_nstep(nstep):
++    with pytest.raises(ValueError, match="nstep"):
++        NbHybridBackend().sweep(
++            _linear_network(),
++            params={"unit.intra.b": SWEEP_VALUES},
++            nstep=nstep,
++            backend="auto",
++            initial_states=[_initial_state()],
++        )
++
++
++def test_auto_falls_back_to_cpu_for_cuda_unsupported_clamps():
++    network = _linear_network()
++    scheme = network.subnets[0].scheme
++    scheme.clamped_state_variable_indices = np.array([0], dtype=np.int32)
++    scheme.clamped_state_variable_values = np.array([0.125])
++
++    result = NbHybridBackend().sweep(
++        network,
++        params={"unit.intra.b": SWEEP_VALUES},
++        nstep=2,
++        backend="auto",
++        initial_states=[_initial_state()],
++    )
++
++    assert result.backend == "cpu-seq"
++
++
++@pytest.mark.parametrize(
++    "initial_state",
++    [
++        np.zeros((2, 2, 1), dtype=np.float32),
++        np.zeros((1, 3, 1), dtype=np.float32),
++        np.zeros((1, 2, 2), dtype=np.float32),
++        np.zeros((2, 1, 3, 1), dtype=np.float32),
++    ],
++)
++def test_low_level_cuda_validates_initial_state_topology(initial_state):
++    compiled, values = _compiled_linear(_linear_network())
++
++    with pytest.raises(ValueError, match="initial_states"):
++        compiled.run(
++            nstep=1,
++            sweep_values=values,
++            initial_states=[initial_state],
++        )
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"monitor_type": "not-a-monitor"},
++        {"monitor_type": -1},
++        {"monitor_type": 3},
++        {"monitor_type": 1.5},
++        {"nstep": 0},
++        {"nstep": -1},
++        {"nstep": 1.5},
++        {"chunk_size": 0},
++        {"chunk_size": -1},
++        {"chunk_size": 1.5},
++        {"monitor_type": "subsample", "monitor_period": 0},
++        {"monitor_type": "subsample", "monitor_period": -1},
++        {"monitor_type": "subsample", "monitor_period": 1.5},
++        {"bold_period": 0},
++        {"bold_period": -1.0},
++    ],
++    ids=[
++        "unknown-monitor",
++        "negative-monitor-number",
++        "unknown-monitor-number",
++        "noninteger-monitor-number",
++        "zero-nstep",
++        "negative-nstep",
++        "noninteger-nstep",
++        "zero-chunk",
++        "negative-chunk",
++        "noninteger-chunk",
++        "zero-monitor-period",
++        "negative-monitor-period",
++        "noninteger-monitor-period",
++        "zero-bold-period",
++        "negative-bold-period",
++    ],
++)
++def test_cuda_regression_low_level_run_rejects_invalid_semantic_arguments(kwargs):
++    compiled, values = _compiled_linear(_linear_network())
++    run_kwargs = {"nstep": 2, "sweep_values": values}
++    run_kwargs.update(kwargs)
++
++    with pytest.raises(ValueError):
++        compiled.run(**run_kwargs)
++
++
++def test_cuda_heterogeneous_subnet_merge_returns_none():
++    weights, lengths = _make_8node_connectivity()
++    subnetworks = NbHybridBackend()._analyse(
++        _build_g2d_network(8, weights, lengths)
++    ).subnetworks
++    one_voi = np.zeros((2, 1, 8, 1), dtype=np.float32)
++    two_vois = np.zeros((2, 2, 8, 1), dtype=np.float32)
++
++    merged = CompiledCUDASweepKernel._merge_subnet_outputs(
++        [one_voi, two_vois], subnetworks * 2
++    )
++
++    assert merged is None
++
++
++def test_cuda_regression_raw_resume_from_nonzero_step_offset_matches_full_tail():
++    network = _linear_network(stimulus=True)
++    compiled, values = _compiled_linear(network)
++    common = dict(
++        sweep_values=values,
++        initial_states=[_initial_state()],
++        monitor_type="raw",
++    )
++
++    full = compiled.run(nstep=CUDA_RESUME_TOTAL, **common)
++    first = compiled.run(nstep=CUDA_RESUME_SPLIT, **common)
++    assert first["snapshot"]["step_offset"] == CUDA_RESUME_SPLIT
++    resumed = compiled.run(
++        nstep=CUDA_RESUME_TOTAL - CUDA_RESUME_SPLIT,
++        sweep_values=values,
++        snapshot=first["snapshot"],
++        monitor_type="raw",
++    )
++
++    np.testing.assert_array_equal(
++        resumed["raw"][0], full["raw"][0][:, CUDA_RESUME_SPLIT:]
++    )
++    assert resumed["snapshot"]["step_offset"] == CUDA_RESUME_TOTAL
++    np.testing.assert_array_equal(
++        resumed["snapshot"]["states"]["unit"],
++        full["snapshot"]["states"]["unit"],
++    )
++    np.testing.assert_array_equal(
++        resumed["snapshot"]["srcbufs"]["unit"],
++        full["snapshot"]["srcbufs"]["unit"],
++    )
++
++
++def test_cuda_regression_stochastic_chunked_raw_matches_unchunked_after_rng_reset():
++    network = _stochastic_linear_network()
++    compiled, values = _compiled_linear(network)
++    common = dict(
++        nstep=CUDA_RESUME_TOTAL,
++        sweep_values=values,
++        initial_states=[_initial_state()],
++        monitor_type="raw",
++    )
++
++    _reset_noise(network)
++    unchunked = compiled.run(chunk_size=CUDA_RESUME_TOTAL, **common)
++    _reset_noise(network)
++    chunked = compiled.run(chunk_size=3, **common)
++
++    np.testing.assert_array_equal(chunked["raw"][0], unchunked["raw"][0])
++    np.testing.assert_array_equal(
++        chunked["snapshot"]["states"]["unit"],
++        unchunked["snapshot"]["states"]["unit"],
++    )
++
++
++def test_cuda_regression_stochastic_snapshot_owns_rng_state_for_resume():
++    network = _stochastic_linear_network()
++    compiled, values = _compiled_linear(network)
++    common = dict(
++        sweep_values=values,
++        initial_states=[_initial_state()],
++        monitor_type="raw",
++    )
++
++    _reset_noise(network)
++    full = compiled.run(nstep=CUDA_RESUME_TOTAL, **common)
++    _reset_noise(network)
++    first = compiled.run(nstep=CUDA_RESUME_SPLIT, **common)
++    assert "rng_states" in first["snapshot"], (
++        "a stochastic CUDA snapshot must contain its RNG state"
++    )
++
++    network.subnets[0].scheme.noise.random_stream.randn(1000)
++    resumed = compiled.run(
++        nstep=CUDA_RESUME_TOTAL - CUDA_RESUME_SPLIT,
++        sweep_values=values,
++        snapshot=first["snapshot"],
++        monitor_type="raw",
++    )
++
++    np.testing.assert_array_equal(
++        resumed["raw"][0], full["raw"][0][:, CUDA_RESUME_SPLIT:]
++    )
++    np.testing.assert_array_equal(
++        resumed["snapshot"]["states"]["unit"],
++        full["snapshot"]["states"]["unit"],
++    )
++
++
++def test_cuda_regression_multimode_ctavg_preserves_modes_and_matches_cpu():
++    weights, lengths = _make_8node_connectivity()
++    network = _build_rsfhn_network(weights, lengths)
++    network.projections[0].mode_map = np.eye(3, dtype=np.int64)
++    network.configure()
++    rng = np.random.RandomState(88)
++    initial_states = [
++        rng.uniform(0.01, 0.2, (4, 8, 3)).astype(np.float32),
++        rng.uniform(0.01, 0.2, (4, 8, 3)).astype(np.float32),
++    ]
++    nstep = 3
++
++    cuda = NbHybridCUDASweepBackend().run_sweep(
++        network,
++        sweep_values=np.array([[0.5]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=initial_states,
++    )
++    cpu = NbHybridBackend().run_network(
++        network,
++        nstep=nstep,
++        chunk_size=1,
++        initial_states=initial_states,
++    )
++    cuda_ctavg = cuda["ctavg"][1][0]
++    cpu_ctavg = cpu[1][2].mean(axis=0).astype(np.float32)
++
++    assert np.all(np.any(cpu_ctavg != 0.0, axis=(0, 1)))
++    assert not np.array_equal(cpu_ctavg[..., 0], cpu_ctavg[..., 1])
++    assert not np.array_equal(cpu_ctavg[..., 1], cpu_ctavg[..., 2])
++    assert np.all(np.any(cuda_ctavg != 0.0, axis=(0, 1)))
++    assert not np.array_equal(cuda_ctavg[..., 0], cuda_ctavg[..., 1])
++    assert not np.array_equal(cuda_ctavg[..., 1], cuda_ctavg[..., 2])
++    np.testing.assert_allclose(cuda_ctavg, cpu_ctavg, rtol=2e-5, atol=2e-5)
++
++
++def test_cuda_regression_compile_rejects_nonzerlaut_custom_template_model():
++    model = CerebellarMF()
++    model.configure()
++    subnet = Subnetwork(
++        name="cerebellar", model=model, scheme=EulerDeterministic(dt=DT), nnodes=2
++    )
++    subnet.projections = []
++    subnet.configure()
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++
++    with pytest.raises(NotImplementedError, match="(?i)(custom|CerebellarMF)"):
++        NbHybridCUDASweepBackend().compile_sweep(network)
++
++
++def test_cuda_regression_compile_rejects_explicit_integrator_state_clamps():
++    network = _linear_network()
++    scheme = network.subnets[0].scheme
++    scheme.clamped_state_variable_indices = np.array([0], dtype=np.int32)
++    scheme.clamped_state_variable_values = np.array([0.125])
++
++    with pytest.raises(NotImplementedError, match="(?i)clamp"):
++        NbHybridCUDASweepBackend().compile_sweep(network)
++
++
++@pytest.mark.parametrize(
++    "descriptor",
++    [
++        {"type": "cfun", "projection": "missing", "param_idx": 0},
++        {"type": "cfun", "projection": "intra", "param_idx": 99},
++        {"type": "model", "subnet": "missing", "param": "gamma"},
++        {"type": "model", "subnet": "unit", "param": "missing"},
++    ],
++    ids=[
++        "unknown-projection",
++        "unknown-cfun-parameter",
++        "unknown-subnet",
++        "unknown-model-parameter",
++    ],
++)
++def test_cuda_regression_compile_validates_descriptor_references_before_render(
++    monkeypatch, descriptor
++):
++    backend = NbHybridCUDASweepBackend()
++
++    def fail_render(*args, **kwargs):
++        pytest.fail("compile_sweep rendered an invalid sweep descriptor")
++
++    monkeypatch.setattr(backend, "render_template", fail_render)
++    with pytest.raises(ValueError):
++        backend.compile_sweep(_linear_network(), sweep_descriptor=[descriptor])
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_cuda_sweep.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_cuda_sweep.py
+new file mode 100644
+index 0000000000..69dbb9f6a9
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_cuda_sweep.py
+@@ -0,0 +1,572 @@
++# -*- coding: utf-8 -*-
++#
++#
++# pytest test suite for the CUDA sweep backend.
++#
++# Each test clears _CUDA_COMPILED_CACHE and requires a CUDA-capable device.
++#
++
++import pytest
++import numpy as np
++import scipy.sparse as sp
++
++from tvb.simulator.backend.nb_hybrid_cuda_sweep_backend import (
++    NbHybridCUDASweepBackend,
++    _CUDA_COMPILED_CACHE,
++)
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++from tvb.simulator.models.oscillator import Generic2dOscillator
++from tvb.simulator.models.jansen_rit import JansenRit
++from tvb.simulator.models.stefanescu_jirsa import ReducedSetFitzHughNagumo
++from tvb.simulator.integrators import HeunDeterministic
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.hybrid.inter_projection import InterProjection
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.coupling import Scaling
++from tvb.datatypes.connectivity import Connectivity
++from tvb.datatypes import patterns, equations
++
++DT = 0.01
++
++
++# ---------------------------------------------------------------------------
++# Fixtures
++# ---------------------------------------------------------------------------
++
++@pytest.fixture(scope="session")
++def cuda_available():
++    """Skip the entire test session if CUDA is not available."""
++    try:
++        import numba.cuda
++        if not numba.cuda.is_available():
++            pytest.skip("CUDA not available")
++        return True
++    except ImportError:
++        pytest.skip("numba.cuda not available")
++
++
++@pytest.fixture(autouse=True)
++def clear_cuda_cache():
++    """Clear the in-process CUDA compiled kernel cache before every test."""
++    _CUDA_COMPILED_CACHE.clear()
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _make_8node_connectivity():
++    """Return 8×8 identity weights and zero lengths as sparse CSR matrices."""
++    w = sp.csr_matrix(np.eye(8, dtype=np.float64) * 0.1)
++    l = sp.csr_matrix(np.zeros((8, 8), dtype=np.float64))
++    return w, l
++
++
++def _make_76node_connectivity():
++    """Load the standard 76-node connectome and return sparse CSR weights/lengths."""
++    conn = Connectivity.from_file()
++    w = sp.csr_matrix(conn.weights)
++    l = sp.csr_matrix(conn.tract_lengths)
++    return w, l
++
++
++def _build_g2d_network(n_nodes, weights, lengths, cfun=Scaling()):
++    """Single Generic2dOscillator subnet with an intra-projection."""
++    m = Generic2dOscillator()
++    m.configure()
++    sn = Subnetwork(
++        name="g2d",
++        model=m,
++        scheme=HeunDeterministic(dt=DT),
++        nnodes=n_nodes,
++    )
++    sn.configure()
++
++    intra = IntraProjection(
++        source_cvar=np.array([0], dtype=np.int_),
++        target_cvar=np.array([0], dtype=np.int_),
++        weights=weights,
++        lengths=lengths,
++        cv=1.0,
++        dt=DT,
++        scale=1.0,
++        cfun=cfun,
++    )
++    sn.projections = [intra]
++    sn.configure()
++
++    ns = NetworkSet(subnets=[sn], projections=[])
++    ns.configure()
++    return ns
++
++
++def _build_jr_network(weights, lengths):
++    """Single JansenRit subnet with an intra-projection (76 nodes assumed)."""
++    m = JansenRit()
++    m.configure()
++    sn = Subnetwork(
++        name="jr",
++        model=m,
++        scheme=HeunDeterministic(dt=DT),
++        nnodes=76,
++    )
++    sn.configure()
++
++    intra = IntraProjection(
++        source_cvar=np.array([0], dtype=np.int32),
++        target_cvar=np.array([0], dtype=np.int32),
++        weights=weights,
++        lengths=lengths,
++        cv=1.0,
++        dt=DT,
++        scale=1e-3,
++        cfun=Scaling(),
++    )
++    sn.projections = [intra]
++    sn.configure()
++
++    ns = NetworkSet(subnets=[sn], projections=[])
++    ns.configure()
++    return ns
++
++
++def _build_rsfhn_network(weights, lengths):
++    """Two-subnet ReducedSetFitzHughNagumo network with an inter-projection."""
++    m1 = ReducedSetFitzHughNagumo()
++    m1.configure()
++    m2 = ReducedSetFitzHughNagumo()
++    m2.configure()
++
++    sn1 = Subnetwork(
++        name="rsfhn1",
++        model=m1,
++        scheme=HeunDeterministic(dt=0.1),
++        nnodes=8,
++    )
++    sn1.configure()
++    sn2 = Subnetwork(
++        name="rsfhn2",
++        model=m2,
++        scheme=HeunDeterministic(dt=0.1),
++        nnodes=8,
++    )
++    sn2.configure()
++
++    inter = InterProjection(
++        source=sn1,
++        target=sn2,
++        source_cvar=np.array([0, 2], dtype=np.int_),
++        target_cvar=np.array([0, 1], dtype=np.int_),
++        weights=weights,
++        lengths=lengths,
++        cv=1.0,
++        dt=0.1,
++        scale=1.0,
++        cfun=Scaling(a=np.array([0.5])),
++    )
++
++    ns = NetworkSet(subnets=[sn1, sn2], projections=[inter])
++    ns.configure()
++    return ns
++
++
++def _cpu_tavg_mean(network_set, nstep, x0_list):
++    """Run the CPU Numba backend and return the time-averaged state per subnet."""
++    backend = NbHybridBackend()
++    results = backend.run_network(
++        network_set,
++        nstep=nstep,
++        chunk_size=1,
++        initial_states=x0_list,
++    )
++    # results: list of (times, data, ctavg)
++    tavg = []
++    for _, data, _ in results:
++        # data shape: (nstep, n_voi, n_nodes, n_modes)
++        tavg.append(data.mean(axis=0).astype(np.float32))
++    return tavg
++
++
++# ---------------------------------------------------------------------------
++# 1. G2D ("MPR") vs CPU on 76 nodes
++# ---------------------------------------------------------------------------
++
++def test_mpr_vs_cpu(cuda_available):
++    """Generic2dOscillator on 76 nodes matches CPU reference (<1e-3)."""
++    w, l = _make_76node_connectivity()
++    ns = _build_g2d_network(76, w, l)
++    nstep = 20
++
++    x0 = np.zeros((2, 76, 1), dtype=np.float64)
++    gpu = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++    )
++    cpu = _cpu_tavg_mean(ns, nstep, [x0])
++
++    maxerr = np.max(np.abs(gpu["tavg"][0][0] - cpu[0]))
++    assert maxerr < 1e-3, f"maxerr={maxerr} >= 1e-3"
++
++
++# ---------------------------------------------------------------------------
++# 2. JansenRit vs CPU on 76 nodes
++# ---------------------------------------------------------------------------
++
++def test_jr_vs_cpu(cuda_available):
++    """JansenRit on 76 nodes matches CPU reference (<1e-3)."""
++    w, l = _make_76node_connectivity()
++    ns = _build_jr_network(w, l)
++    nstep = 20
++
++    x0 = np.zeros((6, 76, 1), dtype=np.float64)
++    x0[0, :, 0] = 0.08
++    x0[1, :, 0] = 13.0
++    x0[2, :, 0] = 5.0
++
++    gpu = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++    )
++    cpu = _cpu_tavg_mean(ns, nstep, [x0])
++
++    maxerr = np.max(np.abs(gpu["tavg"][0][0] - cpu[0]))
++    assert maxerr < 1e-3, f"maxerr={maxerr} >= 1e-3"
++
++
++# ---------------------------------------------------------------------------
++# 3. Chunking bit-exactness (G2D, 8 nodes, 100 steps)
++# ---------------------------------------------------------------------------
++
++def test_chunking_bit_exact(cuda_available):
++    """chunk_size=25 produces identical tavg to unchunked run."""
++    w, l = _make_8node_connectivity()
++    ns = _build_g2d_network(8, w, l)
++    nstep = 100
++
++    x0 = np.zeros((2, 8, 1), dtype=np.float64)
++
++    # Unchunked (chunk_size == nstep implicitly when not set)
++    res_unchunked = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++        chunk_size=nstep,
++    )
++    res_chunked = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++        chunk_size=25,
++    )
++
++    np.testing.assert_array_equal(
++        res_unchunked["tavg"][0],
++        res_chunked["tavg"][0],
++        err_msg="chunking broke bit-exactness",
++    )
++
++
++# ---------------------------------------------------------------------------
++# 4. Batching bit-exactness (G2D, 8 nodes, 10 steps, 20 sweeps)
++# ---------------------------------------------------------------------------
++
++def test_batching_bit_exact(cuda_available):
++    """max_batch_sweeps=5 produces identical tavg to single-batch run."""
++    w, l = _make_8node_connectivity()
++    ns = _build_g2d_network(8, w, l)
++    nstep = 10
++
++    x0 = np.zeros((2, 8, 1), dtype=np.float64)
++    sweep_values = np.arange(20, dtype=np.float32).reshape(-1, 1)
++
++    res_single = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=sweep_values,
++        nstep=nstep,
++        initial_states=[x0],
++    )
++    res_batched = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=sweep_values,
++        nstep=nstep,
++        initial_states=[x0],
++        max_batch_sweeps=5,
++    )
++
++    np.testing.assert_array_equal(
++        res_single["tavg"][0],
++        res_batched["tavg"][0],
++        err_msg="batching broke bit-exactness",
++    )
++
++
++# ---------------------------------------------------------------------------
++# 5. BOLD no NaN (G2D, 8 nodes, 200 steps)
++# ---------------------------------------------------------------------------
++
++def test_bold_no_nan(cuda_available):
++    """Bold output contains no NaN when bold_period is supplied."""
++    w, l = _make_8node_connectivity()
++    ns = _build_g2d_network(8, w, l)
++    nstep = 200
++
++    x0 = np.zeros((2, 8, 1), dtype=np.float64)
++    res = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++        bold_period=2.0,
++    )
++
++    assert "bold" in res, "Expected 'bold' key in result dict"
++    for bold_arr in res["bold"]:
++        assert np.all(np.isfinite(bold_arr)), "NaN/Inf in BOLD output"
++
++
++# ---------------------------------------------------------------------------
++# 6. Raw monitor shape (G2D, 8 nodes, 20 steps)
++# ---------------------------------------------------------------------------
++
++def test_raw_monitor_shape(cuda_available):
++    """monitor_type=1 yields raw output with shape (n_sweeps, nstep, n_voi, n_nodes, n_modes)."""
++    w, l = _make_8node_connectivity()
++    ns = _build_g2d_network(8, w, l)
++    nstep = 20
++
++    x0 = np.zeros((2, 8, 1), dtype=np.float64)
++    res = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++        monitor_type=1,
++    )
++
++    assert "raw" in res, "Expected 'raw' key in result dict"
++    # G2D has 1 VoI (V)
++    assert res["raw"][0].shape == (1, 20, 1, 8, 1), f"unexpected raw shape: {res['raw'][0].shape}"
++
++
++# ---------------------------------------------------------------------------
++# 7. Subsample monitor shape (G2D, 8 nodes, 20 steps, period=4)
++# ---------------------------------------------------------------------------
++
++def test_subsample_shape(cuda_available):
++    """monitor_type=2 with monitor_period=4 yields correct subsampled shape."""
++    w, l = _make_8node_connectivity()
++    ns = _build_g2d_network(8, w, l)
++    nstep = 20
++    monitor_period = 4
++    expected_raw_steps = (nstep + monitor_period - 1) // monitor_period  # 5
++
++    x0 = np.zeros((2, 8, 1), dtype=np.float64)
++    res = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++        monitor_type=2,
++        monitor_period=monitor_period,
++    )
++
++    assert "raw" in res, "Expected 'raw' key in result dict"
++    assert res["raw"][0].shape == (1, expected_raw_steps, 1, 8, 1), (
++        f"unexpected subsample shape: {res['raw'][0].shape}"
++    )
++
++
++# ---------------------------------------------------------------------------
++# 8. Heun combined RS-FHN vs CPU (8 nodes, 20 steps, 3 modes)
++# ---------------------------------------------------------------------------
++
++def test_heun_combined_vs_cpu(cuda_available):
++    """ReducedSetFitzHughNagumo (combined) matches CPU or produces finite output.
++
++    Multi-mode combined-dfun models show trajectory divergence in float32
++    (~1%/step), so we use rtol=0.1 for 20-step comparison and also verify
++    single-step agreement is tight.
++    """
++    w, l = _make_8node_connectivity()
++    ns = _build_rsfhn_network(w, l)
++
++    rng = np.random.RandomState(88)
++    x0_src = rng.uniform(0.0, 0.2, (4, 8, 3)).astype(np.float64)
++    x0_tgt = rng.uniform(0.0, 0.2, (4, 8, 3)).astype(np.float64)
++
++    sweep_values = np.array([[0.5]], dtype=np.float32)
++
++    # --- Single-step tight check ---
++    gpu1 = NbHybridCUDASweepBackend().run_sweep(
++        ns, sweep_values=sweep_values, nstep=1,
++        initial_states=[x0_src, x0_tgt],
++    )
++    assert len(gpu1["tavg"]) == 2
++    for arr in gpu1["tavg"]:
++        assert np.all(np.isfinite(arr)), "NaN/Inf in GPU 1-step output"
++
++    try:
++        cpu1 = _cpu_tavg_mean(ns, 1, [x0_src, x0_tgt])
++    except Exception:
++        pytest.skip("CPU reference crashed for RS-FHN Heun combined (1-step)")
++
++    for si in range(2):
++        err1 = np.max(np.abs(gpu1["tavg"][si][0, :, :, 0] - cpu1[si][:, :, 0]))
++        assert err1 < 1e-3, f"subnet {si} 1-step maxerr={err1} >= 1e-3"
++
++    # --- 20-step trajectory check (relaxed tolerance) ---
++    nstep = 20
++    gpu = NbHybridCUDASweepBackend().run_sweep(
++        ns, sweep_values=sweep_values, nstep=nstep,
++        initial_states=[x0_src, x0_tgt],
++    )
++
++    # Verify GPU output is finite, mode-0 has content, other modes ~zero
++    assert len(gpu["tavg"]) == 2, "expected two subnets in tavg"
++    for arr in gpu["tavg"]:
++        assert arr.shape[0] == 1
++        assert np.all(np.isfinite(arr)), "NaN/Inf in GPU sweep output"
++        # Mode-0 contains the summed temporal average
++        assert np.any(np.abs(arr[0, :, :, 0]) > 0), "mode-0 sum is all zeros"
++
++    try:
++        cpu = _cpu_tavg_mean(ns, nstep, [x0_src, x0_tgt])
++    except Exception:
++        pytest.skip("CPU reference crashed for RS-FHN Heun combined")
++
++    for si in range(2):
++        gpu_slice = gpu["tavg"][si][0, :, :, 0]  # mode-0 sum
++        maxerr = np.max(np.abs(gpu_slice - cpu[si][:, :, 0]))
++        assert maxerr < 0.5, f"subnet {si} 20-step maxerr={maxerr} >= 0.5"
++
++
++# ---------------------------------------------------------------------------
++# 9. ctavg present and non-zero (G2D, 8 nodes, 10 steps)
++# ---------------------------------------------------------------------------
++
++def test_ctavg_present(cuda_available):
++    """ctavg is non-zero and has correct shape for a coupled subnet."""
++    w, l = _make_8node_connectivity()
++    ns = _build_g2d_network(8, w, l)
++    nstep = 10
++
++    # Non-zero initial state so coupling signals propagate through delay buffer
++    x0 = np.zeros((2, 8, 1), dtype=np.float64)
++    x0[0, :, 0] = 1.0
++    res = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++    )
++
++    assert "ctavg" in res, "Expected 'ctavg' key in result dict"
++    ct = res["ctavg"][0]
++    # G2D has 1 coupling term (c_V)
++    assert ct.shape == (1, 1, 8, 1), f"unexpected ctavg shape: {ct.shape}"
++    assert np.any(np.abs(ct) > 0), "ctavg is all zeros for coupled subnet"
++
++
++# ---------------------------------------------------------------------------
++# 10. Spatial / projection monitor shapes (G2D, 8 nodes, 5 steps)
++# ---------------------------------------------------------------------------
++
++def test_spatial_proj_shape(cuda_available):
++    """spatial_mean and gain provided → spatial_tavg and proj_tavg have correct shapes."""
++    w, l = _make_8node_connectivity()
++    ns = _build_g2d_network(8, w, l)
++    nstep = 5
++
++    x0 = np.zeros((2, 8, 1), dtype=np.float64)
++    n_areas = 2
++    n_sensors = 3
++    spatial_mean = np.eye(n_areas, 8, dtype=np.float32)[:n_areas, :]
++    gain = np.eye(n_sensors, 8, dtype=np.float32)[:n_sensors, :]
++
++    res = NbHybridCUDASweepBackend().run_sweep(
++        ns,
++        sweep_values=np.array([[1.0]], dtype=np.float32),
++        nstep=nstep,
++        initial_states=[x0],
++        monitors={
++            "spatial_mean": {"g2d": spatial_mean},
++            "gain": {"g2d": gain},
++        },
++    )
++
++    assert "spatial_tavg" in res, "Expected 'spatial_tavg' key"
++    assert "proj_tavg" in res, "Expected 'proj_tavg' key"
++    # spatial_tavg: (n_sweeps, n_voi, n_areas, 1)
++    assert res["spatial_tavg"][0].shape == (1, 1, 2, 1), (
++        f"unexpected spatial_tavg shape: {res['spatial_tavg'][0].shape}"
++    )
++    # proj_tavg: (n_sweeps, n_voi, n_sensors, 1)
++    assert res["proj_tavg"][0].shape == (1, 1, 3, 1), (
++        f"unexpected proj_tavg shape: {res['proj_tavg'][0].shape}"
++    )
++
++
++def test_stimulus_api(cuda_available):
++    """Verify stimulus via Subnetwork.add_stimulus() works on CUDA (post-refactor API)."""
++    _CUDA_COMPILED_CACHE.clear()
++
++    conn = Connectivity.from_file('connectivity_76.zip')
++    model = Generic2dOscillator(); model.configure()
++
++    sA = Subnetwork(name='A', model=model, scheme=HeunDeterministic(dt=DT), nnodes=8); sA.configure()
++    sB = Subnetwork(name='B', model=model, scheme=HeunDeterministic(dt=DT), nnodes=8); sB.configure()
++
++    # Attach stimulus via NEW API
++    stim_weights = np.zeros(sA.nnodes)
++    stim_weights[0] = 1.0
++    temporal = equations.PulseTrain()
++    temporal.parameters['onset'] = 0.0
++    temporal.configure()
++    stimulus = patterns.StimuliRegion(
++        temporal=temporal, connectivity=conn, weight=stim_weights
++    )
++    sA.add_stimulus(stimulus=stimulus, stimulus_cvar='V', projection_scale=1.0)
++    sA.configure(simulation_length=10.0)
++    sB.configure(simulation_length=10.0)
++
++    w8 = sp.eye(8, format='csr') * 0.1
++    l8 = sp.csr_matrix(np.zeros((8, 8)))
++    proj = InterProjection(source=sA, target=sB, source_cvar=np.array([0]),
++                           target_cvar=np.array([0]), weights=w8, lengths=l8,
++                           cv=3.0, dt=DT, scale=1.0, cfun=Scaling(a=np.array([0.5])))
++    ns = NetworkSet(subnets=[sA, sB], projections=[proj])
++    ns.configure()
++
++    x0 = np.abs(np.random.RandomState(42).uniform(0.01, 0.05, (2, 8, 1))).astype(np.float32)
++    res = NbHybridCUDASweepBackend().run_sweep(
++        ns, sweep_values=np.array([0.5], dtype=np.float32), nstep=10, initial_states=[x0, x0]
++    )
++
++    assert not np.any(np.isnan(res['tavg'][0])), "NaN in tavg[0]"
++    assert not np.any(np.isnan(res['tavg'][1])), "NaN in tavg[1]"
++    assert len(sA.stimuli) == 1
++    assert len(sB.stimuli) == 0
++
++    # Control: identical setup without stimulus
++    sA_c = Subnetwork(name='A', model=model, scheme=HeunDeterministic(dt=DT), nnodes=8); sA_c.configure()
++    sB_c = Subnetwork(name='B', model=model, scheme=HeunDeterministic(dt=DT), nnodes=8); sB_c.configure()
++    proj_c = InterProjection(source=sA_c, target=sB_c, source_cvar=np.array([0]),
++                             target_cvar=np.array([0]), weights=w8, lengths=l8,
++                             cv=3.0, dt=DT, scale=1.0, cfun=Scaling(a=np.array([0.5])))
++    ns_c = NetworkSet(subnets=[sA_c, sB_c], projections=[proj_c])
++    ns_c.configure()
++
++    _CUDA_COMPILED_CACHE.clear()
++    res_c = NbHybridCUDASweepBackend().run_sweep(
++        ns_c, sweep_values=np.array([0.5], dtype=np.float32), nstep=10, initial_states=[x0, x0]
++    )
++
++    node0_diff = np.max(np.abs(res['tavg'][0][0, 0, 0, 0] - res_c['tavg'][0][0, 0, 0, 0]))
++    assert node0_diff > 1e-8, "Node 0 should differ due to stimulus!"

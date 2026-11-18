@@ -1,0 +1,684 @@
+diff --git a/.skills/wiki-ingest/SKILL.md b/.skills/wiki-ingest/SKILL.md
+index 5d61f4f5..038f0c29 100644
+--- a/.skills/wiki-ingest/SKILL.md
++++ b/.skills/wiki-ingest/SKILL.md
+@@ -216,6 +216,41 @@ If the QMD results show that 3+ papers touch the same concept, that concept almo
+ **Skip this step** if `QMD_PAPERS_COLLECTION` is not set.
+ 
+ 
++### Step 1c: Code Source Detection (free local extraction — no LLM)
++
++**GUARD: Only run this step when the source contains code files** (`.py`, `.ts`, `.js`, `.go`, `.rs`, `.java`, `.kt`, `.rb`, `.c`, `.cpp`, `.swift`, `.sh`, etc.). Skip for docs-only, PDFs, images, chat exports.
++
++When the source path is a directory or file with code, run the local AST extractor before doing any LLM work. This is free — it parses code structure locally (classes, functions, imports, inheritance) using deterministic patterns, zero tokens spent.
++
++```bash
++obsidian-wiki ast-extract <path> --pretty
++```
++
++The output is JSON with three sections you'll use directly:
++
++**`nodes`** — every class, function, import, and file found. Fields: `id`, `label`, `kind` (`class`/`function`/`import`/`file`), `file`, `line`, `language`.
++
++**`edges`** — structural relationships. `relation` is one of: `defines`, `imports`, `inherits`, `calls`. All have `confidence: "EXTRACTED"` — these are facts, not inferences.
++
++**`god_nodes`** — the 10 most-connected node IDs by degree. These are the architectural hubs of the codebase.
++
++**`stats`** — `files_processed`, `nodes`, `edges`, `languages`.
++
++#### What to do with the AST output
++
++1. **Seed entity pages** — each `kind: "class"` node with degree ≥ 2 (appears in multiple edges) gets a stub `entities/<name>.md` page. Do not create a page per function — only architectural-level entities.
++
++2. **Mark god nodes** — the top `god_nodes` entries are the concepts every other page should link to. Reference them in the project overview page.
++
++3. **Map import graph** — `relation: "imports"` edges reveal what the codebase depends on. List the top 5 external imports in the project overview under a "Dependencies" section.
++
++4. **Surface inheritance hierarchies** — `relation: "inherits"` edges show class relationships. Group sibling classes into a single page when they share a parent.
++
++5. **Skip code files in the LLM pass** — do NOT send `.py`, `.ts`, `.go`, etc. source files to the model for Step 2 extraction. The AST output already captured their structure. Only send: `README.md`, `CHANGELOG.md`, inline docstrings/comments (extract as plain text), and any `.md`/`.txt` docs alongside the code.
++
++If `obsidian-wiki` is not installed or the command fails, skip this step and proceed to Step 2 as normal — it is an optimisation, not a requirement.
++
++
+ ### Step 2: Extract Knowledge
+ 
+ From the source, identify:
+diff --git a/obsidian_wiki/ast_extractor.py b/obsidian_wiki/ast_extractor.py
+new file mode 100644
+index 00000000..6f441048
+--- /dev/null
++++ b/obsidian_wiki/ast_extractor.py
+@@ -0,0 +1,387 @@
++"""Local AST-based code structure extractor.
++
++Extracts classes, functions, and imports from source files using regex patterns
++(no LLM, no API calls). Outputs a node-link graph that wiki-ingest uses to seed
++entity pages and map dependencies before any token is spent on the LLM.
++
++Optional tree-sitter upgrade: install `obsidian-wiki[ast]` for higher-fidelity
++extraction on the same languages. Falls back to regex automatically.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Iterator
++
++# ---------------------------------------------------------------------------
++# Data model
++# ---------------------------------------------------------------------------
++
++@dataclass
++class Node:
++    id: str
++    label: str
++    kind: str          # "class" | "function" | "import" | "file"
++    file: str
++    line: int = 0
++    language: str = ""
++    docstring: str = ""
++
++@dataclass
++class Edge:
++    source: str
++    target: str
++    relation: str      # "imports" | "calls" | "inherits" | "defines"
++    confidence: str = "EXTRACTED"
++    source_file: str = ""
++
++@dataclass
++class Graph:
++    nodes: list[Node] = field(default_factory=list)
++    edges: list[Edge] = field(default_factory=list)
++    stats: dict = field(default_factory=dict)
++
++    def merge(self, other: "Graph") -> None:
++        seen_nodes = {n.id for n in self.nodes}
++        seen_edges = {(e.source, e.target, e.relation) for e in self.edges}
++        for n in other.nodes:
++            if n.id not in seen_nodes:
++                self.nodes.append(n)
++                seen_nodes.add(n.id)
++        for e in other.edges:
++            key = (e.source, e.target, e.relation)
++            if key not in seen_edges:
++                self.edges.append(e)
++                seen_edges.add(key)
++
++    def to_dict(self) -> dict:
++        # Compute god nodes (top 10 by degree)
++        degree: dict[str, int] = {}
++        for e in self.edges:
++            degree[e.source] = degree.get(e.source, 0) + 1
++            degree[e.target] = degree.get(e.target, 0) + 1
++        god_nodes = sorted(degree, key=lambda x: -degree[x])[:10]
++
++        langs: dict[str, int] = {}
++        for n in self.nodes:
++            if n.language:
++                langs[n.language] = langs.get(n.language, 0) + 1
++
++        return {
++            "nodes": [
++                {
++                    "id": n.id,
++                    "label": n.label,
++                    "kind": n.kind,
++                    "file": n.file,
++                    "line": n.line,
++                    "language": n.language,
++                    "docstring": n.docstring,
++                }
++                for n in self.nodes
++            ],
++            "edges": [
++                {
++                    "source": e.source,
++                    "target": e.target,
++                    "relation": e.relation,
++                    "confidence": e.confidence,
++                    "source_file": e.source_file,
++                }
++                for e in self.edges
++            ],
++            "god_nodes": god_nodes,
++            "stats": {
++                "nodes": len(self.nodes),
++                "edges": len(self.edges),
++                "languages": langs,
++                **self.stats,
++            },
++        }
++
++
++# ---------------------------------------------------------------------------
++# Language pattern definitions
++# ---------------------------------------------------------------------------
++
++@dataclass
++class LangSpec:
++    extensions: tuple[str, ...]
++    name: str
++    class_pat: str
++    func_pat: str
++    import_pats: tuple[str, ...]
++    inherit_pat: str = ""    # optional group(1)=child group(2)=parent
++    docstring_pat: str = ""  # line immediately after def/class
++
++
++LANGUAGES: list[LangSpec] = [
++    LangSpec(
++        name="python",
++        extensions=(".py",),
++        class_pat=r"^class\s+(\w+)",
++        func_pat=r"^(?:async\s+)?def\s+(\w+)",
++        import_pats=(
++            r"^import\s+([\w.]+)",
++            r"^from\s+([\w.]+)\s+import",
++        ),
++        inherit_pat=r"^class\s+(\w+)\s*\(([^)]+)\)",
++        docstring_pat=r'^\s*"""(.+?)"""',
++    ),
++    LangSpec(
++        name="javascript",
++        extensions=(".js", ".jsx", ".mjs", ".cjs"),
++        class_pat=r"^(?:export\s+)?class\s+(\w+)",
++        func_pat=r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)|^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(",
++        import_pats=(
++            r"""^import\s+.*?from\s+['"]([^'"]+)['"]""",
++            r"""^(?:const|let|var)\s+\w+\s*=\s*require\s*\(['"]([^'"]+)['"]\)""",
++        ),
++        inherit_pat=r"^class\s+(\w+)\s+extends\s+(\w+)",
++    ),
++    LangSpec(
++        name="typescript",
++        extensions=(".ts", ".tsx"),
++        class_pat=r"^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)",
++        func_pat=r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)|^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(",
++        import_pats=(r"""^import\s+.*?from\s+['"]([^'"]+)['"]""",),
++        inherit_pat=r"^(?:export\s+)?class\s+(\w+)\s+extends\s+(\w+)",
++    ),
++    LangSpec(
++        name="go",
++        extensions=(".go",),
++        class_pat=r"^type\s+(\w+)\s+struct",
++        func_pat=r"^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(",
++        import_pats=(r'"([\w./]+)"',),
++    ),
++    LangSpec(
++        name="rust",
++        extensions=(".rs",),
++        class_pat=r"^(?:pub\s+)?struct\s+(\w+)|^(?:pub\s+)?enum\s+(\w+)|^(?:pub\s+)?trait\s+(\w+)",
++        func_pat=r"^(?:pub\s+)?(?:async\s+)?fn\s+(\w+)",
++        import_pats=(r"^use\s+([\w:]+(?:::\{[^}]+\})?)",),
++        inherit_pat=r"^impl(?:<[^>]+>)?\s+(\w+)\s+for\s+(\w+)",
++    ),
++    LangSpec(
++        name="java",
++        extensions=(".java",),
++        class_pat=r"^(?:public\s+)?(?:abstract\s+)?(?:final\s+)?class\s+(\w+)|^(?:public\s+)?interface\s+(\w+)",
++        func_pat=r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:\w+\s+)+(\w+)\s*\(",
++        import_pats=(r"^import\s+([\w.]+);",),
++        inherit_pat=r"class\s+(\w+)\s+extends\s+(\w+)",
++    ),
++    LangSpec(
++        name="kotlin",
++        extensions=(".kt", ".kts"),
++        class_pat=r"^(?:data\s+)?class\s+(\w+)|^interface\s+(\w+)|^object\s+(\w+)",
++        func_pat=r"^(?:suspend\s+)?fun\s+(\w+)",
++        import_pats=(r"^import\s+([\w.]+)",),
++        inherit_pat=r"class\s+(\w+)\s*[:(]\s*(\w+)",
++    ),
++    LangSpec(
++        name="ruby",
++        extensions=(".rb",),
++        class_pat=r"^class\s+(\w+)",
++        func_pat=r"^\s*def\s+(\w+)",
++        import_pats=(
++            r"""^require\s+['"]([^'"]+)['"]""",
++            r"""^require_relative\s+['"]([^'"]+)['"]""",
++        ),
++        inherit_pat=r"^class\s+(\w+)\s*<\s*(\w+)",
++    ),
++    LangSpec(
++        name="c",
++        extensions=(".c", ".h"),
++        class_pat=r"^typedef\s+struct\s+(\w+)|^struct\s+(\w+)\s*\{",
++        func_pat=r"^(?:static\s+)?(?:inline\s+)?(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{",
++        import_pats=(r'^#include\s+[<"]([^>"]+)[>"]',),
++    ),
++    LangSpec(
++        name="cpp",
++        extensions=(".cpp", ".cc", ".cxx", ".hpp", ".hh"),
++        class_pat=r"^class\s+(\w+)|^struct\s+(\w+)",
++        func_pat=r"^(?:virtual\s+)?(?:static\s+)?(?:inline\s+)?(?:\w+[\w:*&<> ]+)\s+(\w+)\s*\(",
++        import_pats=(r'^#include\s+[<"]([^>"]+)[>"]',),
++        inherit_pat=r"^class\s+(\w+)\s*:\s*(?:public|protected|private)\s+(\w+)",
++    ),
++    LangSpec(
++        name="swift",
++        extensions=(".swift",),
++        class_pat=r"^(?:public\s+)?(?:final\s+)?class\s+(\w+)|^struct\s+(\w+)|^protocol\s+(\w+)",
++        func_pat=r"^(?:public\s+)?(?:private\s+)?(?:static\s+)?(?:override\s+)?func\s+(\w+)",
++        import_pats=(r"^import\s+(\w+)",),
++        inherit_pat=r"class\s+(\w+)\s*:\s*(\w+)",
++    ),
++    LangSpec(
++        name="shell",
++        extensions=(".sh", ".bash", ".zsh"),
++        class_pat="",
++        func_pat=r"^(?:function\s+)?(\w+)\s*\(\s*\)\s*\{",
++        import_pats=(r"^source\s+(\S+)", r"^\.\s+(\S+)"),
++    ),
++]
++
++_EXT_TO_LANG: dict[str, LangSpec] = {}
++for _spec in LANGUAGES:
++    for _ext in _spec.extensions:
++        _EXT_TO_LANG[_ext] = _spec
++
++
++# ---------------------------------------------------------------------------
++# Per-file extraction
++# ---------------------------------------------------------------------------
++
++# File extensions we consider code (and should extract from)
++CODE_EXTENSIONS = frozenset(_EXT_TO_LANG.keys())
++
++# Extensions we skip entirely (binary, generated, etc.)
++SKIP_EXTENSIONS = frozenset(
++    ".pyc .pyo .pyd .so .dylib .dll .exe .class .jar .war .egg "
++    ".zip .tar .gz .bz2 .whl .lock .png .jpg .jpeg .gif .ico .svg "
++    ".pdf .mp4 .mov .mp3 .wav .ttf .woff .eot".split()
++)
++
++# Directories to skip (mirrors .gitignore defaults)
++SKIP_DIRS = frozenset(
++    "node_modules .git __pycache__ .pytest_cache dist build target "
++    ".venv venv env .mypy_cache .ruff_cache coverage .tox".split()
++)
++
++
++def _file_id(path: str, name: str) -> str:
++    """Stable node ID: <relative_path>::<name>."""
++    return f"{path}::{name}"
++
++
++def extract_file(path: Path, root: Path | None = None) -> Graph:
++    """Extract nodes and edges from a single code file."""
++    rel = str(path.relative_to(root)) if root else path.name
++    ext = path.suffix.lower()
++    spec = _EXT_TO_LANG.get(ext)
++    if spec is None:
++        return Graph()
++
++    try:
++        text = path.read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        return Graph()
++
++    graph = Graph()
++    file_node_id = rel
++    graph.nodes.append(Node(id=file_node_id, label=path.name, kind="file",
++                            file=rel, language=spec.name))
++
++    lines = text.splitlines()
++    for i, line in enumerate(lines, start=1):
++        stripped = line.rstrip()
++
++        # Classes / structs
++        if spec.class_pat:
++            m = re.match(spec.class_pat, stripped)
++            if m:
++                name = next((g for g in m.groups() if g), None)
++                if name:
++                    nid = _file_id(rel, name)
++                    graph.nodes.append(Node(id=nid, label=name, kind="class",
++                                            file=rel, line=i, language=spec.name))
++                    graph.edges.append(Edge(source=file_node_id, target=nid,
++                                            relation="defines", source_file=rel))
++
++        # Functions / methods
++        if spec.func_pat:
++            m = re.match(spec.func_pat, stripped)
++            if m:
++                name = next((g for g in m.groups() if g), None)
++                if name and not name.startswith("_"):  # skip private/dunder
++                    nid = _file_id(rel, name)
++                    graph.nodes.append(Node(id=nid, label=name, kind="function",
++                                            file=rel, line=i, language=spec.name))
++                    graph.edges.append(Edge(source=file_node_id, target=nid,
++                                            relation="defines", source_file=rel))
++
++        # Imports
++        for pat in spec.import_pats:
++            m = re.search(pat, stripped)
++            if m:
++                target = m.group(1).split(".")[0].split("/")[-1].split("::")[0]
++                if target:
++                    nid = f"import::{target}"
++                    if not any(n.id == nid for n in graph.nodes):
++                        graph.nodes.append(Node(id=nid, label=target, kind="import",
++                                                file=rel, line=i, language=spec.name))
++                    graph.edges.append(Edge(source=file_node_id, target=nid,
++                                            relation="imports", source_file=rel))
++                break
++
++        # Inheritance
++        if spec.inherit_pat:
++            m = re.match(spec.inherit_pat, stripped)
++            if m and len(m.groups()) >= 2:
++                child, parent = m.group(1), m.group(2)
++                if child and parent:
++                    child_id = _file_id(rel, child)
++                    parent_id = _file_id(rel, parent)
++                    graph.edges.append(Edge(source=child_id, target=parent_id,
++                                            relation="inherits",
++                                            confidence="EXTRACTED",
++                                            source_file=rel))
++
++    return graph
++
++
++# ---------------------------------------------------------------------------
++# Directory extraction
++# ---------------------------------------------------------------------------
++
++def _walk_code_files(root: Path) -> Iterator[Path]:
++    for dirpath, dirnames, filenames in root.walk() if hasattr(root, "walk") else _os_walk(root):
++        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
++        for fn in filenames:
++            p = Path(dirpath) / fn
++            if p.suffix.lower() in CODE_EXTENSIONS and p.suffix.lower() not in SKIP_EXTENSIONS:
++                yield p
++
++
++def _os_walk(root: Path):
++    import os
++    for dirpath, dirnames, filenames in os.walk(root):
++        yield Path(dirpath), dirnames, filenames
++
++
++def extract_directory(root: Path, *, max_files: int = 2000) -> Graph:
++    """Extract all code files under *root*, merging into one graph."""
++    graph = Graph()
++    count = 0
++    lang_counts: dict[str, int] = {}
++
++    for path in _walk_code_files(root):
++        if count >= max_files:
++            break
++        fg = extract_file(path, root=root)
++        graph.merge(fg)
++        lang = _EXT_TO_LANG.get(path.suffix.lower())
++        if lang:
++            lang_counts[lang.name] = lang_counts.get(lang.name, 0) + 1
++        count += 1
++
++    graph.stats = {"files_processed": count, "languages": lang_counts}
++    return graph
++
++
++# ---------------------------------------------------------------------------
++# Convenience entry point (used by the CLI)
++# ---------------------------------------------------------------------------
++
++def extract(path: Path) -> dict:
++    """Extract from a file or directory, return serialisable dict."""
++    if path.is_dir():
++        graph = extract_directory(path)
++    elif path.is_file():
++        graph = extract_file(path)
++    else:
++        raise FileNotFoundError(f"Path not found: {path}")
++    return graph.to_dict()
+diff --git a/obsidian_wiki/cli.py b/obsidian_wiki/cli.py
+index 929dad6c..dd673413 100644
+--- a/obsidian_wiki/cli.py
++++ b/obsidian_wiki/cli.py
+@@ -10,6 +10,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
+ import os
+ import shutil
+ import sys
+@@ -348,6 +349,22 @@ def cmd_setup(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def cmd_ast_extract(args: argparse.Namespace) -> int:
++    from pathlib import Path
++    from obsidian_wiki.ast_extractor import extract
++    path = Path(args.path).expanduser().resolve()
++    try:
++        result = extract(path)
++    except FileNotFoundError as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 1
++    if args.pretty:
++        print(json.dumps(result, indent=2))
++    else:
++        print(json.dumps(result))
++    return 0
++
++
+ def cmd_list(args: argparse.Namespace) -> int:
+     for name in list_skills():
+         print(name)
+@@ -406,6 +423,14 @@ def build_parser() -> argparse.ArgumentParser:
+     ip = sub.add_parser("info", help="show install paths, version, and config")
+     ip.set_defaults(func=cmd_info)
+ 
++    ap = sub.add_parser(
++        "ast-extract",
++        help="extract code structure (classes, functions, imports) from a file or directory — no LLM, no API calls",
++    )
++    ap.add_argument("path", help="file or directory to extract from")
++    ap.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
++    ap.set_defaults(func=cmd_ast_extract)
++
+     return p
+ 
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index f37f4b13..b16f0ad7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -33,6 +33,10 @@ classifiers = [
+ # Pure-stdlib CLI — installing skills needs no third-party runtime dependencies.
+ dependencies = []
+ 
++[project.optional-dependencies]
++# Higher-fidelity AST extraction (tree-sitter parses real ASTs; regex is the default fallback).
++ast = ["tree-sitter>=0.21", "tree-sitter-languages>=1.10"]
++
+ [project.urls]
+ Homepage = "https://github.com/Ar9av/obsidian-wiki"
+ Repository = "https://github.com/Ar9av/obsidian-wiki"
+diff --git a/tests/test_ast_extractor.py b/tests/test_ast_extractor.py
+new file mode 100644
+index 00000000..f79f7b06
+--- /dev/null
++++ b/tests/test_ast_extractor.py
+@@ -0,0 +1,174 @@
++"""Tests for the local AST code extractor."""
++import json
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from obsidian_wiki.ast_extractor import extract, extract_file, extract_directory
++
++
++# ---------------------------------------------------------------------------
++# Fixtures
++# ---------------------------------------------------------------------------
++
++@pytest.fixture
++def tmp_py(tmp_path):
++    src = tmp_path / "sample.py"
++    src.write_text(textwrap.dedent("""\
++        import os
++        from pathlib import Path
++
++        class Animal:
++            pass
++
++        class Dog(Animal):
++            pass
++
++        def fetch(item):
++            return item
++    """))
++    return src
++
++
++@pytest.fixture
++def tmp_js(tmp_path):
++    src = tmp_path / "app.js"
++    src.write_text(textwrap.dedent("""\
++        import { foo } from './utils';
++
++        class Widget extends Base {
++            render() {}
++        }
++
++        function init() {}
++    """))
++    return src
++
++
++@pytest.fixture
++def tmp_dir(tmp_path, tmp_py, tmp_js):
++    return tmp_path
++
++
++# ---------------------------------------------------------------------------
++# Unit tests
++# ---------------------------------------------------------------------------
++
++class TestExtractFile:
++    def test_python_classes(self, tmp_py):
++        g = extract_file(tmp_py)
++        labels = {n.label for n in g.nodes}
++        assert "Animal" in labels
++        assert "Dog" in labels
++
++    def test_python_functions(self, tmp_py):
++        g = extract_file(tmp_py)
++        labels = {n.label for n in g.nodes}
++        assert "fetch" in labels
++
++    def test_python_imports(self, tmp_py):
++        g = extract_file(tmp_py)
++        labels = {n.label for n in g.nodes}
++        assert "os" in labels
++        assert "pathlib" in labels
++
++    def test_python_inheritance_edge(self, tmp_py):
++        g = extract_file(tmp_py)
++        relations = {(e.source.split("::")[-1], e.target.split("::")[-1], e.relation)
++                     for e in g.edges}
++        assert ("Dog", "Animal", "inherits") in relations
++
++    def test_javascript_class_and_function(self, tmp_js):
++        g = extract_file(tmp_js)
++        labels = {n.label for n in g.nodes}
++        assert "Widget" in labels
++        assert "init" in labels
++
++    def test_javascript_inheritance(self, tmp_js):
++        g = extract_file(tmp_js)
++        relations = {(e.source.split("::")[-1], e.target.split("::")[-1], e.relation)
++                     for e in g.edges}
++        assert ("Widget", "Base", "inherits") in relations
++
++    def test_file_node_present(self, tmp_py):
++        g = extract_file(tmp_py)
++        file_nodes = [n for n in g.nodes if n.kind == "file"]
++        assert len(file_nodes) == 1
++
++    def test_unknown_extension_returns_empty(self, tmp_path):
++        f = tmp_path / "data.csv"
++        f.write_text("a,b,c\n1,2,3\n")
++        g = extract_file(f)
++        assert g.nodes == []
++        assert g.edges == []
++
++
++class TestExtractDirectory:
++    def test_multi_language(self, tmp_dir):
++        g = extract_directory(tmp_dir)
++        langs = g.stats.get("languages", {})
++        assert "python" in langs
++        assert "javascript" in langs
++
++    def test_files_processed_count(self, tmp_dir):
++        g = extract_directory(tmp_dir)
++        assert g.stats["files_processed"] == 2
++
++    def test_nodes_merged(self, tmp_dir):
++        g = extract_directory(tmp_dir)
++        assert len(g.nodes) > 5
++
++
++class TestExtractEntry:
++    def test_file_path(self, tmp_py):
++        result = extract(tmp_py)
++        assert "nodes" in result
++        assert "edges" in result
++        assert "god_nodes" in result
++        assert "stats" in result
++
++    def test_dir_path(self, tmp_dir):
++        result = extract(tmp_dir)
++        assert result["stats"]["files_processed"] == 2
++
++    def test_missing_path_raises(self, tmp_path):
++        with pytest.raises(FileNotFoundError):
++            extract(tmp_path / "nonexistent.py")
++
++    def test_god_nodes_is_list(self, tmp_dir):
++        result = extract(tmp_dir)
++        assert isinstance(result["god_nodes"], list)
++
++    def test_output_is_json_serialisable(self, tmp_dir):
++        result = extract(tmp_dir)
++        json.dumps(result)  # must not raise
++
++
++class TestCLI:
++    def test_cli_ast_extract_file(self, tmp_py):
++        proc = subprocess.run(
++            [sys.executable, "-m", "obsidian_wiki.cli", "ast-extract", str(tmp_py)],
++            capture_output=True, text=True,
++        )
++        assert proc.returncode == 0
++        data = json.loads(proc.stdout)
++        assert data["stats"]["nodes"] > 0
++
++    def test_cli_ast_extract_pretty(self, tmp_py):
++        proc = subprocess.run(
++            [sys.executable, "-m", "obsidian_wiki.cli", "ast-extract", str(tmp_py), "--pretty"],
++            capture_output=True, text=True,
++        )
++        assert proc.returncode == 0
++        # Pretty mode produces indented JSON
++        assert "\n  " in proc.stdout
++
++    def test_cli_missing_path_exits_nonzero(self, tmp_path):
++        proc = subprocess.run(
++            [sys.executable, "-m", "obsidian_wiki.cli", "ast-extract", str(tmp_path / "nope.py")],
++            capture_output=True, text=True,
++        )
++        assert proc.returncode != 0

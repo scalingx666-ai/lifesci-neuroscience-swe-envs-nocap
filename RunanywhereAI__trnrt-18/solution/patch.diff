@@ -1,0 +1,185 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d296dd9..c47109e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
+ 
+ ### Changed
+ 
++- A request without `temperature`, `top_p`, `top_k` or `min_p` takes the checkpoint's `generation_config.json`
++  values, as vLLM does by default. For GLM-5.3-Flash that is top_p 0.95; it was 1.0.
+ - The display name is TrnRT. The package, the `trnrt` command, environment variables and metric names are unchanged.
+ - Server, engine and router messages go through Python `logging`, on stderr. Their text is unchanged, and
+   `TRNRT_LOG_LEVEL` sets the level. They used to be printed, some on stdout. A hang report still reaches stderr when
+diff --git a/docs/API.md b/docs/API.md
+index 4c08eea..3b401a0 100644
+--- a/docs/API.md
++++ b/docs/API.md
+@@ -23,6 +23,10 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
+   `"low"`, `"high"` or `"max"`, the default. Other values are refused, since the template would answer them at max.
+ - `max_tokens` counts reasoning too. Without it, a chat request may generate up to the rest of the context
+   (`--max-model-len` minus the prompt), as vLLM does; a completion stops at 16 tokens, the OpenAI API's default.
++- Sampling defaults come from the checkpoint's `generation_config.json`, as in vLLM: a request that sets no
++  `temperature`, `top_p`, `top_k` or `min_p` gets the checkpoint's value (GLM-5.3-Flash: temperature 1.0, top_p 0.95).
++  Without one, temperature and top_p are 1.0. Sampling draws from the 64 most likely tokens at most
++  (`trnrt/engine/sampler.py`), so top_p 1.0 is top-64.
+ - A response cut off by `max_tokens` has `finish_reason` `"length"`, even when it ends in a tool call: that call may
+   be incomplete.
+ - A client that disconnects aborts its request, streamed or not.
+diff --git a/tests/test_serve_api.py b/tests/test_serve_api.py
+index 98b459d..2d20d14 100644
+--- a/tests/test_serve_api.py
++++ b/tests/test_serve_api.py
+@@ -592,3 +592,38 @@ def test_a_client_that_disconnects_aborts_its_request(stream):
+         th.join(timeout=30)
+         for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
+             lp.stop()
++
++
++def test_the_checkpoints_generation_config_sets_the_sampling_defaults(serve, tmp_path):
++    """A request that sets no temperature or top_p samples at the checkpoint's generation_config.json values
++    (GLM-5.3-Flash's: temperature 1.0, top_p 0.95), as vLLM does by default; it sampled at top_p 1.0. A request's own
++    values win; a value out of range in the file is not used; no file, the server's defaults (1.0, 1.0)."""
++    from fastapi.testclient import TestClient
++
++    from trnrt.serve import api
++
++    msgs = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2}
++
++    def params_with(gen: dict | None, body: dict, path: str = "/v1/chat/completions"):
++        d = tmp_path / str(len(list(tmp_path.iterdir())))
++        d.mkdir()
++        if gen is not None:
++            (d / "generation_config.json").write_text(json.dumps(gen))
++        eng = ScriptedEngine(PLAIN)
++        eng.model_path = str(d)
++        with TestClient(api.build_app(eng, "glm")) as c:
++            r = c.post(path, json=body)
++            assert r.status_code == 200, r.text
++        for lp in [lp for lp in api._LOOPS if lp.engine is eng]:
++            lp.stop()
++        p = eng.added[-1].params
++        return p.temperature, p.top_p, p.top_k, p.min_p
++
++    glm = {"eos_token_id": [1], "temperature": 1.0, "top_p": 0.95, "do_sample": True}
++    assert params_with(glm, msgs) == (1.0, 0.95, 0, 0.0)
++    assert params_with(glm, {"prompt": [1], "max_tokens": 2}, "/v1/completions") == (1.0, 0.95, 0, 0.0)
++    assert params_with(glm, {**msgs, "top_p": 0.5, "temperature": 0}) == (0.0, 0.5, 0, 0.0)
++    assert params_with(glm, {**msgs, "top_p": None}) == (1.0, 0.95, 0, 0.0)  # null: unset
++    assert params_with({"temperature": 0.6, "top_k": 20, "min_p": 0.05}, msgs) == (0.6, 1.0, 20, 0.05)
++    assert params_with({"top_p": 0, "temperature": -1, "top_k": "x"}, msgs) == (1.0, 1.0, 0, 0.0)
++    assert params_with(None, msgs) == (1.0, 1.0, 0, 0.0)
+diff --git a/trnrt/serve/api.py b/trnrt/serve/api.py
+index fdbbe13..7d1c21c 100644
+--- a/trnrt/serve/api.py
++++ b/trnrt/serve/api.py
+@@ -27,6 +27,7 @@
+ import json
+ import logging
+ import math
++import os
+ import queue
+ import re
+ import signal
+@@ -435,9 +436,46 @@ def _flag(body: dict, key: str, default: bool = False) -> bool:
+     return v
+ 
+ 
+-def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingParams:
++# The sampling fields a checkpoint's generation_config.json may set defaults for, with the range each must be in.
++# Penalties are left out: a default the engine refuses (engine.unsupported) would fail every request.
++_GEN_DEFAULTS = {"temperature": (0.0, math.inf), "top_p": (0.0, 1.0), "top_k": (-1, _INT64_MAX), "min_p": (0.0, 1.0)}
++
++
++def generation_defaults(model_path: str | None) -> dict[str, float]:
++    """The checkpoint's sampling defaults, from its generation_config.json, for a request that sets none: vLLM's
++    `--generation-config auto`, its default. GLM-5.3-Flash's (eb9eb208) sets temperature 1.0 and top_p 0.95, so a
++    request without top_p sampled the whole candidate set at top_p 1.0. A value of the wrong type or out of range is
++    left out (the server's own default stands) and logged; no file, no defaults."""
++    if not model_path:
++        return {}
++    path = os.path.join(model_path, "generation_config.json")
++    try:
++        with open(path) as f:
++            gen = json.load(f)
++    except FileNotFoundError:
++        return {}
++    except (OSError, ValueError) as e:
++        logger.warning("trnrt: %s is unreadable (%s); no sampling defaults from it", path, e)
++        return {}
++    out: dict[str, float] = {}
++    for k, (lo, hi) in _GEN_DEFAULTS.items():
++        v = gen.get(k) if isinstance(gen, dict) else None
++        if v is None:
++            continue
++        if type(v) in (int, float) and math.isfinite(v) and lo <= v <= hi and (k != "top_p" or v > 0):
++            out[k] = v
++        else:
++            logger.warning("trnrt: %s sets %s to %r, out of range; not used as a default", path, k, v)
++    return out
++
++
++def _params(
++    body: dict, default_max: int, chat: bool, vocab: int, defaults: dict[str, float] | None = None
++) -> SamplingParams:
+     """A request's sampling. Every field is checked here, before the request is queued: 400 for a value of the wrong
+-    type or out of range, and the default for a null. default_max is used when the request sets no max_tokens."""
++    type or out of range, and the default for a null. default_max is used when the request sets no max_tokens;
++    `defaults` (generation_defaults) replace the server's own temperature, top_p, top_k and min_p defaults."""
++    d = defaults or {}
+     asked = _refused(body)
+     if asked:
+         raise _bad(f"not supported: {', '.join(asked)}")
+@@ -458,13 +496,13 @@ def _params(body: dict, default_max: int, chat: bool, vocab: int) -> SamplingPar
+     max_new = _int(body, "max_tokens", None, 1)
+     if max_new is None:
+         max_new = _int(body, "max_completion_tokens", default_max, 1)
+-    top_k = _int(body, "top_k", 0, -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
++    top_k = _int(body, "top_k", int(d.get("top_k", 0)), -1)  # -1 and 0 both turn it off (vLLM's -1, the engine's 0)
+     return SamplingParams(
+         max_new_tokens=max_new,
+-        temperature=_num(body, "temperature", 1.0, lo=0.0),
+-        top_p=_num(body, "top_p", 1.0, lo=0.0, hi=1.0, lo_open=True),
++        temperature=_num(body, "temperature", d.get("temperature", 1.0), lo=0.0),
++        top_p=_num(body, "top_p", d.get("top_p", 1.0), lo=0.0, hi=1.0, lo_open=True),
+         top_k=max(top_k, 0),
+-        min_p=_num(body, "min_p", 0.0, lo=0.0, hi=1.0),
++        min_p=_num(body, "min_p", d.get("min_p", 0.0), lo=0.0, hi=1.0),
+         repetition_penalty=_num(body, "repetition_penalty", 1.0, lo=0.0, lo_open=True),
+         frequency_penalty=_num(body, "frequency_penalty", 0.0),
+         presence_penalty=_num(body, "presence_penalty", 0.0),
+@@ -675,6 +713,9 @@ def build_app(engine: LLMEngine, model_name: str) -> FastAPI:
+     # stream, and two threads in one Hugging Face fast tokenizer can raise "Already borrowed".
+     prompt_pool = ThreadPoolExecutor(1, thread_name_prefix="trnrt-prompt")
+     prompt_tok = copy.deepcopy(tok)
++    gen_defaults = generation_defaults(getattr(engine, "model_path", None))
++    if gen_defaults:
++        logger.info("trnrt: sampling defaults from the checkpoint's generation_config.json: %s", gen_defaults)
+ 
+     @app.get("/health")
+     async def health():
+@@ -888,7 +929,9 @@ async def completions(http: HTTPRequest):
+         else:
+             raise HTTPException(status_code=400, detail="prompt must be a string or a list of token ids")
+         # max_tokens defaults to 16, the OpenAI completions API's default
+-        return await _generate(http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab), chat=False)
++        return await _generate(
++            http, body, ids, _params(body, 16, chat=False, vocab=loop_.vocab, defaults=gen_defaults), chat=False
++        )
+ 
+     @app.post("/v1/chat/completions")
+     async def chat(http: HTTPRequest):
+@@ -898,7 +941,12 @@ async def chat(http: HTTPRequest):
+         # (Max) can run long, and a smaller hidden default would cut the answer off
+         room = max(engine.cfg.max_model_len - len(ids), 1)
+         return await _generate(
+-            http, body, ids, _params(body, room, chat=True, vocab=loop_.vocab), chat=True, parse=parse
++            http,
++            body,
++            ids,
++            _params(body, room, chat=True, vocab=loop_.vocab, defaults=gen_defaults),
++            chat=True,
++            parse=parse,
+         )
+ 
+     return app

@@ -1,0 +1,51 @@
+# Issue
+
+**Title:** Convert max.js and to-array.js to typescript
+
+## Description
+
+- Convert the `utilities/max` and `utilities/to-array` to Typescript
+- Replaces referenced default imports with named imports
+
+<!-- If you don't mind add a fun gif or meme, but no pressure -->
+![A GIF or MEME to give some spice of the internet](url)
+
+## Description
+<!--- Describe your changes in detail -->
+
+## Motivation and Context
+<!--- Why is this change required? What problem does it solve? -->
+<!--- If it fixes an open issue, please link to the issue here. -->
+
+
+Contributes to #551 
+
+## How Has This Been Tested?
+
+Ran the unit tests, verified the results for tests where these functions are used (it appears some of the other tests are still broken)
+
+## Screenshots (if appropriate):
+
+## Types of changes
+<!--- What types of changes does your code introduce? Put an `x` in all the boxes that apply: -->
+- [ ] Bug fix (non-breaking change which fixes an issue)
+- [x] New feature (non-breaking change which adds functionality)
+- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+
+## Author's Checklist:
+<!--- Go over all the following points, and put an `x` in all the boxes that apply. -->
+<!--- If you're unsure about any of these, don't hesitate to ask. We're here to help! -->
+- [x] My code focuses on the main motivation and avoids scope creep.
+- [x] My code passes current tests and adds new tests where possible.
+- [ ] My code is [SOLID](https://en.wikipedia.org/wiki/SOLID_(object-oriented_design)) and [DRY](https://en.wikipedia.org/wiki/Don%27t_repeat_yourself).
+- [ ] I have updated the documentation as needed.
+
+## Reviewer's Checklist:
+- [ ] I kept my comments to the author positive, specific, and productive.
+- [x] I tested the code and didn't find any new problems.
+- [x] I think the motivation is good for the project.
+- [x] I think the code works to satisfies the motivation.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `66a68ed09cca`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

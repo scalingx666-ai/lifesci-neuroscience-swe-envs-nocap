@@ -1,0 +1,500 @@
+diff --git a/torchlens/_state.py b/torchlens/_state.py
+index bfff388686..31f7a7939c 100644
+--- a/torchlens/_state.py
++++ b/torchlens/_state.py
+@@ -51,6 +51,9 @@
+ _crawled_module_keys: Set[str] = set()
+ """sys.modules keys already scanned; only scan new ones on each call."""
+ 
++_dir_cache: Dict[type, list] = {}
++"""Per-type cache of filtered dir() results for extend_search_stack_from_item."""
++
+ _prepared_models: "weakref.WeakSet" = weakref.WeakSet()
+ """Models whose forwards are already wrapped; WeakSet prevents GC issues."""
+ 
+diff --git a/torchlens/cleanup.py b/torchlens/cleanup.py
+index 9093fa21c5..4de053d23f 100644
+--- a/torchlens/cleanup.py
++++ b/torchlens/cleanup.py
+@@ -16,6 +16,17 @@ def cleanup(self):
+     torch.cuda.empty_cache()
+ 
+ 
++def _clear_entry_attributes(log_entry: TensorLog):
++    """Clear all instance attributes from a TensorLog entry."""
++    for attr in dir(log_entry):
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")
++            if not attr.startswith("__") and not callable(getattr(log_entry, attr)):
++                if isinstance(getattr(type(log_entry), attr, None), property):
++                    continue
++                delattr(log_entry, attr)
++
++
+ def _remove_log_entry(self, log_entry: TensorLog, remove_references: bool = True):
+     """Given a TensorLog, destroys it and all references to it.
+ 
+@@ -27,19 +38,72 @@ def _remove_log_entry(self, log_entry: TensorLog, remove_references: bool = True
+         tensor_label = log_entry.layer_label
+     else:
+         tensor_label = log_entry.tensor_label_raw
+-    for attr in dir(log_entry):
+-        with warnings.catch_warnings():
+-            warnings.simplefilter("ignore")
+-            if not attr.startswith("__") and not callable(getattr(log_entry, attr)):
+-                # Skip properties defined on the class (they have no instance deleter)
+-                if isinstance(getattr(type(log_entry), attr, None), property):
+-                    continue
+-                delattr(log_entry, attr)
++    _clear_entry_attributes(log_entry)
+     del log_entry
+     if remove_references:
+         _remove_log_entry_references(self, tensor_label)
+ 
+ 
++# List fields on ModelLog that hold tensor labels and need filtering during batch removal.
++_LIST_FIELDS_TO_CLEAN = [
++    "input_layers",
++    "output_layers",
++    "buffer_layers",
++    "internally_initialized_layers",
++    "internally_terminated_layers",
++    "internally_terminated_bool_layers",
++    "layers_with_saved_activations",
++    "layers_with_saved_gradients",
++    "_layers_where_internal_branches_merge_with_input",
++]
++
++
++def _batch_remove_log_entries(self, entries_to_remove, remove_references: bool = True):
++    """Remove multiple TensorLog entries at once, avoiding O(N*M) list.remove() calls.
++
++    Args:
++        entries_to_remove: Iterable of TensorLog objects to remove.
++        remove_references: Whether to also remove references from ModelLog list/dict fields.
++    """
++    # Collect labels for O(1) lookup, then clear each entry's attributes.
++    labels_to_remove = set()
++    for entry in entries_to_remove:
++        if self._pass_finished:
++            labels_to_remove.add(entry.layer_label)
++        else:
++            labels_to_remove.add(entry.tensor_label_raw)
++        _clear_entry_attributes(entry)
++
++    if not remove_references:
++        return
++
++    # Single-pass filter on each list field (replaces N × remove_entry_from_list calls).
++    for field in _LIST_FIELDS_TO_CLEAN:
++        collection = getattr(self, field)
++        collection[:] = [x for x in collection if x not in labels_to_remove]
++
++    self.conditional_branch_edges = [
++        tup
++        for tup in self.conditional_branch_edges
++        if tup[0] not in labels_to_remove and tup[1] not in labels_to_remove
++    ]
++
++    # Single-pass filter on dict fields.
++    # layers_computed_with_params values are lists.
++    for group_label, group_tensors in list(self.layers_computed_with_params.items()):
++        self.layers_computed_with_params[group_label] = [
++            t for t in group_tensors if t not in labels_to_remove
++        ]
++    self.layers_computed_with_params = {
++        k: v for k, v in self.layers_computed_with_params.items() if len(v) > 0
++    }
++
++    # equivalent_operations values are sets.
++    for group_label, group_tensors in list(self.equivalent_operations.items()):
++        group_tensors -= labels_to_remove
++    self.equivalent_operations = {k: v for k, v in self.equivalent_operations.items() if len(v) > 0}
++
++
+ def _remove_log_entry_references(self, layer_to_remove: str):
+     """Removes all references to a given TensorLog in the ModelLog object.
+ 
+diff --git a/torchlens/data_classes/model_log.py b/torchlens/data_classes/model_log.py
+index e041d56a48..db5183a94e 100644
+--- a/torchlens/data_classes/model_log.py
++++ b/torchlens/data_classes/model_log.py
+@@ -3,7 +3,7 @@
+ from collections import OrderedDict, defaultdict
+ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+ 
+-from ..cleanup import _remove_log_entry, cleanup
++from ..cleanup import _remove_log_entry, _batch_remove_log_entries, cleanup
+ from .module_log import ModuleAccessor
+ from .param_log import ParamAccessor
+ from ..helper_funcs import (
+@@ -280,3 +280,4 @@ def root_module(self):
+     _postprocess = postprocess
+     _run_and_log_inputs_through_model = run_and_log_inputs_through_model
+     _remove_log_entry = _remove_log_entry
++    _batch_remove_log_entries = _batch_remove_log_entries
+diff --git a/torchlens/helper_funcs.py b/torchlens/helper_funcs.py
+index e8b21639db..b8df1dd4f3 100644
+--- a/torchlens/helper_funcs.py
++++ b/torchlens/helper_funcs.py
+@@ -217,16 +217,19 @@ def _get_func_call_stack(num_context_lines: int = 7):
+         "torchlens/model_funcs.py",
+     )
+ 
+-    # Collect lightweight frame data using sys._getframe() — no file I/O
++    # Phase 1: Collect lightweight frame data — only co_filename, co_name, f_lineno.
++    # Do NOT do f_locals/f_globals dict lookups yet (expensive, ~50/call).
+     raw_frames = []
+     frame = sys._getframe(0)
+     while frame is not None:
+-        filename = frame.f_code.co_filename
+-        func_name = frame.f_code.co_name
+-        lineno = frame.f_lineno
+-        # Extract function object eagerly (cheap dict lookup) for lazy sig/doc later
+-        func_obj = frame.f_locals.get(func_name) or frame.f_globals.get(func_name)
+-        raw_frames.append((filename, func_name, lineno, func_obj))
++        raw_frames.append(
++            (
++                frame.f_code.co_filename,
++                frame.f_code.co_name,
++                frame.f_lineno,
++                frame,  # keep reference for phase 2 func_obj lookup
++            )
++        )
+         frame = frame.f_back
+ 
+     # Walk bottom-up (deepest caller last → first in output) and collect
+@@ -238,7 +241,7 @@ def _get_func_call_stack(num_context_lines: int = 7):
+     filtered_indices = []
+ 
+     for idx in range(len(raw_frames) - 1, -1, -1):
+-        filename, func_name, lineno, func_obj = raw_frames[idx]
++        filename, func_name, lineno, frame_ref = raw_frames[idx]
+ 
+         # Skip torchlens internals and PyTorch _call_impl
+         if any(filename.endswith(s) for s in _TORCHLENS_SUFFIXES):
+@@ -265,10 +268,12 @@ def _get_func_call_stack(num_context_lines: int = 7):
+     if pre_forward_frame_idx is not None and pre_forward_frame_idx not in filtered_indices:
+         filtered_indices.append(pre_forward_frame_idx)
+ 
+-    # Build FuncCallLocation objects — source loading is deferred
++    # Phase 2: Build FuncCallLocation objects only for surviving frames (~5-10).
++    # Do the expensive f_locals/f_globals dict lookup only here.
+     result = []
+     for idx in filtered_indices:
+-        filename, func_name, lineno, func_obj = raw_frames[idx]
++        filename, func_name, lineno, frame_ref = raw_frames[idx]
++        func_obj = frame_ref.f_locals.get(func_name) or frame_ref.f_globals.get(func_name)
+         loc = FuncCallLocation(
+             file=filename,
+             line_number=lineno,
+@@ -503,6 +508,8 @@ def extend_search_stack_from_item(item: Any, address: str, address_full, next_st
+         item: The item
+         next_stack: Stack to add to
+     """
++    from . import _state
++
+     if type(item) in [list, tuple, set]:
+         if address == "":
+             next_stack.extend(
+@@ -526,15 +533,22 @@ def extend_search_stack_from_item(item: Any, address: str, address_full, next_st
+                 ]
+             )
+ 
++    # Cache dir() results per type — dir() walks the full MRO and is expensive.
++    # Same types (e.g. every nn.Conv2d) have identical dir() output.
++    obj_type = type(item)
++    if obj_type not in _state._dir_cache:
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")
++            _state._dir_cache[obj_type] = [
++                a
++                for a in dir(item)
++                if not a.startswith("__") and a not in _ATTR_SKIP_SET and "grad" not in a
++            ]
++    filtered_attrs = _state._dir_cache[obj_type]
++
+     with warnings.catch_warnings():
+         warnings.simplefilter("ignore")
+-        for attr_name in dir(item):
+-            if (
+-                (attr_name.startswith("__"))
+-                or (attr_name in _ATTR_SKIP_SET)
+-                or ("grad" in attr_name)
+-            ):
+-                continue
++        for attr_name in filtered_attrs:
+             try:
+                 attr = getattr(item, attr_name)
+             except Exception:
+diff --git a/torchlens/model_funcs.py b/torchlens/model_funcs.py
+index ffc8d24628..bafe00774c 100644
+--- a/torchlens/model_funcs.py
++++ b/torchlens/model_funcs.py
+@@ -116,6 +116,7 @@ def _prepare_model_session(
+     creates ParamLog objects, and tags buffer tensors.
+     """
+     _module_class_metadata_cache.clear()
++    _state._dir_cache.clear()
+     model_log.model_name = str(type(model).__name__)
+     model.tl_source_model_log = model_log
+ 
+diff --git a/torchlens/postprocess/graph_traversal.py b/torchlens/postprocess/graph_traversal.py
+index d1e37160f4..44fb673c5a 100644
+--- a/torchlens/postprocess/graph_traversal.py
++++ b/torchlens/postprocess/graph_traversal.py
+@@ -182,17 +182,17 @@ def _remove_orphan_nodes(self):
+     orphan_nodes = orig_nodes - nodes_seen
+     self.orphan_layers = list(orphan_nodes)
+ 
+-    # Now remove all orphaned nodes.
++    # Now remove all orphaned nodes using batch removal.
++
++    orphan_entries = [self._raw_tensor_dict[label] for label in orphan_nodes]
++    self._batch_remove_log_entries(orphan_entries, remove_references=True)
+ 
+     new_tensor_dict = OrderedDict()
+     new_tensor_list = []
+     for tensor_label in self._raw_tensor_labels_list:
+-        tensor_entry = self[tensor_label]
+         if tensor_label not in orphan_nodes:
+-            new_tensor_dict[tensor_label] = tensor_entry
++            new_tensor_dict[tensor_label] = self._raw_tensor_dict[tensor_label]
+             new_tensor_list.append(tensor_label)
+-        else:
+-            self._remove_log_entry(tensor_entry, remove_references=True)
+     self._raw_tensor_labels_list = new_tensor_list
+     self._raw_tensor_dict = new_tensor_dict
+ 
+diff --git a/torchlens/postprocess/labeling.py b/torchlens/postprocess/labeling.py
+index 8dac766e45..aa2cce198b 100644
+--- a/torchlens/postprocess/labeling.py
++++ b/torchlens/postprocess/labeling.py
+@@ -75,6 +75,19 @@ def _log_final_info_for_all_layers(self):
+     """
+     unique_layers_seen = set()  # to avoid double-counting params of recurrent layers
+     operation_num = 1
++
++    # Shadow sets for O(1) membership checks in _log_module_hierarchy_info_for_layer.
++    # Lists are kept as primary storage (insertion order matters for downstream consumers),
++    # but linear `in` checks on lists are expensive for large models.
++    _shadow_sets = {
++        "module_layers": defaultdict(set),
++        "module_pass_layers": defaultdict(set),
++        "top_level_module_passes": set(),
++        "module_pass_children": defaultdict(set),
++        "module_addresses": set(),
++        "module_passes": set(),
++    }
++
+     for t, tensor_entry in enumerate(self):
+         if tensor_entry.layer_type in ["input", "buffer"]:
+             tensor_entry.operation_num = 0
+@@ -89,7 +102,7 @@ def _log_final_info_for_all_layers(self):
+         _replace_layer_names_for_tensor_entry(self, tensor_entry)
+ 
+         # Log the module hierarchy information:
+-        _log_module_hierarchy_info_for_layer(self, tensor_entry)
++        _log_module_hierarchy_info_for_layer(self, tensor_entry, _shadow_sets)
+         if tensor_entry.bottom_level_submodule_pass_exited is not None:
+             submodule_pass_nice_name = ":".join(
+                 [str(i) for i in tensor_entry.bottom_level_submodule_pass_exited]
+@@ -152,6 +165,22 @@ def _log_final_info_for_all_layers(self):
+     self.total_params_fsize_nice = human_readable_size(self.total_params_fsize)
+ 
+ 
++_LIST_FIELDS_TO_RENAME = [
++    "parent_layers",
++    "orig_ancestors",
++    "child_layers",
++    "sibling_layers",
++    "spouse_layers",
++    "input_ancestors",
++    "output_descendents",
++    "internally_initialized_parents",
++    "internally_initialized_ancestors",
++    "cond_branch_start_children",
++    "equivalent_operations",
++    "same_layer_operations",
++]
++
++
+ def _replace_layer_names_for_tensor_entry(self, tensor_entry: TensorLog):
+     """
+     Replaces all layer names in the fields of a TensorLog with their final
+@@ -160,78 +189,81 @@ def _replace_layer_names_for_tensor_entry(self, tensor_entry: TensorLog):
+     Args:
+         tensor_entry: TensorLog to replace layer names for.
+     """
+-    list_fields_to_rename = [
+-        "parent_layers",
+-        "orig_ancestors",
+-        "child_layers",
+-        "sibling_layers",
+-        "spouse_layers",
+-        "input_ancestors",
+-        "output_descendents",
+-        "internally_initialized_parents",
+-        "internally_initialized_ancestors",
+-        "cond_branch_start_children",
+-        "equivalent_operations",
+-        "same_layer_operations",
+-    ]
+-    for field in list_fields_to_rename:
+-        orig_layer_names = getattr(tensor_entry, field)
+-        field_type = type(orig_layer_names)
+-        new_layer_names = field_type(
+-            [self._raw_to_final_layer_labels[raw_name] for raw_name in orig_layer_names]
+-        )
+-        setattr(tensor_entry, field, new_layer_names)
++    mapping = self._raw_to_final_layer_labels
++    d = tensor_entry.__dict__
++
++    for field in _LIST_FIELDS_TO_RENAME:
++        orig = d.get(field)
++        if not orig:
++            continue
++        if isinstance(orig, list):
++            d[field] = [mapping[raw] for raw in orig]
++        else:  # set
++            d[field] = type(orig)(mapping[raw] for raw in orig)
+ 
+     # Fix the arg locations field:
+-    for arg_type in ["args", "kwargs"]:
+-        for key, value in tensor_entry.parent_layer_arg_locs[arg_type].items():
+-            tensor_entry.parent_layer_arg_locs[arg_type][key] = self._raw_to_final_layer_labels[
+-                value
+-            ]
++    arg_locs = d.get("parent_layer_arg_locs")
++    if arg_locs:
++        for arg_type in ("args", "kwargs"):
++            sub = arg_locs[arg_type]
++            for key, value in sub.items():
++                sub[key] = mapping[value]
+ 
+     # Fix the field names for different children tensor versions:
+-    new_child_tensor_versions = {}
+-    for (
+-        child_label,
+-        tensor_version,
+-    ) in tensor_entry.children_tensor_versions.items():
+-        new_child_tensor_versions[self._raw_to_final_layer_labels[child_label]] = tensor_version
+-    tensor_entry.children_tensor_versions = new_child_tensor_versions
++    ctv = d.get("children_tensor_versions")
++    if ctv:
++        d["children_tensor_versions"] = {
++            mapping[child_label]: tensor_version for child_label, tensor_version in ctv.items()
++        }
+ 
+ 
+-def _log_module_hierarchy_info_for_layer(self, tensor_entry: TensorLog):
++def _log_module_hierarchy_info_for_layer(self, tensor_entry: TensorLog, _shadow_sets: dict):
+     """
+     Logs the module hierarchy information for a single layer.
+ 
+     Args:
+         tensor_entry: Log entry to mark the module hierarchy info for.
++        _shadow_sets: Shadow sets for O(1) membership checks.
+     """
++    _ml_seen = _shadow_sets["module_layers"]
++    _mpl_seen = _shadow_sets["module_pass_layers"]
++    _tlmp_seen = _shadow_sets["top_level_module_passes"]
++    _mpc_seen = _shadow_sets["module_pass_children"]
++    _ma_seen = _shadow_sets["module_addresses"]
++    _mp_seen = _shadow_sets["module_passes"]
++
+     containing_module_pass_label = None
++    layer_label = tensor_entry.layer_label
+     for m, module_pass_label in enumerate(tensor_entry.containing_modules_origin_nested):
+         module_name, module_pass = module_pass_label
+         module_pass_nice_label = f"{module_name}:{module_pass}"
+         self.module_num_tensors[module_name] += 1
+         self.module_pass_num_tensors[module_pass_nice_label] += 1
+-        if tensor_entry.layer_label not in self.module_layers[module_name]:
+-            self.module_layers[module_name].append(tensor_entry.layer_label)
+-        if tensor_entry.layer_label not in self.module_pass_layers[module_pass_nice_label]:
+-            self.module_pass_layers[module_pass_nice_label].append(tensor_entry.layer_label)
+-        if (m == 0) and (module_pass_nice_label not in self.top_level_module_passes):
++        if layer_label not in _ml_seen[module_name]:
++            _ml_seen[module_name].add(layer_label)
++            self.module_layers[module_name].append(layer_label)
++        if layer_label not in _mpl_seen[module_pass_nice_label]:
++            _mpl_seen[module_pass_nice_label].add(layer_label)
++            self.module_pass_layers[module_pass_nice_label].append(layer_label)
++        if (m == 0) and (module_pass_nice_label not in _tlmp_seen):
++            _tlmp_seen.add(module_pass_nice_label)
+             self.top_level_module_passes.append(module_pass_nice_label)
+         else:
+             if (containing_module_pass_label is not None) and (
+-                module_pass_nice_label
+-                not in self.module_pass_children[containing_module_pass_label]
++                module_pass_nice_label not in _mpc_seen[containing_module_pass_label]
+             ):
++                _mpc_seen[containing_module_pass_label].add(module_pass_nice_label)
+                 self.module_pass_children[containing_module_pass_label].append(
+                     module_pass_nice_label
+                 )
+         containing_module_pass_label = module_pass_nice_label
+         if self.module_num_passes[module_name] < module_pass:
+             self.module_num_passes[module_name] = module_pass
+-        if module_name not in self.module_addresses:
++        if module_name not in _ma_seen:
++            _ma_seen.add(module_name)
+             self.module_addresses.append(module_name)
+-        if module_pass_label not in self.module_passes:
++        if module_pass_nice_label not in _mp_seen:
++            _mp_seen.add(module_pass_nice_label)
+             self.module_passes.append(module_pass_nice_label)
+     tensor_entry.module_nesting_depth = len(tensor_entry.containing_modules_origin_nested)
+ 
+diff --git a/torchlens/postprocess/loop_detection.py b/torchlens/postprocess/loop_detection.py
+index 92ed697f99..9cc0402e61 100644
+--- a/torchlens/postprocess/loop_detection.py
++++ b/torchlens/postprocess/loop_detection.py
+@@ -1,5 +1,6 @@
+ """Step 8: Loop detection, isomorphic subgraph expansion, and layer assignment."""
+ 
++import heapq
+ import itertools as it
+ from collections import OrderedDict, defaultdict, deque
+ from dataclasses import dataclass
+@@ -50,16 +51,18 @@ def _detect_and_label_loops(self):
+     assigned is equal to the number of operations of that type. If so, it's definitely found everything;
+     if not, it runs the procedure again to check if more equivalent operations can be found.
+     """
+-    node_stack = deque(
+-        sorted(
+-            self.input_layers + self.internally_initialized_layers,
+-            key=lambda x: self[x].realtime_tensor_num,
+-        )
+-    )
++    # Pre-compute sort keys to avoid repeated attribute lookups in the heap.
++    _sort_keys = {label: self[label].realtime_tensor_num for label in self._raw_tensor_labels_list}
++
++    initial_labels = self.input_layers + self.internally_initialized_layers
++    node_heap = [(_sort_keys[label], label) for label in initial_labels]
++    heapq.heapify(node_heap)
++    heap_seen = set(initial_labels)
++
+     operation_equivalence_types_seen = set()
+-    while node_stack:
++    while node_heap:
+         # Grab the earliest node in the stack, add its children in sorted order to the stack in advance.
+-        node_label = node_stack.popleft()
++        _, node_label = heapq.heappop(node_heap)
+         node = self[node_label]
+         node_operation_equivalence_type = node.operation_equivalence_type
+ 
+@@ -68,8 +71,10 @@ def _detect_and_label_loops(self):
+             continue
+         operation_equivalence_types_seen.add(node_operation_equivalence_type)
+         for equiv_op in node.equivalent_operations:
+-            node_stack.extend(self[equiv_op].child_layers)
+-        node_stack = deque(sorted(node_stack, key=lambda x: self[x].realtime_tensor_num))
++            for child in self[equiv_op].child_layers:
++                if child not in heap_seen:
++                    heap_seen.add(child)
++                    heapq.heappush(node_heap, (_sort_keys[child], child))
+ 
+         # If no equivalent operations for this node, skip it; it's the only operation for this "layer"
+         if len(node.equivalent_operations) == 1:

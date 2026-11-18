@@ -1,0 +1,114 @@
+diff --git a/src/minisweagent/run/mini.py b/src/minisweagent/run/mini.py
+index c1654bac6..403a632e3 100644
+--- a/src/minisweagent/run/mini.py
++++ b/src/minisweagent/run/mini.py
+@@ -261,8 +261,8 @@ def main(
+         "--total-budget-s",
+         help="Override the mode's total wall-clock budget (seconds). Escape hatch for testing.",
+     ),
+-    scoring_target: str = typer.Option(
+-        "wall",
++    scoring_target: str | None = typer.Option(
++        None,
+         "--target",
+         help=(
+             "Which signal the harness reports as GEAK_RESULT_LATENCY_MS (the scoring metric "
+@@ -270,7 +270,10 @@ def main(
+             "triton.testing.do_bench (includes Python/dispatch overhead). 'kernel' = GPU-only "
+             "kernel time via torch.profiler CUDA events (excludes dispatch). The dual-signal "
+             "harness always reports BOTH (GEAK_RESULT_WALL_MS + GEAK_RESULT_KERNEL_MS) for "
+-            "agent visibility; --target only chooses which becomes the scoring signal."
++            "agent visibility; --target only chooses which becomes the scoring signal. "
++            "Default None -> falls through to GEAK_SCORE_TARGET env -> 'kernel' (so the "
++            "documented env knob and the kernel default actually take effect; previously this "
++            "defaulted to 'wall' and silently overrode both)."
+         ),
+     ),
+     debug: bool = typer.Option(
+@@ -669,15 +672,18 @@ def _resolve_target_language(kt: str | None) -> str | None:
+         return None
+ 
+     _target_language = _resolve_target_language(kernel_type)
+-    # Scoring signal precedence: explicit --target > GEAK_SCORE_TARGET env > "wall".
++    # Scoring signal precedence: explicit --target > GEAK_SCORE_TARGET env > "kernel".
+     # ``kernel`` scores GPU-only kernel time (torch.profiler CUDA events), which
+     # excludes host dispatch + DVFS jitter — the ±1% wall-time noise that drowns
+     # sub-2% kernel gains and lets the agent over-report a noisy favorable draw.
+-    # Keep ``wall`` the default (E2E-correlated, what most callers expect); the
+-    # env knob lets an operator switch the whole fleet to the low-noise signal
+-    # without editing per-run CLI. Generic: no per-kernel special-casing.
++    # DEFAULT is ``kernel``: wall-time scoring lets a patch "win" by collapsing
++    # kernel launches (removing host-dispatch overhead the production CUDA-graph'd /
++    # batched server already amortizes), so such wins do NOT transfer to end-to-end
++    # serving throughput. Scoring GPU kernel time keeps the optimization target
++    # aligned with what actually moves E2E. Override with --target wall /
++    # GEAK_SCORE_TARGET=wall when you specifically want the wall signal.
+     scoring_target_norm = (
+-        scoring_target or os.environ.get("GEAK_SCORE_TARGET") or "wall"
++        scoring_target or os.environ.get("GEAK_SCORE_TARGET") or "kernel"
+     ).strip().lower()
+     if scoring_target_norm not in {"wall", "kernel"}:
+         logger.warning(
+diff --git a/src/minisweagent/run/preprocess_v3/baseline.py b/src/minisweagent/run/preprocess_v3/baseline.py
+index 22a19fb55..3aff7d619 100644
+--- a/src/minisweagent/run/preprocess_v3/baseline.py
++++ b/src/minisweagent/run/preprocess_v3/baseline.py
+@@ -224,11 +224,44 @@ def _build_env(
+     from minisweagent.run.postprocess.evaluation import _ensure_rocm_on_path
+ 
+     _ensure_rocm_on_path(env)
++    _enable_compile_speedups(env)
+     if extra:
+         env.update(extra)
+     return env
+ 
+ 
++def _enable_compile_speedups(env: dict[str, str]) -> None:
++    """Speed up kernel (re)compiles in harness/baseline subprocesses (GEAK #298).
++
++    aiter/Composable-Kernel ``.cu`` kernels recompile on every candidate (HL
++    forces ``AITER_REBUILD=1``); the heavy template build can exceed the
++    preprocess soft-cap before any optimization round runs. Two env-only,
++    universally-safe accelerants:
++
++      * ``MAX_JOBS`` — parallelize the ninja/cpp_extension build across cores
++        (aiter caps it to cores*0.8 / free-mem; we just request a high floor).
++      * ``CMAKE_*_COMPILER_LAUNCHER=ccache`` + ``CCACHE_*`` — cache unchanged
++        translation units so a small kernel edit recompiles ~its diff, not the
++        whole CK template set. ccache is the correct ninja/cmake hook (a bare
++        ``hipcc`` PATH shim is NOT honored by ninja's absolute compiler path).
++
++    Both are no-ops for fast (triton/elementwise) kernels and skipped entirely
++    when ccache is absent, so already-working kernels are unaffected. Respects
++    operator-provided values (never overrides an explicit ``MAX_JOBS``).
++    """
++    import shutil
++
++    env.setdefault("MAX_JOBS", str(max(1, (os.cpu_count() or 8) * 3 // 4)))
++    ccache = shutil.which("ccache", path=env.get("PATH"))
++    if not ccache:
++        return
++    for var in ("CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER",
++                "CMAKE_HIP_COMPILER_LAUNCHER"):
++        env.setdefault(var, "ccache")
++    env.setdefault("CCACHE_SLOPPINESS", "time_macros,include_file_mtime,include_file_ctime")
++    env.setdefault("CCACHE_MAXSIZE", "50G")
++
++
+ def _benchmark_command(harness_path: Path, flag: str = "--benchmark") -> list[str]:
+     """Build the harness benchmark argv (interpreter + path + flag).
+ 
+@@ -703,8 +736,11 @@ def collect_profile(
+     # repeated timeouts. GEAK_SKIP_PROFILE short-circuits it: return a profile-less
+     # (but non-error) ProfileResult so the optimizer plans "blind" and proceeds to
+     # rounds instead of starving on the profiler.
+-    if os.environ.get("GEAK_SKIP_PROFILE", "").strip().lower() in ("1", "true", "yes"):
+-        logger.info("collect_profile: GEAK_SKIP_PROFILE set; skipping profiler-mcp (advisory)")
++    # DEFAULT: skip (the advisory profiler is high-cost / hang-prone and the
++    # optimizer measures every change directly via FULL_BENCHMARK anyway). Opt back
++    # in by explicitly setting GEAK_SKIP_PROFILE to a falsy value (0/false/no).
++    if os.environ.get("GEAK_SKIP_PROFILE", "1").strip().lower() not in ("0", "false", "no"):
++        logger.info("collect_profile: GEAK_SKIP_PROFILE set (default on); skipping profiler-mcp (advisory)")
+         return ProfileResult(
+             harness_path=harness_path.resolve(),
+             command=command,

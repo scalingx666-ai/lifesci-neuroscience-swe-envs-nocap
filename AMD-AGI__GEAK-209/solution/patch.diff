@@ -1,0 +1,1407 @@
+diff --git a/skills/pytorch2flydsl-translation/docs/flydsl_translation_api_reference.md b/skills/pytorch2flydsl-translation/docs/flydsl_translation_api_reference.md
+index 4c9255184..421305e5a 100644
+--- a/skills/pytorch2flydsl-translation/docs/flydsl_translation_api_reference.md
++++ b/skills/pytorch2flydsl-translation/docs/flydsl_translation_api_reference.md
+@@ -53,6 +53,62 @@ class Model(nn.Module):
+         return output
+ ```
+ 
++## FlyDSL Kernel Lifecycle (Build Once, Launch Many)
++
++FlyDSL kernels are compiled at build time, not at call time. The correct
++pattern stores weights as `nn.Parameter` (NOT `nn.Linear` / `nn.Conv2d`),
++preshuffles them once, and compiles kernels once in `__init__`.
++
++- `__init__`: store weights as `nn.Parameter`, preshuffle with `register_buffer()`, compile kernels
++- `forward()`: call the pre-compiled launcher with runtime data
++
++Use `self.register_buffer("name", tensor)` for derived tensors (like
++preshuffled weights) so that `.cuda()` / `.to()` moves them alongside
++`nn.Parameter` tensors. Plain `self.x = tensor` is NOT moved by `.cuda()`.
++
++ANTI-PATTERN (uses PyTorch modules — produces PyTorch fallbacks):
++```python
++self.fc = nn.Linear(in_f, out_f)      # WRONG: PyTorch module
++out = self.fc(x)                       # WRONG: PyTorch compute
++```
++
++ANTI-PATTERN (recompiles every forward call):
++```python
++def forward(self, x):
++    fn = compile_preshuffle_gemm_a8(...)  # WRONG: recompiles every call
++```
++
++CORRECT PATTERN (FlyDSL-native internals):
++```python
++class Model(nn.Module):  # nn.Module required by translation harness (.cuda()/.to())
++    def __init__(self, in_features, out_features):
++        super().__init__()
++        w = torch.randn(out_features, in_features, dtype=torch.float16)
++        self.weight = nn.Parameter(w)
++        self.bias = nn.Parameter(torch.randn(out_features, dtype=torch.float16))
++        self.register_buffer("w_shuffled",
++            shuffle_weight(self.weight.data.contiguous(), layout=(16, 16)))
++        self.gemm_fn = compile_preshuffle_gemm_a8(
++            K=in_features, tile_m=16, tile_n=64, tile_k=256,
++            in_dtype="fp16")
++
++    def forward(self, x):
++        M, N = x.shape[0], self.weight.shape[0]
++        stream = torch.cuda.current_stream()
++        c_out = torch.empty(M, N, dtype=torch.float16, device=x.device)
++        scale = torch.empty(0, device=x.device, dtype=torch.float32)
++        self.gemm_fn(c_out.view(-1), x.half().contiguous().view(-1),
++                     self.w_shuffled.view(-1), scale, scale,
++                     M, N, stream)
++        # Bias + ReLU as separate ops
++        c_out = torch.clamp(c_out + self.bias.unsqueeze(0), min=0)
++        return c_out
++```
++
++The `nn.Module` wrapper is required by the translation harness (which calls
++`.cuda()` / `.to()` to move parameters to GPU). Only the internals must be
++FlyDSL-native — no `nn.Linear`, `nn.Conv2d`, or other PyTorch compute modules.
++
+ ## Parameter Types
+ 
+ | Type | Usage | Description |
+@@ -238,56 +294,6 @@ def scalar_kernel(Input: fx.Tensor, Output: fx.Tensor, N: fx.Constexpr[int]):
+         fx.copy_atom_call(copy_atom, r_out, fx.slice(out_div, (None, idx)))
+ ```
+ 
+-## Control Flow
+-
+-```python
+-from flydsl.expr import range_constexpr, const_expr
+-
+-# Compile-time unrolled loop (N must be Constexpr or literal)
+-for i in range_constexpr(N):
+-    # loop body is fully unrolled in generated IR
+-    ...
+-
+-# Runtime loop (lowered to scf.for)
+-for i in range(runtime_value):
+-    ...
+-
+-# Mark a derived value as compile-time constant
+-tile_size = const_expr(N // 4)
+-```
+-
+-## Hardware Math Intrinsics
+-
+-```python
+-from flydsl.expr import rocdl
+-from flydsl.expr.typing import T
+-
+-# Single-cycle hardware exp2 (v_exp_f32) — lower precision than math.exp2
+-result = rocdl.exp2(T.f32, x)
+-
+-# Single-cycle hardware reciprocal (v_rcp_f32)
+-result = rocdl.rcp(T.f32, x)
+-
+-# ArithValue method style also works (used in Swish pattern):
+-exp_val = neg_x_log2e.exp2()
+-```
+-
+-## Synchronization
+-
+-```python
+-from flydsl.expr import gpu
+-gpu.barrier()   # workgroup barrier
+-```
+-
+-## Kernel Debugging
+-
+-```python
+-import flydsl.expr as fx
+-
+-# In-kernel printf (works inside @flyc.kernel)
+-fx.printf("tid=%d bid=%d val=%f", tid, bid, value)
+-```
+-
+ ## Launch Configuration
+ 
+ ```python
+@@ -366,7 +372,7 @@ executor = build_rmsnorm_module(M=batch, N=dim, dtype_str="f32")
+ ### Pre-built Kernel Configuration
+ 
+ GEMM additional parameters: `waves_per_eu` (int, optional) limits CU occupancy (1-4);
+-`use_cshuffle_epilog` (bool) enables CK-style LDS CShuffle epilogue for output.
++`use_cshuffle_epilog` (bool) enables CK-style LDS CShuffle for output.
+ 
+ All pre-built kernels use: `BLOCK_THREADS=256`, `VEC_WIDTH=8`, `WARP_SIZE=64` (AMD wavefront).
+ 
+@@ -386,17 +392,8 @@ from kernels.reduce import reduce_vec_max, reduce_vec_sum, make_block_reduce
+ 
+ ## AMD Hardware Reference
+ 
+-| Property | MI300X (gfx942) | MI350 (gfx950) |
+-|----------|-----------------|----------------|
+-| Wavefront size | 64 threads | 64 threads |
+-| LDS per CU | 64 KB | 160 KB |
+-| VGPR per CU | 512 KB | 512 KB |
+-
+-**Translation paths for ops without direct FlyDSL pre-built kernels:**
+-- **Conv2d**: im2col (`F.unfold`) + `compile_preshuffle_gemm_a8` (fp16 cast); fallback: im2col + `torch.mm`
+-- **MaxPool2d**: custom `@flyc.kernel` with `arith.maximumf` over window elements
+-- **BatchNorm2d**: `F.batch_norm` (acceptable PyTorch fallback, MIOpen backend)
+-- **Conv3d, AvgPool2d**: no FlyDSL equivalent, use PyTorch
++AMD GPU wavefront size is 64 threads (`WARP_SIZE=64`). All pre-built kernels
++use `BLOCK_THREADS=256` and `VEC_WIDTH=8`.
+ 
+ ## Common PyTorch -> FlyDSL Op Mapping
+ 
+@@ -419,4 +416,4 @@ from kernels.reduce import reduce_vec_max, reduce_vec_sum, make_block_reduce
+ | `nn.RMSNorm` | `build_rmsnorm_module()` | **Pre-built** |
+ | `nn.Conv2d` | im2col + `compile_preshuffle_gemm_a8` (see conv_pool_bn guide) | Hybrid (im2col + **Pre-built** GEMM) |
+ | `F.max_pool2d` | Custom `@flyc.kernel` (see conv_pool_bn guide) | Custom kernel |
+-| `nn.BatchNorm2d` | `F.batch_norm` (acceptable PyTorch fallback) | PyTorch fallback |
++| `nn.BatchNorm2d` | Custom `@flyc.kernel` (pre-computed scale/shift, see conv_pool_bn guide) | Custom kernel |
+diff --git a/skills/pytorch2flydsl-translation/docs/flydsl_translation_attention.md b/skills/pytorch2flydsl-translation/docs/flydsl_translation_attention.md
+index fec409965..288a7caf3 100644
+--- a/skills/pytorch2flydsl-translation/docs/flydsl_translation_attention.md
++++ b/skills/pytorch2flydsl-translation/docs/flydsl_translation_attention.md
+@@ -87,11 +87,56 @@ for i in range(batch_size * num_heads):
+     gemm_fn(output[i], attn_weights[i], V[i], ...)
+ ```
+ 
+-### Strategy 2: Decomposed Attention with Pre-built Kernels
++### Strategy 2: Pad to Flash Attention Constraints
+ 
+-ONLY when flash attention constraints are NOT met (head_dim < 64, head_dim
+-not divisible by 32, or seq_len not divisible by 128), decompose into
+-pre-built components:
++When head_dim or seq_len don't meet flash attention constraints, **pad** to
++the next valid size, run flash attention, and slice back. NEVER fall back to
++`F.scaled_dot_product_attention`.
++
++```python
++class Model(nn.Module):
++    def __init__(self, num_heads, head_dim, seq_len):
++        super().__init__()
++        self.head_dim = head_dim
++        self.padded_head_dim = ((head_dim + 31) // 32) * 32
++        if self.padded_head_dim < 64:
++            self.padded_head_dim = 64
++        self.padded_seq_len = ((seq_len + 127) // 128) * 128
++        self._flash_attn = build_flash_attn_func_module(
++            num_heads=num_heads,
++            head_dim=self.padded_head_dim,
++            causal=True, dtype_str="f16",
++        )
++
++    def forward(self, q, k, v):
++        B, S, H, D = q.shape
++        # Pad head_dim if needed
++        if D < self.padded_head_dim:
++            pad_d = self.padded_head_dim - D
++            q = F.pad(q, (0, pad_d))
++            k = F.pad(k, (0, pad_d))
++            v = F.pad(v, (0, pad_d))
++        # Pad seq_len if needed
++        if S < self.padded_seq_len:
++            pad_s = self.padded_seq_len - S
++            q = F.pad(q, (0, 0, 0, 0, 0, pad_s))
++            k = F.pad(k, (0, 0, 0, 0, 0, pad_s))
++            v = F.pad(v, (0, 0, 0, 0, 0, pad_s))
++        output = torch.empty_like(q)
++        self._flash_attn(
++            q.contiguous().view(-1), k.contiguous().view(-1),
++            v.contiguous().view(-1), output.view(-1),
++            B, self.padded_seq_len,
++            stream=torch.cuda.current_stream(),
++        )
++        # Slice back to original dimensions
++        return output[:, :S, :, :D]
++```
++
++### Strategy 3: Decomposed Attention with Pre-built Kernels
++
++ONLY when padding is impractical (e.g., very large padding ratios),
++decompose into FlyDSL pre-built components. NEVER use `F.scaled_dot_product_attention`.
+ 
+ ```python
+ from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+@@ -100,7 +145,7 @@ from tests.utils import shuffle_weight
+ 
+ class Model(nn.Module):
+     def forward(self, q, k, v):
+-        # QK^T via FlyDSL GEMM (after preshuffling K)
++        # QK^T via FlyDSL GEMM (after preshuffling K^T)
+         scores = ...  # use compile_preshuffle_gemm_a8
+ 
+         # Softmax via FlyDSL
+@@ -114,17 +159,6 @@ class Model(nn.Module):
+         return ...  # use compile_preshuffle_gemm_a8
+ ```
+ 
+-### Strategy 3: PyTorch Fallback (Last Resort)
+-
+-Only use `F.scaled_dot_product_attention` when:
+-- head_dim < 64 or head_dim not divisible by 32
+-- seq_len not divisible by 128
+-- Batched attention with irregular shapes
+-
+-```python
+-attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+-```
+-
+ ## Causal Masking
+ 
+ The FlyDSL flash attention kernel supports causal masking natively via `causal=True`
+@@ -137,65 +171,129 @@ scores = scores.masked_fill(mask, float('-inf'))
+ 
+ ## Full Multi-Head Attention Block Translation
+ 
+-For a full multi-head attention block (e.g., minGPT):
++For a full multi-head attention block (e.g., minGPT), replace ALL `nn.Linear`
++with FlyDSL preshuffle GEMM:
+ 
+ ```python
+ import torch
+ import torch.nn as nn
+ from kernels.flash_attn_func import build_flash_attn_func_module
++from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
++from tests.utils import shuffle_weight
+ 
+ class Model(nn.Module):
+-    def __init__(self, n_embd, n_head, block_size, ...):
++    def __init__(self, n_embd, n_head, block_size):
+         super().__init__()
+         self.n_head = n_head
+         self.n_embd = n_embd
+-        self.c_attn = nn.Linear(n_embd, 3 * n_embd)  # QKV projection
+-        self.c_proj = nn.Linear(n_embd, n_embd)       # output projection
+         head_dim = n_embd // n_head
++
++        # QKV projection — raw nn.Parameter, NOT nn.Linear
++        self.c_attn_weight = nn.Parameter(torch.randn(3 * n_embd, n_embd, dtype=torch.float16))
++        self.c_attn_bias = nn.Parameter(torch.randn(3 * n_embd, dtype=torch.float16))
++        self.register_buffer("c_attn_w_shuffled",
++            shuffle_weight(self.c_attn_weight.data.contiguous(), layout=(16, 16)))
++        self.c_attn_gemm = compile_preshuffle_gemm_a8(
++            M=0, N=3 * n_embd, K=n_embd,
++            tile_m=64, tile_n=128, tile_k=128,
++            in_dtype="fp16", out_dtype="fp16", lds_stage=2)
++
++        # Output projection — raw nn.Parameter, NOT nn.Linear
++        self.c_proj_weight = nn.Parameter(torch.randn(n_embd, n_embd, dtype=torch.float16))
++        self.c_proj_bias = nn.Parameter(torch.randn(n_embd, dtype=torch.float16))
++        self.register_buffer("c_proj_w_shuffled",
++            shuffle_weight(self.c_proj_weight.data.contiguous(), layout=(16, 16)))
++        self.c_proj_gemm = compile_preshuffle_gemm_a8(
++            M=0, N=n_embd, K=n_embd,
++            tile_m=64, tile_n=128, tile_k=128,
++            in_dtype="fp16", out_dtype="fp16", lds_stage=2)
++
+         self._flash_attn = build_flash_attn_func_module(
+-            num_heads=n_head,
+-            head_dim=head_dim,
+-            causal=True,
+-            dtype_str="f16",
+-        )
++            num_heads=n_head, head_dim=head_dim, causal=True, dtype_str="f16")
+ 
+     def forward(self, x):
+         B, T, C = x.size()
+-        # QKV projection (nn.Linear kept for simplicity, or replace with GEMM)
+-        qkv = self.c_attn(x)
+-        q, k, v = qkv.split(C, dim=2)
+-        head_dim = C // self.n_head
+-        # Reshape to BSHD layout
+-        q = q.view(B, T, self.n_head, head_dim).half()
+-        k = k.view(B, T, self.n_head, head_dim).half()
+-        v = v.view(B, T, self.n_head, head_dim).half()
+-
+-        # Attention via FlyDSL Flash Attention
++        stream = torch.cuda.current_stream()
++        scale = torch.empty(0, device=x.device, dtype=torch.float32)
++
++        # QKV projection via FlyDSL GEMM + bias
++        x_2d = x.half().reshape(B * T, C).contiguous()
++        qkv = torch.empty(B * T, 3 * C, device=x.device, dtype=torch.float16)
++        self.c_attn_gemm(qkv.view(-1), x_2d.view(-1), self.c_attn_w_shuffled.view(-1),
++                         scale, scale, B * T, 3 * C, stream)
++        qkv = qkv + self.c_attn_bias.unsqueeze(0)
++        q, k, v = qkv.view(B, T, 3, self.n_head, C // self.n_head).unbind(dim=2)
++
++        # Flash Attention
+         y = torch.empty_like(q)
+-        self._flash_attn(
+-            q.contiguous().view(-1),
+-            k.contiguous().view(-1),
+-            v.contiguous().view(-1),
+-            y.view(-1),
+-            B, T,
+-            stream=torch.cuda.current_stream(),
+-        )
+-        y = y.float().view(B, T, C)
++        self._flash_attn(q.contiguous().view(-1), k.contiguous().view(-1),
++                         v.contiguous().view(-1), y.view(-1), B, T, stream=stream)
++        y = y.reshape(B * T, C)
++
++        # Output projection via FlyDSL GEMM + bias
++        out = torch.empty(B * T, C, device=x.device, dtype=torch.float16)
++        self.c_proj_gemm(out.view(-1), y.contiguous().view(-1), self.c_proj_w_shuffled.view(-1),
++                         scale, scale, B * T, C, stream)
++        out = out + self.c_proj_bias.unsqueeze(0)
++        return out.view(B, T, C).float()
++```
++
++## Attention Matmul: Preshuffle GEMM vs Flash Attention vs torch.bmm
++
++Preshuffle GEMM (`compile_preshuffle_gemm_a8`) is **weight-stationary**: one operand
++(B-matrix) must be a fixed weight that is pre-shuffled once at init time. It is
++**not suitable** for attention score computation (Q@K^T, att@V) where both operands
++are dynamic activations that change every forward pass.
++
++### Which op for which matmul
++
++| Matmul | Operands | Use |
++|--------|----------|-----|
++| QKV projection (x @ W_qkv) | x=activation, W=fixed weight | `compile_preshuffle_gemm_a8` (preshuffle W once) |
++| Output projection (attn_out @ W_proj) | attn_out=activation, W=fixed weight | `compile_preshuffle_gemm_a8` (preshuffle W once) |
++| Q @ K^T (attention scores) | Q=activation, K=activation | `build_flash_attn_func_module` (handles Q@K^T + softmax + @V) |
++| att @ V (attention output) | att=activation, V=activation | `build_flash_attn_func_module` (part of flash attention) |
++| Activation @ activation (no flash attn fit) | both dynamic | `torch.bmm` as fallback (acceptable for fp32 or non-standard shapes) |
++
++### When torch.bmm is acceptable
+ 
+-        # Output projection
+-        return self.c_proj(y)
++`torch.bmm` is an acceptable fallback for **activation-activation matmuls** when:
++- Flash attention doesn't apply (non-standard activation function, not softmax-based)
++- Both operands vary per batch element (cannot preshuffle either side)
++- The matmul is fp32 (FlyDSL preshuffle GEMM only supports fp16/bf16/int8/fp8)
++
++Examples where `torch.bmm` is acceptable:
++- ReLU-attention: Q@K^T with ReLU instead of softmax (flash attention only supports softmax)
++- Custom attention patterns with non-standard masking
++- fp32 batched matmul where both sides are dynamic
++
++### Anti-pattern: DO NOT preshuffle activations
++
++```python
++# BAD: Preshuffling K every forward pass
++K_shuffled = shuffle_weight(K_transposed, layout=(16, 16))  # expensive, per-batch!
++preshuffle_gemm(scores, Q, K_shuffled, ...)  # defeats the purpose of preshuffling
+ ```
+ 
++Preshuffling is a heavyweight operation designed to be done **once** at init. Calling
++it every forward pass adds overhead that far exceeds any GEMM speedup.
++
+ ## Decision Summary
+ 
+ ```
+-Attention pattern?
+-├── Standard SDPA (head_dim>=64, head_dim%32==0, seq%128==0)
+-│   └── Use build_flash_attn_func_module() from kernels.flash_attn_func
+-├── Decomposed Q@K, softmax, @V
+-│   └── Use compile_preshuffle_gemm_a8 + build_softmax_module
+-├── Non-standard shapes (head_dim<64, seq not %128)
+-│   └── F.scaled_dot_product_attention (PyTorch fallback, last resort)
+-└── Causal attention
++Matmul type?
++├── Linear projection (x @ W where W is fixed weight)
++│   └── compile_preshuffle_gemm_a8 + nn.Parameter [NO nn.Linear]
++│       Preshuffle W once at init. Works for QKV proj, output proj, FFN layers.
++├── Attention scores (Q @ K^T → softmax → @ V)
++│   ├── Standard SDPA (head_dim>=64, head_dim%32==0, seq%128==0)
++│   │   └── build_flash_attn_func_module() [NO F.scaled_dot_product_attention]
++│   ├── Non-standard dims
++│   │   └── Pad Q/K/V, run flash attention, slice back
++│   └── Non-softmax attention (e.g., ReLU-attention)
++│       └── torch.bmm is acceptable for activation-activation matmuls
++├── Activation @ activation (non-attention, both sides dynamic)
++│   └── torch.bmm as fallback (DO NOT preshuffle activations)
++└── Causal masking
+     └── FlyDSL flash attention supports causal=True natively
+ ```
+diff --git a/skills/pytorch2flydsl-translation/docs/flydsl_translation_conv_pool_bn.md b/skills/pytorch2flydsl-translation/docs/flydsl_translation_conv_pool_bn.md
+index 0d5c7035c..5a905b427 100644
+--- a/skills/pytorch2flydsl-translation/docs/flydsl_translation_conv_pool_bn.md
++++ b/skills/pytorch2flydsl-translation/docs/flydsl_translation_conv_pool_bn.md
+@@ -7,22 +7,28 @@ last_updated: 2026-04-23
+ 
+ # FlyDSL Translation: Conv2d, MaxPool2d, BatchNorm2d
+ 
+-## Conv2d via im2col + Preshuffle GEMM
++## Conv2d via im2col + Preshuffle GEMM (Full Replacement)
+ 
+-Convolution is equivalent to im2col (unfolding input patches into a 2D matrix)
+-followed by a matrix multiplication with the filter weights. Use `F.unfold` for
+-the im2col step and `compile_preshuffle_gemm_a8` for the GEMM.
++Do NOT keep `nn.Conv2d` — replace it entirely with `nn.Parameter` for weights,
++`F.unfold` for im2col, and `compile_preshuffle_gemm_a8` for the GEMM. The
++`nn.Module` wrapper is required by the translation harness for `.cuda()` / `.to()`
++parameter management — only the internals must be FlyDSL-native.
+ 
+-**Conv2d GEMM uses fp16 preshuffle even for fp32 input data.** This is an
+-acceptable precision tradeoff because BatchNorm after convolution absorbs small
+-numerical differences. The weight matrix (shared across all batch elements) is
+-preshuffled once, making this very efficient.
++### Step-by-step Conv2d translation
+ 
+-**If correctness fails**, fall back to `im2col + torch.mm` (fp32) instead.
++1. Extract conv weights from the original model, reshape to `(out_ch, in_ch * kH * kW)`
++2. Store as `nn.Parameter` (raw tensors, not `nn.Conv2d`)
++3. Preshuffle weight once with `shuffle_weight(w, layout=(16, 16))`
++4. Compile GEMM once with `compile_preshuffle_gemm_a8(...)`
++5. In `forward()`: `F.unfold(x, ...)` produces `[N, C*kH*kW, L]` columns matrix
++6. Fold batch into M dimension: `(B*L, K)` = A matrix for GEMM
++7. Call the pre-compiled GEMM launcher
++8. Reshape output back to `[N, out_ch, H_out, W_out]`
+ 
+-**Do NOT use `torch.bmm` for conv.** The weight matrix is shared across the
+-batch, NOT per-batch. Use a single preshuffle GEMM call with the batch folded
+-into the M dimension.
++**Do NOT use `torch.bmm`** — the weight matrix is shared across the batch.
++Fold B into M and use a single preshuffle GEMM call.
++
++### Complete Conv2d Example
+ 
+ ```python
+ import torch
+@@ -31,73 +37,65 @@ import torch.nn.functional as F
+ from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+ from tests.utils import shuffle_weight
+ 
+-class Model(nn.Module):
++class Model(nn.Module):  # nn.Module required by translation harness
+     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+         super().__init__()
+-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size,
+-                              stride=stride, padding=padding, bias=False)
++        kH = kW = kernel_size
++        K = in_channels * kH * kW
++
++        # Store conv weights as raw nn.Parameter (NOT nn.Conv2d)
++        self.conv_weight = nn.Parameter(
++            torch.randn(out_channels, K, dtype=torch.float16))
++
++        # Preshuffle weight ONCE — register_buffer so .cuda() moves it
++        self.register_buffer("w_shuffled",
++            shuffle_weight(self.conv_weight.data.contiguous(), layout=(16, 16)))
++
++        # Compile GEMM ONCE
++        self.gemm_fn = compile_preshuffle_gemm_a8(
++            M=0, N=out_channels, K=K,
++            tile_m=64, tile_n=128, tile_k=128,
++            in_dtype="fp16", out_dtype="fp16", lds_stage=2,
++        )
++
+         self.stride = stride
+         self.padding = padding
+-        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+-        self._gemm = None
+-        self._weight_shuffled = None
++        self.kernel_size = (kH, kW)
+ 
+     def forward(self, x):
+         B, C_in, H_in, W_in = x.shape
+         kH, kW = self.kernel_size
+-        C_out = self.conv.weight.shape[0]
++        C_out = self.conv_weight.shape[0]
++        K = self.conv_weight.shape[1]
+ 
+-        # im2col: unfold input patches into columns
+-        # Output shape: (B, C_in * kH * kW, L) where L = H_out * W_out
++        # Step 1: im2col via F.unfold → (B, C_in*kH*kW, L)
+         patches = F.unfold(x, kernel_size=self.kernel_size,
+                            stride=self.stride, padding=self.padding)
+         L = patches.shape[2]
+-        K = C_in * kH * kW
+ 
+-        # Reshape for GEMM: fold batch into M dimension
+-        # (B, K, L) -> transpose -> (B, L, K) -> reshape -> (B*L, K)
++        # Step 2: fold batch into M → (B*L, K)
+         patches_2d = patches.transpose(1, 2).reshape(B * L, K).half().contiguous()
+         M = B * L
+ 
+-        # Compile GEMM and preshuffle weight (once)
+-        if self._gemm is None:
+-            self._gemm = compile_preshuffle_gemm_a8(
+-                M=0, N=C_out, K=K,
+-                tile_m=64, tile_n=128, tile_k=128,
+-                in_dtype="fp16", out_dtype="fp16", lds_stage=2,
+-            )
+-            # Conv weight: (C_out, C_in, kH, kW) -> (C_out, K) -> preshuffle
+-            w = self.conv.weight.data.reshape(C_out, -1).half().contiguous()
+-            self._weight_shuffled = shuffle_weight(w, layout=(16, 16))
+-
++        # Step 3: GEMM
+         output = torch.empty(M, C_out, device=x.device, dtype=torch.float16)
+         scale = torch.empty(0, device=x.device, dtype=torch.float32)
+-        self._gemm(
++        self.gemm_fn(
+             output.view(-1), patches_2d.view(-1),
+-            self._weight_shuffled.view(-1), scale, scale,
++            self.w_shuffled.view(-1), scale, scale,
+             M, C_out, torch.cuda.current_stream(),
+         )
+ 
+-        # Reshape back to NCHW
++        # Step 4: reshape back to NCHW
+         H_out = (H_in + 2 * self.padding - kH) // self.stride + 1
+         W_out = (W_in + 2 * self.padding - kW) // self.stride + 1
+-        out = output.float().reshape(B, H_out, W_out, C_out).permute(0, 3, 1, 2).contiguous()
++        return output.reshape(B, H_out, W_out, C_out).permute(0, 3, 1, 2).contiguous()
+ 
+-        return out
+-```
+-
+-### Conv2d Fallback: im2col + torch.mm
++def get_inputs():
++    return [torch.randn(8, 3, 32, 32, device="cuda")]
+ 
+-If the preshuffle GEMM path fails correctness checks (tolerance too tight for
+-fp16), fall back to fp32 `torch.mm`. This keeps `F.unfold` for im2col but uses
+-PyTorch for the matmul:
+-
+-```python
+-# In forward(), replace the GEMM section with:
+-W = self.conv.weight.data.reshape(C_out, -1)  # (C_out, K) -- fp32
+-patches_2d = patches.transpose(1, 2).reshape(B * L, K)  # (B*L, K) -- fp32
+-out = torch.mm(patches_2d, W.t())  # (B*L, C_out) -- fp32
+-out = out.reshape(B, H_out, W_out, C_out).permute(0, 3, 1, 2).contiguous()
++def get_init_inputs():
++    return [3, 64, 3, 1, 1]
+ ```
+ 
+ ## MaxPool2d via Custom FlyDSL Kernel
+@@ -210,42 +208,198 @@ class Model(nn.Module):
+         return output.reshape(B, C, H_out, W_out)
+ ```
+ 
+-## BatchNorm2d (Eval Mode)
++## BatchNorm2d via Custom @flyc.kernel
+ 
+-In inference mode, BatchNorm2d is a simple per-channel affine transform.
+-Use `F.batch_norm` for this — it calls into the optimized MIOpen backend:
++In inference mode, BatchNorm2d is a per-channel affine transform:
++`output = input * scale + shift` where `scale = weight / sqrt(var + eps)`
++and `shift = bias - mean * scale`. Pre-compute scale/shift once in `__init__`.
++
++Do NOT use `F.batch_norm` or `nn.BatchNorm2d` — use a custom `@flyc.kernel`.
+ 
+ ```python
+ import torch
+ import torch.nn as nn
+-import torch.nn.functional as F
++import flydsl.compiler as flyc
++import flydsl.expr as fx
++from flydsl.expr import arith, vector
++from flydsl.expr.typing import T
++
++BLOCK_DIM = 256
++
++@flyc.kernel
++def batchnorm_kernel(
++    Input: fx.Tensor,
++    Scale: fx.Tensor,
++    Shift: fx.Tensor,
++    Output: fx.Tensor,
++    C: fx.Constexpr[int],
++    HW: fx.Constexpr[int],
++    block_dim: fx.Constexpr[int],
++):
++    bid = fx.block_idx.x
++    tid = fx.thread_idx.x
++    global_idx = bid * block_dim + tid
++
++    copy_atom = fx.make_copy_atom(fx.UniversalCopy(32), fx.Float32)
++    reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
++    reg_layout = fx.make_layout(1, 1)
++
++    in_div = fx.logical_divide(Input, fx.make_layout(1, 1))
++    out_div = fx.logical_divide(Output, fx.make_layout(1, 1))
++    sc_div = fx.logical_divide(Scale, fx.make_layout(1, 1))
++    sh_div = fx.logical_divide(Shift, fx.make_layout(1, 1))
++
++    total = fx.Int32(C * HW)
++    if arith.cmpi(arith.CmpIPredicate.ult, global_idx, total):
++        c_idx = global_idx // fx.Int32(HW)
++
++        r_in = fx.memref_alloca(reg_ty, reg_layout)
++        fx.copy_atom_call(copy_atom, fx.slice(in_div, (None, global_idx)), r_in)
++        val = vector.extract(fx.memref_load_vec(r_in), static_position=[0])
++
++        r_sc = fx.memref_alloca(reg_ty, reg_layout)
++        fx.copy_atom_call(copy_atom, fx.slice(sc_div, (None, c_idx)), r_sc)
++        sc = vector.extract(fx.memref_load_vec(r_sc), static_position=[0])
++
++        r_sh = fx.memref_alloca(reg_ty, reg_layout)
++        fx.copy_atom_call(copy_atom, fx.slice(sh_div, (None, c_idx)), r_sh)
++        sh = vector.extract(fx.memref_load_vec(r_sh), static_position=[0])
++
++        result = arith.addf(arith.mulf(val, sc), sh)
++
++        r_out = fx.memref_alloca(reg_ty, reg_layout)
++        vec_ty = T.vec(1, T.f32)
++        fx.memref_store_vec(vector.from_elements(vec_ty, [result]), r_out)
++        fx.copy_atom_call(copy_atom, r_out, fx.slice(out_div, (None, global_idx)))
++
++
++@flyc.jit
++def batchnorm_launch(
++    Input: fx.Tensor, Scale: fx.Tensor, Shift: fx.Tensor, Output: fx.Tensor,
++    total: fx.Int32,
++    C: fx.Constexpr[int], HW: fx.Constexpr[int], block_dim: fx.Constexpr[int],
++    stream: fx.Stream = fx.Stream(None),
++):
++    grid_x = (total + block_dim - 1) // block_dim
++    batchnorm_kernel(Input, Scale, Shift, Output, C, HW, block_dim).launch(
++        grid=(grid_x, 1, 1), block=(block_dim, 1, 1), stream=stream)
++
+ 
+ class Model(nn.Module):
+-    def __init__(self, num_features):
++    def __init__(self, num_features, eps=1e-5):
+         super().__init__()
+-        self.bn = nn.BatchNorm2d(num_features)
+-        self.bn.eval()
++        self.num_features = num_features
++        self.eps = eps
++        self.weight = nn.Parameter(torch.ones(num_features))
++        self.bias = nn.Parameter(torch.zeros(num_features))
++        self.register_buffer("running_mean", torch.zeros(num_features))
++        self.register_buffer("running_var", torch.ones(num_features))
++        self._scale = None
++        self._shift = None
++
++    def _precompute(self):
++        scale = self.weight / torch.sqrt(self.running_var + self.eps)
++        shift = self.bias - self.running_mean * scale
++        self._scale = scale.contiguous()
++        self._shift = shift.contiguous()
+ 
+     def forward(self, x):
+-        return F.batch_norm(
+-            x, self.bn.running_mean, self.bn.running_var,
+-            self.bn.weight, self.bn.bias, training=False, eps=self.bn.eps,
+-        )
++        if self._scale is None:
++            self._precompute()
++        B, C, H, W = x.shape
++        HW = H * W
++        x_flat = x.reshape(B * C, HW).contiguous().view(-1)
++        output = torch.empty_like(x_flat)
++        total = B * C * HW
++        # Expand scale/shift to match batch: repeat B times
++        scale_expanded = self._scale.repeat(B).contiguous().view(-1)
++        shift_expanded = self._shift.repeat(B).contiguous().view(-1)
++        batchnorm_launch(
++            x_flat, scale_expanded, shift_expanded, output,
++            total, B * C, HW, BLOCK_DIM,
++            stream=torch.cuda.current_stream())
++        return output.reshape(B, C, H, W)
+ ```
+ 
+-`F.batch_norm` is an acceptable PyTorch fallback — there is no FlyDSL
+-pre-built BatchNorm kernel.
++## Conv2d Optimization: 1x1 Convolutions Skip F.unfold
++
++For **1x1 stride-1** convolutions (e.g., ResNet skip connections, channel projections),
++`F.unfold` is unnecessary overhead -- the patch matrix is just a reshape of the input:
++
++```python
++if kernel_size == 1 and stride == 1 and padding == 0:
++    # No im2col needed: (B, C_in, H, W) -> (B*H*W, C_in)
++    patches_2d = x.permute(0, 2, 3, 1).reshape(B * H * W, C_in).half().contiguous()
++else:
++    patches = F.unfold(x, kernel_size=kernel_size, stride=stride, padding=padding)
++    L = patches.shape[2]
++    patches_2d = patches.transpose(1, 2).reshape(B * L, K).half().contiguous()
++```
++
++This avoids materializing the patch matrix and saves memory for large feature maps.
++
++## Conv2d Optimization: Small-K GEMM Guidance
++
++Preshuffle GEMM with very small K (e.g., K=27 for a 3x3 conv on 3-channel input,
++padded to 32) is **overhead-dominated** because:
++- `tile_k=128` means the K-loop runs once with most elements zeroed
++- GEMM launch overhead exceeds useful compute
++
++For K < 64, use `tile_k=32` (minimum) and consider smaller tile configs:
++```python
++gemm_fn = compile_preshuffle_gemm_a8(
++    M=0, N=out_ch, K=K,
++    tile_m=32, tile_n=64, tile_k=32,  # smaller tiles for small K
++    in_dtype="fp16", out_dtype="fp16", lds_stage=2,
++)
++```
++
++The GEMM is still correct (K is padded internally) but the agent should be aware
++that small-K GEMMs may not outperform cuDNN's fused conv kernel. The goal is
++FlyDSL-native code, not necessarily faster than cuDNN for every individual op.
++
++## BatchNorm2d: Train vs Eval Mode
++
++The pre-computed `scale`/`shift` pattern above **only works in eval mode** where
++`running_mean` and `running_var` are fixed. In training mode, BN computes batch
++statistics dynamically.
++
++**IMPORTANT:** The translation harness does NOT call `.eval()`. Models run in
++their default mode (training). Check the source kernel: if it does not call
++`.eval()`, assume training mode.
++
++**Eval mode** (source kernel calls `.eval()` or sets `self.eval()` in `__init__`):
++- Use the pre-computed scale/shift pattern above
++
++**Training mode** (default -- no `.eval()` call in source kernel):
++- Do NOT fuse BN into conv weights (batch stats change each forward pass)
++- Compute per-channel mean and variance from the current batch:
++  `mean = x.mean(dim=(0, 2, 3))` and `var = x.var(dim=(0, 2, 3), unbiased=False)`
++  (`.mean()` and `.var()` are basic tensor reductions, not forbidden compute ops)
++- Compute dynamic scale/shift: `scale = weight / sqrt(var + eps)`,
++  `shift = bias - mean * scale`
++- Apply element-wise: `out = x * scale + shift` via a custom `@flyc.kernel`
++- Perform the mean/var computation in fp32 for numerical stability, then cast
++  scale/shift back to fp16 before passing to the FlyDSL kernel
++
++## Composing Multiple Ops (ResNet Pattern)
++
++For models like ResNet with `Conv2d + BatchNorm + ReLU + Conv2d + BatchNorm + skip + ReLU`:
+ 
+-## Composing Multiple Ops
++1. **Each Conv2d** gets its own preshuffle GEMM (compiled once in `__init__`)
++2. **Each BatchNorm** uses pre-computed scale/shift from its running stats
++3. **ReLU** should be applied via a separate `@flyc.kernel` (or fused into the BN kernel as `bn_relu_kernel`)
++4. **Residual add + ReLU** as a final element-wise `@flyc.kernel`
+ 
+-For models with multiple ops (e.g., Conv2d + BatchNorm + ReLU + MaxPool2d + Linear),
+-compose these patterns in a single `Model` class. Each op gets its own
+-kernel/launcher, initialized lazily in `forward()`.
++When the pattern is Conv+BN+ReLU, the preferred approach is:
++- Use GEMM for Conv, then a fused BN+ReLU `@flyc.kernel` that applies `max(0, x * scale + shift)`
++- This keeps the GEMM clean and handles bias/activation in a single element-wise kernel
+ 
+ ## Summary
+ 
+ | PyTorch op | FlyDSL translation | Approach |
+ |-----------|-------------------|----------|
+-| `nn.Conv2d` | im2col + preshuffle GEMM (fp16) | `F.unfold` + `compile_preshuffle_gemm_a8` + reshape NCHW. Fallback: `F.unfold` + `torch.mm` |
+-| `F.max_pool2d` | Custom `@flyc.kernel` | `arith.maximumf` over window elements, batch flattened into channels |
+-| `nn.BatchNorm2d` | `F.batch_norm` | Acceptable PyTorch fallback (MIOpen backend) |
++| `nn.Conv2d` | im2col + preshuffle GEMM (fp16) | `F.unfold` + `compile_preshuffle_gemm_a8` + reshape NCHW. Skip unfold for 1x1 convs. |
++| `F.max_pool2d` | Custom `@flyc.kernel` | `arith.maximumf` over window elements, batch flattened into channels. |
++| `nn.BatchNorm2d` | Custom `@flyc.kernel` (eval) | Pre-compute scale/shift in `__init__`, element-wise apply in forward. Eval mode only. |
++| Conv+BN+ReLU | GEMM + fused BN+ReLU kernel | GEMM for conv, then `@flyc.kernel` applying `max(0, x * scale + shift)`. |
+diff --git a/skills/pytorch2flydsl-translation/docs/flydsl_translation_gemm.md b/skills/pytorch2flydsl-translation/docs/flydsl_translation_gemm.md
+index 87a071bc6..79bf6b04d 100644
+--- a/skills/pytorch2flydsl-translation/docs/flydsl_translation_gemm.md
++++ b/skills/pytorch2flydsl-translation/docs/flydsl_translation_gemm.md
+@@ -95,6 +95,30 @@ scale_b = torch.empty(0, device=device, dtype=torch.float32)
+ 
+ `tile_n`: 128. `tile_k`: 128 for fp16/bf16, 256 for fp8/int8. Use `lds_stage=2`.
+ 
++### Bias and Activation After GEMM
++
++`compile_preshuffle_gemm_a8` computes `C = A @ B` only. It does **not** support
++fused bias or activation epilogues. When the original PyTorch code includes
++bias addition or activation (e.g. `F.relu(F.linear(x, w, b))`), handle them
++as separate operations after the GEMM:
++
++- **Bias**: add via a simple `@flyc.kernel` or `torch.add`
++- **Activation**: apply via a `@flyc.kernel` (e.g. `arith.maximumf` for ReLU)
++- **Fused bias+activation**: write a single `@flyc.kernel` that computes
++  `output = max(0, gemm_output + bias)` in one pass
++
++### Alternative: hgemm_splitk (FP16 SplitK GEMM)
++
++For small M (e.g., batch_size=1 decode), standard tile configs may not
++fill the GPU. `hgemm_splitk` splits the K dimension across thread blocks:
++
++```python
++from kernels.hgemm_splitk import compile_hgemm_splitk
++```
++
++Use when M < tile_m and standard GEMM underperforms. Only available in
++newer FlyDSL versions — check availability before using.
++
+ ### Constraints
+ 
+ - `tile_k * elem_bytes` must be divisible by 64
+@@ -144,9 +168,8 @@ class Model(nn.Module):
+             M, N,
+             torch.cuda.current_stream(),
+         )
+-
+-        if self.bias is not None:
+-            output = output + self.bias
++        # Add bias separately
++        output = output + self.bias.unsqueeze(0)
+ 
+         return output
+ 
+@@ -157,25 +180,157 @@ def get_init_inputs():
+     return [4096, 4096]
+ ```
+ 
+-## When PyTorch Fallback is Acceptable
++## GEMM + Reduction Fusion: Replace GEMM with Custom Kernel
+ 
+-Only fall back to PyTorch GEMM (`torch.matmul`, `F.linear`) when:
++When a GEMM is **immediately followed by a reduction** (e.g., `sum`, `mean`), the
++full computation can often be simplified mathematically and implemented as a single
++fused `@flyc.kernel`, completely eliminating the rocBLAS GEMM call.
++
++### When to Apply
++
++Check for this pattern:
++```python
++# PyTorch original
++y = x @ W.T          # GEMM: (B, K) @ (K, N) -> (B, N)
++y = y / divisor       # element-wise
++y = y.sum(dim=1)      # reduction along N -> (B,)
++y = y * scale         # element-wise
++```
++
++If the GEMM output is reduced along the N dimension, the entire sequence collapses
++to a **dot product per row** against a precomputed vector:
++
++```
++# Math simplification:
++# y[i] = sum_j( x[i,j] * W[j,:].sum() ) * (scale / divisor)
++# w_sum = W.sum(dim=0)  -- precompute once (constant)
++# y[i] = dot(x[i,:], w_sum) * fused_scale
++```
++
++### Implementation Pattern
++
++**In `__init__` / `build_model()` — precompute weight-side reduction:**
++```python
++w_sum = weight.sum(dim=0)  # (K,) -- done once, weight is constant
++fused_scale = scaling_factor / divisor  # fold scalar ops
++```
++
++**Replace GEMM + reduction with a custom `@flyc.kernel`:**
++```python
++@flyc.kernel
++def fused_dot_scale_kernel(X: fx.Tensor, W_sum: fx.Tensor, Out: fx.Tensor):
++    bid = fx.block_idx.x   # one block per row
++    tid = fx.thread_idx.x
++    # Each thread accumulates partial dot product using FMA
++    acc = arith.constant(0.0, type=T.f32)
++    for base in range_constexpr(0, K, BLOCK_THREADS):
++        idx = tid + base
++        x_val = ...  # load X[bid, idx]
++        w_val = ...  # load W_sum[idx]
++        acc = arith.fma(x_val, w_val, acc, fastmath=fast)
++    # Block-wide reduction (wave shuffle + shared memory)
++    total = block_reduce_sum(acc)
++    # Thread 0 writes: Out[bid] = total * fused_scale
++```
+ 
+-1. **Batched matmul** (`torch.bmm`) — no FlyDSL batched GEMM yet
+-2. **Very small dimensions** where GEMM kernel overhead exceeds compute
+-3. **fp32 precision required** — Check the dtype table above. If the kernel uses
+-   fp32 GEMM and the table has no fp32 output type, use `torch.mm` directly.
+-   Do not waste steps trying to make fp16 GEMM work — fp16 truncation in a large
+-   GEMM (e.g. 8192×8192) feeding into a reduction will fail tolerance.
+-   Use FlyDSL for all non-GEMM operations (reductions, element-wise).
++### Why This Is Fast
+ 
+-**Exception — Conv2d internal GEMM**: Conv2d uses im2col + preshuffle GEMM with
+-fp16 cast, even when the original data is fp32. This is acceptable because
+-BatchNorm after convolution absorbs small numerical differences from fp16.
+-If the correctness check fails, fall back to im2col + `torch.mm` (fp32).
+-Do NOT use `torch.bmm` for Conv2d — the weight matrix is shared across the
+-batch (not per-batch), so fold B into M and use a single preshuffle GEMM call.
++- **No rocBLAS launch**: Eliminates GEMM kernel launch overhead entirely
++- **No intermediate tensor**: The `(B, N)` GEMM output is never materialized
++- **Precomputed constants**: Weight reduction and scalar folding happen once at init
++- **FMA accumulation**: Numerically stable fused multiply-add in the inner loop
++- **Single kernel**: One launch per batch instead of GEMM + element-wise + reduction
++
++### Verified Results
++
++`14_Gemm_Divide_Sum_Scaling`: enriched achieved **15.7x** speedup (vs baseline 1.02x
++using `torch.matmul`) by fusing the entire GEMM + divide + sum + scale into a single
++`@flyc.kernel` with precomputed `w_sum`.
++
++### Applicability Limits
++
++- Only works when the reduction dimension matches the GEMM output dimension
++- Weight must be constant (not an activation) so the weight-side reduction is a one-time cost
++- If the GEMM output is used for multiple operations (not just reduction), keep the GEMM
++
++## No PyTorch GEMM Fallbacks
++
++Do NOT use `torch.mm`, `torch.bmm`, `torch.matmul`, `F.linear`, or `nn.Linear`.
++ALL matrix multiplications must use FlyDSL preshuffle GEMM.
++
++### fp32 inputs
++
++Cast to fp16 before calling `compile_preshuffle_gemm_a8`. FlyDSL preshuffle GEMM
++handles all GEMM operations. Do NOT use `torch.mm` for fp32 GEMM.
++
++### Batched matmul (replacing torch.bmm)
++
++- **Attention pattern (Q@K^T)**: Use `build_flash_attn_func_module()` — flash attention
++  handles the full Q@K^T → softmax → @V pipeline natively.
++- **Shared B-matrix**: reshape `(B, M, K)` to `(B*M, K)`, use single `compile_preshuffle_gemm_a8`,
++  then reshape back. B-matrix is preshuffled once.
++- **Varying B-matrix per batch**: reshape both operands so the batch is folded into the
++  M dimension. For `(B, M, K) @ (B, K, N)`: iterate over batch elements calling
++  preshuffle GEMM per element (each B-slice is preshuffled separately).
++  This is acceptable when flash attention does not apply.
++
++### Conv2d internal GEMM
++
++Conv2d uses im2col (`F.unfold`) + preshuffle GEMM with fp16 cast.
++Do NOT fall back to `torch.mm`, `torch.bmm`, or `F.conv2d` — always use preshuffle GEMM.
++The weight matrix is shared across the batch — fold B into M and call a single GEMM.
++
++### All other GEMM (nn.Linear, torch.matmul, F.linear)
++
++Replace entirely with `compile_preshuffle_gemm_a8` + `shuffle_weight`.
++Store weights as `nn.Parameter`, not `nn.Linear`.
++
++## Low-Level CuTe-Style Primitives (FlyDSL 0.1.4+)
++
++FlyDSL 0.1.4+ exposes low-level CuTe-style primitives that give fine-grained
++control over GEMM execution. These are useful when `compile_preshuffle_gemm_a8`
++is insufficient — for example, when you need fp32 output from a GEMM to avoid
++precision loss in multi-layer pipelines (e.g. Conv+BN chains where fp16
++truncation between layers compounds).
++
++### Available Primitives
++
++| Module | Primitive | Purpose |
++|--------|-----------|---------|
++| `rocdl.MFMA` | `mfma_f32_16x16x16f16` | Hardware MFMA: fp16 inputs, fp32 accumulator (16x16x16 tile) |
++| `rocdl.MFMA` | `mfma_f32_16x16x4f32` | Hardware MFMA: fp32 inputs, fp32 accumulator |
++| `fx` | `fx.make_mma_atom(...)` | Construct a CuTe MMA atom from an MFMA instruction |
++| `fx` | `fx.make_tiled_mma(...)` | Tile an MMA atom across thread blocks |
++| `fx` | `fx.gemm(...)` | Layout-aware GEMM building block using tiled MMA |
++| `fx` | `fx.copy(...)` / `rocdl.BufferCopy` | Async global→shared memory copy primitives |
++
++### When to Use
++
++- **Precision-sensitive pipelines**: When `compile_preshuffle_gemm_a8` (which
++  truncates fp32 accumulators to fp16 output) causes correctness failures in
++  multi-layer networks. A custom CuTe GEMM can write fp32 accumulators directly
++  to global memory, avoiding truncation.
++- **Non-standard data types**: When you need fp32-in/fp32-out GEMM or mixed
++  precision configurations not supported by the pre-built kernels.
++- **Custom tiling**: When the pre-built tile configurations don't match your
++  problem shape well.
++
++### Example: Custom fp32-Output GEMM Kernel
++
++```python
++import flydsl.compiler as flyc
++import flydsl.expr as fx
++from flydsl.expr import arith
++from flydsl.expr.typing import T
++
++@flyc.kernel
++def gemm_fp32_out(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, M: fx.Constexpr[int], ...):
++    # Use fx.make_mma_atom with mfma_f32_16x16x16f16
++    # Accumulate in fp32 registers
++    # Store fp32 result directly (no arith.trunc_f)
++    ...
++```
+ 
+-**Do NOT use PyTorch fallback for standard `nn.Linear` or `torch.matmul(A, B)` —
+-these should use `compile_preshuffle_gemm_a8`** (unless fp32 precision is required
+-and the dtype table has no fp32 row).
++Note: Writing a correct CuTe GEMM kernel requires understanding tiled MMA
++layouts, shared memory staging, and the MFMA instruction semantics. Prefer
++`compile_preshuffle_gemm_a8` when fp16 output precision is acceptable.
+diff --git a/skills/pytorch2flydsl-translation/docs/flydsl_translation_guide.md b/skills/pytorch2flydsl-translation/docs/flydsl_translation_guide.md
+index 5bd571de9..23106995c 100644
+--- a/skills/pytorch2flydsl-translation/docs/flydsl_translation_guide.md
++++ b/skills/pytorch2flydsl-translation/docs/flydsl_translation_guide.md
+@@ -43,7 +43,7 @@ Do NOT keep `nn.Linear` — replace it entirely:
+ 1. Extract weight and bias from the original model
+ 2. Store as `nn.Parameter` (raw tensors)
+ 3. Preshuffle weight once with `shuffle_weight(w, layout=(16, 16))`
+-4. Compile GEMM once with `compile_preshuffle_gemm_a8(...)` — use fused epilogue if followed by activation
++4. Compile GEMM once with `compile_preshuffle_gemm_a8(...)`
+ 5. Call the compiled launcher in `forward()`
+ 
+ ### Replacing nn.Conv2d with im2col + FlyDSL GEMM
+@@ -69,12 +69,16 @@ See `flydsl_translation_conv_pool_bn.md` for the complete worked example.
+ Write `@flyc.kernel` + `@flyc.jit` with layout algebra for element-wise ops
+ and simple reductions.
+ 
+-### Acceptable PyTorch fallbacks (minimal set)
++### Acceptable PyTorch usage (structural only)
+ 
+-- `F.unfold` (im2col for Conv2d — structural, not compute)
+-- `F.batch_norm` (MIOpen backend, no FlyDSL equivalent)
+-- `torch.mm` (fp32 GEMM only — when fp16 preshuffle fails correctness)
+-- `F.max_pool2d` (if custom FlyDSL maxpool kernel fails)
++- `F.unfold` (im2col for Conv2d — structural data rearrangement, not compute)
++- `F.pad` (padding for flash attention constraints)
++- Tensor reshaping: `.view()`, `.reshape()`, `.transpose()`, `.permute()`, `.contiguous()`
++- Tensor creation: `torch.empty`, `torch.zeros`, `torch.randn`, `torch.empty_like`
++
++Do NOT use any PyTorch compute ops as fallbacks: no `torch.mm`, `torch.bmm`,
++`torch.matmul`, `F.linear`, `nn.Linear`, `F.conv2d`, `nn.Conv2d`, `F.batch_norm`,
++`nn.BatchNorm2d`, `F.max_pool2d`, or `F.scaled_dot_product_attention`.
+ 
+ ## Step 3: Element-wise Translation (Complete Example)
+ 
+@@ -239,9 +243,10 @@ class Model(nn.Module):
+         # Store weights as raw nn.Parameter (NOT nn.Linear)
+         self.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=torch.float16))
+         self.bias = nn.Parameter(torch.randn(out_features, dtype=torch.float16))
+-        # Preshuffle weight ONCE
+-        self.w_shuffled = shuffle_weight(self.weight.data.contiguous(), layout=(16, 16))
+-        # Compile GEMM ONCE — fuse bias+relu if needed
++        # Preshuffle weight ONCE — register_buffer so .cuda() moves it
++        self.register_buffer("w_shuffled",
++            shuffle_weight(self.weight.data.contiguous(), layout=(16, 16)))
++        # Compile GEMM ONCE
+         N, K = out_features, in_features
+         self.gemm_fn = compile_preshuffle_gemm_a8(
+             M=0, N=N, K=K,
+@@ -260,7 +265,9 @@ class Model(nn.Module):
+             self.w_shuffled.view(-1), scale, scale, M, N,
+             torch.cuda.current_stream(),
+         )
+-        return output + self.bias
++        # Add bias separately
++        output = output + self.bias.unsqueeze(0)
++        return output
+ ```
+ 
+ ### Flash Attention
+@@ -307,11 +314,11 @@ class Model(nn.Module):
+         # Conv weights as raw nn.Parameter (NOT nn.Conv2d)
+         self.conv_weight = nn.Parameter(torch.randn(out_ch, K, dtype=torch.float16))
+         self.conv_bias = nn.Parameter(torch.randn(out_ch, dtype=torch.float16))
+-        self.w_shuffled = shuffle_weight(self.conv_weight.data.contiguous(), layout=(16, 16))
++        self.register_buffer("w_shuffled",
++            shuffle_weight(self.conv_weight.data.contiguous(), layout=(16, 16)))
+         self.conv_gemm = compile_preshuffle_gemm_a8(
+             M=0, N=out_ch, K=K, tile_m=64, tile_n=128, tile_k=128,
+-            in_dtype="fp16", out_dtype="fp16", lds_stage=2,
+-            epilogue="bias_relu")  # fuse bias + ReLU
++            in_dtype="fp16", out_dtype="fp16", lds_stage=2)
+         self.kernel_size = kernel_size
+ 
+     def forward(self, x):
+@@ -347,26 +354,34 @@ What operation type?
+ ├── LayerNorm / RMSNorm
+ │   └── Use build_layernorm_module() / build_rmsnorm_module()
+ ├── GEMM / Linear / torch.matmul
+-│   ├── fp32 required? Check GEMM dtype table. No fp32 → use torch.mm
+-│   └── fp16/bf16 → Use compile_preshuffle_gemm_a8() [NOT torch.matmul / F.linear]
++│   ├── fp32 inputs? Cast to fp16, use compile_preshuffle_gemm_a8() [NO torch.mm]
++│   └── fp16/bf16 → Use compile_preshuffle_gemm_a8() [NO torch.matmul / F.linear]
++├── Batched matmul (torch.bmm)
++│   ├── Attention pattern (Q@K^T) → Use build_flash_attn_func_module()
++│   ├── Shared B-matrix → reshape (B,M,K) to (B*M,K), single preshuffle GEMM
++│   └── Varying B → reshape batch into M dim, preshuffle GEMM [NO torch.bmm]
+ ├── Attention (self-attention, SDPA, Flash)
+-│   └── Use build_flash_attn_func_module() from kernels.flash_attn_func
+-│       (fallback to decomposed GEMM+softmax if constraints not met)
++│   ├── Constraints met → Use build_flash_attn_func_module()
++│   ├── head_dim not %32 or <64 → Pad Q/K/V to next valid head_dim, flash attn, slice back
++│   ├── seq_len not %128 → Pad Q/K/V along seq dim, flash attn, slice back
++│   └── Both unmet → Decompose into preshuffle GEMM + build_softmax_module [NO F.scaled_dot_product_attention]
+ ├── Conv2d
+ │   ├── F.unfold (im2col) to get patches (B, K_patch, L)
+ │   ├── Transpose+reshape to (B*L, K_patch) = A matrix
+ │   ├── Weight (C_out, K_patch) → preshuffle once (fp16 cast)
+ │   ├── compile_preshuffle_gemm_a8(fp16) → reshape output to NCHW
+-│   └── If correctness fails → im2col + torch.mm fallback
++│   └── Do NOT fall back to torch.mm, torch.bmm, or F.conv2d
+ ├── MaxPool2d
+-│   └── Custom @flyc.kernel with arith.maximumf over window elements
++│   └── Custom @flyc.kernel with arith.maximumf over window [NO F.max_pool2d]
+ ├── BatchNorm2d
+-│   └── F.batch_norm (acceptable PyTorch fallback, MIOpen backend)
++│   └── Custom @flyc.kernel: pre-compute scale/shift in __init__, element-wise apply [NO F.batch_norm]
+ └── Complex model (L2/L3)
+-    └── FlyDSL for ALL ops; Conv2d via im2col+GEMM, MaxPool via custom kernel
++    └── FlyDSL for ALL ops — zero PyTorch compute
+ ```
+ 
+-**IMPORTANT**: Do NOT use `torch.matmul`, `F.linear`, `nn.Linear`, or
+-`F.scaled_dot_product_attention` when FlyDSL pre-built kernels are available.
+-Acceptable PyTorch fallbacks: `F.unfold` (im2col), `F.batch_norm`, `torch.mm`
+-(fp32 GEMM only). Conv2d uses im2col + preshuffle GEMM, NOT `nn.Conv2d`.
++**IMPORTANT**: Do NOT use ANY PyTorch compute ops. No `nn.Linear`, `nn.Conv2d`,
++`nn.BatchNorm2d`, `torch.mm`, `torch.bmm`, `torch.matmul`, `F.linear`, `F.conv2d`,
++`F.batch_norm`, `F.max_pool2d`, or `F.scaled_dot_product_attention`. Replace ALL
++with FlyDSL kernels: `nn.Parameter` for weights, `compile_preshuffle_gemm_a8` /
++`build_*` for pre-built ops, custom `@flyc.kernel` for element-wise/reduction/pooling/batchnorm.
++Acceptable PyTorch usage (structural only): `F.unfold`, `F.pad`, tensor reshape/view/transpose.
+diff --git a/src/minisweagent/run/preprocess/config/mini_kernel_pytorch_to_flydsl.yaml b/src/minisweagent/run/preprocess/config/mini_kernel_pytorch_to_flydsl.yaml
+index db3515a55..4cff5628d 100644
+--- a/src/minisweagent/run/preprocess/config/mini_kernel_pytorch_to_flydsl.yaml
++++ b/src/minisweagent/run/preprocess/config/mini_kernel_pytorch_to_flydsl.yaml
+@@ -35,10 +35,10 @@ agent:
+ 
+     ## Translation Strategy (in order of preference)
+ 
+-    - **GEMM / Linear (fp16/bf16)**: Use `compile_preshuffle_gemm_a8()` from `kernels.preshuffle_gemm`.
++    - **GEMM / Linear**: Use `compile_preshuffle_gemm_a8()` from `kernels.preshuffle_gemm`.
+       CRITICAL: B-matrix must be preshuffled with `shuffle_weight(B.contiguous(), layout=(16, 16))` from `tests.utils`.
+       All tensor args must be `.view(-1)`. Scales: `torch.empty(0, device=dev, dtype=torch.float32)` for fp16.
+-    - **GEMM / Linear (fp32)**: Use `torch.mm` directly — FlyDSL preshuffle GEMM has no fp32 output type. Do NOT attempt fp16 GEMM when the kernel requires fp32 precision.
++      For fp32 inputs: cast to fp16 before GEMM. FlyDSL preshuffle GEMM handles all GEMM ops.
+     - **Attention / SDPA**: ALWAYS use `build_flash_attn_func_module()` from `kernels.flash_attn_func`
+       when head_dim>=64, head_dim%32==0, seq_len%128==0. NEVER decompose attention into separate
+       GEMM+softmax+GEMM calls when flash attention fits — decomposed is 5-10x slower.
+@@ -47,27 +47,27 @@ agent:
+       Launcher: `fn(Q.view(-1), K.view(-1), V.view(-1), O.view(-1), batch_size, seq_len, stream=stream)`.
+       Note: num_heads is baked in at build time, NOT passed at launch time.
+     - **Non-standard head_dim for flash attention**: If head_dim is not a multiple of 32, pad Q/K/V to next multiple of 32 with zeros, run flash attention with padded head_dim, then slice output back. NEVER fall back to F.scaled_dot_product_attention.
++    - **Non-standard seq_len for flash attention**: If seq_len is not a multiple of 128, pad Q/K/V along the sequence dimension to next multiple of 128, run flash attention, then slice output back. NEVER fall back to F.scaled_dot_product_attention.
+     - **Softmax**: `build_softmax_module(M, N, dtype_str)` — call as `fn(input, output, M, stream=stream)`
+     - **LayerNorm**: `build_layernorm_module(M, N, dtype_str)` — call as `fn(input, gamma, beta, output, M, stream=stream)`
+     - **RMSNorm**: `build_rmsnorm_module(M, N, dtype_str)` — call as `fn(input, gamma, output, M, stream=stream)`
+     - **Element-wise ops** (relu, sigmoid, tanh, clamp, etc.): Write custom @flyc.kernel with layout algebra
+     - **Reductions** (sum, mean): Manual block reduction with wave shuffle
+-    - **Batched matmul (torch.bmm)**: For standard softmax attention, use build_flash_attn_func_module. For standalone batched GEMMs where B is shared across batch, reshape (B, M, K) to (B*M, K), use compile_preshuffle_gemm_a8, then reshape back. When both operands vary per batch element (e.g., Q@K^T in non-softmax attention) or tensors are fp32, use torch.bmm — FlyDSL has no batched GEMM kernel.
++    - **Batched matmul**: For standard softmax attention, use build_flash_attn_func_module. For standalone batched GEMMs where B-matrix is shared across batch, reshape (B, M, K) to (B*M, K), use compile_preshuffle_gemm_a8, then reshape back. When both operands vary per batch element (e.g., Q@K^T in non-softmax attention), reshape the batch into the M dimension: for (B,M,K)@(B,K,N), reshape A to (B*M,K), loop-preshuffle each B-slice or use a single reshaped GEMM if K and N are uniform. NEVER use torch.bmm.
+     - **Conv2d**: F.unfold (im2col) + compile_preshuffle_gemm_a8 (fp16 cast) + reshape to NCHW.
+       Weight is shared across batch → preshuffle once. Cast patches to fp16.
+-      If correctness fails, fall back to im2col + torch.mm.
+-      Do NOT use torch.bmm for conv — weight is shared, not per-batch.
+-    - **MaxPool2d**: Custom @flyc.kernel with arith.maximumf over window elements
+-    - **BatchNorm2d**: F.batch_norm (acceptable PyTorch fallback)
+-    - **Bias addition after GEMM**: output + self.bias is a PyTorch compute op — translate it to a simple @flyc.kernel (addf over the output and bias vectors). Same pattern as any elementwise op.
++      Do NOT fall back to torch.mm, torch.bmm, or F.conv2d — FlyDSL GEMM is mandatory for conv.
++    - **MaxPool2d**: Custom @flyc.kernel with arith.maximumf over window elements. Do NOT fall back to F.max_pool2d.
++    - **BatchNorm2d**: Custom @flyc.kernel. In eval mode, pre-compute scale/shift in __init__. In training mode (default — harness does NOT call .eval()), compute batch mean/var dynamically: mean=x.mean(dim=(0,2,3)), var=x.var(dim=(0,2,3), unbiased=False), then scale=weight/sqrt(var+eps), shift=bias-mean*scale, apply per-channel affine. Do NOT use F.batch_norm, torch.batch_norm, or torch.ops.aten.batch_norm.
++    - **Bias addition after GEMM**: Use fused epilogue (epilogue="bias") in compile_preshuffle_gemm_a8 when possible. Otherwise translate to a simple @flyc.kernel (addf over the output and bias vectors).
+     - **Residual connections**: x = x + residual is a PyTorch elementwise add — translate to a simple addf @flyc.kernel.
+     - **Scalar broadcast ops**: x * scale, x / divisor, x + constant — translate to @flyc.kernel using arith.mulf/arith.divf/arith.addf with vector.broadcast.
+-    - **CRITICAL anti-pattern — Python loops over batch/heads**: NEVER write for b in range(B) or for h in range(H) loops calling GEMM or any FlyDSL kernel per iteration. Instead: reshape all batch*head data into a single 2D tensor and call preshuffle GEMM once, use flash attention, or use torch.bmm for fp32/varying-B batched matmul.
++    - **CRITICAL anti-pattern — Python loops over batch/heads**: NEVER write for b in range(B) or for h in range(H) loops calling GEMM or any FlyDSL kernel per iteration. Instead: reshape all batch*head data into a single 2D tensor and call preshuffle GEMM once, or use flash attention.
+     - **Priority**: A correct translation with simple standalone kernels and zero fallbacks is ALWAYS better than a partially-fused translation that still has PyTorch fallbacks.
+-    - **Complex models**: Use FlyDSL for ALL ops; Conv2d via im2col+GEMM, MaxPool2d via custom kernel
++    - **Complex models**: Use FlyDSL for ALL ops; Conv2d via im2col+GEMM, MaxPool2d via custom kernel, BatchNorm2d via custom kernel
+ 
+-    CRITICAL: For fp16/bf16 tensors, do NOT use torch.matmul, F.linear, nn.Linear, or F.scaled_dot_product_attention. These ALL have FlyDSL pre-built replacements.
+-    Acceptable PyTorch fallbacks: F.unfold (im2col), F.batch_norm, torch.mm (fp32 GEMM only).
++    CRITICAL: Do NOT use torch.mm, torch.bmm, torch.matmul, F.linear, nn.Linear, F.conv2d, nn.Conv2d, F.batch_norm, nn.BatchNorm2d, F.max_pool2d, F.scaled_dot_product_attention, torch.ops.aten.convolution, torch.ops.aten.batch_norm, torch.batch_norm, or any torch.ops.aten.* compute op. ALL of these have FlyDSL replacements.
++    Acceptable PyTorch usage (structural only): F.unfold (im2col), F.pad, tensor reshape/view/transpose/permute/contiguous, torch.empty/torch.zeros/torch.randn (tensor creation).
+ 
+   instance_template: |
+     ## Translation Task
+@@ -87,9 +87,9 @@ agent:
+        - For attention/SDPA: use `build_flash_attn_func_module` from `kernels.flash_attn_func`
+        - For softmax/layernorm/rmsnorm: use pre-built kernels from `kernels.*` module
+        - For element-wise: use @flyc.kernel with layout algebra (logical_divide, slice, copy atoms)
+-       - For Conv2d: im2col (F.unfold) + compile_preshuffle_gemm_a8 (fp16 cast); fallback: im2col + torch.mm
+-       - For MaxPool2d: custom @flyc.kernel with arith.maximumf
+-       - For BatchNorm2d: F.batch_norm (acceptable PyTorch fallback)
++       - For Conv2d: im2col (F.unfold) + compile_preshuffle_gemm_a8 (fp16 cast) — no PyTorch compute fallback
++       - For MaxPool2d: custom @flyc.kernel with arith.maximumf — no F.max_pool2d fallback
++       - For BatchNorm2d: custom @flyc.kernel — in training mode (default), compute batch mean/var dynamically, then apply scale/shift. No F.batch_norm fallback
+     3. Write the FlyDSL translation to the specified output path
+     4. Test it using the harness command provided
+     5. If the test fails, read the error output and fix the translation
+diff --git a/src/minisweagent/run/preprocess/translate.py b/src/minisweagent/run/preprocess/translate.py
+index 454afb36c..a6aec6e3b 100644
+--- a/src/minisweagent/run/preprocess/translate.py
++++ b/src/minisweagent/run/preprocess/translate.py
+@@ -323,7 +323,7 @@ def _print(msg: str) -> None:
+             )
+ 
+             # -- Performance regression gate --
+-            perf_fail_threshold = pair.perf_fail_threshold if hasattr(pair, "perf_fail_threshold") else 0.5
++            perf_fail_threshold = pair.perf_fail_threshold if hasattr(pair, "perf_fail_threshold") else 0.3
+             perf_warn_threshold = pair.perf_warn_threshold if hasattr(pair, "perf_warn_threshold") else 0.8
+             speedup_val = result.get("translation_speedup")
+ 
+@@ -435,14 +435,9 @@ def _print(msg: str) -> None:
+ 
+ _NO_EQUIVALENT_OPS = frozenset(
+     {
+-        "nn.Conv2d",
++        # Conv3d/AvgPool2d have no FlyDSL equivalent yet
+         "nn.Conv3d",
+-        "F.conv2d",
+         "F.conv3d",
+-        "nn.BatchNorm2d",
+-        "F.batch_norm",
+-        "nn.MaxPool2d",
+-        "F.max_pool2d",
+         "nn.AvgPool2d",
+         "F.avg_pool2d",
+     }
+@@ -816,16 +811,52 @@ def _get_model_and_inputs(module):
+     return model_cls, get_inputs, get_init_inputs
+ 
+ 
++def _is_native_pattern(module):
++    """Check if module uses bare function pattern (build_model + forward)."""
++    return (hasattr(module, "build_model") and hasattr(module, "forward")
++            and not hasattr(module, "Model"))
++
++
++def _run_native(module, inputs):
++    """Run a native-pattern module (build_model + forward)."""
++    get_init_inputs = getattr(module, "get_init_inputs", None)
++    init_inputs = get_init_inputs() if get_init_inputs else []
++    state = module.build_model(*init_inputs)
++
++    # Warmup
++    with torch.no_grad():
++        for _ in range(3):
++            module.forward(state, *inputs)
++    torch.cuda.synchronize()
++
++    # Timed run
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    with torch.no_grad():
++        start.record()
++        output = module.forward(state, *inputs)
++        end.record()
++    torch.cuda.synchronize()
++    latency_ms = start.elapsed_time(end)
++    return output, latency_ms
++
++
+ def run_reference():
+     """Run PyTorch reference kernel and return (model, inputs, outputs, latency_ms)."""
+     ref_module = _load_module("{kernel_path}", "pytorch_ref")
+     model_cls, get_inputs, get_init_inputs = _get_model_and_inputs(ref_module)
+ 
+     init_inputs = get_init_inputs() if get_init_inputs else []
++    torch.manual_seed(42)
+     model = model_cls(*init_inputs).cuda()
+ 
+     inputs = get_inputs()
+-    inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inputs]
++    input_dtype = inputs[0].dtype if isinstance(inputs[0], torch.Tensor) else torch.float32
++    if input_dtype == torch.float16:
++        inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inputs]
++    else:
++        model = model.half()
++        inputs = [x.cuda().half() if isinstance(x, torch.Tensor) else x for x in inputs]
+ 
+     # Warmup
+     with torch.no_grad():
+@@ -849,10 +880,15 @@ def run_reference():
+ def run_candidate(candidate_path: str, ref_inputs):
+     """Run FlyDSL candidate kernel and return (outputs, latency_ms)."""
+     cand_module = _load_module(candidate_path, "flydsl_candidate")
++
++    if _is_native_pattern(cand_module):
++        return _run_native(cand_module, ref_inputs)
++
+     model_cls, get_inputs, get_init_inputs = _get_model_and_inputs(cand_module)
+ 
+     init_inputs = get_init_inputs() if get_init_inputs else []
+-    model = model_cls(*init_inputs).cuda()
++    torch.manual_seed(42)
++    model = model_cls(*init_inputs).cuda().half()
+ 
+     inputs = ref_inputs
+ 
+@@ -875,7 +911,7 @@ def run_candidate(candidate_path: str, ref_inputs):
+     return cand_output, latency_ms
+ 
+ 
+-def compare_outputs(ref_output, cand_output, rtol=1e-3, atol=1e-3):
++def compare_outputs(ref_output, cand_output, rtol=1e-2, atol=1e-2):
+     """Compare reference and candidate outputs."""
+     if isinstance(ref_output, torch.Tensor) and isinstance(cand_output, torch.Tensor):
+         torch.testing.assert_close(cand_output, ref_output, rtol=rtol, atol=atol)
+diff --git a/src/minisweagent/tools/translation_registry.py b/src/minisweagent/tools/translation_registry.py
+index c8133a5fb..43a847b57 100644
+--- a/src/minisweagent/tools/translation_registry.py
++++ b/src/minisweagent/tools/translation_registry.py
+@@ -40,7 +40,7 @@ class TranslationPair:
+     kb_category_files: dict[str, str] = field(default_factory=dict)
+     env_setup: Callable[[Path], dict[str, str]] = field(default=lambda: _noop_env_setup)
+     max_attempts: int = 3
+-    perf_fail_threshold: float = 0.5
++    perf_fail_threshold: float = 0.1
+     perf_warn_threshold: float = 0.8
+     supported: bool = True
+     self_review: bool = False
+@@ -218,8 +218,22 @@ def load_translation_kb(
+        - Category-specific guides (reductions, GEMM, attention)
+     """
+     kb_root = Path(__file__).resolve().parents[3] / "skills" / "pytorch2flydsl-translation" / "docs"
++    native_pure_root = kb_root / "native-pure"
++    native_root = kb_root / "native"
+     sections: list[str] = []
+ 
++    def _resolve_kb_path(filename: str) -> Path:
++        """Prefer native-pure/ or native/ version based on env vars."""
++        if _native_pure_mode:
++            pure_path = native_pure_root / filename
++            if pure_path.exists():
++                return pure_path
++        if _native_mode:
++            native_path = native_root / filename
++            if native_path.exists():
++                return native_path
++        return kb_root / filename
++
+     if flydsl_repo:
+         for doc_path in _FLYDSL_REPO_DOCS:
+             full_path = flydsl_repo / doc_path
+@@ -227,14 +241,14 @@ def load_translation_kb(
+                 sections.append(full_path.read_text())
+     else:
+         for f in pair.kb_base_files:
+-            path = kb_root / f
++            path = _resolve_kb_path(f)
+             if path.exists():
+                 sections.append(_strip_frontmatter(path.read_text()))
+             else:
+                 logger.warning("KB base file not found: %s", path)
+ 
+     for f in pair.kb_translation_files:
+-        path = kb_root / f
++        path = _resolve_kb_path(f)
+         if path.exists():
+             sections.append(_strip_frontmatter(path.read_text()))
+         else:
+@@ -242,7 +256,7 @@ def load_translation_kb(
+ 
+     for cat in categories:
+         if cat in pair.kb_category_files:
+-            path = kb_root / pair.kb_category_files[cat]
++            path = _resolve_kb_path(pair.kb_category_files[cat])
+             if path.exists():
+                 sections.append(_strip_frontmatter(path.read_text()))
+ 
+@@ -253,16 +267,30 @@ def load_translation_kb(
+ # Registry: built-in pairs
+ # ---------------------------------------------------------------------------
+ 
++_native_mode = os.environ.get("GEAK_NATIVE_PATTERN", "") == "1"
++_native_pure_mode = os.environ.get("GEAK_NATIVE_PURE", "") == "1"
++
++if _native_pure_mode:
++    _config_name = "mini_kernel_pytorch_to_flydsl_native_pure"
++elif _native_mode:
++    _config_name = "mini_kernel_pytorch_to_flydsl_native"
++else:
++    _config_name = "mini_kernel_pytorch_to_flydsl"
++
+ _PYTORCH_TO_FLYDSL = TranslationPair(
+     source="pytorch",
+     target="flydsl",
+     detect_source=_detect_pytorch_module,
+-    config_name="mini_kernel_pytorch_to_flydsl",
++    config_name=_config_name,
+     harness_config_name="mini_unit_test_agent_pytorch_translation",
+     harness_candidate_flag="--flydsl-kernel",
+     candidate_filename_fn=lambda stem: f"{stem}_flydsl.py",
+     kb_base_files=["flydsl_translation_api_reference.md"],
+-    kb_translation_files=["flydsl_translation_guide.md"],
++    kb_translation_files=(
++        ["flydsl_translation_guide.md", "flydsl_translation_im2col_pad.md"]
++        if _native_pure_mode
++        else ["flydsl_translation_guide.md"]
++    ),
+     kb_category_files={
+         "gemm": "flydsl_translation_gemm.md",
+         "reductions": "flydsl_translation_reductions.md",

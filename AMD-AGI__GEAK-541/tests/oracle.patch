@@ -1,0 +1,700 @@
+diff --git a/e2e_workflow/scripts/capture_shapes.py b/e2e_workflow/scripts/capture_shapes.py
+index 74f6f07bc..1ea83c5a8 100755
+--- a/e2e_workflow/scripts/capture_shapes.py
++++ b/e2e_workflow/scripts/capture_shapes.py
+@@ -22,11 +22,22 @@
+ Then launch the server with PYTHONPATH=<overlay>:$PYTHONPATH and run a short bench. On process exit
+ (atexit) the records are flushed to <out_dir>/reference_io.pt + meta.json.
+ 
++Scope: only EAGER calls are recorded. A call made while torch.compile traces a region (vLLM compiles the
++model forward with fullgraph=True) is passed through untouched, because the recording below cannot be
++traced, and the compiled graph never re-enters this wrapper at run time. Such a call is only counted, in
++``compiled_passthrough_calls``; it adds nothing to the call count, the shape histogram, the oracle or the
++GEAK_TARGET marker. A target reached only through compiled regions therefore writes a meta.json with
++total_calls_observed 0 and compiled_passthrough_calls above 0, which kernel_selection.verify() reports as
++capture_compiled_unobservable; a target reached through both has a histogram that covers its eager calls
++only, and meta.json says so in ``capture_scope``.
++
+ Anti-cheating: the oracle is captured from the UNMODIFIED baseline kernel. The optimizer later must
+ match it. The unittest + this file's outputs must not be edited during optimization.
+ """
+ import atexit, functools, importlib, json, os, re, shutil, sys, threading
+ 
++CAPTURE_SCOPE = "eager_calls_only: calls inside a torch.compile region are traced, not run, so they are not recorded"
++
+ # Issue #429: process-local MXFP4 MoE oracles can retain multi-GiB tensors per rank/retry until the
+ # workspace is evicted. Defaults bound heavy oracle persistence; set CAPTURE_BYTE_BUDGET=0 for unlimited.
+ _DEFAULT_BYTE_BUDGET = os.environ.get("CAPTURE_BYTE_BUDGET", "8GiB")
+@@ -86,6 +97,8 @@
+     "synth_leaves": 0, "synth_bytes_saved": 0,
+     "oracle_bytes_est": 0, "budget_exceeded": False,
+     "budget_skip_count": 0, "oracle_save_count": 0, "meta_flush_count": 0,
++    # Resolved by install(), so the wrapper never imports torch on its hot path.
++    "is_compiling": lambda: False, "compiled_passthrough_calls": 0,
+ }
+ 
+ 
+@@ -471,6 +484,14 @@ def _torch():
+     return torch
+ 
+ 
++def _compile_probe():
++    """``torch.compiler.is_compiling``, or a constant False where torch (or that query) is absent."""
++    try:
++        return _torch().compiler.is_compiling
++    except (ImportError, AttributeError):
++        return lambda: False
++
++
+ def _snapshot(x):
+     """Detach+clone tensors to CPU so later in-place ops can't corrupt the oracle. Pass scalars/None
+     through; summarize unsupported objects by repr so the record stays loadable."""
+@@ -687,6 +708,10 @@ def _sig(args, kwargs):
+ 
+ def _wrapper(*args, **kwargs):
+     s = _STATE
++    # Dynamo folds this to True while tracing a compiled region (vLLM's fullgraph forward), which it cannot trace.
++    if s["is_compiling"]():
++        s["compiled_passthrough_calls"] += 1
++        return s["orig"](*args, **kwargs)
+     # This marker is consumed by kernel_selection.py from the capture run's torch trace.  It turns
+     # "the hook saw calls" into stronger evidence: the GPU kernel selected from the baseline profile
+     # must actually execute while THIS callable is active.  record_function is effectively a no-op
+@@ -858,7 +883,7 @@ def _maybe_flush(in_graph=False):
+ 
+ def _flush(write_oracle=True):
+     s = _STATE
+-    if not s["records"] and not s["shape_counts"]:
++    if not s["records"] and not s["shape_counts"] and not s["compiled_passthrough_calls"]:
+         sys.stderr.write("[capture_shapes] no records captured; nothing to flush\n")
+         return
+     torch = _torch()
+@@ -938,6 +963,8 @@ def walk(o):
+         "attr": s["attr"],
+         "num_cases": len(records),
+         "total_calls_observed": s["calls"],
++        "capture_scope": CAPTURE_SCOPE,
++        "compiled_passthrough_calls": s["compiled_passthrough_calls"],
+         "regimes_covered": sorted(s["regime_seen"]),
+         "cases": cases,
+         "shape_counts": shape_hist,
+@@ -1078,6 +1105,7 @@ def install(target, out_dir, max_cases=5):
+                                  _DEFAULT_STRUCTURAL_OPERANDS).split(",") if k.strip()}
+     s.update(target=target, out_dir=out_dir, max_cases=int(max_cases),
+              orig=orig, mod=mod, attr=attr, installed=True,
++             is_compiling=_compile_probe(),
+              byte_budget=byte_budget, case_byte_limit=case_byte_limit,
+              persist_policy=persist_policy, share_min_bytes=share_min_bytes or (16 << 20),
+              structural_keys=structural, synth_min_bytes=synth_min_bytes or (64 << 10),
+diff --git a/e2e_workflow/scripts/kernel_selection.py b/e2e_workflow/scripts/kernel_selection.py
+index f08fc98e2..978be1d41 100644
+--- a/e2e_workflow/scripts/kernel_selection.py
++++ b/e2e_workflow/scripts/kernel_selection.py
+@@ -336,14 +336,21 @@ def verify(target_callable, device_kernel, capture_meta, trace_events, candidate
+ 
+     meta_target = ""
+     observed_calls = 0
++    compiled_calls = 0
+     if isinstance(capture_meta, dict):
+         module = str(capture_meta.get("module") or "").strip()
+         attr = str(capture_meta.get("attr") or "").strip()
+         meta_target = f"{module}:{attr}" if module and attr else ""
+         observed_calls = int(capture_meta.get("total_calls_observed") or 0)
++        compiled_calls = int(capture_meta.get("compiled_passthrough_calls") or 0)
+     if meta_target != target_callable:
+         failed.append("capture_target_mismatch")
+-    if observed_calls <= 0:
++    # A hook that only ran inside torch.compile regions leaves no marker in the trace, so the trace
++    # checks below would fail for that one reason; name it once instead.
++    compiled_only = observed_calls <= 0 < compiled_calls
++    if compiled_only:
++        failed.append("capture_compiled_unobservable")
++    elif observed_calls <= 0:
+         failed.append("target_not_observed")
+ 
+     candidates = []
+@@ -364,7 +371,7 @@ def verify(target_callable, device_kernel, capture_meta, trace_events, candidate
+         if _complete_spans(trace_events, INSTALL_PREFIX + candidate)
+     ]
+     missing_candidate_markers = sorted(set(candidates) - set(installed_candidates))
+-    if missing_candidate_markers:
++    if missing_candidate_markers and not compiled_only:
+         failed.append("candidate_marker_not_installed")
+     selected_evidence = evidence.get(target_callable) or {
+         "marker": MARKER_PREFIX + target_callable, "spans": [], "marker_calls": 0,
+@@ -372,12 +379,12 @@ def verify(target_callable, device_kernel, capture_meta, trace_events, candidate
+     }
+     marker = selected_evidence["marker"]
+     spans = selected_evidence["spans"]
+-    if not spans:
++    if not spans and not compiled_only:
+         failed.append("target_marker_missing")
+ 
+     related_external_ids = selected_evidence["related_external_ids"]
+     matched = selected_evidence["matched"]
+-    if not matched:
++    if not matched and not compiled_only:
+         failed.append("device_kernel_not_under_target")
+     deeper = [
+         candidate for candidate, candidate_evidence in evidence.items()
+diff --git a/e2e_workflow/scripts/tests/test_capture_shapes.py b/e2e_workflow/scripts/tests/test_capture_shapes.py
+index 5cf65e40c..4c1d199e4 100644
+--- a/e2e_workflow/scripts/tests/test_capture_shapes.py
++++ b/e2e_workflow/scripts/tests/test_capture_shapes.py
+@@ -38,6 +38,7 @@
+ import threading
+ import types
+ import unittest
++from unittest.mock import Mock, patch
+ 
+ SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+@@ -99,6 +100,7 @@ def _reset_state(mod):
+         share_min_bytes=16 << 20, shared_tensors={}, shared_bytes_est=0,
+         oracle_bytes_est=0, budget_exceeded=False,
+         budget_skip_count=0, oracle_save_count=0, meta_flush_count=0,
++        compiled_passthrough_calls=0,
+     )
+ 
+ 
+@@ -409,6 +411,22 @@ def __repr__(self):
+ # _wrapper -- the recording hot path
+ # --------------------------------------------------------------------------- #
+ class TestWrapperRecording(_RecorderTestCase):
++    def test_compiling_passes_through_without_recording(self):
++        argument, option, result = object(), object(), object()
++        original = Mock(return_value=result)
++        is_compiling = Mock(return_value=True)
++        with patch.dict(cs._STATE, orig=original, is_compiling=is_compiling):
++            self.assertIs(cs._wrapper(argument, option=option), result)
++            original.assert_called_once_with(argument, option=option)
++            is_compiling.assert_called_once_with()
++            self.assertEqual(cs._STATE["compiled_passthrough_calls"], 1)
++            self.assertEqual(cs._STATE["calls"], 0)
++            self.assertEqual(cs._STATE["records"], [])
++            self.assertEqual(cs._STATE["shape_counts"], {})
++            self.assertEqual(cs._STATE["sequence"], [])
++            self.assertEqual(self.torch.saved, [])
++            self.assertEqual(os.listdir(self.out_dir), [])
++
+     def test_call_is_transparent_and_records_the_shape_key(self):
+         mod, _ = self._hook(fn=lambda *a, **k: FakeTensor((4, 8)))
+         with _stderr():
+@@ -698,6 +716,21 @@ def test_flush_with_nothing_captured_writes_no_files(self):
+         self.assertIn("nothing to flush", err.getvalue())
+         self.assertEqual(os.listdir(self.out_dir), [])
+ 
++    def test_a_capture_that_only_passed_compiled_calls_through_still_writes_meta(self):
++        mod, _ = self._hook()
++        with patch.dict(cs._STATE, is_compiling=lambda: True), _stderr():
++            mod.op(FakeTensor((4, 8)))
++            mod.op(FakeTensor((4, 8)))
++            cs._flush()
++        meta = self._meta()
++        self.assertEqual(meta["total_calls_observed"], 0)
++        self.assertEqual(meta["compiled_passthrough_calls"], 2)
++        self.assertEqual(meta["num_cases"], 0)
++        self.assertEqual(meta["module"], "fake_serving_layer")
++        self.assertEqual(meta["attr"], "op")
++        self.assertFalse(os.path.exists(os.path.join(self.out_dir, "reference_io.pt")))
++        self.assertEqual(self.torch.saved, [])
++
+     def test_periodic_flush_lands_a_usable_capture_before_atexit(self):
+         # An OOM/SIGKILL never fires atexit, so a small workload must already be on disk.
+         mod, _ = self._hook()
+diff --git a/e2e_workflow/scripts/tests/test_capture_shapes_compiled.py b/e2e_workflow/scripts/tests/test_capture_shapes_compiled.py
+new file mode 100644
+index 000000000..c6538d45d
+--- /dev/null
++++ b/e2e_workflow/scripts/tests/test_capture_shapes_compiled.py
+@@ -0,0 +1,153 @@
++"""capture_shapes inside a torch.compile(fullgraph=True) region, the way vLLM compiles a model forward.
++
++vLLM's forward calls the hooked dispatch function (e.g. ``rocm_unquantized_gemm``) inside a graph that Dynamo
++traces with ``fullgraph=True``, so any construct Dynamo cannot trace in the recording wrapper is an engine-start
++failure, not a skipped record. Needs torch; skipped where it is not installed or cannot load its runtime.
++"""
++import atexit
++import contextlib
++import importlib
++import importlib.util
++import io
++import itertools
++import json
++import os
++import shutil
++import sys
++import tempfile
++import types
++import unittest
++from unittest import mock
++
++
++def _import_torch():
++    """torch, or None when it is absent or installed with a runtime library that cannot be loaded."""
++    try:
++        return importlib.import_module("torch")
++    except (ImportError, OSError):
++        return None
++
++
++torch = _import_torch()
++
++SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++TARGET = "fake_compiled_layer:gemm"
++DEVICE_KERNEL = "gemm_kernel"
++_LOADS = itertools.count()
++
++
++def _load_capture_shapes():
++    for name in ("CAPTURE_TARGET", "CAPTURE_OUT"):
++        os.environ.pop(name, None)
++    # A name per load: Dynamo resolves an inlined function's globals through sys.modules by name, so a reused
++    # name would let one test's compiled graph write into the previous test's module state.
++    spec = importlib.util.spec_from_file_location(
++        f"capture_shapes_compiled_{next(_LOADS)}", os.path.join(SCRIPTS_DIR, "capture_shapes.py"))
++    mod = importlib.util.module_from_spec(spec)
++    # Dynamo resolves an inlined function's globals through sys.modules.
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _load_kernel_selection():
++    spec = importlib.util.spec_from_file_location("kernel_selection_compiled", os.path.join(SCRIPTS_DIR, "kernel_selection.py"))
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++class TestTorchImportGuard(unittest.TestCase):
++    def test_a_torch_whose_runtime_library_cannot_load_is_treated_as_absent(self):
++        with mock.patch.object(importlib, "import_module", side_effect=OSError("librocm_sysdeps_elf.so.1")):
++            self.assertIsNone(_import_torch())
++
++
++@unittest.skipIf(torch is None, "needs torch")
++class TestCaptureUnderCompile(unittest.TestCase):
++    def setUp(self):
++        self.cs = _load_capture_shapes()
++        self.addCleanup(sys.modules.pop, self.cs.__name__, None)
++        self.addCleanup(atexit.unregister, self.cs._flush)
++        self.out_dir = tempfile.mkdtemp(prefix="capture_compiled_test_")
++        self.addCleanup(shutil.rmtree, self.out_dir, True)
++        layer = types.ModuleType("fake_compiled_layer")
++        layer.gemm = lambda x, w: x @ w.t()
++        sys.modules[layer.__name__] = layer
++        self.addCleanup(sys.modules.pop, layer.__name__, None)
++        self.layer = layer
++        torch._dynamo.reset()
++        self.addCleanup(torch._dynamo.reset)
++        self.cs.install(TARGET, self.out_dir, max_cases=2)
++        self.ks = _load_kernel_selection()
++
++    def _forward(self, x, w):
++        return self.layer.gemm(x, w) + 1
++
++    def _flush(self):
++        with contextlib.redirect_stderr(io.StringIO()):
++            self.cs._flush()
++        with open(os.path.join(self.out_dir, "meta.json")) as fh:
++            return json.load(fh)
++
++    def _trace(self, *, target_ran):
++        events = [{"cat": "cpu_op", "name": self.ks.INSTALL_PREFIX + TARGET,
++                   "ph": "X", "pid": 1, "tid": 2, "ts": 90, "dur": 1}]
++        if target_ran:
++            events += [
++                {"cat": "cpu_op", "name": self.ks.MARKER_PREFIX + TARGET,
++                 "ph": "X", "pid": 1, "tid": 2, "ts": 100, "dur": 100},
++                {"cat": "cpu_op", "name": "launch", "ph": "X", "pid": 1, "tid": 2,
++                 "ts": 110, "dur": 5, "args": {"External id": 7}},
++                {"cat": "kernel", "name": f"void {DEVICE_KERNEL}(int)", "ph": "X",
++                 "ts": 120, "dur": 25, "args": {"External id": 7}},
++            ]
++        return events
++
++    def test_the_hooked_callable_compiles_with_fullgraph(self):
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        compiled = torch.compile(self._forward, fullgraph=True, backend="eager")
++
++        torch.testing.assert_close(compiled(x, w), x @ w.t() + 1)
++
++    def test_eager_calls_are_still_recorded(self):
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        self._forward(x, w)
++
++        self.assertEqual(self.cs._STATE["calls"], 1)
++        self.assertEqual(list(self.cs._STATE["shape_counts"].values()), [1])
++
++    def test_a_target_reached_only_through_compiled_regions_is_named_unobservable(self):
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        torch.compile(self._forward, fullgraph=True, backend="eager")(x, w)
++
++        meta = self._flush()
++        verdict = self.ks.verify(TARGET, DEVICE_KERNEL, meta, self._trace(target_ran=False))
++
++        self.assertEqual(meta["total_calls_observed"], 0)
++        self.assertGreaterEqual(meta["compiled_passthrough_calls"], 1)
++        self.assertEqual(verdict["failed"], ["capture_compiled_unobservable"])
++
++    def test_every_call_of_a_compiled_region_is_counted_not_only_its_trace(self):
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        compiled = torch.compile(self._forward, fullgraph=True, backend="eager")
++        for _ in range(3):
++            compiled(x, w)
++
++        self.assertEqual(self.cs._STATE["compiled_passthrough_calls"], 3)
++
++    def test_an_eager_call_beside_a_compiled_one_is_selected_and_the_capture_states_its_scope(self):
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        torch.compile(self._forward, fullgraph=True, backend="eager")(x, w)
++        self._forward(x, w)
++
++        meta = self._flush()
++        verdict = self.ks.verify(TARGET, DEVICE_KERNEL, meta, self._trace(target_ran=True))
++
++        self.assertEqual(meta["total_calls_observed"], 1)
++        self.assertEqual(meta["capture_scope"], self.cs.CAPTURE_SCOPE)
++        self.assertTrue(verdict["ok"], verdict)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/e2e_workflow/scripts/tests/test_kernel_selection.py b/e2e_workflow/scripts/tests/test_kernel_selection.py
+index 0eb283610..3a70df0e9 100644
+--- a/e2e_workflow/scripts/tests/test_kernel_selection.py
++++ b/e2e_workflow/scripts/tests/test_kernel_selection.py
+@@ -382,9 +382,10 @@ def test_the_fixture_still_covers_symbols_taken_from_real_captures(self):
+ 
+ 
+ class TestSelectionVerdict(unittest.TestCase):
+-    def meta(self, calls=7, target=TARGET):
++    def meta(self, calls=7, target=TARGET, compiled=0):
+         module, attr = target.split(":", 1)
+-        return {"module": module, "attr": attr, "total_calls_observed": calls}
++        return {"module": module, "attr": attr, "total_calls_observed": calls,
++                "compiled_passthrough_calls": compiled}
+ 
+     def test_0720_live_inner_launcher_is_selection_success(self):
+         verdict = ks.verify(TARGET, KERNEL, self.meta(), trace())
+@@ -601,6 +602,17 @@ def test_zero_live_calls_is_rejected(self):
+         self.assertFalse(verdict["ok"])
+         self.assertIn("target_not_observed", verdict["failed"])
+ 
++    def test_calls_seen_only_inside_compiled_regions_are_named_instead_of_read_from_a_trace(self):
++        verdict = ks.verify(TARGET, KERNEL, self.meta(calls=0, compiled=3), [])
++        self.assertFalse(verdict["ok"])
++        self.assertEqual(verdict["failed"], ["capture_compiled_unobservable"])
++
++    def test_a_compiled_call_does_not_excuse_a_missing_trace_when_eager_calls_were_observed(self):
++        verdict = ks.verify(TARGET, KERNEL, self.meta(calls=2, compiled=3), trace(under_target=False))
++        self.assertFalse(verdict["ok"])
++        self.assertIn("device_kernel_not_under_target", verdict["failed"])
++        self.assertNotIn("capture_compiled_unobservable", verdict["failed"])
++
+     def test_cli_writes_the_same_machine_verdict(self):
+         with tempfile.TemporaryDirectory() as root:
+             meta_path = os.path.join(root, "meta.json")
+diff --git a/interface/run_e2e.md b/interface/run_e2e.md
+index 0ea1d1ec4..1351f78da 100644
+--- a/interface/run_e2e.md
++++ b/interface/run_e2e.md
+@@ -522,7 +522,8 @@ accepted configuration in both harnesses. It is the numeric compatibility
+ metric for the cross-handoff comparison; `handoff_alignment` is the
+ authoritative verdict and is `unverified` until actual Setup launch evidence
+ matches an upstream observed identity. GEAK reads that evidence from
+-`baseline/server.log` (parsed SGLang `ServerArgs` or ATOM `Engine kwargs`) or
++`baseline/server.log` (parsed SGLang `ServerArgs`, ATOM `Engine kwargs` or vLLM
++`non-default args`) or
+ `baseline/magpie_launch.log` (an emitted launch identity). When the handoff names
+ the orchestrator's own baseline server log
+ (`baseline_env_spec.measurement_evidence.actual_server_log_path`), GEAK parses it
+@@ -534,7 +535,13 @@ itself (`geak_launched`: profile round 0, validation base and final), because a
+ matching Setup says nothing about a later launch. `server_identity.status` is the
+ worst of all checks (mismatched > unverified > matched); a launch field logged in a
+ form the parser does not know is recorded under `unparsed` and makes that check
+-unverified. Every evidence path actually read is recorded in
++unverified. For vLLM, whose `non-default args` line lists every argument that
++differs from its default, every field is compared, including one the parser has
++never seen, except the run-scoped `host`, `port`, `model_tag` and the
++`profiler_config` of GEAK's own profile servers. Two servers that differ in a
++field are `mismatched`; a field logged by only one side is `unverified`; an item
++that is not a `key: value` pair is recorded under `unparsed`. Every evidence path
++actually read is recorded in
+ `server_identity.evidence_paths`.
+ `measurement_divergence_pct` remains an exact compatibility alias for existing
+ callers. If the handoff omits `orchestrator_best_tput_same_config`, both
+diff --git a/interface/run_e2e.py b/interface/run_e2e.py
+index 37049598e..67625a531 100644
+--- a/interface/run_e2e.py
++++ b/interface/run_e2e.py
+@@ -3224,6 +3224,49 @@ def _open_server_log(log_path: Path):
+     return log_path.open(encoding="utf-8", errors="ignore")
+ 
+ 
++_VLLM_NON_DEFAULT_ARGS_MARKER = "non-default args: {"
++# Logged on every launch yet never part of the configuration: transport, the positional echo of ``model``, and
++# GEAK's own torch profiler wrapper (only its profile servers carry it).
++_VLLM_NON_IDENTITY_KEYS = frozenset({"host", "port", "model_tag", "profiler_config"})
++
++
++def _parse_vllm_non_default_args(text: str) -> dict[str, Any]:
++    """Extract launch fields from vLLM's ``non-default args: {...}`` line.
++
++    vLLM logs once, at startup, every CLI argument that differs from its default as a dict repr, so the key set is
++    open: every field except the run-scoped ``_VLLM_NON_IDENTITY_KEYS`` is part of the identity and is compared,
++    including one this parser has never seen. Each top-level item is evaluated on its own. A field whose value is
++    not a literal is listed under ``unparsed``, so a version-drifted log reads as unverified instead of as a value;
++    so is an item that is not a ``key: value`` pair.
++    """
++    start = text.find(_VLLM_NON_DEFAULT_ARGS_MARKER)
++    if start < 0:
++        return {}
++    body = text[start + len(_VLLM_NON_DEFAULT_ARGS_MARKER):].rstrip()
++    if body.endswith("}"):
++        body = body[:-1]
++    observed: dict[str, Any] = {}
++    unparsed: list[str] = []
++    for item in _split_top_level_items(body):
++        raw_key, sep, raw_value = item.partition(":")
++        try:
++            key = ast.literal_eval(raw_key.strip()) if sep else None
++        except (ValueError, SyntaxError):
++            key = None
++        if not isinstance(key, str):
++            unparsed.append("<malformed item>")
++            continue
++        if key in _VLLM_NON_IDENTITY_KEYS:
++            continue
++        try:
++            observed[key] = ast.literal_eval(raw_value.strip())
++        except (ValueError, SyntaxError):
++            unparsed.append(key)
++    if unparsed:
++        observed["unparsed"] = sorted(set(unparsed))
++    return observed
++
++
+ def _read_server_identity_evidence(log_path: Path) -> tuple[dict[str, Any], str]:
+     """Read direct launch identity evidence without loading an unbounded log."""
+     try:
+@@ -3258,6 +3301,18 @@ def _read_server_identity_evidence(log_path: Path) -> tuple[dict[str, Any], str]
+     except OSError:
+         return {}, ""
+ 
++    # vLLM logs the arguments that differ from its defaults once, as one line.
++    try:
++        with _open_server_log(log_path) as handle:
++            for line in handle:
++                if _VLLM_NON_DEFAULT_ARGS_MARKER not in line:
++                    continue
++                server_args = _parse_vllm_non_default_args(line)
++                if server_args:
++                    return {"backend": "vllm", "server_args": server_args}, ""
++    except OSError:
++        return {}, ""
++
+     # A Magpie recipe can log its immutable identity directly. This is useful
+     # for backends other than SGLang and for opaque upstream digest identities.
+     try:
+@@ -3474,6 +3529,11 @@ def _server_identity_alignment(handoff: dict, eval_dir: Path) -> dict[str, Any]:
+     }
+     if equal is False:
+         out["mismatches"] = _identity_mismatches(expected, observed)
++    if any(path.is_file() for path in candidates) and not observed:
++        out["observed_problem"] = (
++            "no launch record this parser recognises (SGLang ServerArgs, ATOM Engine kwargs, vLLM non-default "
++            "args, identity=) in the Setup server log"
++        )
+     if launched:
+         out["geak_launched"] = launched
+         out["geak_launched_reference"] = "orchestrator_server_log" if reference else expected_source
+diff --git a/interface/test_run_e2e_alignment.py b/interface/test_run_e2e_alignment.py
+index 9a56bb9a9..f2d3f2ff0 100644
+--- a/interface/test_run_e2e_alignment.py
++++ b/interface/test_run_e2e_alignment.py
+@@ -29,9 +29,11 @@
+ 
+ import gzip
+ import importlib.util
++import io
+ import json
+ import shutil
+ from pathlib import Path
++from unittest.mock import patch
+ 
+ import pytest
+ 
+@@ -965,6 +967,171 @@ def test_a_malformed_capture_sizes_value_is_unparsed_not_raised() -> None:
+     assert facts["compilation_level"] == 3
+ 
+ 
++def _vllm_log(path: Path, *, seqs: int = 32, port: int = 30001, mtp: bool = True) -> Path:
++    spec = ", 'speculative_config': {'method': 'mtp', 'num_speculative_tokens': 1}" if mtp else ""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(
++        "INFO 10-27 08:00:00 [api_server.py:1] vLLM API server version 0.27.1.dev5\n"
++        f"INFO 10-27 08:00:00 [api_utils.py:273] non-default args: {{'model_tag': '/models/Qwen3.5-9B', "
++        f"'host': '0.0.0.0', 'port': {port}, 'model': '/models/Qwen3.5-9B', 'max_num_seqs': {seqs}, "
++        f"'gpu_memory_utilization': 0.9{spec}}}\n",
++        encoding="utf-8",
++    )
++    return path
++
++
++def test_vllm_parser_without_non_default_args_returns_no_fields() -> None:
++    assert rx._parse_vllm_non_default_args("INFO server ready\n") == {}
++
++
++def test_vllm_parser_lists_an_item_without_a_colon_as_unparsed() -> None:
++    assert rx._parse_vllm_non_default_args(
++        "non-default args: {'model': '/models/Qwen3.5-9B', malformed, 'max_num_seqs': 32}"
++    ) == {"model": "/models/Qwen3.5-9B", "max_num_seqs": 32, "unparsed": ["<malformed item>"]}
++
++
++@pytest.mark.parametrize("raw_key", ["model", "'model' +", "1", "['model']"])
++def test_vllm_parser_lists_a_key_that_is_not_a_string_literal_as_unparsed(raw_key: str) -> None:
++    assert rx._parse_vllm_non_default_args(
++        f"non-default args: {{{raw_key}: '/models/invalid', 'max_num_seqs': 32}}"
++    ) == {"max_num_seqs": 32, "unparsed": ["<malformed item>"]}
++
++
++def test_vllm_parser_drops_run_scoped_fields() -> None:
++    assert rx._parse_vllm_non_default_args(
++        "non-default args: {'model_tag': '/m', 'host': '0.0.0.0', 'port': 8000, "
++        "'profiler_config': ProfilerConfig(profiler='torch'), 'max_num_seqs': 32}"
++    ) == {"max_num_seqs": 32}
++
++
++def test_vllm_parser_keeps_a_field_it_has_never_seen() -> None:
++    assert rx._parse_vllm_non_default_args(
++        "non-default args: {'max_num_seqs': 32, 'new_scheduler_flag': True}"
++    ) == {"max_num_seqs": 32, "new_scheduler_flag": True}
++
++
++def _vllm_identity(tmp_path: Path, name: str, args: str) -> dict:
++    path = tmp_path / name
++    path.write_text(f"INFO non-default args: {{{args}}}\n", encoding="utf-8")
++    evidence, _ = rx._read_server_identity_evidence(path)
++    return evidence
++
++
++# The launch lines of one configuration as a real Qwen3.5 session logged them: a baseline server and a GEAK profile
++# server, which differ only in the port and in the profiler wrapper GEAK adds.
++_VLLM_BASELINE = (
++    "'model_tag': '/m', 'port': 8888, 'model': '/m', 'trust_remote_code': True, 'dtype': 'bfloat16', "
++    "'max_model_len': 4096, 'language_model_only': True, 'max_num_seqs': 15, "
++    "'speculative_config': {'method': 'mtp', 'num_speculative_tokens': 1}"
++)
++_VLLM_PROFILE = _VLLM_BASELINE.replace("8888", "46495") + ", 'profiler_config': ProfilerConfig(profiler='torch')"
++
++
++def test_a_profile_server_and_the_baseline_server_of_one_configuration_match(tmp_path: Path) -> None:
++    baseline = _vllm_identity(tmp_path, "baseline.log", _VLLM_BASELINE)
++    profile = _vllm_identity(tmp_path, "profile.log", _VLLM_PROFILE)
++
++    assert "profiler_config" not in profile["server_args"]
++    assert rx._identity_value_equal(baseline, profile) is True
++
++
++def test_servers_that_differ_in_a_field_the_parser_has_never_seen_are_mismatched(tmp_path: Path) -> None:
++    first = _vllm_identity(tmp_path, "a.log", "'model': '/m', 'new_scheduler_flag': True")
++    second = _vllm_identity(tmp_path, "b.log", "'model': '/m', 'new_scheduler_flag': False")
++
++    assert rx._identity_value_equal(first, second) is False
++
++
++def test_a_field_logged_by_only_one_server_leaves_the_identity_unverified(tmp_path: Path) -> None:
++    with_flag = _vllm_identity(tmp_path, "a.log", "'model': '/m', 'new_scheduler_flag': True")
++    without_flag = _vllm_identity(tmp_path, "b.log", "'model': '/m'")
++
++    assert rx._identity_value_equal(with_flag, without_flag) is None
++
++
++def test_language_model_only_changes_the_verdict(tmp_path: Path) -> None:
++    text_only = _vllm_identity(tmp_path, "a.log", _VLLM_BASELINE)
++    full_model = _vllm_identity(tmp_path, "b.log", _VLLM_BASELINE.replace("'language_model_only': True, ", ""))
++    flipped = _vllm_identity(tmp_path, "c.log", _VLLM_BASELINE.replace("True, 'max_num", "False, 'max_num"))
++
++    assert rx._identity_value_equal(text_only, full_model) is None
++    assert rx._identity_value_equal(text_only, flipped) is False
++
++
++def test_vllm_log_read_error_returns_no_identity(tmp_path: Path) -> None:
++    with patch.object(
++        rx,
++        "_open_server_log",
++        side_effect=[
++            io.StringIO("INFO server ready\n"),
++            io.StringIO("INFO server ready\n"),
++            OSError("unreadable log"),
++        ],
++    ) as open_log:
++        assert rx._read_server_identity_evidence(tmp_path / "server.log") == ({}, "")
++
++    assert open_log.call_count == 3
++
++
++def test_vllm_non_default_args_are_read_as_launch_identity(tmp_path: Path) -> None:
++    observed, _ = rx._read_server_identity_evidence(_vllm_log(tmp_path / "server.log"))
++
++    assert observed == {
++        "backend": "vllm",
++        "server_args": {
++            "model": "/models/Qwen3.5-9B",
++            "max_num_seqs": 32,
++            "gpu_memory_utilization": 0.9,
++            "speculative_config": {"method": "mtp", "num_speculative_tokens": 1},
++        },
++    }
++
++
++def test_a_vllm_setup_server_is_judged_against_the_orchestrator_log(tmp_path: Path) -> None:
++    """The 2026-10-27 R9600D run read "unverified" on every vLLM launch, whatever it served."""
++    eval_dir = tmp_path / "e2e"
++    _vllm_log(eval_dir / "baseline" / "server.log", port=8000)
++    _vllm_log(eval_dir / "validation" / "base" / "server.log", seqs=256)
++    handoff = _atom_handoff(_vllm_log(tmp_path / "hl" / "server.log"))
++
++    identity = rx._server_identity_alignment(handoff, eval_dir)
++
++    assert identity["expected_source"] == "orchestrator_server_log"
++    assert identity["observed"]["backend"] == "vllm" and "mismatches" not in identity
++    assert identity["status"] == "mismatched"
++    assert identity["geak_launched"][0]["mismatches"] == [{"key": "max_num_seqs", "expected": 32, "observed": 256}]
++    assert "orchestrator_reference_problem" not in identity
++
++
++def test_a_setup_log_with_no_known_launch_record_says_so(tmp_path: Path) -> None:
++    eval_dir = tmp_path / "e2e"
++    (eval_dir / "baseline").mkdir(parents=True)
++    (eval_dir / "baseline" / "server.log").write_text("INFO server ready\n", encoding="utf-8")
++
++    identity = rx._server_identity_alignment(_atom_handoff(tmp_path / "missing" / "server.log"), eval_dir)
++
++    assert identity["status"] == "unverified"
++    assert "no launch record this parser recognises" in identity["observed_problem"]
++
++
++def test_vllm_config_objects_are_listed_as_unparsed_not_read_as_values(tmp_path: Path) -> None:
++    log = tmp_path / "server.log"
++    log.write_text(
++        "INFO 10-27 08:00:00 [api_utils.py:273] non-default args: {'model': '/models/Qwen3.5-9B', "
++        "'compilation_config': CompilationConfig(level=3, cudagraph_capture_sizes=[1, 2]), "
++        "'speculative_config': SpeculativeConfig(method='mtp', num_speculative_tokens=1), 'max_num_seqs': 32}\n",
++        encoding="utf-8",
++    )
++
++    observed, _ = rx._read_server_identity_evidence(log)
++
++    assert observed["server_args"] == {
++        "model": "/models/Qwen3.5-9B",
++        "max_num_seqs": 32,
++        "unparsed": ["compilation_config", "speculative_config"],
++    }
++
++
+ def test_rotation_skips_an_incomplete_newest_attempt_and_records_it(tmp_path: Path) -> None:
+     eval_dir = tmp_path / "e2e"
+     _atom_log(eval_dir / "baseline" / "server.log")

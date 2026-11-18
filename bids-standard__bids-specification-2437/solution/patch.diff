@@ -1,0 +1,677 @@
+diff --git a/.github/workflows/announce_release.yml b/.github/workflows/announce_release.yml
+new file mode 100644
+index 0000000000..3243753c81
+--- /dev/null
++++ b/.github/workflows/announce_release.yml
+@@ -0,0 +1,27 @@
++name: "Announce release on PRs and issues"
++
++# Post a "released in vX.Y.Z" comment on every PR included in a release,
++# and a "fixed in vX.Y.Z" comment on every issue those PRs closed.
++
++on:
++  release:
++    types: [published]
++
++permissions:
++  contents: read
++  issues: write
++  pull-requests: write
++
++jobs:
++  announce:
++    if: github.repository == 'bids-standard/bids-specification'
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v7
++        with:
++          fetch-depth: 0
++      - uses: astral-sh/setup-uv@v7
++      - name: Announce release
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: tools/announce_release.py --post "${{ github.event.release.tag_name }}"
+diff --git a/Release_Protocol.md b/Release_Protocol.md
+index 0e5217ccd9..b1f840ddc1 100644
+--- a/Release_Protocol.md
++++ b/Release_Protocol.md
+@@ -235,6 +235,17 @@ Verify ReadTheDocs builds complete and publish. If needed, manually
+ trigger [builds](https://readthedocs.org/projects/bids-specification/builds/)
+ for `stable` and the most recent tag.
+ 
++Publishing the GitHub release also triggers the
++[`Announce release on PRs and issues`](https://github.com/bids-standard/bids-specification/actions/workflows/announce_release.yml)
++workflow, which posts a "PR released in `vX.Y.Z`" comment on every PR that was
++merged for this release and a "Issue fixed in `vX.Y.Z`" comment on every issue
++those PRs close (`Fixes #N` / `Closes #N`). The workflow is idempotent — if
++re-published, comments are not duplicated.
++
++To back-fill comments on past releases that pre-date this workflow, run
++`tools/announce_release.py` locally (see the script's header for usage). It
++defaults to dry-run; pass `--post` to actually comment.
++
+ ### 9. Edit the mkdocs.yml file site_name to set a new development version
+ 
+ Please open a pull request and create a merge commit to `master` with the title `REL: <version>-dev`.
+diff --git a/tools/announce_release.py b/tools/announce_release.py
+new file mode 100755
+index 0000000000..4a16281494
+--- /dev/null
++++ b/tools/announce_release.py
+@@ -0,0 +1,335 @@
++#!/usr/bin/env -S uv run
++# /// script
++# requires-python = ">=3.13"
++# dependencies = [
++#     "gql[aiohttp]",
++# ]
++# ///
++
++# How to use this script:
++# 1. Provide a GitHub token via the GITHUB_TOKEN environment variable. The
++#    quickest way if you have the `gh` CLI authenticated is:
++#        GITHUB_TOKEN=$(gh auth token) tools/announce_release.py ...
++#    Otherwise generate a PAT at https://github.com/settings/tokens with
++#    `public_repo` scope (write access is needed for --post).
++# 2. Run from a checkout of bids-standard/bids-specification — the script
++#    uses `git log` between tags to discover PRs included in each release.
++#
++
++# Examples (all default to dry-run; add --post to actually comment,
++# assuming GITHUB_TOKEN env var set e.g. via GITHUB_TOKEN=$(gh auth token)
++# and exported
++#
++#   tools/announce_release.py v1.11.0
++#   tools/announce_release.py                                 # latest tag
++#   tools/announce_release.py --retroactive --since v1.10.0
++#   tools/announce_release.py --post v1.11.1
++#
++# Idempotent: skips PRs/issues that already have an identical comment.
++#
++# Modeled after datalad/release-action's `make_release_comments`:
++#   https://github.com/datalad/release-action/blob/master/datalad_release_action/client.py
++import argparse
++import asyncio
++import os
++import re
++import subprocess as sp
++import sys
++from dataclasses import dataclass
++
++import aiohttp
++from gql import Client, gql
++from gql.transport.aiohttp import AIOHTTPTransport
++
++REPO = "bids-standard/bids-specification"
++TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
++
++PR_INFO_QUERY = gql(
++    """\
++query($owner: String!, $name: String!, $number: Int!, $issue_cursor: String) {
++  repository(owner: $owner, name: $name) {
++    pullRequest(number: $number) {
++      title
++      closingIssuesReferences(first: 50, after: $issue_cursor) {
++        nodes { number repository { nameWithOwner } }
++        pageInfo { endCursor hasNextPage }
++      }
++    }
++  }
++}
++"""
++)
++
++COMMENTS_QUERY = gql(
++    """\
++query($owner: String!, $name: String!, $number: Int!, $after: String) {
++  repository(owner: $owner, name: $name) {
++    issueOrPullRequest(number: $number) {
++      ... on Issue {
++        comments(first: 100, after: $after) {
++          nodes { body }
++          pageInfo { endCursor hasNextPage }
++        }
++      }
++      ... on PullRequest {
++        comments(first: 100, after: $after) {
++          nodes { body }
++          pageInfo { endCursor hasNextPage }
++        }
++      }
++    }
++  }
++}
++"""
++)
++
++
++@dataclass
++class PRInfo:
++    number: int
++    title: str
++    closing_issues: list[int]
++
++
++def git(*args: str) -> str:
++    return sp.run(
++        ["git", *args], capture_output=True, check=True, text=True
++    ).stdout.strip()
++
++
++def release_tags() -> list[str]:
++    """Version tags (vX.Y.Z) ordered oldest-first."""
++    out = git("tag", "--sort=version:refname")
++    return [t for t in out.splitlines() if TAG_RE.match(t)]
++
++
++def prs_in_range(prev_tag: str | None, tag: str) -> list[int]:
++    """Find PR numbers in commits between prev_tag and tag (first-parent).
++
++    Recognizes both squash-merge `... (#NNN)` and `Merge pull request #NNN ...`
++    commit subject styles.
++    """
++    rev = f"{prev_tag}..{tag}" if prev_tag else tag
++    out = git("log", rev, "--first-parent", "--pretty=%s")
++    seen: dict[int, None] = {}  # dict preserves insertion order, dedupes
++    for line in out.splitlines():
++        if (m := re.search(r"\(#(\d+)\)\s*$", line)) or (
++            m := re.match(r"Merge pull request #(\d+)", line)
++        ):
++            seen[int(m.group(1))] = None
++    return list(seen)
++
++
++def release_link(tag: str) -> str:
++    return f"[`{tag}`](https://github.com/{REPO}/releases/tag/{tag})"
++
++
++def pr_comment_body(tag: str) -> str:
++    return f"PR released in {release_link(tag)}"
++
++
++def issue_comment_body(tag: str) -> str:
++    return f"Issue fixed in {release_link(tag)}"
++
++
++async def get_pr_info(client: Client, number: int) -> PRInfo | None:
++    owner, name = REPO.split("/")
++    closing: list[int] = []
++    title = ""
++    cursor: str | None = None
++    while True:
++        result = await client.execute_async(
++            PR_INFO_QUERY,
++            variable_values={
++                "owner": owner,
++                "name": name,
++                "number": number,
++                "issue_cursor": cursor,
++            },
++        )
++        pr = result["repository"]["pullRequest"]
++        if pr is None:
++            return None
++        title = pr["title"]
++        page = pr["closingIssuesReferences"]
++        for n in page["nodes"]:
++            if n["repository"]["nameWithOwner"] == REPO:
++                closing.append(n["number"])
++        if not page["pageInfo"]["hasNextPage"]:
++            return PRInfo(number=number, title=title, closing_issues=closing)
++        cursor = page["pageInfo"]["endCursor"]
++
++
++async def has_comment(client: Client, number: int, body: str) -> bool:
++    owner, name = REPO.split("/")
++    target = body.strip()
++    cursor: str | None = None
++    while True:
++        result = await client.execute_async(
++            COMMENTS_QUERY,
++            variable_values={
++                "owner": owner,
++                "name": name,
++                "number": number,
++                "after": cursor,
++            },
++        )
++        node = result["repository"]["issueOrPullRequest"]
++        if node is None:
++            return False
++        comments = node["comments"]
++        for c in comments["nodes"]:
++            if c["body"].strip() == target:
++                return True
++        if not comments["pageInfo"]["hasNextPage"]:
++            return False
++        cursor = comments["pageInfo"]["endCursor"]
++
++
++async def post_comment(
++    session: aiohttp.ClientSession, token: str, number: int, body: str
++) -> None:
++    url = f"https://api.github.com/repos/{REPO}/issues/{number}/comments"
++    headers = {
++        "Authorization": f"Bearer {token}",
++        "Accept": "application/vnd.github+json",
++        "X-GitHub-Api-Version": "2022-11-28",
++    }
++    async with session.post(url, json={"body": body}, headers=headers) as resp:
++        if resp.status not in (200, 201):
++            text = await resp.text()
++            raise RuntimeError(f"POST {url}: HTTP {resp.status} - {text}")
++
++
++async def annotate_release(
++    client: Client,
++    session: aiohttp.ClientSession,
++    token: str,
++    tag: str,
++    prev_tag: str | None,
++    *,
++    post: bool,
++) -> None:
++    print(f"\n=== Release {tag} (prev: {prev_tag or 'initial'}) ===")
++    pr_numbers = prs_in_range(prev_tag, tag)
++    if not pr_numbers:
++        print("  (no PRs found in commit range)")
++        return
++    print(f"  {len(pr_numbers)} PR(s) in this release")
++    pr_body = pr_comment_body(tag)
++    iss_body = issue_comment_body(tag)
++    for pr_num in pr_numbers:
++        pr_url = f"https://github.com/{REPO}/pull/{pr_num}"
++        pr = await get_pr_info(client, pr_num)
++        if pr is None:
++            print(f"  - PR #{pr_num} {pr_url} — not found via API; skipping")
++            continue
++        marker = "POST" if post else "DRY"
++        if await has_comment(client, pr.number, pr_body):
++            status = "comment already exists, skip"
++        else:
++            status = f"[{marker}] comment on PR"
++            if post:
++                await post_comment(session, token, pr.number, pr_body)
++        print(f"  - PR #{pr.number} {pr_url} — {status} — {pr.title!r}")
++        for issue_num in pr.closing_issues:
++            issue_url = f"https://github.com/{REPO}/issues/{issue_num}"
++            if await has_comment(client, issue_num, iss_body):
++                status = "comment already exists, skip"
++            else:
++                status = f"[{marker}] comment on issue"
++                if post:
++                    await post_comment(session, token, issue_num, iss_body)
++            print(f"      issue #{issue_num} {issue_url} — {status}")
++
++
++def select_tags(args: argparse.Namespace, tags: list[str]) -> list[str] | None:
++    """Return the list of release tags to process, or None on a validation error
++    (the error message is printed to stderr).
++    """
++    if not tags:
++        print("No vX.Y.Z release tags found.", file=sys.stderr)
++        return None
++    if args.retroactive:
++        start = 0
++        if args.since:
++            if args.since not in tags:
++                print(
++                    f"--since {args.since!r} is not a known release tag.",
++                    file=sys.stderr,
++                )
++                return None
++            start = tags.index(args.since)
++        return tags[start:]
++    if args.tag:
++        if args.tag not in tags:
++            print(f"{args.tag!r} is not a known release tag.", file=sys.stderr)
++            return None
++        return [args.tag]
++    return [tags[-1]]
++
++
++async def main_async(
++    args: argparse.Namespace, selected: list[str], tags: list[str]
++) -> int:
++    token = os.environ.get("GITHUB_TOKEN")
++    if not token:
++        print("GITHUB_TOKEN environment variable is not set.", file=sys.stderr)
++        return 1
++    transport = AIOHTTPTransport(
++        url="https://api.github.com/graphql",
++        headers={"Authorization": f"Bearer {token}"},
++    )
++    client = Client(transport=transport, fetch_schema_from_transport=False)
++    async with aiohttp.ClientSession() as session:
++        for tag in selected:
++            idx = tags.index(tag)
++            prev = tags[idx - 1] if idx > 0 else None
++            await annotate_release(client, session, token, tag, prev, post=args.post)
++    return 0
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description=(
++            "Post 'PR released in vX.Y.Z' / 'Issue fixed in vX.Y.Z' comments "
++            "on the PRs included in a release and the issues those PRs close."
++        )
++    )
++    parser.add_argument(
++        "tag",
++        nargs="?",
++        help="Release tag, e.g. v1.11.1. Defaults to the most recent vX.Y.Z tag.",
++    )
++    parser.add_argument(
++        "--retroactive",
++        action="store_true",
++        help="Process all historical releases (oldest first).",
++    )
++    parser.add_argument(
++        "--since",
++        metavar="TAG",
++        help="With --retroactive: start at this tag (inclusive).",
++    )
++    parser.add_argument(
++        "--post",
++        action="store_true",
++        help="Actually post comments. Default is dry-run.",
++    )
++    args = parser.parse_args()
++    if args.tag and args.retroactive:
++        parser.error("Cannot combine a single TAG argument with --retroactive.")
++    if args.since and not args.retroactive:
++        parser.error("--since only makes sense with --retroactive.")
++    # Resolve and validate tag selection (uses git, no network needed) BEFORE
++    # requiring GITHUB_TOKEN, so e.g. typos / `-- --help` invocation patterns
++    # fail with a clear message instead of the token error.
++    tags = release_tags()
++    selected = select_tags(args, tags)
++    if selected is None:
++        sys.exit(1)
++    sys.exit(asyncio.run(main_async(args, selected, tags)))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/tests/test_announce_release.py b/tools/tests/test_announce_release.py
+new file mode 100755
+index 0000000000..452d5ad5db
+--- /dev/null
++++ b/tools/tests/test_announce_release.py
+@@ -0,0 +1,275 @@
++#!/usr/bin/env -S uv run
++# /// script
++# requires-python = ">=3.13"
++# dependencies = [
++#     "pytest>=8",
++#     "gql[aiohttp]",
++# ]
++# ///
++
++# Tests for tools/announce_release.py.
++#
++# Run with:
++#   tools/tests/test_announce_release.py              # via uv-run shebang
++#   uv run --with pytest pytest tools/tests/test_announce_release.py
++#
++# Covers the pure-logic units:
++#   - TAG_RE tag filter
++#   - comment-body / release-link formatting
++#   - prs_in_range commit-subject parsing
++#   - release_tags filter
++#   - CLI argparse validation
++#
++# The GraphQL/REST functions (get_pr_info, has_comment, post_comment) are
++# exercised end-to-end via the dry-run on the real repo's git history; they
++# are not unit-tested here to avoid baking the GitHub GraphQL schema into the
++# test fixtures.
++import importlib.util
++import subprocess as sp
++import sys
++from pathlib import Path
++
++import pytest
++
++HERE = Path(__file__).resolve().parent
++SCRIPT = HERE.parent / "announce_release.py"
++_spec = importlib.util.spec_from_file_location("announce_release", SCRIPT)
++ann = importlib.util.module_from_spec(_spec)
++sys.modules["announce_release"] = ann
++_spec.loader.exec_module(ann)
++
++
++# ---------- TAG_RE -----------------------------------------------------------
++
++
++@pytest.mark.parametrize("tag", ["v1.0.0", "v10.20.30", "v1.11.1", "v0.0.1"])
++def test_tag_regex_accepts(tag):
++    assert ann.TAG_RE.match(tag), tag
++
++
++@pytest.mark.parametrize(
++    "tag",
++    [
++        "1.0.0",  # missing v
++        "v1.0",  # missing patch
++        "schema-1.2.3",  # schema tag
++        "v1.0.0-dev",  # pre-release suffix
++        "v1.0.0.post1",  # post-release suffix
++        "v.1.1.2",  # bogus historical tag in this repo
++    ],
++)
++def test_tag_regex_rejects(tag):
++    assert not ann.TAG_RE.match(tag), tag
++
++
++# ---------- formatting ------------------------------------------------------
++
++
++def test_release_link_format():
++    link = ann.release_link("v1.11.1")
++    assert "[`v1.11.1`]" in link
++    assert (
++        "https://github.com/bids-standard/bids-specification/releases/tag/v1.11.1"
++        in link
++    )
++
++
++def test_pr_and_issue_comment_bodies_differ_and_contain_tag():
++    pr = ann.pr_comment_body("v1.0.0")
++    iss = ann.issue_comment_body("v1.0.0")
++    assert pr != iss
++    assert "v1.0.0" in pr and "v1.0.0" in iss
++    assert pr.startswith("PR released in ")
++    assert iss.startswith("Issue fixed in ")
++
++
++# ---------- prs_in_range ----------------------------------------------------
++
++
++def test_prs_in_range_squash_and_merge(monkeypatch):
++    """Parses both squash-merge `... (#NNN)` and `Merge pull request #NNN` subjects.
++
++    Skips REL: subject (no PR ref) and dedupes repeated PR numbers (insertion-order).
++    """
++    fake_log = "\n".join(  # noqa: FLY002
++        [
++            "REL: Version 1.11.1",  # no PR ref, skip
++            "[FIX] Add emg to timeseries rule (#2346)",  # squash
++            "fix: Allow mkdocs to render links in glossary (#2345)",  # squash
++            "Merge pull request #2189 from bids-standard/rel/1.10.1",  # merge
++            "chore: commit with no PR ref",  # skip
++            "another (#2346)",  # duplicate
++            "tail #1234 in middle, not at end",  # skip (not (#))
++        ]
++    )
++    monkeypatch.setattr(ann, "git", lambda *a: fake_log)
++    assert ann.prs_in_range("v1.10.0", "v1.11.0") == [2346, 2345, 2189]
++
++
++def test_prs_in_range_handles_no_prev_tag(monkeypatch):
++    monkeypatch.setattr(ann, "git", lambda *a: "Initial commit\nfeat: x (#1)\n")
++    assert ann.prs_in_range(None, "v1.0.0") == [1]
++
++
++def test_prs_in_range_empty(monkeypatch):
++    monkeypatch.setattr(ann, "git", lambda *a: "")
++    assert ann.prs_in_range("v1.0.0", "v1.0.1") == []
++
++
++# ---------- release_tags ---------------------------------------------------
++
++
++def test_release_tags_filters_and_preserves_order(monkeypatch):
++    raw = "\n".join(  # noqa: FLY002
++        [
++            "schema-1.2.3",
++            "v.1.1.2",  # malformed
++            "v1.1.2",
++            "v1.10.0",
++            "v1.10.1",
++            "v1.11.0",
++            "v1.11.1-dev",  # pre-release
++            "v1.11.1",
++        ]
++    )
++    monkeypatch.setattr(ann, "git", lambda *a: raw)
++    assert ann.release_tags() == ["v1.1.2", "v1.10.0", "v1.10.1", "v1.11.0", "v1.11.1"]
++
++
++# ---------- CLI argparse validation ----------------------------------------
++
++
++def _run_script(*argv):
++    """Run the script as a subprocess, returning (returncode, stderr)."""
++    proc = sp.run(
++        [sys.executable, str(SCRIPT), *argv],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    return proc.returncode, proc.stderr
++
++
++def test_cli_rejects_tag_with_retroactive():
++    rc, err = _run_script("v1.11.1", "--retroactive")
++    assert rc != 0
++    assert "--retroactive" in err
++
++
++def test_cli_rejects_since_without_retroactive():
++    rc, err = _run_script("--since", "v1.10.0")
++    assert rc != 0
++    assert "--since" in err
++
++
++def test_cli_missing_token(monkeypatch):
++    """Without GITHUB_TOKEN, the script exits 1 with a clear message."""
++    import os
++
++    env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
++    proc = sp.run(
++        [sys.executable, str(SCRIPT), "v1.11.1"],
++        capture_output=True,
++        text=True,
++        env=env,
++        cwd=str(HERE.parent.parent),  # repo root
++        check=False,
++    )
++    assert proc.returncode == 1
++    assert "GITHUB_TOKEN" in proc.stderr
++
++
++def test_cli_help_without_token():
++    """`--help` must work even without GITHUB_TOKEN (argparse short-circuits)."""
++    import os
++
++    env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
++    proc = sp.run(
++        [sys.executable, str(SCRIPT), "--help"],
++        capture_output=True,
++        text=True,
++        env=env,
++        cwd=str(HERE.parent.parent),
++        check=False,
++    )
++    assert proc.returncode == 0
++    assert "usage:" in proc.stdout
++    assert "--retroactive" in proc.stdout
++
++
++def test_cli_unknown_tag_message_before_token():
++    """Invalid tag is reported before the token check (so e.g. a typo doesn't
++    surface as a confusing 'GITHUB_TOKEN not set'). Important for the
++    `uv run script -- --help` pattern, which makes argparse see `--help`
++    as a positional tag."""
++    import os
++
++    env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
++    proc = sp.run(
++        [sys.executable, str(SCRIPT), "v9.99.99"],
++        capture_output=True,
++        text=True,
++        env=env,
++        cwd=str(HERE.parent.parent),
++        check=False,
++    )
++    assert proc.returncode == 1
++    assert "not a known release tag" in proc.stderr
++    assert "GITHUB_TOKEN" not in proc.stderr
++
++
++# ---------- select_tags ----------------------------------------------------
++
++
++def _ns(**kw):
++    """Build an argparse.Namespace with sensible defaults."""
++    import argparse
++
++    return argparse.Namespace(
++        tag=kw.get("tag"),
++        retroactive=kw.get("retroactive", False),
++        since=kw.get("since"),
++        post=kw.get("post", False),
++    )
++
++
++def test_select_tags_default_picks_latest():
++    tags = ["v1.0.0", "v1.1.0", "v1.2.0"]
++    assert ann.select_tags(_ns(), tags) == ["v1.2.0"]
++
++
++def test_select_tags_explicit_tag():
++    tags = ["v1.0.0", "v1.1.0", "v1.2.0"]
++    assert ann.select_tags(_ns(tag="v1.1.0"), tags) == ["v1.1.0"]
++
++
++def test_select_tags_explicit_unknown(capsys):
++    assert ann.select_tags(_ns(tag="v9.9.9"), ["v1.0.0"]) is None
++    assert "not a known release tag" in capsys.readouterr().err
++
++
++def test_select_tags_retroactive_full():
++    tags = ["v1.0.0", "v1.1.0", "v1.2.0"]
++    assert ann.select_tags(_ns(retroactive=True), tags) == tags
++
++
++def test_select_tags_retroactive_since():
++    tags = ["v1.0.0", "v1.1.0", "v1.2.0"]
++    assert ann.select_tags(_ns(retroactive=True, since="v1.1.0"), tags) == [
++        "v1.1.0",
++        "v1.2.0",
++    ]
++
++
++def test_select_tags_retroactive_since_unknown(capsys):
++    assert ann.select_tags(_ns(retroactive=True, since="v9.9.9"), ["v1.0.0"]) is None
++    assert "--since" in capsys.readouterr().err
++
++
++def test_select_tags_no_tags(capsys):
++    assert ann.select_tags(_ns(), []) is None
++    assert "No vX.Y.Z release tags" in capsys.readouterr().err
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))

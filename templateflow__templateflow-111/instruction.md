@@ -1,0 +1,14 @@
+# Issue
+
+**Title:** MRG: ``tpl-MouseIn``
+
+## Description
+
+Name: In Vivo MP2RAGE Templates of the C57Bl6/J Mouse Brain
+## Template description
+```JSON
+{"Authors": ["Kim, E", "MacNicol, E", "Cash, D"], "BIDSVersion": "1.6.0", "Curators": ["MacNicol, E", "Kim, E"], "Identifier": "MouseIn", "License": "CC-by-nc-sa-4.0 International", "Name": "In Vivo MP2RAGE Templates of the C57Bl6/J Mouse Brain", "ReferencesAndLinks": ["https://osf.io/szyqe/"], "TemplateFlowVersion": "1.0.0", "res": {"1": {"origin": [5.7, 7.9125, -2.7125], "shape": [456, 528, 320], "zooms": [0.025, 0.025, 0.025]}, "2": {"origin": [8.61909, 8.23389, -3.30921], "shape": [108, 108, 64], "zooms": [0.15, 0.15, 0.15]}}}\`\`\`
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `85026e1cfe52`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

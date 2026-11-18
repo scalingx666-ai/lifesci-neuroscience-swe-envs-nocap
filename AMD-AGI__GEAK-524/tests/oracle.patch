@@ -1,0 +1,1227 @@
+diff --git a/.github/workflows/ci-l0-checks.yml b/.github/workflows/ci-l0-checks.yml
+index 587e19c71..a584f9253 100644
+--- a/.github/workflows/ci-l0-checks.yml
++++ b/.github/workflows/ci-l0-checks.yml
+@@ -301,6 +301,8 @@ jobs:
+       # Pure node (fs/path only) — no npm install needed.
+       - name: expert_skills OFF-identical regression
+         run: node e2e_workflow/scripts/test_expert_skills_off_identical.js
++      - name: Candidate coverage and independent speedup review regression
++        run: node --test e2e_workflow/scripts/test_speedup_review.js
+       - name: AgentX-only kernel extraction and fixed-load compatibility
+         run: |
+           set -e   # without this only the LAST line's exit code is the step's verdict
+diff --git a/e2e_workflow/README.md b/e2e_workflow/README.md
+index 103cdd684..d4aa73a80 100644
+--- a/e2e_workflow/README.md
++++ b/e2e_workflow/README.md
+@@ -469,6 +469,25 @@ args: { ...same..., accuracy_gate:"gsm8k", accuracy_limit:200, accuracy_tol:0.01
+ - The eval client is `scripts/gsm8k_eval.py` (model-agnostic; queries the OpenAI-compatible endpoint).
+ - Leaving it unset (`"none"`) changes nothing vs before — the gate stays throughput + parity only.
+ 
++An accuracy-gated speedup above the Amdahl estimate triggers **one independent A/B review**, not a
++correctness rewrite. The existing `implausible_speedup_margin` option remains supported (default
++`1.0`, review above twice the estimate; the runner forwards `GEAK_IMPLAUSIBLE_SPEEDUP_MARGIN`). A
++confirmation uses fresh reference/candidate servers, at least two timed replicas per leg, and the
++same correctness and engagement gates. If the gain reproduces, it is accepted even above the estimate.
++Already confirmed evidence is reused only for the same candidate, reference, workload and measurement
++protocol identities. The workload identity covers only what decides the served requests, so a profile
++and an A/B of the same workload share it; bench/protocol details go in the separate protocol digest.
++Missing provenance, a timeout or repeated old A/B artifacts leaves the candidate unconfirmed without
++starting another kernel rewrite. Final Validate still performs the normal combined-stack check.
++
++The estimate uses the candidate's `affected_gpu_time` coverage when its profile matches the current
++reference and workload: all affected shapes/phases and removed auxiliary kernels, counted once.
++Per-path timings are used when available; applying the head speedup to unmeasured paths is explicitly
++labelled an approximation. Stale/missing coverage falls back to the head estimate. The head's original
++`pct_gpu_time` is preserved for ranking. Candidate checkpoints include the reviewed integration result,
++so timeout recovery respects the same acceptance decision. See [the integrator contract](roles/e2e_integrator.md)
++for coverage and measurement-evidence fields.
++
+ ## Output
+ Everything lands under `<exp_root>/e2e_<model>_<timestamp>/`:
+ - `env_report.{md,json}` — the preflight capability report every phase routes on
+diff --git a/e2e_workflow/e2e_workflow.js b/e2e_workflow/e2e_workflow.js
+index 1ae4f28b5..cd14f9264 100644
+--- a/e2e_workflow/e2e_workflow.js
++++ b/e2e_workflow/e2e_workflow.js
+@@ -473,45 +473,93 @@ const SURGICAL_FIX = String(A.surgical_fix != null ? A.surgical_fix : 'true') ==
+ const FIXABLE_REJECT_RX = /cuda_graph_capture_unsafe|no[_ ]?binary|NO_BINARY_FOR_GPU|hipErrorNoBinaryForGpu|capture[_ ]?(unsafe|hang)|host[_ ]?sync|graph[_ ]?capture|no[_ ]?rebind[_ ]?seam|no[_ ]?engagement|not[_ ]?engaged|signature[_ ]?mismatch|wrong[_ ]?seam/i;
+ // ---- CORRECTNESS-class reject (auto-correct) --------------------------------------------------------
+ // A SECOND fix-and-retryable class: the candidate ENGAGED and beat the isolated oracle but produces the
+-// WRONG output on the LIVE path (parity/accuracy failure) — OR posts an IMPLAUSIBLE e2e speedup (faster
+-// only because it computes degenerate/less work). Distinct from the integration-POSTURE class above: the
++// WRONG output on the LIVE path (parity/accuracy failure). A surprising speedup is a measurement
++// review, not evidence of wrong output. Distinct from the integration-POSTURE class above: the
+ // kernel over-fit the single captured snapshot, assuming input-buffer identity / contents / routing are
+ // stable across calls (e.g. a cache keyed by data_ptr(), a stale reused index/mask, a persistent-state
+ // assumption). A single-snapshot isolated unittest can NEVER catch this (fixed tensors → any such cache
+ // is always "correct"), so a blind re-run reproduces the bug; the corrective loop below feeds this
+ // diagnosis back so the re-author actually removes the over-fit. GENERIC — no kernel/model specifics.
+-const CORRECTNESS_REJECT_RX = /parit|corrupt|mismatch|diverge|garbage|degener|\bnan\b|\binf\b|accuracy[_ ]?regress|wrong[_ ]?output|incorrect|implausible/i;
+-// Amdahl ceiling: the MOST e2e speedup an op that is `pct`% of GPU time can yield at isolated speedup S is
+-// 1/(1 - (pct/100)(1 - 1/S)). A measured e2e delta far above this ceiling can be the fingerprint of a
+-// kernel doing degenerate/less work (corruption). Uses ONLY the profile pct + isolated speedup.
+-const IMPLAUSIBLE_SPEEDUP_MARGIN = parseFloat(A.implausible_speedup_margin != null ? A.implausible_speedup_margin : 1.0); // headroom over the theoretical ceiling before flagging (1.0 = must exceed 2x the ceiling)
++const CORRECTNESS_REJECT_RX = /parit|corrupt|mismatch|diverge|garbage|degener|\bnan\b|\binf\b|accuracy[_ ]?regress|wrong[_ ]?output|incorrect/i;
++// Amdahl is an estimate: GPU duration is not wall time, and an overlay can affect more than one
++// profile row. Keep the legacy option name, but use its margin to request a measurement review.
++const IMPLAUSIBLE_SPEEDUP_MARGIN = parseFloat(A.implausible_speedup_margin != null ? A.implausible_speedup_margin : 1.0);
+ function amdahlCeilingPct(pct_gpu_time, isolated) {
+   const p = Math.max(0, Math.min(1, (pct_gpu_time || 0) / 100));
+   const s = (isolated && isolated > 1) ? isolated : 1;
+   if (p <= 0 || s <= 1) return Infinity;   // unknown inputs -> never flag (fail-open)
+   return (1 / (1 - p * (1 - 1 / s)) - 1) * 100;
+ }
+-// PARITY-AWARE guard (fixes the false-positive that would DROP real wins). The Amdahl ceiling is derived
+-// from an imperfect profile `pct_gpu_time`; a genuine win can legitimately exceed it when the profile
+-// under-counts the op, or when the change has system-wide effects (memory pressure / batching / a config
+-// swap). So the implausible-speedup verdict is applied ONLY when the acceptance rests on the SOFT gate —
+-// a sampled task-accuracy probe (quant / `accuracy_gate=gsm8k`), where a degenerate output could squeak
+-// past a small sample. A BYTE-EXACT parity pass is a HARD correctness guarantee → its speedup is real
+-// even above the ceiling → never flagged. This removes the false-positive on byte-exact (incl. config
+-// env/flag) wins while keeping the backstop exactly where byte-parity is waived. Backward-safe: an
+-// integrator that doesn't report `parity_kind` only trips the guard when the RUN uses an accuracy gate.
++// Byte-exact accepts retain their existing behavior. Accuracy-gated accepts may need an independent
++// A/B confirmation; exceeding the estimate alone must never trigger a kernel correctness rewrite.
+ function parityIsSoft(integ) {
+   const pk = integ && integ.parity_kind;               // 'byte_exact' | 'accuracy' | 'none' (optional)
+   if (pk === 'accuracy') return true;
+   if (pk === 'byte_exact' || pk === 'none') return false;
+   return ACCURACY_GATE !== 'none';                      // unknown -> soft only when the run uses an accuracy gate
+ }
+-function isImplausibleSpeedup(pct_gpu_time, isolated, integ) {
+-  if (!parityIsSoft(integ)) return false;              // hard byte-exact correctness -> trust the speedup
+-  const ceilPct = amdahlCeilingPct(pct_gpu_time, isolated);
++function speedupEstimate(pct_gpu_time, isolated, integ) {
++  const fallback = { pct_gpu_time, estimate_pct: amdahlCeilingPct(pct_gpu_time, isolated), source: 'head_estimate' };
++  const coverage = integ && integ.affected_gpu_time;
++  const m = integ && integ.measurement_evidence;
++  if (!coverage || !m || !coverage.profile_path || !m.candidate_digest || !m.reference_digest || !m.workload_digest
++      || coverage.candidate_digest !== m.candidate_digest
++      || coverage.reference_digest !== m.reference_digest || coverage.workload_digest !== m.workload_digest
++      || !Array.isArray(coverage.kernels) || !coverage.kernels.length) return fallback;
++  // IDs identify disjoint rows in ONE profile/denominator (kernel + shape + phase). Do not count a
++  // module total together with its children, or duplicate a split-K reduction already in a group.
++  const seen = new Map();
++  let pct = 0, saved = 0, uniform = false;
++  for (const row of coverage.kernels) {
++    if (!row || typeof row.id !== 'string' || !row.id || typeof row.pct_gpu_time !== 'number'
++        || !Number.isFinite(row.pct_gpu_time) || row.pct_gpu_time < 0 || row.pct_gpu_time > 100) return fallback;
++    const signature = JSON.stringify([row.pct_gpu_time, row.isolated_speedup, row.removed === true]);
++    if (seen.has(row.id)) {
++      if (seen.get(row.id) !== signature) return fallback;
++      continue;
++    }
++    seen.set(row.id, signature);
++    pct += row.pct_gpu_time;
++    if (row.removed === true) saved += row.pct_gpu_time / 100;
++    else {
++      let s = row.isolated_speedup;
++      if (!(typeof s === 'number' && Number.isFinite(s) && s > 0)) { s = isolated; uniform = true; }
++      if (!(typeof s === 'number' && Number.isFinite(s) && s > 0)) return fallback;
++      saved += row.pct_gpu_time / 100 * (1 - 1 / s);
++    }
++  }
++  if (!(pct > 0) || pct > 100 + 1e-9) return fallback;
++  return { pct_gpu_time: pct, estimate_pct: saved >= 1 ? Infinity : (1 / (1 - saved) - 1) * 100,
++    source: uniform ? 'coverage_uniform_estimate' : 'coverage_per_path' };
++}
++function speedupNeedsReview(pct_gpu_time, isolated, integ) {
++  if (!parityIsSoft(integ)) return false;
++  const ceilPct = speedupEstimate(pct_gpu_time, isolated, integ).estimate_pct;
+   if (!Number.isFinite(ceilPct)) return false;
+   return ((integ && integ.e2e_delta_pct) || 0) > ceilPct * (1 + IMPLAUSIBLE_SPEEDUP_MARGIN) + 1e-9;
+ }
++function confirmationEvidenceMatches(integ) {
++  const review = integ && integ.speedup_review;
++  const before = review && review.original_measurement;
++  const after = integ && integ.measurement_evidence;
++  if (!review || review.status !== 'confirmed' || !before || !after) return false;
++  // Equal numbers are allowed; re-reading the same artifacts is not independent evidence.
++  if (!before.measurement_id || !after.measurement_id || before.measurement_id === after.measurement_id
++      || !before.ref_summary || !before.cand_summary || !after.ref_summary || !after.cand_summary
++      || new Set([before.ref_summary, before.cand_summary, after.ref_summary, after.cand_summary]).size !== 4
++      || after.fresh_pair !== true || after.configs_matched !== true || after.workload_matched !== true
++      || !Number.isInteger(after.ref_replicas) || !Number.isInteger(after.cand_replicas)
++      || after.ref_replicas < 2 || after.cand_replicas < 2) return false;
++  // protocol_digest is newer than the other identities: older evidence may omit it on both sides.
++  if ((before.protocol_digest || after.protocol_digest) && before.protocol_digest !== after.protocol_digest) return false;
++  return ['candidate_digest', 'reference_digest', 'workload_digest'].every(
++    (key) => typeof before[key] === 'string' && before[key].length > 0 && before[key] === after[key]);
++}
++function confirmedSpeedup(integ) {
++  return !!(integ && integ.gate === 'accepted' && integ.ab_complete === true
++    && integ.output_parity === 'pass' && ['accuracy', 'byte_exact'].includes(integ.parity_kind)
++    && confirmationEvidenceMatches(integ));
++}
+ // Classify a reject reason into a fix-and-retry class ('' = terminal, not auto-correctable).
+ // POSTURE IS TESTED FIRST. CORRECTNESS_REJECT_RX contains a bare `mismatch`, which used to swallow
+ // the `signature_mismatch` that FIXABLE_REJECT_RX names explicitly: a seam whose signature does not
+@@ -523,23 +571,26 @@ function isImplausibleSpeedup(pct_gpu_time, isolated, integ) {
+ // statement about its output is meaningless anyway.
+ function rejectClass(reason) {
+   const r = reason || '';
++  // Review diagnostics may mention an accuracy gate or a configuration mismatch. They are never
++  // a reason to re-author a kernel. Also keep legacy implausible-only rejects out of that loop.
++  if (/^(speedup_review_|implausible_speedup)/i.test(r)) return '';
+   if (FIXABLE_REJECT_RX.test(r)) return 'integration';
+   if (CORRECTNESS_REJECT_RX.test(r)) return 'correctness';
+   return '';
+ }
+-// A gate 'accept'/'stack' only counts as a REAL win if the measured e2e delta is not an implausible
+-// (corruption) speedup. Centralizes the guard so every integrate site treats a too-good-to-be-true
+-// delta as a reject instead of banking it. GENERIC (uses only pct_gpu_time + isolated speedup).
++// runIntegrateBothLegs resolves the review before any caller can bank the candidate. A confirmed
++// measurement can exceed the estimate by any amount; actual parity failures still reject.
+ function integAccepted(integ, pct_gpu_time, isolated) {
+   return !!(integ && (integ.gate === 'accepted' || integ.gate === 'stack')
+-    && !isImplausibleSpeedup(pct_gpu_time, isolated, integ));
++    && integ.ab_complete !== false && integ.output_parity !== 'fail'
++    && !(integ.speedup_review && ['pending', 'inconclusive', 'rejected'].includes(integ.speedup_review.status))
++    && (!speedupNeedsReview(pct_gpu_time, isolated, integ) || confirmedSpeedup(integ)));
+ }
+-// The reason string to feed the corrective loop: if the gate "passed" but the delta is impossible, emit
+-// an implausible_speedup verdict (routes to the correctness corrective); else the integrator's own reason.
+ function gateRejectReason(integ, pct_gpu_time, isolated) {
++  if (integ && integ.output_parity === 'fail') return 'parity_regression';
+   if (integ && (integ.gate === 'accepted' || integ.gate === 'stack')
+-      && isImplausibleSpeedup(pct_gpu_time, isolated, integ))
+-    return `implausible_speedup (+${(integ.e2e_delta_pct || 0).toFixed(1)}% >> Amdahl ceiling +${amdahlCeilingPct(pct_gpu_time, isolated).toFixed(1)}% on a soft/accuracy-gated accept — likely corruption/degenerate work)`;
++      && !integAccepted(integ, pct_gpu_time, isolated))
++    return 'speedup_review_pending: independent A/B confirmation required';
+   return integ ? (integ.reason || integ.gate || '') : '';
+ }
+ // ---- DEEP MODE (opt-in, default OFF) ----------------------------------------------------------------
+@@ -1502,9 +1553,30 @@ const KERNEL_LAYER_SCHEMA = obj({
+   validation_status: { type: 'string' }, note: { type: 'string' },
+ }, ['ran', 'final_patch', 'final_geomean']);
+ 
++const MEASUREMENT_EVIDENCE_SCHEMA = obj({
++  measurement_id: { type: 'string' }, candidate_digest: { type: 'string' },
++  reference_digest: { type: 'string' }, workload_digest: { type: 'string' }, protocol_digest: { type: 'string' },
++  ref_summary: { type: 'string' }, cand_summary: { type: 'string' },
++  ref_replicas: { type: 'number' }, cand_replicas: { type: 'number' },
++  fresh_pair: { type: 'boolean' }, configs_matched: { type: 'boolean' }, workload_matched: { type: 'boolean' },
++}, []);
+ const INTEGRATE_SCHEMA = obj({
+   short_name: { type: 'string' }, provenance_ok: { type: 'boolean' },
+   isolated_speedup: { type: 'number' }, pct_gpu_time: { type: 'number' },
++  affected_gpu_time: obj({
++    candidate_digest: { type: 'string' },
++    profile_path: { type: 'string' }, reference_digest: { type: 'string' }, workload_digest: { type: 'string' },
++    kernels: { type: 'array', items: obj({
++      id: { type: 'string' }, pct_gpu_time: { type: 'number' }, isolated_speedup: { type: 'number' },
++      removed: { type: 'boolean' },
++    }, ['id', 'pct_gpu_time']) },
++  }, ['profile_path', 'candidate_digest', 'reference_digest', 'workload_digest', 'kernels']),
++  measurement_evidence: MEASUREMENT_EVIDENCE_SCHEMA,
++  speedup_review: obj({
++    status: { type: 'string', enum: ['pending', 'confirmed', 'inconclusive', 'rejected'] },
++    original_measurement: MEASUREMENT_EVIDENCE_SCHEMA,
++    estimate: { type: 'object', additionalProperties: true },
++  }, ['status']),
+   e2e_throughput_tok_s: { type: 'number' }, e2e_delta_pct: { type: 'number' },
+   // A/B completion signals: the integrator MUST set ab_complete=true ONLY when
+   // BOTH the reference and candidate serving legs were measured. When it ran out
+@@ -1515,7 +1587,7 @@ const INTEGRATE_SCHEMA = obj({
+   output_parity: { type: 'string' },
+   // How the correctness of an ACCEPT was established: 'byte_exact' (hard greedy byte-parity vs the true
+   // baseline), 'accuracy' (soft sampled task-accuracy probe — quant / accuracy_gate), or 'none'. The
+-  // implausible-speedup guard only distrusts an 'accuracy'/soft accept; a byte_exact accept is trusted.
++  // speedup review requests independent measurement evidence for a surprising accuracy-gated win.
+   parity_kind: { type: 'string' },
+   gate: { type: 'string', enum: ['accepted', 'stack', 'rejected', 'incomplete'] },
+   accepted_overlay: { type: 'string' }, reason: { type: 'string' },
+@@ -2856,11 +2928,64 @@ async function adoptAbandonedVerdict(integ, label) {
+ // up to AB_FINISH_RETRIES times. General contract used by every integrate site
+ // (head, milestone, finalize-gate, disk-recovered): an A/B never ends after the
+ // reference leg alone — it is driven to a complete ref+cand measurement.
++const SPEEDUP_REVIEW_RESULTS = new Map();
++async function reviewSpeedup(integ, inputs, label, phaseName) {
++  const kr = inputs.KERNEL_RESULT || {};
++  const pct = kr.pct_gpu_time || 0, isolated = kr.verified_isolated_speedup || 0;
++  if (!abDone(integ) || !['accepted', 'stack'].includes(integ.gate) || integ.output_parity === 'fail'
++      || !speedupNeedsReview(pct, isolated, integ) || confirmedSpeedup(integ)) return integ;
++  if (integ.speedup_review && ['pending', 'inconclusive', 'rejected'].includes(integ.speedup_review.status)) return integ;
++  const original = integ.measurement_evidence || {};
++  const estimate = speedupEstimate(pct, isolated, integ);
++  // Cache by measurement AND candidate/reference inputs. Returning the same cached A/B cannot
++  // restart a review, including when Finalize revisits a pending integration.
++  const key = JSON.stringify([original, kr, inputs.CURRENT_OVERLAY, inputs.CURRENT_FLAGS,
++    inputs.CURRENT_ENV, inputs.WORKLOAD, integ.ref_med, integ.cand_med]);
++  if (SPEEDUP_REVIEW_RESULTS.has(key)) return SPEEDUP_REVIEW_RESULTS.get(key);
++  const pending = { ...integ, speedup_review: { status: 'inconclusive', original_measurement: original, estimate },
++    reason: 'speedup_review_inconclusive: independent A/B confirmation unavailable' };
++  SPEEDUP_REVIEW_RESULTS.set(key, pending);
++  log(`  ${label}: speedup review (+${integ.e2e_delta_pct}% vs estimate +${estimate.estimate_pct.toFixed(2)}%, ` +
++    `${estimate.pct_gpu_time}% GPU, ${estimate.source}); one independent A/B, no kernel rewrite.`);
++  if (!['measurement_id', 'candidate_digest', 'reference_digest', 'workload_digest', 'ref_summary', 'cand_summary']
++      .every((field) => typeof original[field] === 'string' && original[field].length > 0)) {
++    pending.reason = 'speedup_review_inconclusive: original A/B provenance missing; cannot bind a confirmation';
++    return pending;
++  }
++  if (searchClosed(`${label}: speedup review`)) return pending;
++  const reviewInputs = { ...inputs, FORCE_FRESH_AB: true, RESUME_AB: false, REUSE_REF: false,
++    REPLICAS: Math.max(2, Number(inputs.REPLICAS) || 1),
++    CAND_OVERLAY_DIR: integ.accepted_overlay || '',
++    SPEEDUP_REVIEW: { original_measurement: original, estimate },
++  };
++  delete reviewInputs.SHARED_REF_MED;
++  const fresh = await safeAgent(roleAgent('e2e_integrator', 'integrate',
++    'Confirm this surprising speedup with ONE independent A/B. Follow FORCE_FRESH_AB in your role: ' +
++    'use separate ref/cand artifact directories, preserve the exact candidate and current reference, ' +
++    'measure at least two replicas per leg and repeat the configured correctness and engagement gates. ' +
++    'Do not reuse old benchmark legs or rewrite the kernel. Amdahl is an estimate, never a correctness verdict. ' +
++    'Return the fresh measurements and their provenance; if the gain reproduces, accept even above the estimate.',
++    reviewInputs), { phase: phaseName, label: `${label} speedup review`, schema: INTEGRATE_SCHEMA }, 1);
++  let result = pending;
++  if (fresh && fresh.ab_complete === true && fresh.gate !== 'incomplete') {
++    const checked = { ...fresh, speedup_review: { status: 'confirmed', original_measurement: original, estimate } };
++    if (confirmationEvidenceMatches(checked)) {
++      if (fresh.gate === 'accepted' && fresh.output_parity === 'pass'
++          && ['accuracy', 'byte_exact'].includes(fresh.parity_kind)) result = checked;
++      else if (fresh.gate === 'rejected' || fresh.output_parity === 'fail') {
++        result = { ...checked, gate: 'rejected', speedup_review: { ...checked.speedup_review, status: 'rejected' } };
++      }
++    }
++  }
++  SPEEDUP_REVIEW_RESULTS.set(key, result);
++  return result;
++}
+ async function runIntegrateBothLegs(intro, inputs, label, phaseName) {
+   // Caller inputs win; the accuracy gate and the tuning carve-out only ever ADD keys (each is {} when
+   // off / when no tuning was banked).
+   const withTuning = {
+     MEASUREMENT_PURPOSE: 'search', REPLICAS: SEARCH_REPLICAS,
++    PROFILE_TOPN_JSON: (profile && profile.profile_topN_json) || '',
+     ...ACCURACY_INPUTS, ...tuningIntegrateInputs(), ...inputs,
+   };
+   let integ = await adoptAbandonedVerdict(await safeAgent(
+@@ -2883,12 +3008,18 @@ async function runIntegrateBothLegs(intro, inputs, label, phaseName) {
+         { ...withTuning, RESUME_AB: true }),
+       { phase: phaseName, label: finishLabel, schema: INTEGRATE_SCHEMA }), finishLabel);
+   }
++  integ = await reviewSpeedup(integ, withTuning, label, phaseName);
+   if (integ && integ.short_name) {
+-    const candidateId = String(integ.short_name).replace(/[^A-Za-z0-9_.-]+/g, '_');
+-    const accepted = integ.gate === 'accepted' || integ.gate === 'stack';
++    // Preserve every candidate's review when several backends share one head short_name.
++    const measurementId = (integ.measurement_evidence && integ.measurement_evidence.measurement_id) || withTuning.CAND_TAG || '';
++    const candidateId = [integ.short_name, measurementId].filter(Boolean).join('_').replace(/[^A-Za-z0-9_.-]+/g, '_');
++    const kr = withTuning.KERNEL_RESULT || {};
++    const accepted = integAccepted(integ, kr.pct_gpu_time, kr.verified_isolated_speedup);
++    const reviewPending = integ.speedup_review && ['pending', 'inconclusive'].includes(integ.speedup_review.status);
+     await persistE2EValidationCheckpoint(`overlay/candidate_${candidateId}/e2e_validation.json`, {
+-      phase: 'Overlay', validation_level: 'integrator', gate: integ.gate || 'incomplete',
+-      committed: accepted, validation_status: accepted ? 'accepted_intermediate' : 'incomplete',
++      phase: 'Overlay', validation_level: 'integrator', gate: reviewPending ? 'incomplete' : (integ.gate || 'incomplete'),
++      committed: accepted, validation_status: accepted ? 'accepted_intermediate' : (reviewPending ? 'speedup_review_pending' : 'incomplete'),
++      integration_result: integ,
+       baseline_throughput_tok_s: integ.ref_med || 0,
+       final_throughput_tok_s: integ.cand_med || integ.e2e_throughput_tok_s || 0,
+       throughput_speedup: (integ.ref_med && integ.cand_med) ? integ.cand_med / integ.ref_med : 0,
+@@ -2965,8 +3096,8 @@ async function tryCorrectiveReauthor(spec) {
+   if (!eligible) return { banked: false };
+   const curTput = (spec.cur && spec.cur.tput) || 0;
+   // The corrective instruction is CLASS-SPECIFIC. `integration` = the posture is wrong (JIT/capture/
+-  // host-sync); `correctness` = the output is wrong on the live path (parity/accuracy fail or an
+-  // implausible speedup), i.e. the kernel over-fit the single captured snapshot. Both KEEP the
++  // host-sync); `correctness` = the output is wrong on the live path (parity/accuracy fail),
++  // e.g. the kernel over-fit the single captured snapshot. Both KEEP the
+   // algorithm + isolated win and fix only the defect. GENERIC — the text describes the failure CLASS,
+   // never this specific kernel/model.
+   const INTEGRATION_FIX_TASK =
+@@ -2993,8 +3124,7 @@ async function tryCorrectiveReauthor(spec) {
+     `state across calls or assume the previous call's indices/mask still apply. (3) If you use atomics/scatter-add ` +
+     `into a reused output, zero it each call inside the captured region. VALIDATE your fix adversarially: call the ` +
+     `kernel on TWO different routing snapshots back-to-back REUSING the same input buffers, and on repeated calls ` +
+-    `with fresh contents, asserting bit/tol correctness on EACH — a data_ptr cache or stale reuse must fail this. ` +
+-    `An implausible speedup (far above the op's Amdahl ceiling) means it is doing less/degenerate work — treat as wrong.`;
++    `with fresh contents, asserting bit/tol correctness on EACH — a data_ptr cache or stale reuse must fail this.`;
+   for (let cAttempt = 1; cAttempt <= HEAD_CORRECTIVE_MAX; cAttempt++) {
+     log(`  ${spec.short_name}: ${fixClass.toUpperCase()} reject (${reason}) — corrective ${cAttempt}/${HEAD_CORRECTIVE_MAX} (fix-and-retry the iso winner; NOT a new head, NOT charged to head_budget).`);
+     // TIER 1 — lightweight SURGICAL patch (one agent, minutes). Most rejects are a tiny seam bug.
+@@ -3036,6 +3166,7 @@ async function tryCorrectiveReauthor(spec) {
+         code_patch: fix.final_patch, final_patch: fix.final_patch,
+         authored_kernel_eval_dir: fix.eval_dir || spec.kernel_eval_dir || (base.KERNEL_RESULT && base.KERNEL_RESULT.authored_kernel_eval_dir) || '',
+         verified_isolated_speedup: fix.final_geomean,
++        pct_gpu_time: spec.pct_gpu_time || (base.KERNEL_RESULT && base.KERNEL_RESULT.pct_gpu_time) || 0,
+         corrective_fix_of: reason } };
+     if (spec.cur) {
+       fixInputs.CURRENT_OVERLAY = spec.cur.overlay; fixInputs.CURRENT_FLAGS = spec.cur.flags;
+@@ -3046,31 +3177,24 @@ async function tryCorrectiveReauthor(spec) {
+       `integrate ${spec.short_name} corrective`, spec.phase_name || 'HeadKernel');
+     const ab2 = !!(integ2 && integ2.gate !== 'incomplete' && integ2.ab_complete !== false);
+     const pctForGuard = spec.pct_gpu_time || (spec.base_inputs && spec.base_inputs.KERNEL_RESULT && spec.base_inputs.KERNEL_RESULT.pct_gpu_time) || 0;
+-    // Implausible-speedup guard: a "win" whose e2e delta blows past the op's Amdahl ceiling is corruption
+-    // masquerading as a win (does less/degenerate work) — never bank it; treat as a correctness reject and
+-    // let the next corrective attempt fix it. GENERIC (uses only pct_gpu_time + isolated).
+-    const implausible2 = ab2 && (integ2.gate === 'accepted' || integ2.gate === 'stack')
+-      && isImplausibleSpeedup(pctForGuard, fix.final_geomean, integ2);
+-    if (ab2 && (integ2.gate === 'accepted' || integ2.gate === 'stack') && integ2.e2e_throughput_tok_s > curTput && !implausible2) {
++    if (ab2 && integAccepted(integ2, pctForGuard, fix.final_geomean) && integ2.e2e_throughput_tok_s > curTput) {
+       // Carry the CORRECTED patch out to the caller's bankAccepted. The gated KERNEL_RESULT at the
+       // call site still holds the broken kernel, and recording that into the KB would publish a
+       // patch that was rejected on this very box as if it were the win.
+       return { banked: true, integ: integ2, isolated: fix.final_geomean, patch: fix.final_patch,
+         kernel_eval_dir: fix.eval_dir || spec.kernel_eval_dir || '' };
+     }
+-    reason = implausible2
+-      ? `implausible_speedup (+${(integ2.e2e_delta_pct || 0).toFixed(1)}% >> Amdahl ceiling +${amdahlCeilingPct(pctForGuard, fix.final_geomean).toFixed(1)}% — corruption)`
+-      : ((integ2 && (integ2.reason || integ2.gate)) || reason);
++    reason = gateRejectReason(integ2, pctForGuard, fix.final_geomean) || reason;
+     // STRUCTURED stop (do NOT re-classify from the prose reason — it may MENTION "corruption" while saying
+     // it was RESOLVED, which would loop wastefully). If this attempt made the kernel CORRECT (parity no
+-    // longer failing) and it was not an implausible speedup, the ONLY remaining problem is throughput/
+-    // do-no-harm — more re-authoring cannot create Amdahl headroom that isn't there, so STOP now.
+-    if (ab2 && integ2.output_parity !== 'fail' && !implausible2) {
+-      log(`  ${spec.short_name}: corrective produced a CORRECT kernel with no e2e win (do-no-harm: ${reason}) — stopping; throughput headroom for this op is exhausted.`);
++    // longer failing), a throughput issue or an inconclusive measurement review cannot justify
++    // another correctness rewrite.
++    if (ab2 && integ2.output_parity !== 'fail') {
++      log(`  ${spec.short_name}: corrective has no bankable e2e win (${reason}) — stopping kernel rewrites.`);
+       break;
+     }
+     log(`  ${spec.short_name}: corrective still rejected (${reason}).`);
+-    fixClass = implausible2 ? 'correctness' : rejectClass(reason);
++    fixClass = rejectClass(reason);
+     if (fixClass === '') break;   // new failure not auto-correctable -> stop retrying
+     // Progressive: the NEXT attempt builds on this attempt's (partially) fixed kernel, not the original.
+     spec.kernel_eval_dir = fix.eval_dir || spec.kernel_eval_dir;
+@@ -5348,9 +5472,9 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+           ...tuningIntegrateInputs(), ...ACCURACY_INPUTS,
+           ...(opts.final && ACCURACY_GATE !== 'none' ? { ACCURACY_LIMIT: DEEP_FINAL_ACCURACY_LIMIT } : {}),   // de-noise the finalize accuracy decision
+         };
+-        const integ = await safeAgent(
+-          roleAgent('e2e_integrator', 'integrate', 'Apply a deep head candidate; gate on e2e throughput; report engagement/cudagraph/mem/decode for feedback.', deepInputs),
+-          { phase: 'HeadKernel', label: `integrate ${c.uid} g${e2eGateCount}`, schema: INTEGRATE_SCHEMA });
++        const integ = await runIntegrateBothLegs(
++          'Apply a deep head candidate; gate on e2e throughput; report engagement/cudagraph/mem/decode for feedback.',
++          deepInputs, `integrate ${c.uid} g${e2eGateCount}`, 'HeadKernel');
+         if (integ && integ.output_parity === 'fail') {
+           log(`  [deep] ${c.uid}: REJECTED — output_parity=fail vs true baseline.`);
+           history.ledger.push({ direction: c.uid, isolated_speedup: c.best, e2e_delta_pct: integ.e2e_delta_pct, verdict: 'dead_end', lesson: 'parity fail vs true baseline' });
+@@ -5360,8 +5484,8 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+           log(`  [deep] ${c.uid}: ACCEPTED. e2e now ${curTput} tok/s (+${integ.e2e_delta_pct}%); target ${Math.round(BASELINE_TPUT * DEEP_E2E_TARGET)} tok/s.`);
+           history.ledger.push({ direction: c.uid, isolated_speedup: c.best, e2e_delta_pct: integ.e2e_delta_pct, verdict: 'confirmed', lesson: integ.reason || '' });
+         } else {
+-          // gateRejectReason converts an implausible "pass" into a corruption reject so it routes to the
+-          // correctness corrective (the deep site already calls the corrective helper for every reject).
++          // Only actual correctness/integration failures enter the corrective helper.
++          // An inconclusive speedup review stops without re-authoring the candidate.
+           const dreason = gateRejectReason(integ, c.head.pct_gpu_time, c.best);
+           const dcorr = await tryCorrectiveReauthor({
+             short_name: c.head.short_name, op_kind: c.ext.op_kind, shapes: c.ext.shapes, dtype: c.ext.dtype, regime: c.head.regime,
+@@ -5696,8 +5820,7 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+         log(`  ${h.short_name}: ACCEPTED. e2e now ${curTput} tok/s (+${integ.e2e_delta_pct}%).`);
+         history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ.e2e_delta_pct, verdict: 'confirmed', lesson: integ.reason || '' });
+       } else {
+-        // gateRejectReason injects an implausible_speedup verdict when the gate "passed" but the delta is
+-        // impossible (corruption) — so a fake win routes to the correctness corrective instead of banking.
++        // A measurement review never routes to the correctness corrective.
+         const reason = gateRejectReason(integ, h.pct_gpu_time, cand.isolated);
+         const corr = (cand.kind === 'authored' && rejectClass(reason) !== '')
+           ? await tryCorrectiveReauthor({
+@@ -6031,9 +6154,8 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+           history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, verdict: 'incomplete', lesson: integ ? integ.reason || 'A/B not finished' : 'integrate timed out/null before A/B completed' });
+         }
+       } else {
+-        // gateRejectReason injects an implausible_speedup verdict when the gate "passed" but the delta is
+-        // impossible (corruption); rejectClass then routes parity/accuracy/implausible rejects to the
+-        // correctness corrective and JIT/capture/host-sync rejects to the integration corrective.
++        // Route actual parity/accuracy failures to correctness fixes and JIT/capture failures
++        // to integration fixes; an inconclusive speedup review is not a kernel defect.
+         const reason = gateRejectReason(integ, h.pct_gpu_time, cand.isolated);
+         const corr = (cand.kind === 'authored')
+           ? await tryCorrectiveReauthor({
+diff --git a/e2e_workflow/roles/e2e_integrator.md b/e2e_workflow/roles/e2e_integrator.md
+index 836ec51ef..89b8c8191 100644
+--- a/e2e_workflow/roles/e2e_integrator.md
++++ b/e2e_workflow/roles/e2e_integrator.md
+@@ -44,19 +44,16 @@ e2e_optimization.md` (measurement discipline + the Amdahl stop rule).
+ 5. **Report `parity_kind` on every ACCEPT** so the orchestrator can trust the win correctly:
+    `"byte_exact"` when acceptance rests on hard greedy byte-parity vs the TRUE baseline; `"accuracy"`
+    when it rests on the soft sampled task-accuracy probe (a quant kernel / `ACCURACY_GATE=gsm8k`, where
+-   byte-parity is waived); `"none"` if no correctness check ran. This matters: the orchestrator only
+-   distrusts a too-good-to-be-true speedup on an `accuracy` (soft) accept — a `byte_exact` accept is a
+-   hard correctness guarantee and is trusted even above its Amdahl ceiling (the profile can under-count).
+-6. **Implausible-speedup guard (a correctness signal, not a win) — for the SOFT gate.** The MOST e2e
+-   speedup an op that is `pct_gpu_time`% of GPU time can yield at its isolated speedup S is the Amdahl
+-   ceiling `1/(1 - (pct/100)(1 - 1/S))`. When you accept a QUANT / accuracy-gated kernel (byte-parity
+-   waived) and the measured e2e delta BLOWS PAST that ceiling, the kernel is likely doing LESS / degenerate
+-   work (corruption) that squeaked past a small accuracy sample — a fast-but-wrong server (truncated /
+-   degenerate generations). Re-check accuracy on a LARGER sample vs the TRUE baseline; if it does not
+-   genuinely hold, report `gate:"rejected"` with reason **`implausible_speedup`**. (A byte-exact accept is
+-   NOT subject to this — trust it.) Use the reason vocabulary the orchestrator's auto-correct classifier
+-   keys on — `parity_regression`, `accuracy_regression`, `implausible_speedup`, `output_corruption` — so a
+-   fixable correctness reject is routed to a corrective re-author rather than dropped.
++   byte-parity is waived); `"none"` if no correctness check ran. An accept still requires correctness
++   evidence; `none` does not waive requirement 4.
++6. **Surprising speedup is a measurement-review signal.** Amdahl's estimate
++   `1/(1 - sum(p_i * (1 - 1/S_i))) - 1` depends on complete coverage and representative timings;
++   summed GPU kernel duration also omits launch gaps and other wall-time effects. Exceeding this
++   estimate NEVER proves incorrect output and is not a reason to rewrite the kernel. Report the
++   measured gate normally. The orchestrator may request one independent A/B with `FORCE_FRESH_AB`.
++   If that reproduces the gain and correctness holds, accept even above the estimate. Reject for
++   actual failures (`parity_regression`, `accuracy_regression`, `output_corruption`) or measured
++   throughput/engagement failures, not for `implausible_speedup` alone.
+ 
+ If any fails, REJECT and record why (with the numbers) for the eval-dir timeline report — a real
+ isolated speedup that doesn't show up e2e is an expected Amdahl outcome, not a bug.
+@@ -85,6 +82,82 @@ Inputs: `EVAL_DIR`, `MODEL_PATH`, `BACKEND` (sglang|vllm), `GPU_ID`, `WORKLOAD`,
+ verified_isolated_speedup, pct_gpu_time; for a HEAD-op winner also: `op_kind`, `winner_kind`
+ ∈ {env,flag,patch}, `apply_env`, `apply_flags`, `code_patch`, `tuning_artifact`, `parity_note`),
+ `CURRENT_OVERLAY`, `CURRENT_FLAGS`/`CURRENT_ENV`, `CURRENT_THROUGHPUT`, `SKILL_DIR`.
++Optional: `PROFILE_TOPN_JSON` (latest profile, possibly stale), `FORCE_FRESH_AB`, `SPEEDUP_REVIEW`,
++`CAND_OVERLAY_DIR` (the already-built candidate; benchmark it without rebuilding).
++
++### Measurement identity and candidate coverage
++
++Report `measurement_evidence` on every completed A/B, including when recovering an on-disk result.
++Derive it from artifacts; missing evidence stays missing, never invented:
++
++- `candidate_digest`, `reference_digest`: SHA-256 of canonical manifests of the respective deployed
++  overlay/patch/table contents and effective serving configuration (including model identity, TP,
++  memory fraction, flags/env and relevant library/source revisions). Exclude benchmark output/logs
++  from these manifests. Hash content, not just paths. Recompute before reuse or confirmation.
++- `workload_digest`: SHA-256 of the canonical workload IDENTITY manifest: only the fields that decide
++  which requests are served (request set/dataset or generator, seed, ISL/OSL and length range,
++  concurrency, token limits). Build this manifest once from the run's workload and reuse the SAME
++  value in `measurement_evidence` and `affected_gpu_time`; a profile and an A/B of the same workload
++  must have equal digests. Never include profile/trace file hashes, bench script hashes, warmups,
++  request counts or other measurement-protocol fields: they differ between profiling and benchmarking
++  of the same workload, and then the coverage estimate can never be used.
++- `protocol_digest`: SHA-256 of the A/B measurement protocol manifest: bench client and script
++  revision, measurement mode, timed request count, warmups and metric basis. Timed replica count is
++  recorded separately so confirmation can use more samples without changing the protocol.
++- `ref_summary`, `cand_summary`: absolute, immutable paths to the completed benchmark summaries.
++  `measurement_id`: SHA-256 of both summary paths and their contents. Report the actual
++  `ref_replicas` / `cand_replicas`, not the requested count.
++- `fresh_pair`: both legs were independently launched for this A/B (false for a shared/cached ref).
++  `configs_matched`: both use the same serving configuration except the declared candidate change.
++  `workload_matched`: same requests and work contract, with successful response counts and token
++  counts checked; no missing, truncated or degenerate work. Record the detailed checks in the result.
++
++Before returning a cached A/B, inspect `EVAL_DIR/overlay/candidate_*/e2e_validation.json` for a matching
++`integration_result`. Match the original measurement ID and candidate/reference/workload/protocol manifests.
++Return that reviewed result, preserving `speedup_review` and the fresh pair's numbers when present.
++An inconclusive review is still inconclusive after a workflow resume; do not replace it with the old
++raw `accepted` result and restart the same review. New candidate content or a new reference requires
++a new measurement identity.
++
++Preserve `pct_gpu_time` as the selected head's share. Separately report `affected_gpu_time` by mapping
++the actual candidate patch/rebinds to ALL affected reference-profile rows: all selected shape buckets,
++prefill and decode, plus auxiliary kernels removed by the patch. A whole-module rebind can cover many
++rows; a guarded shape-specific replacement only covers its matching buckets. A module import alone
++does not establish that every path changed.
++
++`affected_gpu_time` contains `profile_path`, the patch's `candidate_digest`, the profile's
++`reference_digest` and `workload_digest` (the workload identity digest defined above, computed the
++same way as for the measurement; profile file provenance belongs in `profile_path`, not the digest),
++and `kernels: [{id, pct_gpu_time, isolated_speedup?, removed?}]`. IDs must identify disjoint rows in
++one profile/denominator (device kernel + shape + phase); do not mix module totals with child rows,
++repeat grouped reductions, sum ranks, or mix profiles. Use the CURRENT accepted reference stack.
++Check the profile provenance against the measurement manifests. If the profile is from before an
++accepted change, retain its real old digest or omit coverage; never relabel it as current. If needed
++for diagnosis, collect a separate untimed reference profile; profiling must not contaminate the A/B.
++
++Report measured per-path speedups where available; mark a completely eliminated kernel `removed:true`
++without also charging its removal in another row's speedup. Omit unmeasured per-path speedups. The
++workflow labels a fallback using the head speedup across coverage as `coverage_uniform_estimate`,
++not a measured per-path prediction. Invalid/stale coverage falls back to the advisory head estimate.
++
++### Independent speedup confirmation (`FORCE_FRESH_AB=true`)
++
++This takes precedence over RESUME_AB, REUSE_REF, SHARED_REF_MED, and the ordinary disk-resume rule.
++Keep the exact candidate and current accepted reference; do not rebuild or rewrite the kernel.
++Under the candidate's existing `$CB`, use `speedup_review_<original measurement_id>/ref` and `/cand`
++as new output directories, leaving the original A/B intact. Launch fresh servers for BOTH legs and
++run at least two timed replicas per leg with the run-wide lifecycle. Repeat engagement and the
++configured accuracy/parity gate, comparing accuracy to the TRUE baseline as usual. An already
++completed review in that directory can be returned only after verifying both content manifests,
++workload, protocol, artifact identity and replica counts; it is the same review, not another measurement.
++Never fall back to the original/shared reference or silently reduce this review to one replica.
++
++`SPEEDUP_REVIEW.original_measurement` identifies the original pair. Return the new pair's evidence
++and ordinary measured verdict; the workflow checks distinct artifact identities and matching
++candidate/reference/workload/protocol digests. Reconstruct missing original provenance during ordinary disk
++recovery, before requesting a review; never manufacture a matching identity. Missing provenance or incomplete review is
++inconclusive, not a correctness failure. No additional kernel fix/re-measure loops are authorized
++by this review. The normal final Validate phase remains authoritative.
+ 
+ **ACCURACY GATE (only if `ACCURACY_GATE=gsm8k` is in your inputs; else use the normal parity gate).**
+ For a QUANTIZED kernel, byte-exact greedy parity is the WRONG bar (a within-tolerance kernel rounds
+@@ -308,7 +381,7 @@ unchanged; you just also persist the diagnostics the deep feedback/harness-refin
+    defer, or "leave for later" the candidate leg. The two blocks run within ~30 min back-to-back, so box
+    drift between them is negligible (the box drifts over hours, not minutes). If you want extra drift
+    robustness on a borderline result, defer the authoritative estimate to validation.
+-   **RESUME / finish a cut-off A/B (`RESUME_AB` is set in your inputs, OR a usable
++   **RESUME / finish a cut-off A/B (only when `FORCE_FRESH_AB` is false/unset; `RESUME_AB` is set in your inputs, OR a usable
+    `$CB/ref/bench_summary.json` already exists on disk):** a summary is reusable only when
+    `status=="complete"` and `usable_for_acceptance==true`. When it is usable, do NOT re-run the
+    reference leg — reuse the on-disk aggregate and run ONLY the MISSING candidate block, then gate.
+@@ -364,6 +437,23 @@ Return JSON:
+   "provenance_ok": true,
+   "isolated_speedup": 0.0,
+   "pct_gpu_time": 0.0,
++  "affected_gpu_time": {
++    "profile_path": "<current reference profile, omit this object when unavailable>",
++    "candidate_digest": "<candidate manifest SHA-256>",
++    "reference_digest": "<profile reference manifest SHA-256>",
++    "workload_digest": "<workload identity manifest SHA-256, same definition as measurement_evidence>",
++    "kernels": [{"id": "<disjoint kernel/shape/phase row>", "pct_gpu_time": 0.0}]
++  },
++  "measurement_evidence": {
++    "measurement_id": "<pair artifact SHA-256>",
++    "candidate_digest": "<candidate manifest SHA-256>",
++    "reference_digest": "<reference manifest SHA-256>",
++    "workload_digest": "<workload identity manifest SHA-256>",
++    "protocol_digest": "<measurement protocol manifest SHA-256>",
++    "ref_summary": "<absolute path>", "cand_summary": "<absolute path>",
++    "ref_replicas": 1, "cand_replicas": 1,
++    "fresh_pair": true, "configs_matched": true, "workload_matched": true
++  },
+   "e2e_throughput_tok_s": 0.0,
+   "e2e_delta_pct": 0.0,
+   "ref_med": 0.0,
+diff --git a/e2e_workflow/scripts/test_speedup_review.js b/e2e_workflow/scripts/test_speedup_review.js
+new file mode 100644
+index 000000000..7b6060bab
+--- /dev/null
++++ b/e2e_workflow/scripts/test_speedup_review.js
+@@ -0,0 +1,253 @@
++// CPU-only regression for #522. Execute the shipped workflow helpers and integration wrapper.
++// Run: node --test e2e_workflow/scripts/test_speedup_review.js
++const assert = require('node:assert/strict');
++const { test } = require('node:test');
++const fs = require('node:fs');
++const path = require('node:path');
++const src = fs.readFileSync(path.join(__dirname, '..', 'e2e_workflow.js'), 'utf8');
++const core = src.slice(src.indexOf('const CORRECTNESS_REJECT_RX ='), src.indexOf('// ---- DEEP MODE'));
++const wrapper = src.slice(src.indexOf('const SPEEDUP_REVIEW_RESULTS ='), src.indexOf('// Lightweight SURGICAL FIX'));
++const abDone = src.match(/^const abDone = .*;$/m)[0];
++
++const measurement = (name, extra = {}) => ({
++  measurement_id: name, candidate_digest: 'candidate-content', reference_digest: 'h0-content',
++  workload_digest: 'workload', ref_summary: `/bench/${name}/ref.json`, cand_summary: `/bench/${name}/cand.json`,
++  ref_replicas: 2, cand_replicas: 2, fresh_pair: true, configs_matched: true, workload_matched: true, ...extra,
++});
++const candidate = (extra = {}) => ({
++  short_name: 'blockscale', gate: 'accepted', ab_complete: true, output_parity: 'pass', parity_kind: 'accuracy',
++  pct_gpu_time: 7.18, isolated_speedup: 1.4596, ref_med: 335.171, cand_med: 361.051,
++  e2e_throughput_tok_s: 361.051, e2e_delta_pct: 7.72, accepted_overlay: '/overlay/h1',
++  measurement_evidence: measurement('original'), ...extra,
++});
++const inputs = {
++  KERNEL_RESULT: { pct_gpu_time: 7.18, verified_isolated_speedup: 1.4596, code_patch: '/h1.diff' },
++  CURRENT_OVERLAY: '/overlay/h0', CURRENT_FLAGS: '--tp 8', CURRENT_ENV: '', WORKLOAD: { isl: 8192, osl: 1024, conc: 4 },
++  REUSE_REF: true, SHARED_REF_MED: 335.171, RESUME_AB: true,
++};
++const coverage = (rows = [7.18, 3.47, 1.37]) => ({
++  candidate_digest: 'candidate-content',
++  profile_path: '/profile/h0.json', reference_digest: 'h0-content', workload_digest: 'workload',
++  kernels: rows.map((pct, i) => ({ id: `path-${i}`, pct_gpu_time: pct })),
++});
++
++function harness(original = candidate(), fresh = candidate({ measurement_evidence: measurement('confirmation') }), closed = false) {
++  const calls = [], checkpoints = [];
++  const safeAgent = async (request, opts, tries) => {
++    calls.push({ ...request, opts, tries });
++    return structuredClone(request.inputs.FORCE_FRESH_AB ? fresh : original);
++  };
++  const api = new Function('safeAgent', 'persistE2EValidationCheckpoint', 'searchClosed', `
++    const A = {}, ACCURACY_GATE = 'gsm8k', FIXABLE_REJECT_RX = /no_engagement|signature_mismatch/;
++    const SEARCH_REPLICAS = 1, ACCURACY_INPUTS = {}, MEASUREMENT_MODE = 'warm_server';
++    const EVAL_DIR = '/eval', WORKLOAD = {}, INTEGRATE_SCHEMA = {}, profile = {profile_topN_json:'/profile/h0.json'};
++    const AB_FINISH_RETRIES = 3, log = () => {}, tuningIntegrateInputs = () => ({});
++    const roleAgent = (role, phase, intro, inputs) => ({role, phase, intro, inputs});
++    const adoptAbandonedVerdict = async r => r;
++    ${core}\n${abDone}\n${wrapper}
++    return { speedupEstimate, speedupNeedsReview, confirmedSpeedup, integAccepted, gateRejectReason,
++      rejectClass, reviewSpeedup, runIntegrateBothLegs };
++  `)(safeAgent, async (p, value) => checkpoints.push({ path: p, ...value }), () => closed);
++  return { ...api, calls, checkpoints };
++}
++
++test('workflow remains syntactically valid in its async workflow wrapper', () => {
++  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
++  assert.doesNotThrow(() => new AsyncFunction(src.replace('export const meta', 'const meta')));
++});
++
++test('#522 whole-module coverage includes the second shape and prefill without changing the head', async () => {
++  const c = candidate({ affected_gpu_time: coverage() });
++  const h = harness(c);
++  const estimate = h.speedupEstimate(7.18, 1.4596, c);
++  assert.ok(Math.abs(estimate.pct_gpu_time - 12.02) < 1e-9);
++  assert.ok(Math.abs(estimate.estimate_pct - 3.9337544649) < 1e-8);
++  assert.equal(estimate.source, 'coverage_uniform_estimate');
++  assert.equal(c.pct_gpu_time, 7.18);
++  const result = await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
++  assert.equal(h.integAccepted(result, 7.18, 1.4596), true);
++  assert.equal(h.calls.length, 1);
++  assert.equal(h.checkpoints[0].committed, true);
++  assert.equal(h.calls[0].inputs.PROFILE_TOPN_JSON, '/profile/h0.json');
++});
++
++test('#524 feedback: profile and A/B of the same workload share one workload identity digest', () => {
++  // Qwen3.5 run: the role used to ask for a profile-manifest digest (with profile/trace file hashes)
++  // in coverage and a bench-protocol digest in the measurement, so coverage could never match.
++  const role = fs.readFileSync(path.join(__dirname, '..', 'roles', 'e2e_integrator.md'), 'utf8');
++  assert.doesNotMatch(role, /profile workload manifest/);
++  assert.match(role, /reuse the SAME\s+value in `measurement_evidence` and `affected_gpu_time`/);
++  const sha = (o) => require('node:crypto').createHash('sha256').update(JSON.stringify(o)).digest('hex');
++  const identity = { dataset: 'random', seed: 0, isl: 8192, osl: 1024, random_range_ratio: 0.8, conc: 4 };
++  const workload = sha(identity);
++  const evidence = measurement('original', { workload_digest: workload, protocol_digest: sha({
++    bench_client: 'inferencex', measurement_mode: 'warm_server', num_prompts: 40, num_warmups: 8,
++    metric_basis: 'aggregate_output_tok_s' }) });
++  const c = candidate({ pct_gpu_time: 6.49, isolated_speedup: 1.7746, e2e_delta_pct: 6.2,
++    measurement_evidence: evidence, affected_gpu_time: { ...coverage([6.49, 2.84, 2.84]), workload_digest: workload } });
++  const h = harness();
++  const estimate = h.speedupEstimate(6.49, 1.7746, c);
++  assert.equal(estimate.source, 'coverage_uniform_estimate');
++  assert.ok(Math.abs(estimate.pct_gpu_time - 12.17) < 1e-9);
++  assert.ok(Math.abs(estimate.estimate_pct - 5.61) < 0.01);
++  assert.equal(h.speedupNeedsReview(6.49, 1.7746, c), false, '+6.2% is within twice the coverage estimate');
++  const headOnly = { ...c, affected_gpu_time: undefined };
++  assert.equal(h.speedupNeedsReview(6.49, 1.7746, headOnly), true, 'the head-only estimate would review');
++});
++
++test('per-path estimate includes a removed reduce and uses measured speedups, including a slowdown', () => {
++  const h = harness();
++  const rows = [
++    { id: 'decode-main', pct_gpu_time: 4.53, isolated_speedup: 1.28 },
++    { id: 'reduce', pct_gpu_time: 2.65, removed: true },
++    { id: 'other-shape', pct_gpu_time: 3.47, isolated_speedup: 0.9 },
++    { id: 'prefill', pct_gpu_time: 1.37, isolated_speedup: 1.94 },
++  ];
++  const c = candidate({ affected_gpu_time: { ...coverage(), kernels: rows } });
++  const saved = .0453 * (1 - 1 / 1.28) + .0265 + .0347 * (1 - 1 / .9) + .0137 * (1 - 1 / 1.94);
++  const estimate = h.speedupEstimate(7.18, 1.4596, c);
++  assert.equal(estimate.source, 'coverage_per_path');
++  assert.ok(Math.abs(estimate.estimate_pct - (1 / (1 - saved) - 1) * 100) < 1e-9);
++  c.affected_gpu_time.kernels.push({ ...rows[1] });
++  assert.deepEqual(h.speedupEstimate(7.18, 1.4596, c), estimate, 'duplicate reduction is counted once');
++});
++
++test('stale, conflicting or invalid coverage falls back to an explicitly labelled head estimate', () => {
++  const h = harness();
++  for (const cov of [
++    { ...coverage(), candidate_digest: 'another-overlay' },
++    { ...coverage(), reference_digest: 'pre-h0-content' },
++    { ...coverage(), workload_digest: 'different-workload' },
++    coverage([60, 60]), coverage([-1]), coverage([NaN]),
++    { ...coverage(), kernels: [{ id: 'same', pct_gpu_time: 7 }, { id: 'same', pct_gpu_time: 8 }] },
++  ]) {
++    assert.equal(h.speedupEstimate(7.18, 1.4596, candidate({ affected_gpu_time: cov })).source, 'head_estimate');
++  }
++});
++
++test('a confirmed +7.72% win is banked despite the 2.31% head estimate; all sites use the wrapper', async () => {
++  const h = harness();
++  const result = await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
++  assert.equal(result.speedup_review.status, 'confirmed');
++  assert.equal(h.integAccepted(result, 7.18, 1.4596), true);
++  assert.equal(h.calls.length, 2);
++  const review = h.calls[1];
++  assert.equal(review.tries, 1);
++  assert.equal(review.inputs.FORCE_FRESH_AB, true);
++  assert.equal(review.inputs.RESUME_AB, false);
++  assert.equal(review.inputs.REUSE_REF, false);
++  assert.equal('SHARED_REF_MED' in review.inputs, false);
++  assert.equal(review.inputs.REPLICAS, 2);
++  assert.equal(review.inputs.CAND_OVERLAY_DIR, '/overlay/h1');
++  assert.equal(h.checkpoints[0].committed, true);
++  assert.deepEqual(h.checkpoints[0].integration_result, result);
++  assert.match(h.checkpoints[0].path, /candidate_blockscale_confirmation\//);
++  // Deep mode used to call the agent directly, bypassing the common review/checkpoint path.
++  assert.match(src, /deepInputs, `integrate \$\{c\.uid\} g\$\{e2eGateCount\}`, 'HeadKernel'/);
++  assert.doesNotMatch(src, /isImplausibleSpeedup|implausible2/);
++});
++
++test('equal performance numbers from independent artifacts confirm; repeating the old A/B never does', async () => {
++  const h = harness(candidate(), candidate());
++  const first = await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
++  const second = await h.runIntegrateBothLegs('test', inputs, 'h1 finish', 'Finalize-gate');
++  assert.equal(first.speedup_review.status, 'inconclusive');
++  assert.deepEqual(second, first);
++  assert.equal(h.calls.filter(c => c.inputs.FORCE_FRESH_AB).length, 1);
++  assert.equal(h.integAccepted(first, 7.18, 1.4596), false);
++  assert.equal(h.rejectClass(h.gateRejectReason(first, 7.18, 1.4596)), '');
++  assert.equal(h.checkpoints[0].committed, false);
++  assert.equal(h.checkpoints[0].validation_status, 'speedup_review_pending');
++});
++
++test('changed candidate/baseline/workload, reused legs and insufficient samples cannot confirm', async () => {
++  for (const extra of [
++    { candidate_digest: 'new-patch' }, { reference_digest: 'new-stack' }, { workload_digest: 'other' },
++    { protocol_digest: 'different-bench-protocol' }, { ref_summary: '/bench/original/ref.json' }, { cand_summary: '/bench/original/cand.json' },
++    { fresh_pair: false }, { configs_matched: false }, { workload_matched: false },
++    { ref_replicas: 1 }, { cand_replicas: 1 }, { ref_replicas: '2' }, { cand_replicas: 2.5 },
++  ]) {
++    const h = harness(candidate(), candidate({ measurement_evidence: measurement('confirmation', extra) }));
++    const result = await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
++    assert.equal(result.speedup_review.status, 'inconclusive', JSON.stringify(extra));
++    assert.equal(h.integAccepted(result, 7.18, 1.4596), false);
++  }
++});
++
++test('confirmed evidence already on disk avoids another review', async () => {
++  const c = candidate({ measurement_evidence: measurement('confirmation'),
++    speedup_review: { status: 'confirmed', original_measurement: measurement('original') } });
++  const h = harness(c);
++  assert.equal(h.integAccepted(await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel'), 7.18, 1.4596), true);
++  assert.equal(h.calls.length, 1);
++});
++
++test('a resumed inconclusive review is not re-run and backend candidates keep distinct checkpoints', async () => {
++  const pending = candidate({ speedup_review: { status: 'inconclusive', original_measurement: measurement('original') } });
++  const resumed = harness(pending);
++  const result = await resumed.runIntegrateBothLegs('resume', inputs, 'h1', 'Finalize-gate');
++  assert.equal(result.speedup_review.status, 'inconclusive');
++  assert.equal(resumed.calls.length, 1);
++  const original = candidate(), fresh = candidate({ measurement_evidence: measurement('confirmation') });
++  const h = harness(original, fresh);
++  await h.runIntegrateBothLegs('test', inputs, 'h1:triton', 'HeadKernel');
++  original.measurement_evidence = measurement('hip-original', { candidate_digest: 'hip' });
++  fresh.measurement_evidence = measurement('hip-confirmation', { candidate_digest: 'hip' });
++  await h.runIntegrateBothLegs('test', inputs, 'h1:hip', 'HeadKernel');
++  assert.notEqual(h.checkpoints[0].path, h.checkpoints[1].path);
++  assert.equal(h.checkpoints[0].integration_result.speedup_review.original_measurement.candidate_digest, 'candidate-content');
++  assert.equal(h.checkpoints[1].integration_result.speedup_review.original_measurement.candidate_digest, 'hip');
++});
++
++test('real accuracy failures and measured throughput regressions remain rejected', async () => {
++  for (const fail of [
++    { gate: 'rejected', output_parity: 'fail', reason: 'accuracy_regression' },
++    { gate: 'rejected', e2e_delta_pct: -1, reason: 'throughput_regression' },
++  ]) {
++    const h = harness(candidate(), candidate({ ...fail, measurement_evidence: measurement('confirmation') }));
++    const result = await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
++    assert.equal(result.gate, 'rejected');
++    assert.equal(h.integAccepted(result, 7.18, 1.4596), false);
++    assert.equal(h.checkpoints[0].committed, false);
++    assert.equal(h.rejectClass(h.gateRejectReason(result, 7.18, 1.4596)), fail.output_parity === 'fail' ? 'correctness' : '');
++  }
++});
++
++test('timeouts, missing provenance and the final reserve stop review without a corrective loop', async () => {
++  for (const [original, fresh, closed] of [
++    [candidate(), null, false], [candidate(), candidate({ gate: 'incomplete', ab_complete: false }), false],
++    [candidate(), candidate({ ab_complete: undefined, measurement_evidence: measurement('confirmation') }), false],
++    [candidate(), candidate({ gate: 'stack', measurement_evidence: measurement('confirmation') }), false],
++    [candidate({ measurement_evidence: undefined }), candidate(), false], [candidate(), candidate(), true],
++  ]) {
++    const h = harness(original, fresh, closed);
++    const result = await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
++    assert.equal(result.speedup_review.status, 'inconclusive');
++    assert.equal(h.rejectClass(h.gateRejectReason(result, 7.18, 1.4596)), '');
++    assert.ok(h.calls.length <= 2);
++    if (!original.measurement_evidence || closed) assert.equal(h.calls.length, 1);
++  }
++});
++
++test('a claimed confirmation still requires an explicit completed correctness gate', () => {
++  const h = harness();
++  for (const extra of [{ output_parity: undefined }, { parity_kind: 'none' }, { ab_complete: undefined }]) {
++    const c = candidate({ measurement_evidence: measurement('confirmation'), ...extra,
++      speedup_review: { status: 'confirmed', original_measurement: measurement('original') } });
++    assert.equal(h.confirmedSpeedup(c), false);
++  }
++});
++
++test('ordinary and byte-exact wins retain their acceptance behavior', async () => {
++  for (const c of [candidate({ e2e_delta_pct: 2 }), candidate({ parity_kind: 'byte_exact' })]) {
++    const h = harness(c);
++    const result = await h.runIntegrateBothLegs('test', inputs, 'h1', 'HeadKernel');
++    assert.equal(h.integAccepted(result, 7.18, 1.4596), true);
++    assert.equal(h.calls.length, 1);
++  }
++  const h = harness();
++  assert.equal(h.rejectClass('implausible_speedup: likely corruption'), '');
++  assert.equal(h.rejectClass('speedup_review_inconclusive: configuration mismatch'), '');
++  assert.equal(h.rejectClass('signature_mismatch'), 'integration');
++  assert.equal(h.rejectClass('accuracy_regression'), 'correctness');
++});
+diff --git a/interface/run_e2e.py b/interface/run_e2e.py
+index 873d8b222..afb8f7593 100644
+--- a/interface/run_e2e.py
++++ b/interface/run_e2e.py
+@@ -81,8 +81,8 @@
+ # ratio was computed against a different pair than the one we report.
+ SPEEDUP_SELF_CONSISTENCY_TOL = 1e-3
+ 
+-# Headroom over an op's theoretical Amdahl ceiling before a measured e2e delta
+-# is treated as corruption rather than a win. Mirrors
++# Headroom over an Amdahl estimate before an accuracy-gated win needs an
++# independent measurement review. Exceeding it is not a correctness failure. Mirrors
+ # IMPLAUSIBLE_SPEEDUP_MARGIN in e2e_workflow.js (1.0 => must exceed 2x the
+ # ceiling); both sides MUST agree or the recovery path banks what the live path
+ # refuses, so this is the SINGLE source of truth: map_args() forwards it to the
+@@ -6196,7 +6196,7 @@ def _ir_float(ir: dict, *keys: str) -> float:
+ 
+ 
+ def _amdahl_ceiling_pct(pct_gpu_time: float, isolated: float) -> float:
+-    """Largest e2e gain an op can produce, from its GPU-time share and isolated speedup.
++    """Advisory e2e estimate from a GPU-time share and isolated speedup.
+ 
+     Port of ``amdahlCeilingPct`` in e2e_workflow.js. ``inf`` when either input is
+     missing, so an unknown profile never flags anything (fail-open).
+@@ -6209,18 +6209,8 @@ def _amdahl_ceiling_pct(pct_gpu_time: float, isolated: float) -> float:
+ 
+ 
+ def _parity_is_soft(ir: dict) -> bool:
+-    """Whether the candidate's acceptance rests on a SAMPLED accuracy probe.
+-
+-    Byte-exact parity is a hard correctness guarantee, so a speedup above the
+-    Amdahl ceiling is believed. A sampled accuracy gate can be squeaked past by
+-    degenerate output, so an impossible speedup there is treated as corruption.
+-
+-    Diverges from ``parityIsSoft`` in e2e_workflow.js in one place: the JS falls
+-    back to the run's ``accuracy_gate`` arg when the label is absent or
+-    unrecognized, and that arg is not in any on-disk artifact. An unlabelled
+-    candidate is therefore treated as soft — the guard still needs the delta to
+-    exceed twice the ceiling before it fires, and a missing profile makes the
+-    ceiling infinite, so this cannot drop a win on schema grounds alone.
++    """Accuracy-gated results can need review. Legacy unlabelled disk results
++    are treated as soft because the workflow's accuracy_gate arg is unavailable.
+     """
+     kind = str(_ir_get(ir, "parity_kind") or "").strip().lower()
+     if kind in ("byte_exact", "none"):
+@@ -6228,8 +6218,95 @@ def _parity_is_soft(ir: dict) -> bool:
+     return True
+ 
+ 
+-def _is_implausible_speedup(ir: dict, delta_pct: float, ceiling_pct: float) -> bool:
+-    """A gain so far past the op's ceiling that it reads as corruption, not a win."""
++def _speedup_estimate(ir: dict) -> dict:
++    """Mirror speedupEstimate: disjoint current-reference coverage, else head fallback."""
++    isolated = _ir_float(ir, "isolated_speedup")
++    pct = _ir_float(ir, "pct_gpu_time")
++    fallback = {"pct_gpu_time": pct, "estimate_pct": _amdahl_ceiling_pct(pct, isolated),
++                "source": "head_estimate"}
++    coverage = ir.get("affected_gpu_time") or {}
++    measured = ir.get("measurement_evidence") or {}
++    if not isinstance(coverage, dict) or not isinstance(measured, dict):
++        return fallback
++    rows = coverage.get("kernels")
++    if (not coverage.get("profile_path") or not measured.get("candidate_digest")
++            or coverage.get("candidate_digest") != measured["candidate_digest"]
++            or not measured.get("reference_digest")
++            or not measured.get("workload_digest")
++            or coverage.get("reference_digest") != measured["reference_digest"]
++            or coverage.get("workload_digest") != measured["workload_digest"]
++            or not isinstance(rows, list) or not rows):
++        return fallback
++    seen = {}
++    pct, saved, uniform = 0.0, 0.0, False
++    for row in rows:
++        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
++            return fallback
++        share = row.get("pct_gpu_time")
++        if (type(share) not in (int, float) or not math.isfinite(share)
++                or not 0 <= share <= 100):
++            return fallback
++        signature = (share, row.get("isolated_speedup"), row.get("removed") is True)
++        if row["id"] in seen:
++            if seen[row["id"]] != signature:
++                return fallback
++            continue
++        seen[row["id"]] = signature
++        pct += share
++        if row.get("removed") is True:
++            saved += share / 100
++        else:
++            speedup = row.get("isolated_speedup")
++            if type(speedup) not in (int, float) or not math.isfinite(speedup) or speedup <= 0:
++                speedup, uniform = isolated, True
++            if not math.isfinite(speedup) or speedup <= 0:
++                return fallback
++            saved += share / 100 * (1 - 1 / speedup)
++    if not 0 < pct <= 100 + 1e-9:
++        return fallback
++    return {"pct_gpu_time": pct,
++            "estimate_pct": math.inf if saved >= 1 else (1 / (1 - saved) - 1) * 100,
++            "source": "coverage_uniform_estimate" if uniform else "coverage_per_path"}
++
++
++def _confirmation_evidence_matches(ir: dict) -> bool:
++    """A distinct pair with the same candidate, baseline and workload confirms a win."""
++    review = ir.get("speedup_review") or {}
++    if not isinstance(review, dict) or review.get("status") != "confirmed":
++        return False
++    before = review.get("original_measurement") or {}
++    after = ir.get("measurement_evidence") or {}
++    if not isinstance(before, dict) or not isinstance(after, dict):
++        return False
++    paths = [before.get("ref_summary"), before.get("cand_summary"),
++             after.get("ref_summary"), after.get("cand_summary")]
++    if (not before.get("measurement_id") or not after.get("measurement_id")
++            or before["measurement_id"] == after["measurement_id"]
++            or not all(isinstance(p, str) and p for p in paths) or len(set(paths)) != 4
++            or after.get("fresh_pair") is not True or after.get("configs_matched") is not True
++            or after.get("workload_matched") is not True):
++        return False
++    for key in ("ref_replicas", "cand_replicas"):
++        value = after.get(key)
++        if (type(value) not in (int, float) or not math.isfinite(value)
++                or value < 2 or value != int(value)):
++            return False
++    # protocol_digest is newer than the other identities: older evidence may omit it on both sides.
++    if ((before.get("protocol_digest") or after.get("protocol_digest"))
++            and before.get("protocol_digest") != after.get("protocol_digest")):
++        return False
++    return all(isinstance(before.get(key), str) and before[key] and before[key] == after.get(key)
++               for key in ("candidate_digest", "reference_digest", "workload_digest"))
++
++
++def _confirmed_speedup(ir: dict) -> bool:
++    return (ir.get("gate") == "accepted" and ir.get("ab_complete") is True
++            and ir.get("output_parity") == "pass" and ir.get("parity_kind") in ("accuracy", "byte_exact")
++            and _confirmation_evidence_matches(ir))
++
++
++def _speedup_needs_review(ir: dict, delta_pct: float, ceiling_pct: float) -> bool:
++    """Review trigger only; independently confirmed gains can exceed it."""
+     if not _parity_is_soft(ir) or not math.isfinite(ceiling_pct):
+         return False
+     return delta_pct > ceiling_pct * (1.0 + IMPLAUSIBLE_SPEEDUP_MARGIN) + 1e-9
+@@ -6254,19 +6331,43 @@ def _integrate_candidates(eval_dir: Path) -> list[dict]:
+     for base in (eval_dir / "overlay", eval_dir / "final" / "overlay"):
+         if not base.is_dir():
+             continue
++        # The workflow checkpoint records the final reviewed result, after the agent's raw A/B.
++        # Match the immutable original measurement ID before applying it to a disk candidate.
++        reviewed = {}
++        for checkpoint in sorted(base.glob("candidate_*/e2e_validation.json")):
++            result = (_read_json(checkpoint) or {}).get("integration_result") or {}
++            if not isinstance(result, dict):
++                continue
++            review = result.get("speedup_review") or {}
++            if not isinstance(review, dict):
++                continue
++            original = review.get("original_measurement") or {}
++            if isinstance(original, dict) and isinstance(original.get("measurement_id"), str):
++                reviewed[original["measurement_id"]] = result
+         for cand in sorted(base.glob("cand_*")):
+             if cand.name in seen:
+                 continue
+             ir = _read_json(cand / "integrate_result.json")
+             if not ir:
+                 continue
++            original = ir.get("measurement_evidence") or {}
++            if not isinstance(original, dict):
++                original = {}
++            result = reviewed.get(original.get("measurement_id"))
++            if result and (result["speedup_review"].get("original_measurement") == original):
++                ir = {**ir, **result}
+             seen.add(cand.name)
+             gate = str(ir.get("gate") or "")
+             delta_pct = _ir_float(ir, "e2e_delta_pct", "delta_pct")
+-            ceiling_pct = _amdahl_ceiling_pct(
+-                _ir_float(ir, "pct_gpu_time"), _ir_float(ir, "isolated_speedup")
+-            )
+-            implausible = _is_implausible_speedup(ir, delta_pct, ceiling_pct)
++            estimate = _speedup_estimate(ir)
++            ceiling_pct = estimate["estimate_pct"]
++            needs_review = _speedup_needs_review(ir, delta_pct, ceiling_pct)
++            review = ir.get("speedup_review") or {}
++            if not isinstance(review, dict):
++                review = {}
++            review_pending = (review.get("status") in
++                              ("pending", "inconclusive", "rejected")
++                              or (needs_review and not _confirmed_speedup(ir)))
+             parity = str(ir.get("output_parity") or "")
+             separated = ir.get("separated")
+             if separated is None:
+@@ -6285,7 +6386,9 @@ def _integrate_candidates(eval_dir: Path) -> list[dict]:
+                 "amdahl_ceiling_pct": (
+                     round(ceiling_pct, 3) if math.isfinite(ceiling_pct) else None
+                 ),
+-                "implausible": implausible,
++                "speedup_estimate": {**estimate, "estimate_pct": (
++                    ceiling_pct if math.isfinite(ceiling_pct) else None)},
++                "speedup_review_pending": review_pending,
+                 "output_parity": parity or None,
+                 "separated": separated,
+                 # winner_kind in {"env","config","flags"} => config-only.
+@@ -6295,7 +6398,7 @@ def _integrate_candidates(eval_dir: Path) -> list[dict]:
+                     and delta_pct > 0.0
+                     and parity != "fail"
+                     and ir.get("ab_complete") is not False
+-                    and not implausible
++                    and not review_pending
+                 ),
+             })
+     return records
+@@ -6586,8 +6689,9 @@ def _recover_best_intermediate_win(eval_dir: Path) -> dict | None:
+             ),
+             "distributions_separated": best["separated"],
+             "stack_only": stack_only or None,
+-            "excluded_as_implausible": [
+-                c["short_name"] for c in candidates if c["implausible"]
++            "speedup_estimate": best["speedup_estimate"],
++            "awaiting_speedup_review": [
++                c["short_name"] for c in candidates if c["speedup_review_pending"]
+             ] or None,
+         },
+     }
+diff --git a/interface/test_run_e2e_margin.py b/interface/test_run_e2e_margin.py
+index 5bd496c3d..4db4ff41f 100644
+--- a/interface/test_run_e2e_margin.py
++++ b/interface/test_run_e2e_margin.py
+@@ -3,9 +3,9 @@
+ 
+ Run:  python3 -m pytest interface/test_run_e2e_margin.py -q
+ 
+-The JS live-path guard (``A.implausible_speedup_margin`` in e2e_workflow.js) and
+-THIS runner's recovery path must apply the SAME margin, or a speedup the live
+-path accepts could be re-flagged (or vice versa) on recovery. run_e2e.py makes
++The JS live-path review trigger (``A.implausible_speedup_margin`` in e2e_workflow.js)
++and THIS runner's recovery path must apply the SAME margin. Independent confirmation
++can clear the review even above this threshold; it is not a correctness verdict. run_e2e.py makes
+ the Python constant the single source of truth: it validates the env-overridable
+ value (finite, non-negative -- an accepted nan/inf/negative would silently
+ disable the guard) and ``map_args`` forwards THAT value to the workflow
+diff --git a/interface/test_run_e2e_recovery.py b/interface/test_run_e2e_recovery.py
+index 692f7c33f..8f9740faf 100644
+--- a/interface/test_run_e2e_recovery.py
++++ b/interface/test_run_e2e_recovery.py
+@@ -257,10 +257,9 @@ def test_a_stack_only_salvage_is_reported_as_provisional(tmp_path):
+     assert out["validation_evidence"]["recovery"]["selected"] == "gemm1"
+ 
+ 
+-def test_a_speedup_far_past_the_amdahl_ceiling_is_not_salvaged(tmp_path):
+-    """The live path refuses to bank a soft-gated candidate whose delta exceeds
+-    twice its theoretical ceiling (corruption doing less work looks like a win).
+-    Recovery must not be a way around that check."""
++def test_a_surprising_speedup_without_confirmation_stays_pending_on_recovery(tmp_path):
++    """Recovery cannot run the independent review; it must preserve a pending win
++    rather than bypass the live review or classify it as incorrect output."""
+     eval_dir = tmp_path / "e2e_implausible"
+     # 25.5% GPU time at 1.0338x isolated caps the e2e gain at ~0.84%.
+     _candidate(eval_dir, "corrupt", parity_kind="accuracy", pct_gpu_time=25.5,
+@@ -268,6 +267,122 @@ def test_a_speedup_far_past_the_amdahl_ceiling_is_not_salvaged(tmp_path):
+                ref_med=9216.263, cand_med=9395.961, e2e_throughput_tok_s=9395.961)
+ 
+     assert rx._recover_best_intermediate_win(eval_dir) is None
++    record = rx._integrate_candidates(eval_dir)[0]
++    assert record["speedup_review_pending"] is True
++    assert record["output_parity"] == "pass"
++
++
++def _measurement(name, **extra):
++    return {
++        "measurement_id": name, "candidate_digest": "candidate-content",
++        "reference_digest": "h0-content", "workload_digest": "workload",
++        "ref_summary": f"/bench/{name}/ref.json", "cand_summary": f"/bench/{name}/cand.json",
++        "ref_replicas": 2, "cand_replicas": 2, "fresh_pair": True,
++        "configs_matched": True, "workload_matched": True, **extra,
++    }
++
++
++def _issue522_candidate(eval_dir, **extra):
++    return _candidate(eval_dir, "h1", **{
++        "parity_kind": "accuracy", "pct_gpu_time": 7.18, "isolated_speedup": 1.4596,
++        "e2e_delta_pct": 7.72, "ref_med": 335.171, "cand_med": 361.051,
++        "e2e_throughput_tok_s": 361.051, "measurement_evidence": _measurement("original"), **extra,
++    })
++
++
++def test_issue522_recovery_uses_full_module_coverage(tmp_path):
++    eval_dir = tmp_path / "e2e_coverage"
++    _issue522_candidate(eval_dir, affected_gpu_time={
++        "candidate_digest": "candidate-content",
++        "profile_path": "/profile/h0.json", "reference_digest": "h0-content", "workload_digest": "workload",
++        "kernels": [{"id": name, "pct_gpu_time": pct} for name, pct in
++                    (("decode_in", 7.18), ("decode_out", 3.47), ("prefill", 1.37))],
++    })
++    wf = rx._recover_best_intermediate_win(eval_dir)
++    assert wf["final_throughput_tok_s"] == pytest.approx(361.051)
++    estimate = wf["recovery_evidence"]["speedup_estimate"]
++    assert estimate["pct_gpu_time"] == pytest.approx(12.02)
++    assert estimate["estimate_pct"] == pytest.approx(3.9337544649)
++    assert estimate["source"] == "coverage_uniform_estimate"
++
++
++def test_profile_and_measurement_share_workload_identity_digest():
++    # #524 feedback: a different bench protocol must not hide coverage of the same workload.
++    ir = {"pct_gpu_time": 6.49, "isolated_speedup": 1.7746,
++          "measurement_evidence": _measurement("original", protocol_digest="inferencex-warm-40x8"),
++          "affected_gpu_time": {
++              "candidate_digest": "candidate-content",
++              "profile_path": "/profile/h0.json", "reference_digest": "h0-content", "workload_digest": "workload",
++              "kernels": [{"id": name, "pct_gpu_time": pct} for name, pct in
++                          (("e01", 6.49), ("router_gemv", 2.84), ("sort", 2.84))],
++          }}
++    estimate = rx._speedup_estimate(ir)
++    assert estimate["source"] == "coverage_uniform_estimate"
++    assert estimate["pct_gpu_time"] == pytest.approx(12.17)
++    assert estimate["estimate_pct"] == pytest.approx(5.61, abs=0.01)
++    assert not rx._speedup_needs_review(ir, 6.2, estimate["estimate_pct"])
++
++
++def test_per_path_coverage_counts_removed_reduce_once(tmp_path):
++    rows = [{"id": "gemm", "pct_gpu_time": 7.18, "isolated_speedup": 1.28},
++            {"id": "reduce", "pct_gpu_time": 2.65, "removed": True},
++            {"id": "prefill", "pct_gpu_time": 1.37, "isolated_speedup": 1.94}]
++    ir = {"pct_gpu_time": 7.18, "isolated_speedup": 1.4596,
++          "measurement_evidence": _measurement("original"), "affected_gpu_time": {
++              "candidate_digest": "candidate-content",
++              "profile_path": "/profile/h0.json", "reference_digest": "h0-content", "workload_digest": "workload",
++              "kernels": rows + [dict(rows[1])],
++          }}
++    estimate = rx._speedup_estimate(ir)
++    saved = .0718 * (1 - 1 / 1.28) + .0265 + .0137 * (1 - 1 / 1.94)
++    assert estimate["estimate_pct"] == pytest.approx((1 / (1 - saved) - 1) * 100)
++    assert estimate["source"] == "coverage_per_path"
++    ir["affected_gpu_time"]["reference_digest"] = "pre-h0"
++    assert rx._speedup_estimate(ir)["source"] == "head_estimate"
++    ir["affected_gpu_time"]["reference_digest"] = "h0-content"
++    ir["affected_gpu_time"]["kernels"][-1]["pct_gpu_time"] = 3
++    assert rx._speedup_estimate(ir)["source"] == "head_estimate"
++
++
++def test_confirmed_speedup_is_recovered_above_the_head_estimate(tmp_path):
++    eval_dir = tmp_path / "e2e_confirmed"
++    _issue522_candidate(eval_dir, measurement_evidence=_measurement("confirmation"),
++                        speedup_review={"status": "confirmed", "original_measurement": _measurement("original")})
++    wf = rx._recover_best_intermediate_win(eval_dir)
++    assert wf["final_throughput_tok_s"] == pytest.approx(361.051)
++    assert wf["recovery_evidence"]["awaiting_speedup_review"] is None
++
++
++@pytest.mark.parametrize("changed", [
++    {"candidate_digest": "new-patch"}, {"reference_digest": "new-stack"}, {"workload_digest": "new-workload"},
++    {"protocol_digest": "different-bench-protocol"}, {"measurement_id": "original"}, {"ref_summary": "/bench/original/ref.json"},
++    {"ref_replicas": 1}, {"cand_replicas": 1}, {"ref_replicas": "2"}, {"cand_replicas": 2.5},
++    {"fresh_pair": False}, {"configs_matched": False}, {"workload_matched": False},
++])
++def test_recovery_cannot_confirm_changed_or_cached_evidence(tmp_path, changed):
++    eval_dir = tmp_path / "e2e_unconfirmed"
++    _issue522_candidate(eval_dir, measurement_evidence=_measurement("confirmation", **changed),
++                        speedup_review={"status": "confirmed", "original_measurement": _measurement("original")})
++    assert rx._recover_best_intermediate_win(eval_dir) is None
++
++
++@pytest.mark.parametrize("status,measurement_id,recover", [
++    ("confirmed", "original", True), ("inconclusive", "original", False),
++    ("rejected", "original", False), ("confirmed", "other-candidate", False),
++])
++def test_recovery_reads_workflow_review_checkpoint_only_for_the_same_measurement(tmp_path, status, measurement_id, recover):
++    eval_dir = tmp_path / "e2e_review_checkpoint"
++    cand = _issue522_candidate(eval_dir)
++    raw = json.loads((cand / "integrate_result.json").read_text())
++    reviewed = {**raw, "measurement_evidence": _measurement("confirmation"),
++                "speedup_review": {"status": status, "original_measurement": _measurement(measurement_id)}}
++    checkpoint = eval_dir / "overlay" / "candidate_h1" / "e2e_validation.json"
++    checkpoint.parent.mkdir()
++    checkpoint.write_text(json.dumps({"integration_result": reviewed}))
++    wf = rx._recover_best_intermediate_win(eval_dir)
++    assert (wf is not None) is recover
++    if recover:
++        assert wf["final_throughput_tok_s"] == pytest.approx(361.051)
+ 
+ 
+ def test_byte_exact_parity_is_trusted_above_its_ceiling(tmp_path):

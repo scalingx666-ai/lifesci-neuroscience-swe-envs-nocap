@@ -1,0 +1,1413 @@
+diff --git a/ChangeLog b/ChangeLog
+index fd4a46a1..8cd7d88e 100755
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,6 +1,10 @@
+ CHANGES
+ =======
+ 
++0.1.0
++-----
++
++* refactor: remove [deflate] extra (it's standard nowadays)
+ * feat: setting up pypi package
+ * chore: dracopy version number in wrong position
+ * chore: bump cloud-volume to match floating resolution release
+diff --git a/README.md b/README.md
+index 8915126a..f66b4293 100755
+--- a/README.md
++++ b/README.md
+@@ -301,6 +301,26 @@ igneous xfer $SRC $DEST --shape 2048,2048,50 --queue $QUEUE
+ igneous -p 4 execute $QUEUE
+ ```
+ 
++We have developed some calculation aids to help you pick the right shape for the transfer task.
++
++```bash
++igneous design ds-shape gs://bucket/dataset --shape 1024,1024,64 --factor 2,2,1
++>>> 715.8 MB
++
++igneous design ds-memory gs://bucket/dataset 3.5e9 --verbose
++>>> Data Width: 8
++>>> Factor: (2, 2, 1)
++>>> Chunk Size: 512, 512, 16
++>>> Memory Limit: 3.5 GB
++>>> -----
++>>> Optimized Shape: 4096,4096,16
++>>> Downsamples: 3
++>>> Memory Used*: 2.9 GB
++>>> 
++>>> *memory used is for retaining the image and all downsamples.
++>>> Additional costs may be incurred from processing.
++```
++
+ #### Scripting Transfer
+ 
+ ```python3
+diff --git a/igneous/downsample_scales.py b/igneous/downsample_scales.py
+index dcc896a6..1072e940 100755
+--- a/igneous/downsample_scales.py
++++ b/igneous/downsample_scales.py
+@@ -12,8 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from __future__ import division
+-from builtins import range
++import math
+ 
+ import numpy as np
+ from cloudvolume import CloudVolume, Vec
+@@ -226,3 +225,84 @@ def create_downsample_scales(
+   vol.commit_info()
+   return vol
+ 
++
++def downsample_shape_from_memory_target(
++  data_width, cx, cy, cz, 
++  factor, byte_target,
++  max_mips=float('inf')
++):
++  """
++  Compute the shape that will give the most downsamples for a given 
++  memory target (e.g. 3e9 bytes aka 3 GB).
++
++  data_width: byte size of dtype
++  cx: chunk size x
++  cy: chunk size y 
++  cz: chunk size z
++  factor: (2,2,1) or (2,2,2) are supported
++  byte_target: memory used should be less than this
++
++  Returns: Vec3 shape
++  """
++  # formulas come from solving the following optimization equations:
++  #
++  # factor (1,1,1)
++  # find integers n and m such that
++  # |n * cx - m * cy| is (approximately) minimized
++  # treat cz as fixed to make thing easier.
++  # We start with a guess that n = sqrt(byte_target / data_width / cx / cy / cz)
++  #
++  # factor (2,2,1)
++  # 4/3 * data_width * cx^(2^n) * cy^(2^n) * cz < byte_target
++  #
++  # factor (2,2,2)
++  # 8/7 * data_width * cx^(2^n) * cy^(2^n) * cz^(2^n) < byte_target
++  #
++  # it's possible to solve for an arbitrary factor, but more complicated
++  # and we really only need those two as the blowup gets intense.
++  if byte_target <= 0:
++    raise ValueError(f"Unable to pick a shape for a byte budget <= 0. Got: {byte_target}")
++
++  if cx * cy * cz <= 0:
++    raise ValueError(f"Chunk size must have a positive integer volume. Got: <{cx},{cy},{cz}>")
++
++  def n_shape(n, c_):
++    num_downsamples = int(math.log2((c_ ** (2*n)) / c_))
++    num_downsamples = int(min(num_downsamples, max_mips))
++    return c_ * (2 ** num_downsamples)
++
++  if factor == (1,1,1):
++    n = int(math.sqrt(byte_target / data_width / cx / cy / cz))
++    m = int(n * cx / cy)
++    out = Vec(n * cx, m * cy, cz)
++  elif factor == (2,2,1):
++    if cx * cy == 1:
++      size = 2 ** int(math.log2(math.sqrt(byte_target / cz)))
++      out = Vec(size, size, cz)
++    else:
++      n = math.log(3/4 * byte_target / data_width / cz)
++      n = n / 2 / math.log(cx * cy)
++      shape = lambda c_: n_shape(n, c_) 
++      out = Vec(shape(cx), shape(cy), cz)
++  elif factor == (2,2,2):
++    if cx * cy * cz == 1:
++      size = 2 ** int(math.log2(round(byte_target ** (1/3), 5)))
++      out = Vec(size, size, size)
++    else:
++      n = math.log(7/8 * byte_target / data_width)
++      n = n / 2 / math.log(cx * cy * cz) 
++      shape = lambda c_: n_shape(n, c_) 
++      out = Vec(shape(cx), shape(cy), shape(cz))
++  else:
++    raise ValueError(f"This is now a harder optimization problem. Got: {factor}")
++
++  out = out.astype(int)
++  min_shape = Vec(cx,cy,cz)
++  if any(out < min_shape):
++    raise ValueError(
++      f"Too little memory allocated to create a valid task."
++      f" Got: {byte_target} Predicted Shape: {out} Minimum Shape: {min_shape}"
++    )
++
++  return out
++
+diff --git a/igneous/task_creation.py b/igneous/task_creation.py
+index 555f7fed..96682a37 100755
+--- a/igneous/task_creation.py
++++ b/igneous/task_creation.py
+@@ -16,6 +16,7 @@
+ from tqdm import tqdm
+ 
+ import cloudvolume
++import cloudvolume.exceptions
+ from cloudvolume import CloudVolume
+ from cloudvolume.lib import Vec, Bbox, max2, min2, xyzrange, find_closest_divisor, yellow, jsonify
+ from cloudvolume.datasource.precomputed.sharding import ShardingSpecification
+@@ -50,18 +51,18 @@
+       print(yellow('$USER was not set. The "owner" field of the provenance file will be blank.'))
+       OPERATOR_CONTACT = ''
+ 
+-def get_bounds(vol, bounds, shape, mip, chunk_size=None):
++def get_bounds(vol, bounds, mip, chunk_size=None):
+   if bounds is None:
+     bounds = vol.bounds.clone()
+   else:
+     bounds = Bbox.create(bounds)
+     bounds = vol.bbox_to_mip(bounds, mip=0, to_mip=mip)
+     if chunk_size is not None:
+-      bounds = bounds.expand_to_chunk_size(chunk_size, vol.mip_voxel_offset(mip))
+-    bounds = Bbox.clamp(bounds, vol.mip_bounds(mip))
++      bounds = bounds.expand_to_chunk_size(chunk_size, vol.meta.voxel_offset(mip))
++    bounds = Bbox.clamp(bounds, vol.meta.bounds(mip))
+   
+ 
+-  print("Volume Bounds: ", vol.mip_bounds(mip))
++  print("Volume Bounds: ", vol.meta.bounds(mip))
+   print("Selected ROI:  ", bounds)
+ 
+   return bounds
+@@ -285,7 +286,7 @@ def ds_shape(mip, chunk_size=None, factor=None):
+     if not preserve_chunk_size or chunk_size:
+       shape = ds_shape(mip + 1, chunk_size, factor)
+ 
+-    bounds = get_bounds(vol, bounds, shape, mip, vol.chunk_size)
++    bounds = get_bounds(vol, bounds, mip, vol.chunk_size)
+     
+     class DownsampleTaskIterator(FinelyDividedTaskIterator):
+       def task(self, shape, offset):
+@@ -351,7 +352,7 @@ def create_deletion_tasks(
+   class DeleteTaskIterator(FinelyDividedTaskIterator):
+     def task(self, shape, offset):
+       bounded_shape = min2(shape, bounds.maxpt - offset)
+-      return DeleteTask(
++      return partial(DeleteTask,
+         layer_path=layer_path,
+         shape=bounded_shape.clone(),
+         offset=offset.clone(),
+@@ -899,48 +900,136 @@ def on_finish(self):
+ 
+ def create_transfer_tasks(
+     src_layer_path, dest_layer_path, 
+-    chunk_size=None, shape=Vec(2048, 2048, 64), 
+-    fill_missing=False, translate=(0,0,0), 
++    chunk_size=None, shape=None, 
++    fill_missing=False, translate=None,
+     bounds=None, mip=0, preserve_chunk_size=True,
+     encoding=None, skip_downsamples=False,
+     delete_black_uploads=False, background_color=0,
+     agglomerate=False, timestamp=None, compress='gzip',
+-    factor=None, sparse=False
++    factor=None, sparse=False, dest_voxel_offset=None,
++    memory_target=3.5e9, max_mips=5
+   ):
+   """
+-  Transfer data from one data layer to another. It's possible
+-  to transfer from a lower resolution mip level within a given
+-  bounding box. The bounding box should be specified in terms of
+-  the highest resolution.
++  Transfer data to a new data layer. You can use this operation
++  to make changes to the dataset representation as well. For 
++  example, you can change the chunk size, compression, bounds,
++  and offset.
++
++  Downsamples will be automatically generated while transferring
++  unless skip_downsamples is set. The number of downsamples will
++  be determined by the chunk size and the task shape.
++
++  bounds: Bbox specified in terms of the destination image and its
++    highest resolution.
++  translate: Vec3 pointing from source bounds to dest bounds
++    and is in terms of the highest resolution of the source image.
++    This allows you to compensate for differing voxel offsets
++    or enables you to move part of the image to a new location.
++  dest_voxel_offset: When creating a new image, move the 
++    global coordinate origin to this point. This is commonly
++    used to "zero" a newly aligned image (e.g. (0,0,0)) 
++
++  background_color: Designates which color should be considered background.
++  chunk_size: (overrides preserve_chunk_size) force chunk size for new layers to be this.
++  compress: None, 'gzip', or 'br' Determines which compression algorithm to use 
++    for new uploaded files.
++  delete_black_uploads: issue delete commands instead of upload chunks
++    that are all background.
++  encoding: "raw", "jpeg", "compressed_segmentation", "compresso", "fpzip", or "kempressed"
++    depending on which kind of data you're dealing with. raw works for everything (no compression) 
++    but you might get better compression with another encoding. You can think of encoding as the
++    image type-specific first stage of compression and the "compress" flag as the data
++    agnostic second stage compressor. For example, compressed_segmentation and gzip work
++    well together, but not jpeg and gzip.
++  factor: (overrides axis) can manually specify what each downsampling round is
++    supposed to do: e.g. (2,2,1), (2,2,2), etc
++  fill_missing: Treat missing image tiles as zeroed for both src and dest.
++  max_mips: (pairs with memory_target) maximum number of downsamples to generate even
++    if the memory budget is large enough for more.
++  memory_target: given a task size in bytes, pick the task shape that will produce the 
++    maximum number of downsamples. Only works for (2,2,1) or (2,2,2).
++  preserve_chunk_size: if true, maintain chunk size of starting mip, else, find the closest
++    evenly divisible chunk size to 64,64,64 for this shape and use that. The latter can be
++    useful when mip 0 uses huge chunks and you want to simply visualize the upper mips.
++  shape: (overrides memory_target) The 3d size of each task. Choose a shape that meets 
++    the following criteria unless you're doing something out of the ordinary.
++    (a) 2^n multiple of destination chunk size (b) doesn't consume too much memory
++    (c) n is related to the downsample factor for each axis, so for a factor of (2,2,1) (default)
++      z only needs to be a single chunk, but x and y should be 2, 4, 8,or 16 times the chunk size.
++    Remember to multiply 4/3 * shape.x * shape.y * shape.z * data_type to estimate how much memory 
++    each task will require. If downsamples are off, you can skip the 4/3. In the future, if chunk
++    sizes match we might be able to do a simple file transfer. The problem can be formulated as 
++    producing the largest number of downsamples within a given memory target.
++
++    EXAMPLE: destination is uint64 with chunk size (128, 128, 64) with a memory target of
++      at most 3GB per task and a downsample factor of (2,2,1).
++
++      The largest number of downsamples is 4 using 2048 * 2048 * 64 sized tasks which will
++      use 2.9 GB of memory. The next size up would use 11.5GB and is too big. 
++
++  sparse: When downsampling segmentation, if true, don't count black pixels when computing
++    the mode. Useful for e.g. synapses and point labels.
++
++  agglomerate: (graphene only) remap the watershed layer to a proofread segmentation.
++  timestamp: (graphene only) integer UNIX timestamp indicating the proofreading state
++    to represent.
+   """
+-  shape = Vec(*shape)
+-  vol = CloudVolume(src_layer_path, mip=mip)
+-  translate = Vec(*translate) // vol.downsample_ratio
+-  
++  src_vol = CloudVolume(src_layer_path, mip=mip)
++
++  if dest_voxel_offset:
++    dest_voxel_offset = Vec(*dest_voxel_offset, dtype=int)
++  else:
++    dest_voxel_offset = src_vol.voxel_offset.clone()
++
+   if factor is None:
+     factor = (2,2,1)
+ 
+-  if factor[2] == 1:
+-    shape.z = int(vol.chunk_size.z * round(shape.z / vol.chunk_size.z))
++  if skip_downsamples:
++    factor = (1,1,1)
+ 
+   if not chunk_size:
+-    chunk_size = vol.info['scales'][mip]['chunk_sizes'][0]
++    chunk_size = src_vol.info['scales'][mip]['chunk_sizes'][0]
+   chunk_size = Vec(*chunk_size)
+ 
+   try:
+-    dvol = CloudVolume(dest_layer_path, mip=mip)
+-  except Exception: # no info file
+-    info = copy.deepcopy(vol.info)
+-    dvol = CloudVolume(dest_layer_path, info=info)
+-    dvol.commit_info()
++    dest_vol = CloudVolume(dest_layer_path, mip=mip)
++  except cloudvolume.exceptions.InfoUnavailableError:
++    info = copy.deepcopy(src_vol.info)
++    dest_vol = CloudVolume(dest_layer_path, info=info, mip=mip)
++    dest_vol.commit_info()
++
++  if dest_voxel_offset is not None:
++    dest_vol.scale["voxel_offset"] = dest_voxel_offset
++
++  # If translate is not set, but dest_voxel_offset is then it should naturally be
++  # only be the difference between datasets.
++  if translate is None:
++    translate = dest_vol.voxel_offset - src_vol.voxel_offset # vector pointing from src to dest
++  else:
++    translate = Vec(*translate) // src_vol.downsample_ratio
+ 
+   if encoding is not None:
+-    dvol.info['scales'][mip]['encoding'] = encoding
+-    if encoding == 'compressed_segmentation' and 'compressed_segmentation_block_size' not in dvol.info['scales'][mip]:
+-      dvol.info['scales'][mip]['compressed_segmentation_block_size'] = (8,8,8)
+-  dvol.info['scales'] = dvol.info['scales'][:mip+1]
+-  dvol.info['scales'][mip]['chunk_sizes'] = [ chunk_size.tolist() ]
+-  dvol.commit_info()
++    dest_vol.info['scales'][mip]['encoding'] = encoding
++    if encoding == 'compressed_segmentation' and 'compressed_segmentation_block_size' not in dest_vol.info['scales'][mip]:
++      dest_vol.info['scales'][mip]['compressed_segmentation_block_size'] = (8,8,8)
++  dest_vol.info['scales'] = dest_vol.info['scales'][:mip+1]
++  dest_vol.info['scales'][mip]['chunk_sizes'] = [ chunk_size.tolist() ]
++  dest_vol.commit_info()
++
++  if shape is None:
++    if memory_target is not None:
++      shape = downsample_scales.downsample_shape_from_memory_target(
++        np.dtype(src_vol.dtype).itemsize, 
++        dest_vol.chunk_size.x, dest_vol.chunk_size.y, dest_vol.chunk_size.z, 
++        factor, memory_target, max_mips
++      )
++    else:
++      raise ValueError("Either shape or memory_target must be specified.")
++
++  shape = Vec(*shape)
++
++  if factor[2] == 1:
++    shape.z = int(dest_vol.chunk_size.z * round(shape.z / dest_vol.chunk_size.z))
+ 
+   if not skip_downsamples:
+     downsample_scales.create_downsample_scales(dest_layer_path, 
+@@ -949,21 +1038,14 @@ def create_transfer_tasks(
+       encoding=encoding
+     )
+ 
+-  if bounds is None:
+-    bounds = vol.bounds.clone()
+-  else:
+-    bounds = vol.bbox_to_mip(bounds, mip=0, to_mip=mip)
+-    bounds = Bbox.clamp(bounds, dvol.bounds)
+-
+-  dvol_bounds = dvol.mip_bounds(mip).clone()
++  dest_bounds = get_bounds(dest_vol, bounds, mip, chunk_size)
+ 
+   class TransferTaskIterator(FinelyDividedTaskIterator):
+     def task(self, shape, offset):  
+-      task_shape = min2(shape.clone(), dvol_bounds.maxpt - offset)
+       return partial(TransferTask,
+         src_path=src_layer_path,
+         dest_path=dest_layer_path,
+-        shape=task_shape,
++        shape=shape.clone(),
+         offset=offset.clone(),
+         fill_missing=fill_missing,
+         translate=translate,
+@@ -991,13 +1073,15 @@ def on_finish(self):
+           'delete_black_uploads': bool(delete_black_uploads),
+           'background_color': background_color,
+           'bounds': [
+-            bounds.minpt.tolist(),
+-            bounds.maxpt.tolist()
++            dest_bounds.minpt.tolist(),
++            dest_bounds.maxpt.tolist()
+           ],
+           'mip': mip,
+           'agglomerate': bool(agglomerate),
+           'timestamp': timestamp,
+           'compress': compress,
++          'encoding': encoding,
++          'memory_target': memory_target,
+           'factor': (tuple(factor) if factor else None),
+           'sparse': bool(sparse),
+         },
+@@ -1005,16 +1089,16 @@ def on_finish(self):
+         'date': strftime('%Y-%m-%d %H:%M %Z'),
+       }
+ 
+-      dvol = CloudVolume(dest_layer_path)
+-      dvol.provenance.sources = [ src_layer_path ]
+-      dvol.provenance.processing.append(job_details) 
+-      dvol.commit_provenance()
++      dest_vol = CloudVolume(dest_layer_path)
++      dest_vol.provenance.sources = [ src_layer_path ]
++      dest_vol.provenance.processing.append(job_details) 
++      dest_vol.commit_provenance()
+ 
+-      if vol.meta.path.protocol != 'boss':
+-        vol.provenance.processing.append(job_details)
+-        vol.commit_provenance()
++      if src_vol.meta.path.protocol != 'boss':
++        src_vol.provenance.processing.append(job_details)
++        src_vol.commit_provenance()
+ 
+-  return TransferTaskIterator(bounds, shape)
++  return TransferTaskIterator(dest_bounds, shape)
+ 
+ def create_contrast_normalization_tasks(
+     src_path, dest_path, levels_path=None,
+@@ -1043,7 +1127,7 @@ def create_contrast_normalization_tasks(
+   downsample_scales.create_downsample_scales(dest_path, mip=mip, ds_shape=shape, preserve_chunk_size=True)
+   dvol.refresh_info()
+ 
+-  bounds = get_bounds(srcvol, bounds, shape, mip)
++  bounds = get_bounds(srcvol, bounds, mip)
+ 
+   class ContrastNormalizationTaskIterator(FinelyDividedTaskIterator):
+     def task(self, shape, offset):
+@@ -1118,7 +1202,7 @@ def create_luminance_levels_tasks(
+   offset = Vec(*offset)
+   zoffset = offset.clone()
+ 
+-  bounds = get_bounds(vol, bounds, shape, mip)
++  bounds = get_bounds(vol, bounds, mip)
+   protocol = vol.meta.path.protocol
+ 
+   class LuminanceLevelsTaskIterator(object):
+@@ -1605,4 +1689,3 @@ def cascade(tq, fnlist):
+       N = tq.enqueued
+       print('\r {} remaining'.format(N), end='')
+       time.sleep(2)
+-
+diff --git a/igneous/tasks/tasks.py b/igneous/tasks/tasks.py
+index eae44ef2..6bbe257b 100755
+--- a/igneous/tasks/tasks.py
++++ b/igneous/tasks/tasks.py
+@@ -77,34 +77,27 @@ def downsample_and_upload(
+       new_bounds.maxpt = new_bounds.minpt + Vec(*mipped.shape[:3])
+       vol[new_bounds] = mipped
+ 
+-class DeleteTask(RegisteredTask):
++@queueable
++def DeleteTask(layer_path:str, shape, offset, mip=0, num_mips=5):
+   """Delete a block of images inside a layer on all mip levels."""
++  shape = Vec(*shape)
++  offset = Vec(*offset)
++  vol = CloudVolume(layer_path, mip=mip, max_redirects=0)
+ 
+-  def __init__(self, layer_path, shape, offset, mip=0, num_mips=5):
+-    super(DeleteTask, self).__init__(layer_path, shape, offset, mip, num_mips)
+-    self.layer_path = layer_path
+-    self.shape = Vec(*shape)
+-    self.offset = Vec(*offset)
+-    self.mip = mip
+-    self.num_mips = num_mips
+-
+-  def execute(self):
+-    vol = CloudVolume(self.layer_path, mip=self.mip, max_redirects=0)
+-
+-    highres_bbox = Bbox( self.offset, self.offset + self.shape )
++  highres_bbox = Bbox( offset, offset + shape )
+ 
+-    top_mip = min(vol.available_mips[-1], self.mip + self.num_mips)
++  top_mip = min(vol.available_mips[-1], mip + num_mips)
+ 
+-    for mip in range(self.mip, top_mip + 1):
+-      vol.mip = mip
+-      bbox = vol.bbox_to_mip(highres_bbox, self.mip, mip)
+-      bbox = bbox.round_to_chunk_size(vol.chunk_size, offset=vol.bounds.minpt)
+-      bbox = Bbox.clamp(bbox, vol.bounds)
++  for mip_i in range(mip, top_mip + 1):
++    vol.mip = mip_i
++    bbox = vol.bbox_to_mip(highres_bbox, mip, mip_i)
++    bbox = bbox.round_to_chunk_size(vol.chunk_size, offset=vol.bounds.minpt)
++    bbox = Bbox.clamp(bbox, vol.bounds)
+ 
+-      if bbox.volume() == 0: 
+-        continue
++    if bbox.volume() == 0: 
++      continue
+ 
+-      vol.delete(bbox)
++    vol.delete(bbox)
+ 
+ @queueable
+ def BlackoutTask(
+@@ -378,7 +371,7 @@ def select_bounding_boxes(self, dataset_bounds):
+ def TransferTask(
+   src_path, dest_path, 
+   mip, shape, offset, 
+-  translate=(0,0,0), # change of origin
++  translate=(0,0,0),
+   fill_missing=False, 
+   skip_first=False, 
+   skip_downsamples=False,
+@@ -391,6 +384,12 @@ def TransferTask(
+   compress='gzip',
+   factor=None
+ ):
++  """
++  Transfer an image to a new location while enabling
++  rechunking, translation, reencoding, recompressing,
++  and downsampling. For graphene, we can also generate
++  proofread segmentation using the agglomerate flag.
++  """
+   shape = Vec(*shape)
+   offset = Vec(*offset)
+   fill_missing = bool(fill_missing)
+@@ -400,28 +399,44 @@ def TransferTask(
+   skip_first = bool(skip_first)
+   skip_downsamples = bool(skip_downsamples)
+ 
+-  srccv = CloudVolume(
++  src_cv = CloudVolume(
+     src_path, fill_missing=fill_missing,
+     mip=mip, bounded=False
+   )
+-  destcv = CloudVolume(
++  dest_cv = CloudVolume(
+     dest_path, fill_missing=fill_missing,
+     mip=mip, delete_black_uploads=delete_black_uploads,
+     background_color=background_color, compress=compress
+   )
+ 
+-  dst_bounds = Bbox(offset, shape + offset)
+-  dst_bounds = Bbox.clamp(dst_bounds, destcv.bounds)
+-  src_bounds = dst_bounds - translate
+-  image = srccv.download(
+-    src_bounds, agglomerate=agglomerate, timestamp=timestamp
++  dst_bbox = Bbox(offset, shape + offset)
++  dst_bbox = Bbox.clamp(dst_bbox, dest_cv.bounds)
++
++  if (
++    skip_downsamples 
++    and agglomerate == False
++    and src_cv.scale == dest_cv.scale
++    and src_cv.dtype == dest_cv.dtype
++    and np.all(translate == (0,0,0))
++  ):
++    # most efficient transfer type, just copy
++    # files possibly without even decompressing
++    src_cv.image.transfer_to(
++      dest_path, dst_bbox, mip, 
++      compress=compress
++    )
++    return
++
++  src_bbox = dst_bbox - translate
++  image = src_cv.download(
++    src_bbox, agglomerate=agglomerate, timestamp=timestamp
+   )
+ 
+   if skip_downsamples:
+-    destcv[dst_bounds] = image
++    dest_cv[dst_bbox] = image
+   else:
+     downsample_and_upload(
+-      image, dst_bounds, destcv,
++      image, dst_bbox, dest_cv,
+       shape, mip=mip,
+       skip_first=skip_first,
+       sparse=sparse, axis=axis,
+diff --git a/igneous_cli/cli.py b/igneous_cli/cli.py
+index 9f13e9e6..5e1a6bfc 100644
+--- a/igneous_cli/cli.py
++++ b/igneous_cli/cli.py
+@@ -1,14 +1,21 @@
++import math
+ import multiprocessing as mp
+ import os
++import sys
+ 
+ import click
++from cloudvolume import CloudVolume
++import numpy as np
+ from taskqueue import TaskQueue
+ from taskqueue.lib import toabs
+ from taskqueue.paths import get_protocol
+ 
+ from igneous import task_creation as tc
++from igneous import downsample_scales
+ from igneous.secrets import LEASE_SECONDS, SQS_REGION_NAME
+ 
++from igneous_cli.humanbytes import format_bytes
++
+ def normalize_path(queuepath):
+   if not get_protocol(queuepath):
+     return "fq://" + toabs(queuepath)
+@@ -73,6 +80,7 @@ def license():
+ @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.")
+ @click.option('--num-mips', default=5, help="Build this many additional pyramid levels. Each increment increases memory requirements per task 4-8x.  Default: 5")
+ @click.option('--cseg', is_flag=True, default=False, help="Use the compressed_segmentation image chunk encoding scheme. Segmentation only.")
++@click.option('--compresso', is_flag=True, default=False, help="Use the compresso image chunk encoding scheme. Segmentation only.")
+ @click.option('--sparse', is_flag=True, default=False, help="Don't count black pixels in mode or average calculations. For images, eliminates edge ghosting in 2x2x2 downsample. For segmentation, prevents small objects from disappearing at high mip levels.")
+ @click.option('--chunk-size', type=Tuple3(), default=None, help="Chunk size of new layers. e.g. 128,128,64")
+ @click.option('--compress', default=None, help="Set the image compression scheme. Options: 'gzip', 'br'")
+@@ -82,7 +90,7 @@ def license():
+ @click.pass_context
+ def downsample(
+ 	ctx, path, queue, mip, fill_missing, 
+-	num_mips, cseg, sparse, 
++	num_mips, cseg, compresso, sparse, 
+ 	chunk_size, compress, volumetric,
+ 	delete_bg, bg_color
+ ):
+@@ -100,7 +108,13 @@ def downsample(
+   current top mip level of the pyramid. This builds it even taller
+   (referred to as "superdownsampling").
+   """
++  if cseg and compresso:
++    print("igneous: must choose one of --cseg or --compresso")
++    sys.exit()
++
+   encoding = ("compressed_segmentation" if cseg else None)
++  encoding = ("compresso" if compresso else None)
++
+   factor = (2,2,1)
+   if volumetric:
+   	factor = (2,2,2)
+@@ -123,23 +137,26 @@ def downsample(
+ @click.argument("src")
+ @click.argument("dest")
+ @click.option('--queue', default=None, required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue")
+-@click.option('--mip', default=0, help="Build upward from this level of the image pyramid. Default: 0")
++@click.option('--mip', default=0, help="Build upward from this level of the image pyramid.", show_default=True)
+ @click.option('--translate', type=Tuple3(), default=(0, 0, 0), help="Translate the bounding box by X,Y,Z voxels in the new location.")
+-@click.option('--downsample/--skip-downsample', is_flag=True, default=True, help="Whether or not to produce downsamples from transfer tiles. Default: True")
++@click.option('--downsample/--skip-downsample', is_flag=True, default=True, help="Whether or not to produce downsamples from transfer tiles.", show_default=True)
+ @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.")
+-@click.option('--num-mips', default=5, help="Build this many additional pyramid levels. Each increment increases memory requirements per task 4-8x.  Default: 5")
++@click.option('--memory', default=3.5e9, type=int, help="Task memory limit in bytes. Task shape will be chosen to fit and maximize downsamples.", show_default=True)
++@click.option('--max-mips', default=5, help="Maximum number of additional pyramid levels.", show_default=True)
+ @click.option('--cseg', is_flag=True, default=False, help="Use the compressed_segmentation image chunk encoding scheme. Segmentation only.")
++@click.option('--compresso', is_flag=True, default=False, help="Use the compresso image chunk encoding scheme. Segmentation only.")
+ @click.option('--sparse', is_flag=True, default=False, help="Don't count black pixels in mode or average calculations. For images, eliminates edge ghosting in 2x2x2 downsample. For segmentation, prevents small objects from disappearing at high mip levels.")
+-@click.option('--shape', type=Tuple3(), default=(2048, 2048, 64), help="Set the task shape in voxels. This also determines how many downsamples you get. e.g. 2048,2048,64")
++@click.option('--shape', type=Tuple3(), default=(2048, 2048, 64), help="(overrides --memory) Set the task shape in voxels. This also determines how many downsamples you get. e.g. 2048,2048,64")
+ @click.option('--chunk-size', type=Tuple3(), default=None, help="Chunk size of destination layer. e.g. 128,128,64")
+-@click.option('--compress', default=None, help="Set the image compression scheme. Options: 'gzip', 'br'")
++@click.option('--compress', default="gzip", help="Set the image compression scheme. Options: 'gzip', 'br'", show_default=True)
+ @click.option('--volumetric', is_flag=True, default=False, help="Use 2x2x2 downsampling.")
+ @click.option('--delete-bg', is_flag=True, default=False, help="Issue a delete instead of uploading a background tile. This is helpful on systems that don't like tiny files.")
+-@click.option('--bg-color', default=0, help="Determines which color is regarded as background. Default: 0")
++@click.option('--bg-color', default=0, help="Determines which color is regarded as background.", show_default=True)
+ @click.pass_context
+ def xfer(
+ 	ctx, src, dest, queue, translate, downsample, mip, 
+-	fill_missing, num_mips, cseg, shape, sparse, 
++	fill_missing, memory, max_mips, 
++  shape, sparse, cseg, compresso,
+ 	chunk_size, compress, volumetric,
+ 	delete_bg, bg_color
+ ):
+@@ -157,12 +174,24 @@ def xfer(
+   2x2x1 downsampling, larger XY dimension is desirable
+   compared to Z as more downsamples can be computed for
+   each 2x2 increase in the task size.
++
++  Use the --memory flag to automatically compute the
++  a reasonable task shape based on your memory limits.
+   """
++  if cseg and compresso:
++    print("igneous: must choose one of --cseg or --compresso")
++    sys.exit()
++
+   encoding = ("compressed_segmentation" if cseg else None)
++  encoding = ("compresso" if compresso else None)
++
+   factor = (2,2,1)
+   if volumetric:
+   	factor = (2,2,2)
+ 
++  if compress and compress.lower() == "false":
++    compress = False
++
+   tasks = tc.create_transfer_tasks(
+     src, dest, 
+     chunk_size=chunk_size, fill_missing=fill_missing, 
+@@ -170,6 +199,7 @@ def xfer(
+     encoding=encoding, skip_downsamples=(not downsample),
+     delete_black_uploads=delete_bg, background_color=bg_color,
+     compress=compress, factor=factor, sparse=sparse,
++    memory_target=memory, max_mips=max_mips
+   )
+ 
+   parallel = int(ctx.obj.get("parallel", 1))
+@@ -504,4 +534,88 @@ def delete_images(
+   tq = TaskQueue(normalize_path(queue))
+   tq.insert(tasks, parallel=parallel)
+ 
++@main.group("design")
++def designgroup():
++  """
++  Tools to aid the design of tasks or neuroglancer layers.
++  """
++  pass
++
++
++@designgroup.command("ds-memory")
++@click.argument("path")
++@click.argument("memory_bytes", type=float)
++@click.option('--mip', default=0, help="Select level of the image pyramid.", show_default=True)
++@click.option('--factor', default="2,2,1", type=Tuple3(), help="Downsample factor to use.", show_default=True)
++@click.option('--verbose', is_flag=True, help="Print some additional information.")
++@click.option('--max-mips', default=5, help="Maximum downsamples to generate from this shape.", show_default=True)
++def dsmemory(path, memory_bytes, mip, factor, verbose, max_mips):
++  """
++  Compute the task shape that maximizes the number of
++  downsamples for a given amount of memory.
++  """ 
++  cv = CloudVolume(path, mip=mip)
++
++  data_width = np.dtype(cv.dtype).itemsize
++  cx, cy, cz = cv.chunk_size
++  memory_bytes = int(memory_bytes)
++
++  shape = downsample_scales.downsample_shape_from_memory_target(
++    data_width, 
++    cx, cy, cz, factor, 
++    memory_bytes, max_mips
++  )
++
++  num_downsamples = int(math.log2(max(shape / cv.chunk_size)))
++
++  mem_used = memory_used(data_width, shape, factor)
++
++  shape = [ str(x) for x in shape ]
++  shape = ",".join(shape)
++
++  if verbose:
++    print(f"Data Width: {data_width} B")
++    print(f"Factor: {factor}")
++    print(f"Chunk Size: {cx}, {cy}, {cz} voxels")
++    print(f"Memory Limit: {format_bytes(memory_bytes, True)}")
++    print("-----")
++    print(f"Optimized Shape: {shape}")
++    print(f"Downsamples: {num_downsamples}")
++    print(f"Memory Used*: {format_bytes(mem_used, True)}")
++    print(
++      "\n"
++      "* memory used is for retaining the image "
++      "and all downsamples.\nAdditional costs may be incurred "
++      "from processing."
++    )
++  else:
++    print(shape)
+ 
++@designgroup.command("ds-shape")
++@click.argument("path")
++@click.argument("shape", type=Tuple3())
++@click.option('--mip', default=0, help="Select level of the image pyramid.", show_default=True)
++@click.option('--factor', default="2,2,1", type=Tuple3(), help="Downsample factor to use.", show_default=True)
++def dsshape(path, shape, mip, factor):
++  """
++  Compute the approximate memory usage for a
++  given downsample task shape.
++  """ 
++  cv = CloudVolume(path, mip=mip)
++  data_width = np.dtype(cv.dtype).itemsize
++  memory_bytes = memory_used(data_width, shape, factor)  
++  print(format_bytes(memory_bytes, True))
++
++def memory_used(data_width, shape, factor): 
++  memory_bytes = data_width * shape[0] * shape[1] * shape[2]
++
++  if factor not in ((1,1,1), (2,2,1), (2,1,2), (1,2,2), (2,2,2)):
++    print(f"igneous: factor must be 2,2,1 or 2,2,2. Got: {factor}")
++    sys.exit()
++
++  # comes from a converging infinite series proof
++  constant = factor[0] * factor[1] * factor[2]
++  if constant != 1:
++    memory_bytes *= constant / (constant - 1)
++
++  return memory_bytes
+diff --git a/igneous_cli/humanbytes.py b/igneous_cli/humanbytes.py
+new file mode 100644
+index 00000000..2f405c71
+--- /dev/null
++++ b/igneous_cli/humanbytes.py
+@@ -0,0 +1,52 @@
++"""
++Formats bytes into a human readable form.
++
++Gracious thanks to Mitch McMabers 
++who placed this code in the public domain.
++
++https://stackoverflow.com/a/63839503/210920
++"""
++
++from typing import List, Union
++
++METRIC_LABELS: List[str] = ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
++BINARY_LABELS: List[str] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"]
++PRECISION_OFFSETS: List[float] = [0.5, 0.05, 0.005, 0.0005] # PREDEFINED FOR SPEED.
++PRECISION_FORMATS: List[str] = ["{}{:.0f} {}", "{}{:.1f} {}", "{}{:.2f} {}", "{}{:.3f} {}"] # PREDEFINED FOR SPEED.
++
++def format_bytes(num: Union[int, float], metric: bool=False, precision: int=1) -> str:
++    """
++    Human-readable formatting of bytes, using binary (powers of 1024)
++    or metric (powers of 1000) representation.
++    """
++
++    assert isinstance(num, (int, float)), "num must be an int or float"
++    assert isinstance(metric, bool), "metric must be a bool"
++    assert isinstance(precision, int) and precision >= 0 and precision <= 3, "precision must be an int (range 0-3)"
++
++    unit_labels = METRIC_LABELS if metric else BINARY_LABELS
++    last_label = unit_labels[-1]
++    unit_step = 1000 if metric else 1024
++    unit_step_thresh = unit_step - PRECISION_OFFSETS[precision]
++
++    is_negative = num < 0
++    if is_negative: # Faster than ternary assignment or always running abs().
++        num = abs(num)
++
++    for unit in unit_labels:
++        if num < unit_step_thresh:
++            # VERY IMPORTANT:
++            # Only accepts the CURRENT unit if we're BELOW the threshold where
++            # float rounding behavior would place us into the NEXT unit: F.ex.
++            # when rounding a float to 1 decimal, any number ">= 1023.95" will
++            # be rounded to "1024.0". Obviously we don't want ugly output such
++            # as "1024.0 KiB", since the proper term for that is "1.0 MiB".
++            break
++        if unit != last_label:
++            # We only shrink the number if we HAVEN'T reached the last unit.
++            # NOTE: These looped divisions accumulate floating point rounding
++            # errors, but each new division pushes the rounding errors further
++            # and further down in the decimals, so it doesn't matter at all.
++            num /= unit_step
++
++    return PRECISION_FORMATS[precision].format("-" if is_negative else "", num, unit)
+diff --git a/requirements.txt b/requirements.txt
+index 8ed5f8d1..3608b43a 100755
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,5 @@
+ click>=6.7
+-cloud-volume>=3.13.0
++cloud-volume>=4.2.0
+ DracoPy>=0.0.19
+ fastremap>=1.10.0
+ google-cloud-logging
+diff --git a/test/downsample_scales_test.py b/test/downsample_scales_test.py
+index efaa7493..1991ea14 100755
+--- a/test/downsample_scales_test.py
++++ b/test/downsample_scales_test.py
+@@ -56,3 +56,62 @@ def test_plane_scales_yz():
+   assert scales[4] == (1,16,16)
+ 
+ 
++def test_downsample_shape_from_memory_target():
++  try:
++    downsample_scales.downsample_shape_from_memory_target(1, 0, 1, 1, (2,2,1), 16)
++    assert False
++  except ValueError:
++    pass
++
++  shape = downsample_scales.downsample_shape_from_memory_target(1, 1, 1, 1, (1,1,1), 16)
++  assert np.all(shape == (4,4,1))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(2, 1, 1, 1, (1,1,1), 16)
++  assert np.all(shape == (2,2,1))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(1, 2, 1, 1, (1,1,1), 16)
++  assert np.all(shape == (4,4,1))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(1, 256, 256, 64, (1,1,1), 20e6)
++  assert np.all(shape == (512,512,64))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(8, 256, 256, 64, (1,1,1), 35e6)
++  assert np.all(shape == (256,256,64))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(8, 256, 256, 64, (1,1,1), 3.5e9)
++  assert np.all(shape == (2560,2560,64))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(1, 1, 1, 1, (2,2,1), 16)
++  assert np.all(shape == (4,4,1))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(1, 1, 1, 1, (2,2,2), 64)
++  assert np.all(shape == (4,4,4))
++
++  try:
++    downsample_scales.downsample_shape_from_memory_target(1, 1, 1, 1, (2,2,1), 0)
++    assert False
++  except ValueError:
++    pass
++
++  try:
++    downsample_scales.downsample_shape_from_memory_target(8, 128, 128, 64, (2,2,1), 100)
++    assert False
++  except ValueError:
++    pass
++
++  shape = downsample_scales.downsample_shape_from_memory_target(8, 128, 128, 64, (2,2,1), 3.5e9)
++  assert np.all(shape == (2048,2048,64))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(1, 128, 128, 64, (2,2,1), 3.5e9)
++  assert np.all(shape == (4096,4096,64))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(8, 128, 128, 64, (2,2,2), 3.5e9)
++  assert np.all(shape == (512,512,256))
++
++  shape = downsample_scales.downsample_shape_from_memory_target(4, 100, 100, 50, (2,2,1), 3.5e9)
++  assert np.all(shape == (3200,3200,50))
++
++
++
++
++
+diff --git a/test/layer_harness.py b/test/layer_harness.py
+index 3cee7562..8b97c20d 100755
+--- a/test/layer_harness.py
++++ b/test/layer_harness.py
+@@ -5,14 +5,15 @@
+ 
+ import os
+ 
+-from cloudvolume import Storage, CloudVolume
++from cloudvolume import CloudVolume
++from cloudfiles import CloudFiles
+ from igneous.task_creation import MockTaskQueue
+ 
+ layer_path = '/tmp/removeme/'
+ 
+ def create_storage(layer_name='layer'):
+     stor_path = os.path.join(layer_path, layer_name)
+-    return Storage('file://' + stor_path, n_threads=0)
++    return CloudFiles('file://' + stor_path)
+ 
+ def create_layer(size, offset, layer_type="image", layer_name='layer', dtype=None):
+ 
+@@ -31,7 +32,8 @@ def create_layer(size, offset, layer_type="image", layer_name='layer', dtype=Non
+     storage = create_storage(layer_name)
+ 
+     CloudVolume.from_numpy(
+-        random_data, vol_path='file://' + layer_path + '/' + layer_name,
++        random_data, 
++        vol_path='file://' + layer_path + '/' + layer_name,
+         resolution=(1,1,1), voxel_offset=offset, 
+         chunk_size=(64,64,64), layer_type=layer_type, 
+         max_mip=0,
+diff --git a/test/test_tasks.py b/test/test_tasks.py
+index bc67d2ea..66f7509f 100755
+--- a/test/test_tasks.py
++++ b/test/test_tasks.py
+@@ -8,8 +8,9 @@
+ import shutil
+ 
+ import numpy as np
+-from cloudvolume import Storage, CloudVolume, EmptyVolumeException, view
++from cloudvolume import CloudVolume, EmptyVolumeException, view
+ import cloudvolume.lib as lib
++from cloudfiles import CloudFiles
+ from taskqueue import MockTaskQueue, TaskQueue
+ import tinybrain
+ 
+@@ -26,15 +27,15 @@
+ @pytest.mark.parametrize("compression_method", ( None, 'gzip', 'br',))
+ def test_downsample_no_offset(compression_method):
+     delete_layer()
+-    storage, data = create_layer(size=(1024,1024,128,1), offset=(0,0,0))
+-    cv = CloudVolume(storage.layer_path)
++    cf, data = create_layer(size=(1024,1024,128,1), offset=(0,0,0))
++    cv = CloudVolume(cf.cloudpath)
+     assert len(cv.scales) == 1
+     assert len(cv.available_mips) == 1
+ 
+     cv.commit_info()
+ 
+     tq = MockTaskQueue()
+-    tasks = create_downsampling_tasks(storage.layer_path, mip=0, num_mips=4, compress=compression_method)
++    tasks = create_downsampling_tasks(cf.cloudpath, mip=0, num_mips=4, compress=compression_method)
+     tq.insert_all(tasks)
+ 
+     cv.refresh_info()
+@@ -69,8 +70,8 @@ def test_downsample_no_offset(compression_method):
+ 
+ def test_downsample_no_offset_2x2x2():
+     delete_layer()
+-    storage, data = create_layer(size=(512,512,512,1), offset=(0,0,0))
+-    cv = CloudVolume(storage.layer_path)
++    cf, data = create_layer(size=(512,512,512,1), offset=(0,0,0))
++    cv = CloudVolume(cf.cloudpath)
+     assert len(cv.scales) == 1
+     assert len(cv.available_mips) == 1
+ 
+@@ -78,7 +79,7 @@ def test_downsample_no_offset_2x2x2():
+ 
+     tq = MockTaskQueue()
+     tasks = create_downsampling_tasks(
+-        storage.layer_path, mip=0, num_mips=3, 
++        cf.cloudpath, mip=0, num_mips=3, 
+         compress=None, factor=(2,2,2)
+     )
+     tq.insert_all(tasks)
+@@ -110,15 +111,15 @@ def test_downsample_no_offset_2x2x2():
+ 
+ def test_downsample_with_offset():
+     delete_layer()
+-    storage, data = create_layer(size=(512,512,128,1), offset=(3,7,11))
+-    cv = CloudVolume(storage.layer_path)
++    cf, data = create_layer(size=(512,512,128,1), offset=(3,7,11))
++    cv = CloudVolume(cf.cloudpath)
+     assert len(cv.scales) == 1
+     assert len(cv.available_mips) == 1
+ 
+     cv.commit_info()
+ 
+     tq = MockTaskQueue()
+-    tasks = create_downsampling_tasks(storage.layer_path, mip=0, num_mips=3)
++    tasks = create_downsampling_tasks(cf.cloudpath, mip=0, num_mips=3)
+     tq.insert_all(tasks)
+ 
+     cv.refresh_info()
+@@ -148,8 +149,8 @@ def test_downsample_with_offset():
+ 
+ def test_downsample_w_missing():
+     delete_layer()
+-    storage, data = create_layer(size=(512,512,128,1), offset=(3,7,11))
+-    cv = CloudVolume(storage.layer_path)
++    cf, data = create_layer(size=(512,512,128,1), offset=(3,7,11))
++    cv = CloudVolume(cf.cloudpath)
+     assert len(cv.scales) == 1
+     assert len(cv.available_mips) == 1
+     delete_layer()
+@@ -159,14 +160,14 @@ def test_downsample_w_missing():
+     tq = MockTaskQueue()
+ 
+     try:
+-        tasks = create_downsampling_tasks(storage.layer_path, mip=0, num_mips=3, fill_missing=False)
++        tasks = create_downsampling_tasks(cf.cloudpath, mip=0, num_mips=3, fill_missing=False)
+         tq.insert_all(tasks)
+     except EmptyVolumeException:
+         pass
+ 
+     tq = MockTaskQueue()
+ 
+-    tasks = create_downsampling_tasks(storage.layer_path, mip=0, num_mips=3, fill_missing=True)
++    tasks = create_downsampling_tasks(cf.cloudpath, mip=0, num_mips=3, fill_missing=True)
+     tq.insert_all(tasks)
+ 
+     cv.refresh_info()
+@@ -185,19 +186,19 @@ def test_downsample_w_missing():
+ 
+ def test_downsample_higher_mip():
+     delete_layer()
+-    storage, data = create_layer(size=(512,512,64,1), offset=(3,7,11))
+-    cv = CloudVolume(storage.layer_path)
++    cf, data = create_layer(size=(512,512,64,1), offset=(3,7,11))
++    cv = CloudVolume(cf.cloudpath)
+     cv.info['scales'] = cv.info['scales'][:1]
+     
+     tq = MockTaskQueue()
+ 
+     cv.commit_info()
+-    tasks = create_downsampling_tasks(storage.layer_path, mip=0, num_mips=2)
++    tasks = create_downsampling_tasks(cf.cloudpath, mip=0, num_mips=2)
+     tq.insert_all(tasks)
+     cv.refresh_info()
+     assert len(cv.available_mips) == 3
+ 
+-    tasks = create_downsampling_tasks(storage.layer_path, mip=1, num_mips=2)
++    tasks = create_downsampling_tasks(cf.cloudpath, mip=1, num_mips=2)
+     tq.insert_all(tasks)
+     cv.refresh_info()
+     assert len(cv.available_mips) == 4
+@@ -207,30 +208,30 @@ def test_downsample_higher_mip():
+ 
+ def test_delete():
+     delete_layer()
+-    storage, _ = create_layer(size=(128,64,64,1), offset=(0,0,0), layer_type="segmentation")
+-    cv = CloudVolume(storage.layer_path)
++    cf, _ = create_layer(size=(128,64,64,1), offset=(0,0,0), layer_type="segmentation")
++    cv = CloudVolume(cf.cloudpath)
+ 
+     DeleteTask(
+-        layer_path=storage.layer_path,
++        layer_path=cf.cloudpath,
+         offset=(0,0,0),
+         shape=(128, 64, 64),
+-    ).execute()
++    )
+ 
+-    fnames = [ _ for _ in storage.list_files() ]
++    fnames = list(cf.list())
+     
+     assert '1_1_1/0-64_0-64_0-64' not in fnames
+     assert '1_1_1/64-128_0-64_0-64' not in fnames
+ 
+ def test_blackout_tasks():
+     delete_layer()
+-    storage, _ = create_layer(size=(128,64,64,1), offset=(0,0,0), layer_type="image")
+-    cv = CloudVolume(storage.layer_path)
++    cf, _ = create_layer(size=(128,64,64,1), offset=(0,0,0), layer_type="image")
++    cv = CloudVolume(cf.cloudpath)
+ 
+     tq = TaskQueue("fq:///tmp/removeme/blackout/")
+ 
+     tq.insert(
+         partial(BlackoutTask, 
+-            cloudpath=storage.layer_path,
++            cloudpath=cf.cloudpath,
+             mip=0,
+             offset=(0,0,0),
+             shape=(128, 64, 64),
+@@ -244,7 +245,7 @@ def test_blackout_tasks():
+     assert np.all(img == 11)
+ 
+     BlackoutTask(
+-        cloudpath=storage.layer_path,
++        cloudpath=cf.cloudpath,
+         mip=0,
+         offset=(0,0,0),
+         shape=(37, 64, 64),
+@@ -269,8 +270,8 @@ def test_blackout_tasks():
+ @pytest.mark.parametrize('compress', ('gzip', 'br'))
+ def test_mesh(compress):
+     delete_layer()
+-    storage, _ = create_layer(size=(64,64,64,1), offset=(0,0,0), layer_type="segmentation")
+-    cv = CloudVolume(storage.layer_path)
++    cf, _ = create_layer(size=(64,64,64,1), offset=(0,0,0), layer_type="segmentation")
++    cv = CloudVolume(cf.cloudpath)
+     # create a box of ones surrounded by zeroes
+     data = np.zeros(shape=(64,64,64,1), dtype=np.uint32)
+     data[1:-1,1:-1,1:-1,:] = 1
+@@ -281,7 +282,7 @@ def test_mesh(compress):
+     t = MeshTask(
+         shape=(64,64,64),
+         offset=(0,0,0),
+-        layer_path=storage.layer_path,
++        layer_path=cf.cloudpath,
+         mip=0,
+         remap_table={"1": "10"},
+         low_padding=0,
+@@ -289,8 +290,8 @@ def test_mesh(compress):
+         compress=compress
+     )
+     t.execute()
+-    assert storage.get_file('mesh/10:0:0-64_0-64_0-64') is not None 
+-    assert list(storage.list_files('mesh/')) == ['mesh/10:0:0-64_0-64_0-64']
++    assert cf.get('mesh/10:0:0-64_0-64_0-64') is not None 
++    assert list(cf.list('mesh/')) == ['mesh/10:0:0-64_0-64_0-64']
+ 
+ 
+ def test_quantize():
+@@ -299,8 +300,8 @@ def test_quantize():
+     delete_layer()
+     delete_layer(qpath)
+ 
+-    storage, _ = create_layer(size=(256,256,128,3), offset=(0,0,0), layer_type="affinities")
+-    cv = CloudVolume(storage.layer_path)
++    cf, _ = create_layer(size=(256,256,128,3), offset=(0,0,0), layer_type="affinities")
++    cv = CloudVolume(cf.cloudpath)
+ 
+     shape = (128, 128, 64)
+     slices = np.s_[ :shape[0], :shape[1], :shape[2], :1 ]
+@@ -310,7 +311,7 @@ def test_quantize():
+     data = data.astype(np.uint8)
+ 
+     task = QuantizeTask(
+-        source_layer_path=storage.layer_path,
++        source_layer_path=cf.cloudpath,
+         dest_layer_path=qpath,
+         shape=shape,
+         offset=(0,0,0),
+@@ -318,7 +319,7 @@ def test_quantize():
+     )
+ 
+     info = create_quantized_affinity_info(
+-        storage.layer_path, qpath, shape, 
++        cf.cloudpath, qpath, shape, 
+         mip=0, chunk_size=[64,64,64], encoding='raw'
+     )
+     qcv = CloudVolume(qpath, info=info)
+@@ -350,8 +351,7 @@ def test_mesh_manifests():
+     n_lods = 2
+     n_fragids = 5
+ 
+-    with Storage(layer_path) as stor:
+-        stor.put_file('info', '{"mesh":"mesh_mip_3_error_40"}'.encode('utf8'))
++    CloudFiles(layer_path).put_json('info', {"mesh":"mesh_mip_3_error_40"})
+ 
+     for segid in range(n_segids):
+         for lod in range(n_lods):
+@@ -392,7 +392,7 @@ def test_luminance_levels_task():
+ 
+     delete_layer(layer_path)
+ 
+-    storage, imgd = create_layer(
++    cf, imgd = create_layer(
+         size=(256,256,128,1), offset=(0,0,0), 
+         layer_type="image", layer_name='luminance_levels'
+     )
+@@ -438,47 +438,3 @@ def test_skeletonization_task():
+     })
+     tq.insert_all(tasks)
+ 
+-
+-        
+-# def test_watershed():
+-#     return # needs expensive julia stuff enabled in dockerfile
+-#     from igneous import WatershedTask
+-#     delete_layer('affinities')
+-#     storage, data = create_layer(size=(64,64,64,3), offset=(0,0,0), layer_type='affinities', layer_name='affinities')
+-
+-#     delete_layer('segmentation')
+-#     storage, data = create_layer(size=(64,64,64,1), offset=(0,0,0), layer_type='segmentation', layer_name='segmentation')
+-
+-#     WatershedTask(chunk_position='0-64_0-64_0-64',
+-#                   crop_position='0-64_0-64_0-64',
+-#                   layer_path_affinities='file:///tmp/removeme/affinities',
+-#                   layer_path_segmentation='file:///tmp/removeme/segmentation',
+-#                   high_threshold=0.999987, low_threshold=0.003, merge_threshold=0.3, 
+-#                   merge_size=800, dust_size=800).execute()
+-
+-
+-# def test_real_data():
+-#     return # this is to expensive to be test by travis
+-#     from igneous import WatershedTask
+-#     from tqdm import tqdm
+-#     from itertools import product
+-#     vol = CloudVolume('s3://neuroglancer/pinky40_v11/affinitymap-jnet')
+-#     scale = vol.info['scales'][0]
+-#     for x_min in range(0, scale['size'][0], 512):
+-#         for y_min in range(0, scale['size'][1], 512):
+-#             for z_min in range(0, scale['size'][2], 1024):
+-#                 x_max = min(scale['size'][0], x_min + 768)
+-#                 y_max = min(scale['size'][1], y_min + 768)
+-#                 z_max = min(scale['size'][2], z_min + 1024)
+-
+-#                 #adds offsets
+-#                 x_min += scale['voxel_offset'][0]; x_max += scale['voxel_offset'][0]
+-#                 y_min += scale['voxel_offset'][1]; y_max += scale['voxel_offset'][1]
+-#                 z_min += scale['voxel_offset'][2]; z_max += scale['voxel_offset'][2]
+-#                 WatershedTask(chunk_position='{}-{}_{}-{}_{}-{}'.format(x_min, x_max, y_min, y_max, z_min, z_max),
+-#                   crop_position='128-640_128-640_0-1024',
+-#                   layer_path_affinities='s3://neuroglancer/pinky40_v11/affinitymap-jnet',
+-#                   layer_path_segmentation='s3://neuroglancer/pinky40_v11/chunked_watershed',
+-#                   high_threshold=0.999987, low_threshold=0.003, merge_threshold=0.3, 
+-#                   merge_size=800, dust_size=800).execute()
+-   
+\ No newline at end of file
+diff --git a/test/test_transfer_tasks.py b/test/test_transfer_tasks.py
+new file mode 100644
+index 00000000..fd8dac45
+--- /dev/null
++++ b/test/test_transfer_tasks.py
+@@ -0,0 +1,145 @@
++import pytest
++
++import copy
++from functools import partial
++from collections import defaultdict
++import os.path
++import shutil
++
++import numpy as np
++from cloudvolume import CloudVolume, EmptyVolumeException, view
++import cloudvolume.lib as lib
++from cloudfiles import CloudFiles
++from taskqueue import MockTaskQueue, TaskQueue
++import tinybrain
++
++import igneous
++import igneous.task_creation as tc
++from igneous.downsample_scales import create_downsample_scales
++
++CHECKER = False
++
++@pytest.fixture(scope="module", params=[ (512,512,128), (600, 600, 200) ])
++def transfer_data(request):
++  if not CHECKER:
++    data = np.random.randint(0xFF, size=request.param, dtype=np.uint8)
++  else:
++    data = np.zeros((512,512,128), dtype=np.uint8)
++    i = 1
++    for x in range(8):
++      for y in range(8):
++        for z in range(2):
++          data[64*x:64*(x+1), 64*y:64*(y+1), 64*z:64*(z+1)] = i
++          i += 1 
++
++  ds_data = tinybrain.downsample_with_averaging(data, factor=[2, 2, 1, 1], num_mips=5)
++  ds_data.insert(0, data)
++
++  for i in range(len(ds_data)):
++    while ds_data[i].ndim < 4:
++      ds_data[i] = ds_data[i][..., np.newaxis]
++
++  return ds_data  
++
++path_root = "/tmp/removeme/transfertask"
++srcpath = f"file://{path_root}/src"
++destpath = f"file://{path_root}/dest"
++
++def rmdest():
++  directory = f"{path_root}/dest"
++  if os.path.exists(directory):
++    shutil.rmtree(directory)
++def rmsrc():
++  directory = f"{path_root}/src"
++  if os.path.exists(directory):
++    shutil.rmtree(directory)
++
++@pytest.fixture(scope="module")
++def tq():
++  return MockTaskQueue()
++
++@pytest.fixture(scope="function")
++def src_cv(transfer_data):
++  rmsrc()
++  rmdest()
++  return CloudVolume.from_numpy(
++    transfer_data[0], 
++    vol_path=srcpath,
++    resolution=(1,1,1), 
++    voxel_offset=(0,0,0), 
++    chunk_size=(64,64,64), 
++    layer_type="image", 
++    max_mip=0,
++  )
++
++def test_transfer_task_vanilla(tq, src_cv, transfer_data):
++  tasks = tc.create_transfer_tasks(src_cv.cloudpath, destpath)
++  tq.insert_all(tasks)
++
++  dest_cv = CloudVolume(destpath)
++  assert np.all(src_cv[:] == dest_cv[:])
++  rmsrc()
++  rmdest()
++
++def test_transfer_task_rechunk(tq, src_cv, transfer_data):
++  tasks = tc.create_transfer_tasks(src_cv.cloudpath, destpath, chunk_size=(50,50,50))
++  tq.insert_all(tasks)
++  dest_cv = CloudVolume(destpath)
++  assert len(dest_cv.scales) == 4
++  assert np.all(src_cv[:] == dest_cv[:])
++  for mip in range(1, 4):
++    dest_cv.mip = mip
++    assert np.all(dest_cv[:] == transfer_data[mip])
++  rmsrc()
++  rmdest()
++
++# chunk size (64,64,64) should test transfer_to pathway
++@pytest.mark.parametrize("chunk_size", [ (50,50,50), (64,64,64) ])
++def test_transfer_task_skip_downsample(tq, src_cv, chunk_size):
++  tasks = tc.create_transfer_tasks(
++    src_cv.cloudpath, destpath, 
++    chunk_size=chunk_size, skip_downsamples=True
++  )
++  tq.insert_all(tasks)
++  dest_cv = CloudVolume(destpath)
++  assert len(dest_cv.scales) == 1
++  assert np.all(src_cv[:] == dest_cv[:])
++  rmsrc()
++  rmdest()
++
++def test_transfer_task_dest_offset(tq, src_cv, transfer_data):
++  tasks = tc.create_transfer_tasks(
++    src_cv.cloudpath, destpath, 
++    chunk_size=(50,50,50), dest_voxel_offset=(100, 100, 100)
++  )
++  tq.insert_all(tasks)
++  dest_cv = CloudVolume(destpath)
++  assert len(dest_cv.scales) == 4
++  assert tuple(dest_cv.voxel_offset) == (100, 100, 100)
++  assert tuple(src_cv.voxel_offset) == (0, 0, 0)
++  assert np.all(src_cv[:] == dest_cv[:])
++  for mip in range(1, 4):
++    dest_cv.mip = mip
++    assert np.all(dest_cv[:] == transfer_data[mip])
++  rmsrc()
++  rmdest()
++
++def test_transfer_task_subset(tq, src_cv, transfer_data):
++  dest_cv = CloudVolume(destpath, info=copy.deepcopy(src_cv.info))
++  dest_cv.scale["size"] = [256, 256, 64]
++  dest_cv.commit_info()
++
++  tasks = tc.create_transfer_tasks(
++    src_cv.cloudpath, destpath, 
++    chunk_size=(64,64,64), 
++    translate=(-128, -128, -64),
++  )
++  tq.insert_all(tasks)
++  dest_cv.refresh_info()
++
++  assert len(dest_cv.scales) == 3
++  assert np.all(src_cv[128:128+256, 128:128+256, 64:64+64] == dest_cv[:])
++
++  rmsrc()
++  rmdest()
++

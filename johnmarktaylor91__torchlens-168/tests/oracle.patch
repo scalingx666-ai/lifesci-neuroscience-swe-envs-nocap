@@ -1,0 +1,665 @@
+diff --git a/tests/test_perf_bundle.py b/tests/test_perf_bundle.py
+new file mode 100644
+index 0000000000..dc6236e6c4
+--- /dev/null
++++ b/tests/test_perf_bundle.py
+@@ -0,0 +1,356 @@
++"""Behavioral tests for the 2026-04-27 performance bundle.
++
++The bundle ships three independent performance fixes uncovered by the
++profiling audit at ``.project-context/research/profiling_audit_2026-04-27.md``:
++
++1. **Bytecode column-offset cache** -- ``_get_col_offset`` no longer
++   re-disassembles the same code object on every captured frame.
++2. **Step 5 fast-skip** -- branch attribution skips the per-op AST work
++   when the model has no captured terminal scalar bools (i.e. no
++   conditional branches that the pipeline can attribute).
++3. **CUDA probe gating** -- ``torch.cuda.empty_cache()`` calls in the
++   postprocess and capture paths are gated behind the cached
++   ``torch.cuda.is_available()`` so CPU-only runs skip CUDA driver
++   probes entirely.
++
++Each fix is verified behaviorally rather than via wall-clock timing
++because timings are flaky in CI. A single optional benchmark probe is
++provided behind ``@pytest.mark.slow`` for local sanity checking.
++"""
++
++from __future__ import annotations
++
++import sys
++import types
++from unittest import mock
++
++import pytest
++import torch
++import torch.nn as nn
++
++import torchlens
++from torchlens.postprocess import control_flow
++from torchlens.utils import introspection
++
++
++# ---------------------------------------------------------------------------
++# Test models
++# ---------------------------------------------------------------------------
++
++
++class _NoConditionalModel(nn.Module):
++    """nn.Sequential-like model with no Python-level conditional branches."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.fc1 = nn.Linear(8, 8)
++        self.fc2 = nn.Linear(8, 4)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = self.fc1(x)
++        x = torch.relu(x)
++        x = self.fc2(x)
++        return x
++
++
++class _ConditionalModel(nn.Module):
++    """Tiny model with a real Python ``if`` branch driven by tensor data."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.fc = nn.Linear(4, 4)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        y = self.fc(x)
++        if y.sum() > 0:
++            y = torch.relu(y)
++        else:
++            y = torch.sigmoid(y)
++        return y
++
++
++# ---------------------------------------------------------------------------
++# Fix 1 -- column-offset cache
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.skipif(
++    sys.version_info < (3, 11),
++    reason="_get_col_offset is a no-op on Python < 3.11",
++)
++class TestColOffsetCache:
++    """Cache should reuse the disassembled offset map per code object."""
++
++    def setup_method(self) -> None:
++        introspection._clear_col_offset_cache()
++
++    def teardown_method(self) -> None:
++        introspection._clear_col_offset_cache()
++
++    def _make_frame_at_offset(self, code: types.CodeType, lasti: int):
++        """Return a duck-typed frame exposing the bits ``_get_col_offset`` reads."""
++
++        return types.SimpleNamespace(f_code=code, f_lasti=lasti)
++
++    def test_repeated_calls_reuse_disassembly(self) -> None:
++        """Two lookups for the same code object disassemble it only once."""
++
++        code = (lambda x, y: x + y).__code__
++
++        with mock.patch.object(
++            introspection.dis,
++            "get_instructions",
++            wraps=introspection.dis.get_instructions,
++        ) as wrapped:
++            introspection._get_col_offset(self._make_frame_at_offset(code, 0))
++            introspection._get_col_offset(self._make_frame_at_offset(code, 0))
++            introspection._get_col_offset(self._make_frame_at_offset(code, 2))
++
++        assert wrapped.call_count == 1, (
++            "Expected dis.get_instructions to run once per code object, "
++            f"observed {wrapped.call_count} calls."
++        )
++
++    def test_different_code_objects_each_disassembled_once(self) -> None:
++        """Each unique code object gets its own cache entry."""
++
++        code_a = (lambda: 1).__code__
++        code_b = (lambda: 2).__code__
++
++        with mock.patch.object(
++            introspection.dis,
++            "get_instructions",
++            wraps=introspection.dis.get_instructions,
++        ) as wrapped:
++            introspection._get_col_offset(self._make_frame_at_offset(code_a, 0))
++            introspection._get_col_offset(self._make_frame_at_offset(code_b, 0))
++            introspection._get_col_offset(self._make_frame_at_offset(code_a, 0))
++            introspection._get_col_offset(self._make_frame_at_offset(code_b, 0))
++
++        assert wrapped.call_count == 2, (
++            "Expected dis.get_instructions to run once per unique code object, "
++            f"observed {wrapped.call_count} calls."
++        )
++
++    def test_cache_returns_consistent_offsets(self) -> None:
++        """Cached lookups agree with a fresh computation on the same instruction."""
++
++        def sample(value: int) -> int:
++            return value + 1
++
++        code = sample.__code__
++
++        # Pick a real instruction offset by walking the bytecode directly.
++        instructions = list(introspection.dis.get_instructions(code))
++        assert instructions, "Sample function must compile to at least one instruction."
++        first_offset = instructions[0].offset
++        expected = (
++            instructions[0].positions.col_offset if instructions[0].positions is not None else None
++        )
++
++        cached = introspection._get_col_offset(self._make_frame_at_offset(code, first_offset))
++        assert cached == expected
++
++        # Hit again to ensure the cached path returns the same value.
++        cached_again = introspection._get_col_offset(self._make_frame_at_offset(code, first_offset))
++        assert cached_again == expected
++
++    def test_unknown_offset_returns_none(self) -> None:
++        """An offset that does not match any indexed instruction yields ``None``."""
++
++        code = (lambda x: x).__code__
++        result = introspection._get_col_offset(self._make_frame_at_offset(code, 9999))
++        assert result is None
++
++
++# ---------------------------------------------------------------------------
++# Fix 2 -- branch attribution fast-skip
++# ---------------------------------------------------------------------------
++
++
++class TestBranchFastSkip:
++    """When no conditional bools exist, Step 5 short-circuits the slow path."""
++
++    def test_fast_skip_triggers_for_non_conditional_model(self) -> None:
++        """A model without if-branches should never call ``attribute_op``."""
++
++        model = _NoConditionalModel()
++        x = torch.randn(2, 8)
++
++        with (
++            mock.patch.object(
++                control_flow.ast_branches,
++                "attribute_op",
++                wraps=control_flow.ast_branches.attribute_op,
++            ) as wrapped_attr,
++            mock.patch.object(
++                control_flow.ast_branches,
++                "classify_bool",
++                wraps=control_flow.ast_branches.classify_bool,
++            ) as wrapped_classify,
++        ):
++            log = torchlens.log_forward_pass(model, x)
++
++        assert wrapped_attr.call_count == 0, (
++            "attribute_op was invoked for a model with no terminal scalar bools; "
++            "the fast-skip precondition is no longer holding."
++        )
++        assert wrapped_classify.call_count == 0, (
++            "classify_bool was invoked for a model with no terminal scalar bools."
++        )
++
++        # And the conditional collections must remain at their empty defaults.
++        assert log.internally_terminated_bool_layers == []
++        assert log.conditional_events == []
++        assert log.conditional_branch_edges == []
++        assert log.conditional_then_edges == []
++        assert log.conditional_elif_edges == []
++        assert log.conditional_else_edges == []
++        assert log.conditional_arm_edges == {}
++        assert log.conditional_edge_passes == {}
++
++    def test_slow_path_runs_when_conditional_present(self) -> None:
++        """A model with an if-branch must still run the full slow path."""
++
++        torch.manual_seed(0)
++        model = _ConditionalModel()
++        x = torch.ones(1, 4)
++
++        with mock.patch.object(
++            control_flow.ast_branches,
++            "attribute_op",
++            wraps=control_flow.ast_branches.attribute_op,
++        ) as wrapped_attr:
++            log = torchlens.log_forward_pass(model, x)
++
++        # The slow path must touch attribute_op at least once, and the
++        # ConditionalEvent table must be populated.
++        assert wrapped_attr.call_count > 0, (
++            "Expected attribute_op to run for a model with a real conditional "
++            "branch; the fast-skip is incorrectly engaging."
++        )
++        assert len(log.conditional_events) >= 1
++        assert len(log.internally_terminated_bool_layers) >= 1
++
++    def test_empty_model_does_not_crash(self) -> None:
++        """A model that produces zero ops must not crash inside Step 5."""
++
++        class _EmptyForward(nn.Module):
++            def forward(self, x: torch.Tensor) -> torch.Tensor:
++                return x
++
++        # The postprocess pipeline already guards a zero-layer log
++        # (``len(self._raw_layer_labels_list) == 0``) and returns early.
++        # We still exercise the path to confirm the fast-skip change does
++        # not introduce a regression upstream of that guard.
++        model = _EmptyForward()
++        x = torch.zeros(2, 2)
++        log = torchlens.log_forward_pass(model, x)
++        assert log.conditional_events == []
++
++
++# ---------------------------------------------------------------------------
++# Fix 3 -- CUDA probe gating
++# ---------------------------------------------------------------------------
++
++
++class TestCudaProbeGating:
++    """``torch.cuda.empty_cache`` is gated behind cached ``cuda.is_available``."""
++
++    def test_no_cuda_calls_when_unavailable(self) -> None:
++        """On a CPU-only run, ``empty_cache`` and ``is_available`` see at most one call."""
++
++        from torchlens.utils import tensor_utils
++
++        # Reset the module-level cache so we observe the first call this test
++        # makes (the conftest may have warmed it up earlier in the session).
++        tensor_utils._cuda_available = None
++
++        with (
++            mock.patch.object(torch.cuda, "is_available", return_value=False) as fake_avail,
++            mock.patch.object(torch.cuda, "empty_cache") as fake_empty,
++        ):
++            model = _NoConditionalModel()
++            x = torch.randn(2, 8)
++            torchlens.log_forward_pass(model, x)
++
++        # The cached helper consults torch.cuda.is_available at most once
++        # for this process; subsequent tensor_utils._is_cuda_available()
++        # calls reuse the cached False value.
++        assert fake_avail.call_count <= 1, (
++            "torch.cuda.is_available was queried "
++            f"{fake_avail.call_count} times; the cache is not being honored."
++        )
++        assert fake_empty.call_count == 0, (
++            "torch.cuda.empty_cache must not be invoked on CPU-only runs; "
++            f"observed {fake_empty.call_count} calls."
++        )
++
++        # The cache must have been populated to the False value we forced.
++        assert tensor_utils._cuda_available is False
++
++    def test_cached_value_short_circuits_subsequent_lookups(self) -> None:
++        """Once cached, ``_is_cuda_available`` does not reach the torch API again."""
++
++        from torchlens.utils import tensor_utils
++
++        tensor_utils._cuda_available = None
++        with mock.patch.object(torch.cuda, "is_available", return_value=False) as fake_avail:
++            assert tensor_utils._is_cuda_available() is False
++            assert tensor_utils._is_cuda_available() is False
++            assert tensor_utils._is_cuda_available() is False
++
++        assert fake_avail.call_count == 1, (
++            "Repeated ``_is_cuda_available`` calls must reuse the cached value; "
++            f"observed {fake_avail.call_count} torch.cuda.is_available calls."
++        )
++
++    @pytest.mark.skipif(
++        not torch.cuda.is_available(),
++        reason="CUDA-only sanity check; skipped without a real CUDA device.",
++    )
++    def test_cuda_path_still_runs_when_available(self) -> None:
++        """On a CUDA host, ``empty_cache`` must still be invoked."""
++
++        from torchlens.utils import tensor_utils
++
++        tensor_utils._cuda_available = None
++        # Don't mock torch.cuda.is_available so the genuine probe is used.
++        with mock.patch.object(
++            torch.cuda, "empty_cache", wraps=torch.cuda.empty_cache
++        ) as wrapped_empty:
++            model = _NoConditionalModel()
++            x = torch.randn(2, 8)
++            torchlens.log_forward_pass(model, x)
++
++        assert wrapped_empty.call_count >= 1
++
++
++# ---------------------------------------------------------------------------
++# Optional benchmark probe (skipped in default CI)
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.slow
++def test_perf_bundle_benchmark_probe() -> None:
++    """End-to-end smoke benchmark to sanity-check the bundle locally.
++
++    Not a regression gate -- timings vary with system load. Simply confirm
++    that the standard log_forward_pass still completes for a small model
++    after the bundle is applied.
++    """
++
++    import time
++
++    model = _NoConditionalModel()
++    x = torch.randn(2, 8)
++
++    # Warm-up to absorb first-call decoration cost.
++    torchlens.log_forward_pass(model, x)
++
++    start = time.perf_counter()
++    for _ in range(3):
++        torchlens.log_forward_pass(model, x)
++    elapsed = time.perf_counter() - start
++
++    assert elapsed < 60.0, f"Bundle benchmark unexpectedly slow: {elapsed:.2f}s"
+diff --git a/torchlens/capture/trace.py b/torchlens/capture/trace.py
+index b6838fdfb9..4f7f81d97e 100644
+--- a/torchlens/capture/trace.py
++++ b/torchlens/capture/trace.py
+@@ -47,6 +47,7 @@
+ from ..utils.introspection import get_vars_of_type_from_obj, nested_assign
+ from ..utils.rng import set_random_seed, log_current_rng_states, set_rng_from_saved_states
+ from ..utils.arg_handling import safe_copy_args, safe_copy_kwargs, normalize_input_args
++from ..utils.tensor_utils import _is_cuda_available
+ from .source_tensors import log_source_tensor
+ from ..data_classes._lookup_keys import _give_user_feedback_about_lookup_key
+ from ..utils.display import _vprint, _vtimed
+@@ -536,5 +537,9 @@ def run_and_log_inputs_through_model(
+ 
+     finally:
+         # Release input tensor references so GC can reclaim CUDA memory.
++        # Gated behind cached cuda.is_available() so CPU-only runs don't pay
++        # the CUDA driver / NVML probe cost (per profiling audit 2026-04-27
++        # finding #4).
+         input_tensors = None  # type: ignore[assignment]
+-        torch.cuda.empty_cache()
++        if _is_cuda_available():
++            torch.cuda.empty_cache()
+diff --git a/torchlens/data_classes/cleanup.py b/torchlens/data_classes/cleanup.py
+index a62913f765..8d8b2a5ca4 100644
+--- a/torchlens/data_classes/cleanup.py
++++ b/torchlens/data_classes/cleanup.py
+@@ -6,7 +6,8 @@
+    deletes all ModelLog attributes (both FIELD_ORDER and internal containers).
+    Breaks circular references (ModelLog <-> LayerPassLog.source_model_log,
+    LayerLog <-> LayerPassLog.parent_layer_log, ModuleLog <-> _source_model_log).
+-   Also frees GPU memory via ``torch.cuda.empty_cache()``.
++   Also frees GPU memory via ``torch.cuda.empty_cache()`` when CUDA is
++   available (gated to avoid CUDA driver probe cost on CPU-only runs).
+ 
+ 2. **_remove_log_entry_references()** — removes a single layer label from all
+    ModelLog list/dict fields that hold graph references.
+@@ -24,6 +25,7 @@
+ 
+ from ..constants import MODEL_LOG_FIELD_ORDER
+ from ..utils.collections import remove_entry_from_list
++from ..utils.tensor_utils import _is_cuda_available
+ from .layer_pass_log import LayerPassLog
+ 
+ 
+@@ -72,7 +74,10 @@ def cleanup(self) -> None:
+     ]:
+         if hasattr(self, attr):
+             delattr(self, attr)
+-    torch.cuda.empty_cache()
++    # Gated behind cached cuda.is_available() so CPU-only runs don't pay the
++    # CUDA driver / NVML probe cost (per profiling audit 2026-04-27 finding #4).
++    if _is_cuda_available():
++        torch.cuda.empty_cache()
+ 
+ 
+ def _clear_entry_attributes(log_entry: LayerPassLog) -> None:
+diff --git a/torchlens/postprocess/__init__.py b/torchlens/postprocess/__init__.py
+index 4f7fd7f053..4b7f01c4fd 100644
+--- a/torchlens/postprocess/__init__.py
++++ b/torchlens/postprocess/__init__.py
+@@ -38,7 +38,7 @@
+ import time
+ import torch
+ 
+-from ..utils.tensor_utils import safe_copy
++from ..utils.tensor_utils import _is_cuda_available, safe_copy
+ 
+ from .control_flow import (
+     _fix_buffer_layers,
+@@ -174,7 +174,10 @@ def postprocess(
+         _undecorate_all_saved_tensors(self)
+ 
+     # Step 14: Clear the cache after any tensor deletions for garbage collection purposes.
+-    torch.cuda.empty_cache()
++    # Gated behind cached cuda.is_available() so CPU-only runs don't pay the
++    # CUDA driver / NVML probe cost (per profiling audit 2026-04-27 finding #4).
++    if _is_cuda_available():
++        torch.cuda.empty_cache()
+ 
+     # Step 15: Log time elapsed.
+     with _vtimed(self, "  Step 15: Log timing"):
+@@ -267,7 +270,10 @@ def postprocess_fast(self: "ModelLog") -> None:
+     _remove_unwanted_entries_and_log_remaining(self)
+     _undecorate_all_saved_tensors(self)
+ 
+-    torch.cuda.empty_cache()
++    # Gated behind cached cuda.is_available() so CPU-only fast-pass runs don't
++    # pay the CUDA driver / NVML probe cost.
++    if _is_cuda_available():
++        torch.cuda.empty_cache()
+     _log_time_elapsed(self)
+     _build_layer_logs(self)
+     # Note: _build_module_logs is NOT called here because module structure
+diff --git a/torchlens/postprocess/control_flow.py b/torchlens/postprocess/control_flow.py
+index 9224823c34..60e5bc98cf 100644
+--- a/torchlens/postprocess/control_flow.py
++++ b/torchlens/postprocess/control_flow.py
+@@ -50,10 +50,31 @@ def _mark_conditional_branches(self: "ModelLog") -> None:
+     4. Backward-flood IF edges from branch-participating bools only.
+     5. Attribute executed ops and forward edges to conditional branch arms.
+     6. Rebuild compatibility views derived from the new primary structures.
++
++    Performance fast-path: when no terminal scalar bools were captured, the
++    model has no conditional branches the pipeline can attribute, so we skip
++    the AST file indexing, per-bool classification, and per-op
++    ``attribute_op()`` work. All ModelLog-level conditional collections are
++    already initialized empty in :meth:`ModelLog.__init__`, and per-layer
++    conditional fields are initialized to their empty defaults during
++    capture (see ``capture/output_tensors.py``). The fast-path is verified
++    against the slow-path defaults via ``tests/test_perf_bundle.py``.
+     """
+ 
++    if _can_fast_skip_step5(self):
++        return
++
+     file_indexes = _build_file_indexes(self)
+     conditional_keys, bool_classifications = _classify_bool_layers(self)
++    # Defensive guard: if no terminal bool produced a structural conditional
++    # key, attribution will produce zero edges, matching the fast-skip output.
++    # This invariant lets future refactors of the bool detector trip an
++    # explicit assertion rather than silently make the fast-path miss work.
++    if not bool_classifications:
++        assert not conditional_keys, (
++            "Internally-terminated bool layers were absent but conditional "
++            "keys were produced; the fast-skip precondition is stale."
++        )
+     events_by_key = _materialize_conditional_events(
+         self,
+         file_indexes,
+@@ -65,6 +86,46 @@ def _mark_conditional_branches(self: "ModelLog") -> None:
+     _materialize_derived_views(self)
+ 
+ 
++def _can_fast_skip_step5(self: "ModelLog") -> bool:
++    """Return True when Step 5 has no work to do.
++
++    The slow path's only branch-attributing inputs are the ModelLog's
++    ``internally_terminated_bool_layers``: if no terminal scalar bool was
++    captured, ``_iter_terminal_scalar_bool_labels`` yields nothing, so
++    every downstream collection (events, edges, per-layer arm children)
++    would resolve to its empty default. Skipping the slow path is then
++    semantically equivalent to running it.
++
++    The function also checks the derived ModelLog-level conditional
++    collections (``conditional_events``, ``conditional_branch_edges``,
++    ``conditional_then_edges``, ``conditional_elif_edges``,
++    ``conditional_else_edges``, ``conditional_arm_edges``,
++    ``conditional_edge_passes``). They are initialized empty in
++    :meth:`ModelLog.__init__`, and the slow path resets them on entry.
++    Any caller that pre-populated these would change the user-visible
++    output if we skipped, so we conservatively run the slow path in that
++    (pathological) case as well.
++    """
++
++    if self.internally_terminated_bool_layers:
++        return False
++    if self.conditional_events:
++        return False
++    if self.conditional_branch_edges:
++        return False
++    if self.conditional_then_edges:
++        return False
++    if self.conditional_elif_edges:
++        return False
++    if self.conditional_else_edges:
++        return False
++    if self.conditional_arm_edges:
++        return False
++    if self.conditional_edge_passes:
++        return False
++    return True
++
++
+ def _build_file_indexes(
+     self: "ModelLog",
+ ) -> Dict[str, Optional[ast_branches.FileIndex]]:
+diff --git a/torchlens/utils/introspection.py b/torchlens/utils/introspection.py
+index e7a6e0d5c0..1df79d95a7 100644
+--- a/torchlens/utils/introspection.py
++++ b/torchlens/utils/introspection.py
+@@ -8,8 +8,8 @@
+ import dis
+ import sys
+ import warnings
+-from types import FrameType
+-from typing import Any, Callable, List, Optional, Set, Type
++from types import CodeType, FrameType
++from typing import Any, Callable, Dict, List, Optional, Set, Type
+ 
+ import numpy as np
+ import torch
+@@ -23,6 +23,86 @@
+ # tensors, which are tracked separately.
+ _ATTR_SKIP_SET = frozenset({"T", "mT", "real", "imag", "H"})
+ 
++# Cached instruction-offset -> column-offset maps, keyed by ``id(code_obj)``.
++#
++# CPython code objects are immutable, so once we disassemble a code object
++# the mapping never changes. ``dis.get_instructions`` is one of the most
++# expensive calls on transformer-style hot paths (per profiling audit
++# 2026-04-27, ``dis.*`` self time ~16.5s on GPT-2). Re-using the parsed
++# offset map per code object reduces repeated work to a single dict lookup.
++#
++# Keys are ``id(code_obj)`` so unloaded code objects (e.g. via
++# ``importlib.reload``) get implicitly evicted: the new module's code
++# objects are fresh objects with new ids, and the old entries become
++# unreachable garbage. To keep the cache from growing without bound on
++# pathological workloads, we apply a soft cap and emit a one-shot warning
++# when crossed (the cap is large enough that real-world models never hit it).
++_COL_OFFSET_CACHE: Dict[int, Dict[int, Optional[int]]] = {}
++_COL_OFFSET_CACHE_SIZE_CAP = 100_000
++_col_offset_cache_warned = False
++
++
++def _build_col_offset_map(code: CodeType) -> Dict[int, Optional[int]]:
++    """Return ``instruction_offset -> column_offset`` for every instruction.
++
++    The map covers all bytecode instructions in ``code``. Instructions whose
++    ``positions`` are missing or whose ``col_offset`` is ``None`` are stored
++    with ``None`` so callers can distinguish "not in map" (unknown offset)
++    from "no column information available" (positions absent).
++    """
++    if sys.version_info < (3, 11):
++        return {}
++    offset_map: Dict[int, Optional[int]] = {}
++    try:
++        for instruction in dis.get_instructions(code):
++            positions = instruction.positions
++            if positions is None:
++                offset_map[instruction.offset] = None
++            else:
++                offset_map[instruction.offset] = positions.col_offset
++    except (TypeError, ValueError):
++        return {}
++    return offset_map
++
++
++def _get_or_build_col_offset_map(code: CodeType) -> Dict[int, Optional[int]]:
++    """Return the cached column-offset map for ``code`` (build on miss).
++
++    The cache is keyed by ``id(code)``. Code objects are immutable, so the
++    cached map is valid for the entire lifetime of the code object.
++    """
++    global _col_offset_cache_warned
++    code_id = id(code)
++    cached = _COL_OFFSET_CACHE.get(code_id)
++    if cached is not None:
++        return cached
++    if not _col_offset_cache_warned and len(_COL_OFFSET_CACHE) >= _COL_OFFSET_CACHE_SIZE_CAP:
++        # Emit a single warning so unbounded growth in pathological workloads
++        # is visible without spamming the logs. Real-world models are well
++        # under this cap; crossing it usually points to a code-object leak.
++        warnings.warn(
++            "torchlens column-offset cache exceeded "
++            f"{_COL_OFFSET_CACHE_SIZE_CAP} entries; new entries will still be "
++            "added but this likely indicates a long-running process touching "
++            "very many unique code objects.",
++            stacklevel=2,
++        )
++        _col_offset_cache_warned = True
++    offset_map = _build_col_offset_map(code)
++    _COL_OFFSET_CACHE[code_id] = offset_map
++    return offset_map
++
++
++def _clear_col_offset_cache() -> None:
++    """Drop all cached column-offset maps.
++
++    Intended for tests that need a clean slate between cache-behaviour
++    assertions.
++    """
++    global _col_offset_cache_warned
++    _COL_OFFSET_CACHE.clear()
++    _col_offset_cache_warned = False
++
+ 
+ def _get_code_qualname(frame: FrameType) -> Optional[str]:
+     """Return ``co_qualname`` when available on this Python version.
+@@ -49,17 +129,13 @@ def _get_col_offset(frame: FrameType) -> Optional[int]:
+     """
+     if sys.version_info < (3, 11):
+         return None
+-    try:
+-        for instruction in dis.get_instructions(frame.f_code):
+-            if instruction.offset != frame.f_lasti:
+-                continue
+-            positions = instruction.positions
+-            if positions is None:
+-                return None
+-            return positions.col_offset
+-    except (TypeError, ValueError):
++    offset_map = _get_or_build_col_offset_map(frame.f_code)
++    if not offset_map:
+         return None
+-    return None
++    # ``offset_map`` may legitimately contain ``None`` for instructions whose
++    # ``positions`` attribute is absent. Use ``get`` so a missing key (e.g.
++    # an instruction we never indexed) also returns ``None``.
++    return offset_map.get(frame.f_lasti)
+ 
+ 
+ def get_vars_of_type_from_obj(

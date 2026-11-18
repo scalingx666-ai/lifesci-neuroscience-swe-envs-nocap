@@ -1,0 +1,13 @@
+# Issue
+
+**Title:** Fix missing return statement
+
+## Description
+
+The `sin_cos()` function does not return the function value.
+
+This bug was spotted by Pylint.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `e4f816a7dfba`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

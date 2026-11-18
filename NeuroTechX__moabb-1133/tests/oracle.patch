@@ -1,0 +1,348 @@
+diff --git a/docs/source/api.rst b/docs/source/api.rst
+index 4c0710ef08..a1187d1186 100644
+--- a/docs/source/api.rst
++++ b/docs/source/api.rst
+@@ -554,6 +554,7 @@ Statistics
+     meta_analysis.combine_effects
+     meta_analysis.combine_pvalues
+     meta_analysis.collapse_session_scores
++    meta_analysis.compute_lowest_subject_scores
+ 
+ -----
+ Utils
+diff --git a/docs/source/whats_new.rst b/docs/source/whats_new.rst
+index b25f528be4..81f3c43c85 100644
+--- a/docs/source/whats_new.rst
++++ b/docs/source/whats_new.rst
+@@ -49,6 +49,7 @@ Enhancements
+ - Add :class:`moabb.datasets.preprocessing.EuclideanAlignment`, a trial-level Euclidean Alignment transformer (He & Wu 2020; Junqueira et al. 2024) that whitens each trial by the inverse square root of the Euclidean mean covariance to remove per-domain covariance shift before a (deep) model sees the data. Inductive and leakage-free by default (``fit`` learns the reference from training trials, ``transform`` re-applies it to unseen trials); ``fit_transform`` gives the transductive, per-recording form. Accepts an :class:`mne.BaseEpochs` or an ``(n_trials, n_channels, n_times)`` ndarray, uses a shrinkage covariance estimator (``"lwf"``) for robustness, and adds no new dependency (``pyriemann >= 0.11`` is already required). Distinct from :class:`pyriemann.transfer.TLCenter`, which recenters covariance *matrices* (:gh:`1108` by `Bruno Aristimunha`_).
+ - Add an ``n_jobs`` parameter to :meth:`moabb.paradigms.base.BaseParadigm.get_data` and :meth:`moabb.datasets.base.BaseDataset.get_data` to load and preprocess subjects in parallel with :class:`joblib.Parallel`. Per-subject processing (reading, filtering, resampling, epoching) is independent, so this gives a near-linear speedup on datasets with many subjects, with identical numerical results. moabb's own patches to the shared BIDS cache files (``participants.tsv``/``.json``, ``dataset_description.json``) now take the mne-bids cross-process file lock, so parallel caching stays consistent (:gh:`1124` by `Bruno Aristimunha`_).
+ - Drive cross-validation folds with any stock scikit-learn cross-validator passed as ``cv_class``, controlled by a ``groups`` argument — a metadata column name, a list of column names (compound key, e.g. ``["subject", "session"]``), or a callable ``metadata -> array`` — together with callable ``cv_kwargs`` resolved against the metadata (e.g. ``cv_class=PredefinedSplit`` with a ``test_fold`` callable to target a single fold). ``groups`` is exposed on :class:`moabb.evaluations.WithinSessionEvaluation`, :class:`moabb.evaluations.WithinSubjectEvaluation`, :class:`moabb.evaluations.CrossSessionEvaluation` and :class:`moabb.evaluations.CrossSubjectEvaluation` and threaded to their splitters; each splitter keeps its default grouping (``"subject"`` / ``"session"`` / labels) when ``groups`` is ``None``. :class:`moabb.evaluations.splitters.CrossDatasetSplitter` gains ``groups`` (its ``group_column`` argument is now a deprecated alias) (:gh:`1104` by `Bruno Aristimunha`_).
++- Add :func:`moabb.analysis.meta_analysis.compute_lowest_subject_scores`, which selects one shared lowest-performing cohort per dataset from a mandatory, explicit reference pipeline and scores every pipeline on those exact subjects. The helper requires identical subject coverage across pipelines and macro-averages the supplied session scores per subject before ranking; it does not recompute subject-level F1 scores from predictions (:gh:`1133` by `Aditya Singh`_)
+ 
+ API changes
+ ~~~~~~~~~~~
+diff --git a/moabb/analysis/meta_analysis.py b/moabb/analysis/meta_analysis.py
+index a1e030a2d3..6d3655f72c 100644
+--- a/moabb/analysis/meta_analysis.py
++++ b/moabb/analysis/meta_analysis.py
+@@ -45,12 +45,105 @@ def collapse_session_scores(df):
+         and values are scores
+     """
+     return (
+-        df.groupby(["pipeline", "dataset", "subject"])
++        df.groupby(["pipeline", "dataset", "subject"], sort=False, observed=True)
+         .mean(numeric_only=True)
+         .reset_index()
+     )
+ 
+ 
++def compute_lowest_subject_scores(df, reference_pipeline, percentile=20):
++    """Score pipelines on subjects selected from a reference pipeline.
++
++    For every dataset, rank subjects by the score of ``reference_pipeline``
++    and keep only the ``percentile`` percent that score lowest. Every pipeline
++    is then averaged over that same cohort.
++
++    The supplied session scores are first macro-averaged per subject, so every
++    subject weighs the same regardless of how many sessions it contributes.
++    This helper does not recompute subject-level F1 scores from predictions.
++
++    Parameters
++    ----------
++    df: :class:`pandas.DataFrame`
++        results obtained by an evaluation, with at least the ``dataset``,
++        ``pipeline``, ``subject`` and ``score`` columns
++    reference_pipeline: str
++        Pipeline whose per-subject scores define the lowest-performing cohort
++        separately for each dataset. Every pipeline in a dataset must contain
++        exactly the same subjects as this reference.
++    percentile: float, default=20
++        percentage of subjects to keep, in ``(0, 100]``. The number of
++        retained subjects is rounded up, and is at least one, so a value
++        small enough always falls back to the single worst subject.
++
++    Returns
++    -------
++    scores: :class:`pandas.DataFrame`
++        One row per (dataset, pipeline) pair, with the mean ``score`` over
++        the retained subjects and the ``n_subjects`` that were retained.
++
++    References
++    ----------
++    .. [1] Gnassounou, T., Collas, A., Flamary, R., and Gramfort, A. (2025).
++           PSDNorm: Test-Time Temporal Normalization for Deep Learning in
++           Sleep Staging.
++           https://arxiv.org/abs/2503.04582
++    """
++    if not 0 < percentile <= 100:
++        raise ValueError(f"percentile must be in (0, 100], got {percentile}")
++
++    score_values = _validate_finite_scores(df["score"], name="raw scores")
++    for column in ("dataset", "pipeline", "subject"):
++        if df[column].isna().any():
++            raise ValueError(f"{column} must not contain missing values")
++
++    validated_df = df.copy()
++    validated_df["score"] = score_values
++    subject_scores = collapse_session_scores(validated_df)
++    rows = []
++    for dataset, dataset_scores in subject_scores.groupby(
++        "dataset", sort=False, observed=True
++    ):
++        reference_scores = dataset_scores[
++            dataset_scores["pipeline"] == reference_pipeline
++        ]
++        if reference_scores.empty:
++            raise ValueError(
++                f"reference pipeline {reference_pipeline!r} is missing from "
++                f"dataset {dataset!r}"
++            )
++
++        reference_subjects = set(reference_scores["subject"])
++        n_keep = max(1, int(np.ceil(len(reference_subjects) * percentile / 100)))
++        selected_subjects = set(
++            reference_scores.sort_values("score", kind="stable")
++            .head(n_keep)["subject"]
++            .tolist()
++        )
++
++        for pipeline, pipeline_scores in dataset_scores.groupby(
++            "pipeline", sort=False, observed=True
++        ):
++            if set(pipeline_scores["subject"]) != reference_subjects:
++                raise ValueError(
++                    f"pipeline {pipeline!r} in dataset {dataset!r} must contain "
++                    f"the same subjects as reference pipeline "
++                    f"{reference_pipeline!r}"
++                )
++            selected_scores = pipeline_scores[
++                pipeline_scores["subject"].map(selected_subjects.__contains__)
++            ]
++            rows.append(
++                {
++                    "dataset": dataset,
++                    "pipeline": pipeline,
++                    "score": selected_scores["score"].mean(),
++                    "n_subjects": n_keep,
++                }
++            )
++    return pd.DataFrame(rows, columns=["dataset", "pipeline", "score", "n_subjects"])
++
++
+ def compute_pvals_wilcoxon(df, order=None):
+     """Compute Wilcoxon rank-sum test on aggregated results.
+ 
+diff --git a/moabb/tests/test_analysis.py b/moabb/tests/test_analysis.py
+index 63fcdbf56a..65ae566f64 100644
+--- a/moabb/tests/test_analysis.py
++++ b/moabb/tests/test_analysis.py
+@@ -387,6 +387,208 @@ def test_rejects_empty_scores(self):
+             ma.compute_pvals_corrected_ttest(df, n_train=80, n_test=20)
+ 
+ 
++def _results_df(scores, dataset="d1", pipeline="p1", sessions=("0",)):
++    """Build an evaluation-like dataframe from per-subject scores."""
++    return pd.DataFrame(
++        [
++            {
++                "dataset": dataset,
++                "pipeline": pipeline,
++                "subject": subject,
++                "session": session,
++                "score": score,
++            }
++            for subject, score in enumerate(scores, start=1)
++            for session in sessions
++        ]
++    )
++
++
++class TestLowestSubjectScores:
++    def test_keeps_the_worst_subjects(self):
++        df = _results_df([0.9, 0.5, 1.0, 0.6, 0.95, 0.99, 0.98, 0.97, 0.96, 0.94])
++        out = ma.compute_lowest_subject_scores(df, "p1", percentile=20)
++        assert len(out) == 1
++        # 20% of 10 subjects, so the two worst: 0.5 and 0.6.
++        assert out.loc[0, "n_subjects"] == 2
++        assert out.loc[0, "score"] == pytest.approx(0.55)
++
++    def test_rounds_the_subject_count_up(self):
++        df = _results_df([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
++        out = ma.compute_lowest_subject_scores(df, "p1", percentile=20)
++        # 20% of 7 subjects is 1.4, rounded up to 2.
++        assert out.loc[0, "n_subjects"] == 2
++        assert out.loc[0, "score"] == pytest.approx(0.15)
++
++    def test_always_keeps_at_least_one_subject(self):
++        df = _results_df([0.3, 0.4, 0.5])
++        out = ma.compute_lowest_subject_scores(df, "p1", percentile=1)
++        assert out.loc[0, "n_subjects"] == 1
++        assert out.loc[0, "score"] == pytest.approx(0.3)
++
++    def test_full_percentile_matches_the_plain_mean(self):
++        scores = [0.4, 0.6, 0.8, 1.0]
++        out = ma.compute_lowest_subject_scores(_results_df(scores), "p1", percentile=100)
++        assert out.loc[0, "n_subjects"] == len(scores)
++        assert out.loc[0, "score"] == pytest.approx(np.mean(scores))
++
++    def test_uses_the_reference_cohort_for_every_pipeline(self):
++        df = pd.concat(
++            [
++                _results_df([0.1, 0.8], pipeline="reference"),
++                _results_df([0.9, 0.05], pipeline="candidate"),
++            ],
++            ignore_index=True,
++        )
++        out = ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++        scores = out.set_index("pipeline")["score"]
++        assert scores["reference"] == pytest.approx(0.1)
++        assert scores["candidate"] == pytest.approx(0.9)
++        assert out["n_subjects"].tolist() == [1, 1]
++
++    def test_rejects_a_missing_reference_pipeline(self):
++        df = _results_df([0.1, 0.2], pipeline="candidate")
++        with pytest.raises(ValueError, match="reference pipeline"):
++            ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++
++    @pytest.mark.parametrize("candidate_scores", [[0.3], [0.3, 0.4, 0.5]])
++    def test_rejects_subject_coverage_different_from_reference(self, candidate_scores):
++        df = pd.concat(
++            [
++                _results_df([0.1, 0.2], pipeline="reference"),
++                _results_df(candidate_scores, pipeline="candidate"),
++            ],
++            ignore_index=True,
++        )
++        with pytest.raises(ValueError, match="same subjects"):
++            ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++
++    @pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
++    def test_rejects_nonfinite_raw_session_scores(self, invalid):
++        df = pd.concat(
++            [
++                _results_df([0.5], pipeline="reference", sessions=("0",)),
++                _results_df([invalid], pipeline="reference", sessions=("1",)),
++            ],
++            ignore_index=True,
++        )
++        with pytest.raises(ValueError, match="raw scores.*finite"):
++            ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++
++    def test_rejects_empty_results(self):
++        df = pd.DataFrame(columns=["dataset", "pipeline", "subject", "score"])
++        with pytest.raises(ValueError, match="raw scores.*empty"):
++            ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++
++    def test_ignores_unused_categorical_group_levels(self):
++        df = pd.concat(
++            [
++                _results_df([0.1, 0.8], pipeline="reference"),
++                _results_df([0.9, 0.2], pipeline="candidate"),
++            ],
++            ignore_index=True,
++        )
++        df["dataset"] = pd.Categorical(df["dataset"], categories=["d1", "unused_dataset"])
++        df["pipeline"] = pd.Categorical(
++            df["pipeline"], categories=["reference", "candidate", "unused_pipeline"]
++        )
++
++        out = ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++
++        assert list(out[["dataset", "pipeline"]].itertuples(index=False, name=None)) == [
++            ("d1", "reference"),
++            ("d1", "candidate"),
++        ]
++        assert np.isfinite(out["score"]).all()
++
++    @pytest.mark.parametrize("column", ["dataset", "pipeline", "subject"])
++    def test_rejects_missing_cohort_identities(self, column):
++        df = _results_df([0.1, 0.8], pipeline="reference")
++        df.loc[1, column] = None
++
++        with pytest.raises(ValueError, match=column):
++            ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++
++    def test_coerces_numeric_object_scores_without_mutating_input(self):
++        df = pd.concat(
++            [
++                _results_df(["0.1", "0.8"], pipeline="reference"),
++                _results_df(["0.9", "0.05"], pipeline="candidate"),
++            ],
++            ignore_index=True,
++        )
++        original = df.copy(deep=True)
++
++        out = ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++
++        scores = out.set_index("pipeline")["score"]
++        assert scores["reference"] == pytest.approx(0.1)
++        assert scores["candidate"] == pytest.approx(0.9)
++        pd.testing.assert_frame_equal(df, original)
++
++    def test_stably_ranks_mixed_subject_identifiers(self):
++        df = pd.DataFrame(
++            [
++                ("reference", 1, 0.2),
++                ("reference", "2", 0.2),
++                ("reference", ("subject", 3), 0.2),
++                ("candidate", 1, 0.9),
++                ("candidate", "2", 0.8),
++                ("candidate", ("subject", 3), 0.7),
++            ],
++            columns=["pipeline", "subject", "score"],
++        )
++        df["dataset"] = "d1"
++        out = ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++        scores = out.set_index("pipeline")["score"]
++        assert scores["reference"] == pytest.approx(0.2)
++        assert scores["candidate"] == pytest.approx(0.85)
++        assert out["n_subjects"].tolist() == [2, 2]
++
++    def test_sessions_are_averaged_before_ranking(self):
++        # Subject 1 holds the single worst session (0.1) but averages 0.5,
++        # above subject 2. Ranking the raw rows would pick subject 1.
++        df = pd.concat(
++            [
++                _results_df([0.1, 0.35], pipeline="reference", sessions=("0",)),
++                _results_df([0.9, 0.35], pipeline="reference", sessions=("1",)),
++                _results_df([0.9, 0.6], pipeline="candidate", sessions=("0",)),
++                _results_df([0.9, 0.6], pipeline="candidate", sessions=("1",)),
++            ],
++            ignore_index=True,
++        )
++        out = ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++        scores = out.set_index("pipeline")["score"]
++        assert scores["reference"] == pytest.approx(0.35)
++        assert scores["candidate"] == pytest.approx(0.6)
++        assert out["n_subjects"].tolist() == [1, 1]
++
++    def test_uses_a_separate_reference_cohort_for_each_dataset(self):
++        df = pd.concat(
++            [
++                _results_df([0.1, 0.8], dataset="d1", pipeline="reference"),
++                _results_df([0.9, 0.2], dataset="d1", pipeline="candidate"),
++                _results_df([0.8, 0.1], dataset="d2", pipeline="reference"),
++                _results_df([0.9, 0.2], dataset="d2", pipeline="candidate"),
++            ],
++            ignore_index=True,
++        )
++        out = ma.compute_lowest_subject_scores(df, "reference", percentile=50)
++        assert len(out) == 4
++        scores = out.set_index(["dataset", "pipeline"])["score"]
++        assert scores[("d1", "reference")] == pytest.approx(0.1)
++        assert scores[("d1", "candidate")] == pytest.approx(0.9)
++        assert scores[("d2", "reference")] == pytest.approx(0.1)
++        assert scores[("d2", "candidate")] == pytest.approx(0.2)
++
++    @pytest.mark.parametrize("percentile", [0, -5, 101])
++    def test_rejects_an_invalid_percentile(self, percentile):
++        with pytest.raises(ValueError, match="percentile"):
++            ma.compute_lowest_subject_scores(
++                _results_df([0.5]), "p1", percentile=percentile
++            )
++
++
+ class TestResults:
+     def setup_method(self, method):
+         self.obj = Results(

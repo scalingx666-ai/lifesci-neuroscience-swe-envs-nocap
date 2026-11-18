@@ -1,0 +1,570 @@
+diff --git a/packages/backend-core/src/app.ts b/packages/backend-core/src/app.ts
+index 31f6345f..136829b9 100644
+--- a/packages/backend-core/src/app.ts
++++ b/packages/backend-core/src/app.ts
+@@ -173,8 +173,25 @@ export function createApp(options: CreateAppOptions): Hono {
+   api.get("/sandbox/:id/files/content", forward("readFile", { idParam: "id", withQuery: true }));
+   api.get("/sandbox/:id/files/raw", forward("readRawFile", { idParam: "id", withQuery: true }));
+   api.delete("/sandbox/:id/files", forward("deleteFile", { idParam: "id", withQuery: true }));
+-  // #47: file upload — POST the base64 body through to the runtime writeFile route.
+-  api.post("/sandbox/:id/files", forward("writeFile", { idParam: "id", withBody: true }));
++  // #47/#256: file upload. A base64 JSON body goes through the buffered
++  // `forward` helper; a raw `application/octet-stream` body is streamed to the
++  // runtime untouched (forward() reads the body via `text()`, which would
++  // UTF-8-decode and corrupt binary bytes — so we must NOT route it there).
++  api.post("/sandbox/:id/files", async (c) => {
++    const contentType = c.req.header("content-type") ?? "";
++    if (contentType.includes("application/octet-stream")) {
++      const rc = await getClient();
++      const query = new URL(c.req.url).search.replace(/^\?/, "");
++      const upstream = await rc.forward("writeFile", {
++        params: { id: c.req.param("id") ?? "" },
++        body: c.req.raw.body, // byte ReadableStream — streamed, not buffered
++        headers: { "content-type": "application/octet-stream" },
++        query: query.length > 0 ? query : undefined,
++      });
++      return relay(c, upstream);
++    }
++    return forward("writeFile", { idParam: "id", withBody: true })(c);
++  });
+ 
+   // ---- SSE byte passthrough (修正4) ------------------------------------
+   // Canonical protocol path `/sse/:id` (RUNTIME_ROUTES.sessionEvents) plus the
+diff --git a/packages/backend-core/src/runtime-client.ts b/packages/backend-core/src/runtime-client.ts
+index cfd1a4e0..23c58816 100644
+--- a/packages/backend-core/src/runtime-client.ts
++++ b/packages/backend-core/src/runtime-client.ts
+@@ -36,8 +36,12 @@ export function buildPath(
+ 
+ export interface ForwardOptions {
+   params?: Record<string, string>;
+-  /** Raw, already-serialized request body to forward. */
+-  body?: string | null;
++  /**
++   * Raw request body to forward. A string for buffered bodies (JSON), or a
++   * byte `ReadableStream` to stream large uploads through without buffering
++   * (#256 — raw octet-stream passthrough).
++   */
++  body?: string | ReadableStream<Uint8Array> | null;
+   headers?: Record<string, string>;
+   /** Query string to append (without leading `?`). */
+   query?: string;
+@@ -67,12 +71,18 @@ export class RuntimeClient {
+   async forward(route: RuntimeRouteName, opts: ForwardOptions = {}): Promise<Response> {
+     const def = RUNTIME_ROUTES[route];
+     const url = this.urlFor(route, opts.params, opts.query);
+-    return this.fetchFn(url, {
++    const init: RequestInit = {
+       method: def.method,
+       headers: opts.headers,
+       body: opts.body ?? undefined,
+       signal: opts.signal,
+-    });
++    };
++    // #256: a streamed body requires `duplex: 'half'` under the Node/undici
++    // fetch (sending a ReadableStream without it throws). Harmless elsewhere.
++    if (opts.body != null && typeof opts.body !== "string") {
++      (init as RequestInit & { duplex: "half" }).duplex = "half";
++    }
++    return this.fetchFn(url, init);
+   }
+ 
+   /**
+diff --git a/packages/backend-core/test/app.test.ts b/packages/backend-core/test/app.test.ts
+index 7a4bef21..b4fad8ae 100644
+--- a/packages/backend-core/test/app.test.ts
++++ b/packages/backend-core/test/app.test.ts
+@@ -58,6 +58,57 @@ describe("Hono app — REST forwarding", () => {
+     expect(res.status).toBe(202);
+   });
+ 
++  // #47: base64 JSON upload still forwards through the buffered path.
++  it("POST /api/sandbox/:id/files (base64 JSON) forwards to writeFile", async () => {
++    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
++      expect(url).toBe("http://runtime.test/sessions/s1/files");
++      expect(init.method).toBe("POST");
++      expect(init.body).toBe('{"path":"a.txt","contentBase64":"aGk="}');
++      return new Response('{"path":"a.txt","size":2}', { status: 201 });
++    });
++    const app = createApp({
++      orchestrator: fakeOrchestrator(),
++      fetchFn: fetchFn as never,
++      serveWeb: false,
++    });
++    const res = await app.request("/api/sandbox/s1/files", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: '{"path":"a.txt","contentBase64":"aGk="}',
++    });
++    expect(res.status).toBe(201);
++  });
++
++  // #256: a raw octet-stream upload must be streamed to the runtime BYTE-FOR-BYTE
++  // (query carried, octet content-type preserved). Routing it through the
++  // buffered `text()` forward would UTF-8-decode and corrupt binary payloads.
++  it("POST /api/sandbox/:id/files (octet-stream) streams raw bytes + ?path=", async () => {
++    const bytes = new Uint8Array([0, 1, 2, 255, 254, 128]);
++    let receivedCt: string | undefined;
++    let receivedBytes: Uint8Array | undefined;
++    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
++      expect(url).toBe("http://runtime.test/sessions/s1/files?path=data%2Fbig.bin");
++      expect(init.method).toBe("POST");
++      receivedCt = (init.headers as Record<string, string>)["content-type"];
++      // body is streamed; drain it back to bytes to prove no corruption
++      receivedBytes = new Uint8Array(await new Response(init.body as BodyInit).arrayBuffer());
++      return new Response('{"path":"data/big.bin","size":6}', { status: 201 });
++    });
++    const app = createApp({
++      orchestrator: fakeOrchestrator(),
++      fetchFn: fetchFn as never,
++      serveWeb: false,
++    });
++    const res = await app.request("/api/sandbox/s1/files?path=data%2Fbig.bin", {
++      method: "POST",
++      headers: { "content-type": "application/octet-stream" },
++      body: bytes,
++    });
++    expect(res.status).toBe(201);
++    expect(receivedCt).toBe("application/octet-stream");
++    expect(receivedBytes).toEqual(bytes);
++  });
++
+   // Regression (BPCASE-0004): /metrics is a RUNTIME_ROUTES entry implemented by
+   // the runtime (server.ts) but was missing from the backend's /api table, so
+   // /api/metrics fell through to the SPA static fallback and returned index.html
+diff --git a/packages/protocol/src/http.ts b/packages/protocol/src/http.ts
+index e96ffba7..a159e738 100644
+--- a/packages/protocol/src/http.ts
++++ b/packages/protocol/src/http.ts
+@@ -189,9 +189,20 @@ export type InterruptResponse = z.infer<typeof InterruptResponseSchema>;
+ 
+ /* ------------------------------------------------------------------ *
+  * POST /sessions/:id/files  (#47 — upload a file into the workspace)
+- * ------------------------------------------------------------------ */
+-
+-/** #47: upload body. Content is base64 (binary-safe over the JSON byte chain). */
++ * ------------------------------------------------------------------ *
++ * Two accepted request shapes, negotiated by `Content-Type` (#256):
++ *   1. base64 JSON — `application/json` body `{ path, contentBase64 }`
++ *      (this schema). Whole payload is buffered in memory; +33% wire
++ *      inflation. Kept for backward compatibility / small files.
++ *   2. raw stream — `application/octet-stream` body is the file bytes
++ *      verbatim, with the workspace-relative path in the `?path=` query
++ *      (e.g. `POST /sessions/:id/files?path=docs/foo.pdf`). Streamed to
++ *      disk, symmetric with the `readRawFile` download. Preferred for
++ *      large uploads.
++ * Both return `WriteFileResponseSchema` and enforce the same traversal
++ * guard + size cap (`BP_UPLOAD_MAX_BYTES`, default 20 MiB). */
++
++/** #47: base64 JSON upload body. Content is base64 (binary-safe over the JSON byte chain). */
+ export const WriteFileRequestSchema = z.object({
+   /** Workspace-relative path (a leading `/workspace` prefix is tolerated). */
+   path: z.string().trim().min(1),
+@@ -263,7 +274,11 @@ export const RUNTIME_ROUTES = {
+   readFile: { method: "GET", path: "/sessions/:id/files/content" },
+   readRawFile: { method: "GET", path: "/sessions/:id/files/raw" },
+   deleteFile: { method: "DELETE", path: "/sessions/:id/files" },
+-  /** #47: upload a file into the workspace. Body: { path, contentBase64 }. */
++  /**
++   * #47/#256: upload a file into the workspace. Two shapes negotiated by
++   * Content-Type: `application/json` body `{ path, contentBase64 }`, or
++   * `application/octet-stream` raw bytes with `?path=` (streamed to disk).
++   */
+   writeFile: { method: "POST", path: "/sessions/:id/files" },
+ } as const satisfies Record<string, RouteDef>;
+ 
+diff --git a/packages/runtime/src/__tests__/server.test.ts b/packages/runtime/src/__tests__/server.test.ts
+index 79d4ba85..fdfbd379 100644
+--- a/packages/runtime/src/__tests__/server.test.ts
++++ b/packages/runtime/src/__tests__/server.test.ts
+@@ -273,6 +273,86 @@ describe("workspace file routes", () => {
+     expect(res.status).toBe(400);
+   });
+ 
++  // #256: raw streaming upload — bytes in the body, path in ?path=.
++  it("uploads a file via raw octet-stream and makes it readable", async () => {
++    const { app: a } = await appWithWorkspace();
++    const bytes = new Uint8Array([0, 1, 2, 3, 255, 254, 128]);
++    const res = await a.request("/sessions/s1/files?path=/workspace/raw/blob.bin", {
++      method: "POST",
++      headers: { "content-type": "application/octet-stream" },
++      body: bytes,
++    });
++    expect(res.status).toBe(201);
++    const body = (await res.json()) as { path: string; size: number };
++    expect(body.path).toBe("raw/blob.bin");
++    expect(body.size).toBe(bytes.byteLength);
++    // exact bytes round-trip through the raw read route (binary-safe)
++    const raw = await a.request("/sessions/s1/files/raw?path=/workspace/raw/blob.bin");
++    expect(new Uint8Array(await raw.arrayBuffer())).toEqual(bytes);
++  });
++
++  it("rejects a raw upload with no ?path= (400)", async () => {
++    const { app: a } = await appWithWorkspace();
++    const res = await a.request("/sessions/s1/files", {
++      method: "POST",
++      headers: { "content-type": "application/octet-stream" },
++      body: new Uint8Array([1, 2, 3]),
++    });
++    expect(res.status).toBe(400);
++  });
++
++  it("rejects a raw upload that escapes the workspace with 400", async () => {
++    const { app: a } = await appWithWorkspace();
++    const res = await a.request("/sessions/s1/files?path=../../../etc/evil", {
++      method: "POST",
++      headers: { "content-type": "application/octet-stream" },
++      body: new Uint8Array([1, 2, 3]),
++    });
++    expect(res.status).toBe(400);
++  });
++
++  // #256: the configurable cap (BP_UPLOAD_MAX_BYTES) bounds both paths, and an
++  // oversize raw upload leaves no partial file behind.
++  it("rejects an oversize raw upload with 400 and cleans up the partial file", async () => {
++    const dataRoot = await mkdtemp(join(tmpdir(), "bp-cap-"));
++    await mkdir(join(dataRoot, "workspaces", "s1"), { recursive: true });
++    const manager = new SessionManager({
++      persist: false,
++      dataRoot,
++      agentFactory: mockAgentFactory,
++      uploadMaxBytes: 8,
++    });
++    const a = createServer({ manager }).app;
++    const res = await a.request("/sessions/s1/files?path=/workspace/big.bin", {
++      method: "POST",
++      headers: { "content-type": "application/octet-stream" },
++      body: new Uint8Array(64), // 64 bytes > 8-byte cap
++    });
++    expect(res.status).toBe(400);
++    // no partial file left on disk
++    const listed = await readdir(join(dataRoot, "workspaces", "s1"));
++    expect(listed).not.toContain("big.bin");
++  });
++
++  it("rejects an oversize base64 upload with 400", async () => {
++    const dataRoot = await mkdtemp(join(tmpdir(), "bp-cap64-"));
++    await mkdir(join(dataRoot, "workspaces", "s1"), { recursive: true });
++    const manager = new SessionManager({
++      persist: false,
++      dataRoot,
++      agentFactory: mockAgentFactory,
++      uploadMaxBytes: 8,
++    });
++    const a = createServer({ manager }).app;
++    const contentBase64 = Buffer.from("x".repeat(64)).toString("base64");
++    const res = await a.request("/sessions/s1/files", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ path: "/workspace/big.txt", contentBase64 }),
++    });
++    expect(res.status).toBe(400);
++  });
++
+   // #60: a composer upload staged under workspaces/local/ (the draft sandbox id)
+   // must be drained into the real session workspace before the agent runs, so
+   // the agent's cwd (workspaces/<sid>/) contains the file the user attached.
+diff --git a/packages/runtime/src/server.ts b/packages/runtime/src/server.ts
+index 072fc6a3..d953f61a 100644
+--- a/packages/runtime/src/server.ts
++++ b/packages/runtime/src/server.ts
+@@ -179,9 +179,30 @@ export function createServer(opts: SessionManagerOptions & { manager?: SessionMa
+     }
+   });
+ 
+-  // #47: upload a file into the workspace (base64 body). Path-traversal guard +
+-  // 20 MiB cap live in SessionManager.writeSessionFile.
++  // #47/#256: upload a file into the workspace. Two shapes negotiated by
++  // Content-Type. Path-traversal guard + configurable size cap
++  // (BP_UPLOAD_MAX_BYTES) live in SessionManager.
+   app.post("/sessions/:id/files", async (c) => {
++    const contentType = c.req.header("content-type") ?? "";
++    // #256: raw streaming upload — bytes are the request body, path is in ?path=.
++    if (contentType.includes("application/octet-stream")) {
++      const path = c.req.query("path");
++      if (!path || path.trim() === "") {
++        return c.json({ error: "path query parameter is required" }, 400);
++      }
++      try {
++        const res = await manager.writeSessionFileStream(
++          c.req.param("id"),
++          path,
++          c.req.raw.body,
++        );
++        return c.json(res, 201);
++      } catch (err) {
++        // path traversal / oversize → 400 (client error), not 500
++        return c.json({ error: (err as Error).message }, 400);
++      }
++    }
++    // #47: base64 JSON body (backward-compatible / small files).
+     const parsed = WriteFileRequestSchema.safeParse(await safeBody(c));
+     if (!parsed.success) {
+       return c.json({ error: "path and contentBase64 are required" }, 400);
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index 3e15be0f..8686fb1d 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -10,6 +10,9 @@
+  * work files under `<dataRoot>/workspaces/{sid}/`.
+  */
+ import { mkdir, readFile, writeFile, readdir, rm, stat, rename } from "node:fs/promises";
++import { createWriteStream } from "node:fs";
++import { pipeline } from "node:stream/promises";
++import { Readable, Transform } from "node:stream";
+ import { join, resolve, sep, dirname } from "node:path";
+ import { randomUUID } from "node:crypto";
+ import {
+@@ -58,6 +61,28 @@ function makeDeferred<T>(): Deferred<T> {
+ /** #167 default concurrent-provider-calls cap when nothing is configured. */
+ const DEFAULT_MAX_CONCURRENT_AGENTS = 4;
+ 
++/** #256 default upload size cap (20 MiB) when `BP_UPLOAD_MAX_BYTES` is unset. */
++const DEFAULT_UPLOAD_MAX_BYTES = 20 * 1024 * 1024;
++
++/**
++ * #256: resolve the max upload size in bytes. Precedence: explicit option →
++ * `BP_UPLOAD_MAX_BYTES` env → 20 MiB default. A non-positive or unparseable
++ * value falls back to the default (a 0 cap would reject everything). `0` is NOT
++ * treated as "unlimited": hosted deployments raise the cap explicitly; there is
++ * intentionally no infinite setting.
++ */
++export function resolveUploadMaxBytes(opt?: number, env = process.env): number {
++  if (typeof opt === "number" && Number.isFinite(opt) && opt > 0) {
++    return Math.floor(opt);
++  }
++  const raw = env.BP_UPLOAD_MAX_BYTES?.trim();
++  if (raw !== undefined && raw !== "") {
++    const n = Number(raw);
++    if (Number.isFinite(n) && n > 0) return Math.floor(n);
++  }
++  return DEFAULT_UPLOAD_MAX_BYTES;
++}
++
+ /**
+  * Resolve the per-session provider concurrency cap: explicit option wins, else
+  * `BP_MAX_CONCURRENT_AGENTS`, else the default. Non-integer / empty env falls
+@@ -209,6 +234,12 @@ export interface SessionManagerOptions {
+    * throttling. Tests inject this directly.
+    */
+   maxConcurrentAgents?: number;
++  /**
++   * #256: max upload size in bytes for workspace file writes (both the base64
++   * and raw-stream paths). Default 20 MiB; env override `BP_UPLOAD_MAX_BYTES`.
++   * Hosts raise this to accept large datasets/models. Tests inject directly.
++   */
++  uploadMaxBytes?: number;
+ }
+ 
+ /** Roles inferred from agent name. */
+@@ -304,6 +335,10 @@ export class SessionManager {
+   private readonly maxConcurrentAgents: number;
+   private readonly providerSlots = new Map<string, ProviderSemaphore>();
+ 
++  // #256: max upload size in bytes (base64 + raw-stream paths). Configurable
++  // so hosted deployments can accept large files; default 20 MiB.
++  private readonly uploadMaxBytes: number;
++
+   constructor(opts: SessionManagerOptions = {}) {
+     this.dataRoot = opts.dataRoot ?? process.env.BP_DATA_DIR ?? join(process.cwd(), ".bp-data");
+     this.agentFactory = opts.agentFactory ?? selectFactory();
+@@ -328,6 +363,7 @@ export class SessionManager {
+       opts.routerSkillsDir ?? join(this.dataRoot, "bp_template", "skills-router");
+ 
+     this.maxConcurrentAgents = resolveMaxConcurrentAgents(opts.maxConcurrentAgents);
++    this.uploadMaxBytes = resolveUploadMaxBytes(opts.uploadMaxBytes);
+ 
+     const limitBytes = opts.memLimitBytes ?? parseMemLimitMb(process.env);
+     this.memWatchdog =
+@@ -529,13 +565,14 @@ export class SessionManager {
+    * `resolveWorkspacePath` guard prevents path traversal; parent dirs are
+    * created so an upload like `docs/foo.pdf` works. The file lands in the
+    * agent's cwd, so it can `read` it by its workspace-relative path.
+-   * `maxBytes` (default 20 MiB) bounds the decoded size.
++   * `maxBytes` bounds the decoded size (default: the configured upload cap,
++   * `BP_UPLOAD_MAX_BYTES` / 20 MiB — see #256).
+    */
+   async writeSessionFile(
+     sid: string,
+     rel: string,
+     contentBase64: string,
+-    maxBytes = 20 * 1024 * 1024,
++    maxBytes = this.uploadMaxBytes,
+   ): Promise<{ path: string; size: number }> {
+     const buf = Buffer.from(contentBase64, "base64");
+     if (buf.byteLength > maxBytes) {
+@@ -544,14 +581,74 @@ export class SessionManager {
+     const abs = this.resolveWorkspacePath(sid, rel);
+     await mkdir(dirname(abs), { recursive: true });
+     await writeFile(abs, buf);
+-    // Return the workspace-relative path (strip the absolute root prefix).
+-    // Cross-platform (#5): always emit POSIX `/` so the API contract is
+-    // identical across hosts; the frontend embeds this in URL query strings
+-    // (`?path=foo/bar.txt`) and the model echoes it back via `read_file`.
++    return { path: this.relWorkspacePath(sid, abs), size: buf.byteLength };
++  }
++
++  /**
++   * #256: stream an uploaded file into the session workspace without buffering
++   * the whole payload. The raw request body (`application/octet-stream`) is
++   * piped to disk; bytes are counted as they flow and the write is aborted
++   * (and the partial file removed) the moment the configured cap is exceeded,
++   * so a hostile/oversize upload can't fill the disk. Same traversal guard and
++   * parent-dir creation as `writeSessionFile`; symmetric with `readSessionFileRaw`.
++   *
++   * `body` accepts a web `ReadableStream` (Hono's `c.req.raw.body`) or a Node
++   * `Readable`; `null`/absent is treated as an empty file.
++   */
++  async writeSessionFileStream(
++    sid: string,
++    rel: string,
++    body: ReadableStream<Uint8Array> | Readable | null,
++    maxBytes = this.uploadMaxBytes,
++  ): Promise<{ path: string; size: number }> {
++    const abs = this.resolveWorkspacePath(sid, rel);
++    await mkdir(dirname(abs), { recursive: true });
++
++    // Normalize either stream flavor to a Node Readable.
++    const source: Readable =
++      body == null
++        ? Readable.from([])
++        : body instanceof Readable
++          ? body
++          : Readable.fromWeb(body as import("node:stream/web").ReadableStream<Uint8Array>);
++
++    let size = 0;
++    let tooLarge = false;
++    const counter = new Transform({
++      transform(chunk: Buffer, _enc, cb) {
++        size += chunk.byteLength;
++        if (size > maxBytes) {
++          tooLarge = true;
++          // Abort the pipeline; the catch below cleans up the partial file.
++          cb(new Error(`file too large: exceeds limit of ${maxBytes}`));
++          return;
++        }
++        cb(null, chunk);
++      },
++    });
++
++    try {
++      await pipeline(source, counter, createWriteStream(abs));
++    } catch (err) {
++      // Remove the partial file so a failed/oversize upload leaves no trace.
++      await rm(abs, { force: true }).catch(() => {});
++      if (tooLarge) {
++        throw new Error(`file too large: ${size} bytes exceeds limit of ${maxBytes}`);
++      }
++      throw err;
++    }
++    return { path: this.relWorkspacePath(sid, abs), size };
++  }
++
++  /**
++   * Workspace-relative form of an absolute path under the session root.
++   * Cross-platform (#5): always emit POSIX `/` so the API contract is identical
++   * across hosts; the frontend embeds this in URL query strings
++   * (`?path=foo/bar.txt`) and the model echoes it back via `read_file`.
++   */
++  private relWorkspacePath(sid: string, abs: string): string {
+     const root = this.workspaceDir(sid);
+-    const relOut =
+-      abs === root ? "" : abs.slice(root.length + 1).split(sep).join("/");
+-    return { path: relOut, size: buf.byteLength };
++    return abs === root ? "" : abs.slice(root.length + 1).split(sep).join("/");
+   }
+ 
+   /**
+diff --git a/packages/web/src/__tests__/api.test.ts b/packages/web/src/__tests__/api.test.ts
+index b3f39442..132481d9 100644
+--- a/packages/web/src/__tests__/api.test.ts
++++ b/packages/web/src/__tests__/api.test.ts
+@@ -266,6 +266,42 @@ describe("api.sandbox.uploadFile — #47 base64 upload to the workspace", () =>
+   });
+ });
+ 
++describe("api.sandbox.uploadFile — #256 raw octet-stream for large files", () => {
++  // A Blob reporting a size at/above the 4 MiB threshold: uploadFile must switch
++  // to the raw streaming path (bytes as the body, path in ?path=) and never
++  // touch base64 (no FileReader stub here, so a base64 attempt would throw).
++  function bigBlob(): Blob {
++    const b = new Blob(["x"]);
++    Object.defineProperty(b, "size", { value: 4 * 1024 * 1024 });
++    return b;
++  }
++
++  it("streams raw bytes with ?path= and an octet-stream content-type", async () => {
++    fetchMock.mockResolvedValueOnce(
++      makeResponse({ status: 201, contentType: "application/json", json: { path: "data/big.bin", size: 4194304 } }),
++    );
++    const file = bigBlob();
++    const out = await api.sandbox.uploadFile("s1", "data/big.bin", file);
++
++    const [url, init] = fetchMock.mock.calls[0]!;
++    // path is carried in the query, URL-encoded
++    expect(String(url)).toMatch(/\/sandbox\/s1\/files\?path=data%2Fbig\.bin$/);
++    const ri = init as RequestInit;
++    expect(ri.method).toBe("POST");
++    expect((ri.headers as Record<string, string>)["content-type"]).toBe("application/octet-stream");
++    // the Blob itself is the body — not a JSON string
++    expect(ri.body).toBe(file);
++    expect(out).toEqual({ path: "data/big.bin", size: 4194304 });
++  });
++
++  it("throws the backend error message on a non-ok raw response", async () => {
++    fetchMock.mockResolvedValueOnce(
++      makeResponse({ ok: false, status: 400, contentType: "application/json", json: { error: "file too large" } }),
++    );
++    await expect(api.sandbox.uploadFile("s1", "data/big.bin", bigBlob())).rejects.toThrow("file too large");
++  });
++});
++
+ // #206: parseError previously read only `detail`, so the backend's Zod shape
+ // `{ error, details }` and bare `{ error }` (e.g. 409) degraded to the generic
+ // "Request failed (...)". Driven through api.providers.create (handleJson path).
+diff --git a/packages/web/src/utils/api.ts b/packages/web/src/utils/api.ts
+index 7628a44e..a794f655 100644
+--- a/packages/web/src/utils/api.ts
++++ b/packages/web/src/utils/api.ts
+@@ -119,6 +119,14 @@ async function handleJson<T>(res: Response): Promise<T> {
+   return (await res.json()) as T;
+ }
+ 
++/**
++ * #256: files at/above this size upload as a raw `application/octet-stream`
++ * stream instead of base64 JSON. Small files stay on the base64 path (one
++ * request shape, no streaming overhead); large files avoid the +33% base64
++ * inflation and whole-file memory buffering. 4 MiB is a conservative cutoff.
++ */
++const RAW_UPLOAD_THRESHOLD_BYTES = 4 * 1024 * 1024;
++
+ /** #47: encode a Blob/File as base64 (without the data: prefix) for upload. */
+ function blobToBase64(blob: Blob): Promise<string> {
+   return new Promise((resolve, reject) => {
+@@ -376,8 +384,25 @@ export const api = {
+       }
+     },
+ 
+-    // #47: upload a file into the workspace (base64 over the JSON byte chain).
++    // #47/#256: upload a file into the workspace. Files at/above the raw
++    // threshold stream as `application/octet-stream` (no +33% base64 inflation,
++    // no whole-file buffering on the proxy/runtime); smaller files keep the
++    // base64 JSON path. The runtime accepts both (negotiated by Content-Type).
+     async uploadFile(sandboxId: string, path: string, file: Blob): Promise<{ path: string; size: number }> {
++      if (file.size >= RAW_UPLOAD_THRESHOLD_BYTES) {
++        const res = await apiFetch(
++          `${API_BASE}/sandbox/${sandboxId}/files?path=${encodeURIComponent(path)}`,
++          {
++            method: "POST",
++            headers: { ...authHeaders(), "content-type": "application/octet-stream" },
++            body: file,
++          },
++        );
++        if (!res.ok) {
++          throw new Error(await parseError(res));
++        }
++        return handleJson(res);
++      }
+       const contentBase64 = await blobToBase64(file);
+       const res = await apiFetch(`${API_BASE}/sandbox/${sandboxId}/files`, {
+         method: "POST",

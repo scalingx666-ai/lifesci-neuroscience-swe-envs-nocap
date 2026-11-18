@@ -1,0 +1,1875 @@
+diff --git a/changelog.d/20260905_143000_yarikoptic_nf_add_archive_content_multiple.md b/changelog.d/20260905_143000_yarikoptic_nf_add_archive_content_multiple.md
+new file mode 100644
+index 0000000000..757f3459c7
+--- /dev/null
++++ b/changelog.d/20260905_143000_yarikoptic_nf_add_archive_content_multiple.md
+@@ -0,0 +1,40 @@
++### 🚀 Enhancements and New Features
++
++- `add-archive-content` now takes any number of archives (or keys) in a
++  single invocation.  Their content is extracted and added within a single
++  commit, reusing the same batched git-annex processes, which is
++  substantially faster than invoking the command once per archive.  All
++  given archives are vetted before any of them is acted on, and original
++  archives (`--delete`) are removed only once all of them were added.
++  Addresses [#6590](https://github.com/datalad/datalad/issues/6590)
++  (by [@yarikoptic](https://github.com/yarikoptic))
++
++- `add-archive-content` now yields a result record for every given archive,
++  identifying it via `path` and `type='file'` (or `key` and `type='key'`
++  with `--key`), in addition to the dataset-level record it yielded before.
++  Result records about archives which can not be used now identify the
++  archive as well, instead of the dataset.  Two conditions which raised a
++  `RuntimeError` before -- the archive not being under annex control, and
++  its content not being available locally -- are now reported as
++  `impossible` result records.
++  (by [@yarikoptic](https://github.com/yarikoptic))
++
++- `add-archive-content` gained `--overwrite-prior-check`
++  (`error` (default), `stats`, `ignore`), which guards the content one
++  archive added against the archives which follow it in the same
++  invocation.  Discarding it is only possible with
++  `--existing=overwrite`, and now leads to an error unless permitted;
++  `stats` permits it and reports the affected files as
++  `overwritten prior` in the statistics.  Files with identical content,
++  and the `--existing` suffix modes (which rename the incoming file
++  rather than discard anything), are never reported.
++  (by [@yarikoptic](https://github.com/yarikoptic))
++
++### 🐛 Bug Fixes
++
++- `add-archive-content --delete-after` failed (`git rm` of a non-existing
++  path, followed by `OSError: Directory not empty`) and left a temporary
++  `.datalad*` directory behind, whenever it was invoked from a directory
++  other than the root of the dataset and the dataset was not given as a
++  `Dataset` instance.
++  (by [@yarikoptic](https://github.com/yarikoptic))
+diff --git a/datalad/local/add_archive_content.py b/datalad/local/add_archive_content.py
+index e20434a672..6eb3925be5 100644
+--- a/datalad/local/add_archive_content.py
++++ b/datalad/local/add_archive_content.py
+@@ -17,6 +17,7 @@
+ import re
+ import tempfile
+ import warnings
++from collections import namedtuple
+ from os.path import (
+     basename,
+     curdir,
+@@ -44,10 +45,15 @@
+ from datalad.log import (
+     log_progress,
+     logging,
++    with_result_progress,
+ )
+ from datalad.support.annexrepo import AnnexRepo
+-from datalad.support.exceptions import AnnexBatchCommandError
++from datalad.support.exceptions import (
++    AnnexBatchCommandError,
++    CapturedException,
++)
+ from datalad.support.constraints import (
++    EnsureChoice,
+     EnsureNone,
+     EnsureStr,
+ )
+@@ -56,6 +62,7 @@
+ from datalad.support.strings import apply_replacement_rules
+ from datalad.utils import (
+     Path,
++    ensure_list,
+     ensure_tuple_or_list,
+     file_basename,
+     getpwd,
+@@ -75,6 +82,491 @@
+ # all but by default to print only the one associated with this given action
+ 
+ 
++def _add_archive_content(
++        archive,
++        *,
++        ds,
++        annex,
++        annexarchive,
++        key,
++        key_rpath,
++        origin,
++        archive_path,
++        extract_rpath,
++        total_stats,
++        prior_paths,
++        res_kwargs,
++        add_archive_leading_dir=False,
++        strip_leading_dirs=False,
++        leading_dirs_depth=None,
++        leading_dirs_consider=None,
++        exclude=None,
++        rename=None,
++        existing='fail',
++        overwrite_prior_check='error',
++        annex_options=None,
++        copy=False,
++        drop_after=False,
++        delete_after=False):
++    """Add the content of a single archive to the dataset
++
++    Helper of `AddArchiveContent.__call__`, which does all the work for a
++    single archive, so that a single invocation of the command could handle
++    any number of them.  Nothing is committed here -- that is left to the
++    caller, so that content of multiple archives could end up in a single
++    commit.  The removal of the original archive (`delete`) is left to the
++    caller as well, for the same reason.
++
++    Parameters
++    ----------
++    archive : str or Path
++      Archive (or a key, if `origin` is 'key') as specified by the caller.
++      Used to derive names for the extracted content, and for messages.
++    ds : Dataset
++    annex : AnnexRepo
++      Repository of `ds`.
++    annexarchive : ArchiveAnnexCustomRemote
++      Provides the cache of extracted archives, and the URLs to compose for
++      the extracted files.
++    key : str
++      Annex key of the archive.
++    key_rpath : str or Path
++      Location of the content of `key`, as established (and thus verified to
++      be present) by the caller.
++    origin : {'archive', 'key'}
++      Whether the archive was specified as a file or as an annex key.
++    archive_path : Path
++      Absolute path of the archive.
++    extract_rpath : Path or None
++      Directory, relative to the root of `ds`, to extract the content into.
++      `None` stands for the root of the dataset itself.
++    total_stats : ActivityStats
++      Statistics of this archive are added to this instance.
++    prior_paths : dict
++      Paths added by the archives processed before this one, mapped to the
++      archive each of them came from.  Updated in place with the paths this
++      archive added, but only once all of them were added, so that a
++      collision *within* a single archive is never taken for a collision
++      with a preceding one.  Left empty (and not consulted) whenever the
++      check is not in effect -- see `overwrite_prior_check`.
++    res_kwargs : dict
++      Common arguments for the result records.
++
++    All other parameters are as described for the `add_archive_content`
++    command.
++
++    Yields
++    ------
++    dict
++      Result records.
++    """
++    archive_basename = file_basename(archive)
++
++    # now we simply need to go through every file in that archive and
++    lgr.info(
++        "Adding content of the archive %s into annex %s", archive, annex
++    )
++    earchive = annexarchive.cache[key_rpath]
++
++    delete_after_rpath = None
++
++    prefix_dir = basename(tempfile.mkdtemp(prefix=".datalad",
++                                           dir=annex.path)) \
++        if delete_after \
++        else None
++
++    # dedicated stats for this archive, added to the overall ones at the end
++    stats = ActivityStats()
++
++    # paths added by this archive, merged into `prior_paths` only once we are
++    # through with it.  With --delete-after every archive extracts into its own
++    # temporary directory, so no two of them can ever collide and there is
++    # nothing to keep track of.
++    added_paths = {}
++    track_added = overwrite_prior_check != 'ignore' and not delete_after
++    if not track_added:
++        lgr.debug("Not tracking paths added by %s: overwrite_prior_check=%s, "
++                  "delete_after=%s", archive, overwrite_prior_check,
++                  delete_after)
++
++    # start a progress bar for extraction
++    pbar_id = f'add-archive-{archive_path}'
++    try:
++        # keep track of extracted files for progress bar logging
++        file_counter = 0
++        # iterative over all files in the archive
++        extracted_files = list(earchive.get_extracted_files())
++        log_progress(
++            lgr.info, pbar_id, 'Extracting archive',
++            label="Extracting %s" % archive_basename,
++            unit=' Files',
++            total = len(extracted_files),
++            noninteractive_level = logging.INFO)
++        for extracted_file in extracted_files:
++            file_counter += 1
++            files_left = len(extracted_files) - file_counter
++            log_progress(
++                lgr.info, pbar_id,
++                "Files to extract %i ", files_left,
++                update=1,
++                increment=True,
++                noninteractive_level=logging.DEBUG)
++            stats.files += 1
++            extracted_path = Path(earchive.path) / Path(extracted_file)
++
++            if extracted_path.is_symlink():
++                link_path = str(extracted_path.resolve())
++                if not exists(link_path):
++                    # TODO: config  addarchive.symlink-broken='skip'
++                    lgr.warning(
++                        "Path %s points to non-existing file %s" %
++                        (extracted_path, link_path)
++                    )
++                    stats.skipped += 1
++                    continue
++                    # TODO: check if points outside of archive - warn & skip
++
++            url = annexarchive.get_file_url(
++                archive_key=key,
++                file=extracted_file,
++                size=os.stat(extracted_path).st_size)
++
++            # preliminary target name which might get modified by renames
++            target_file_orig = target_file = Path(extracted_file)
++
++            # stream archives would not have had the original filename
++            # information in them, so would be extracted under a name
++            # derived from their annex key.
++            # Provide ad-hoc handling for such cases
++            if (len(extracted_files) == 1 and
++                Path(archive).suffix in ('.xz', '.gz', '.lzma') and
++                    Path(key_rpath).name.startswith(Path(
++                        extracted_file).name)):
++                # take archive's name without extension for filename & place
++                # where it was originally extracted
++                target_file = \
++                    Path(extracted_file).parent / Path(archive).stem
++
++            if strip_leading_dirs:
++                leading_dir = earchive.get_leading_directory(
++                    depth=leading_dirs_depth, exclude=exclude,
++                    consider=leading_dirs_consider)
++                leading_dir_len = \
++                    len(leading_dir) + len(opsep) if leading_dir else 0
++                target_file = str(target_file)[leading_dir_len:]
++
++            if add_archive_leading_dir:
++                # place extracted content under a directory corresponding to
++                # the archive name with suffix stripped.
++                target_file = Path(archive_basename) / target_file
++
++            if rename:
++                target_file = apply_replacement_rules(rename,
++                                                      str(target_file))
++
++            # continue to next iteration if extracted_file in excluded
++            if exclude:
++                try:  # since we need to skip outside loop from inside loop
++                    for regexp in exclude:
++                        if re.search(regexp, extracted_file):
++                            lgr.debug(
++                                "Skipping %s since contains %s pattern",
++                                extracted_file, regexp)
++                            stats.skipped += 1
++                            raise StopIteration
++                except StopIteration:
++                    continue
++
++            if delete_after:
++                # place target file in a temporary directory
++                target_file = Path(prefix_dir) / Path(target_file)
++                # but also allow for it in the orig
++                target_file_orig = Path(prefix_dir) / Path(target_file_orig)
++
++            target_file_path_orig = annex.pathobj / target_file_orig
++
++            # If we were invoked in a subdirectory, patch together the
++            # correct path
++            target_file_path = extract_rpath / target_file \
++                if extract_rpath else target_file
++            target_file_path = annex.pathobj / target_file_path
++
++            # when the file already exists...
++            if lexists(target_file_path):
++                handle_existing = True
++                same_content = md5sum(str(target_file_path)) == \
++                    md5sum(str(extracted_path))
++                # was this very path added by one of the archives which came
++                # before in this same call?  Identical content is not a loss,
++                # so it does not count.  `prior_paths` is empty whenever the
++                # check is not in effect.
++                prior_archive = None if same_content \
++                    else prior_paths.get(str(target_file_path))
++                if same_content:
++                    if not annex.is_under_annex(str(extracted_path)):
++                        # if under annex -- must be having the same content,
++                        # we should just add possibly a new extra URL
++                        # but if under git -- we cannot/should not do
++                        # anything about it ATM
++                        if existing != 'overwrite':
++                            continue
++                    else:
++                        handle_existing = False
++                if not handle_existing:
++                    pass  # nothing... just to avoid additional indentation
++                elif existing == 'fail':
++                    message = \
++                        "{} exists, but would be overwritten by new file " \
++                        "{} of {}. Consider adjusting --existing".format\
++                        (target_file_path, extracted_file, archive)
++                    if prior_archive is not None:
++                        # do not let the advice above lead into data loss:
++                        # 'overwrite' would discard what that archive added
++                        message += \
++                            ". Note that it was added from {} earlier in " \
++                            "this very call, so --existing=overwrite would " \
++                            "lose its content, while " \
++                            "--existing=archive-suffix keeps both".format(
++                                prior_archive)
++                    # point at the archive we are failing on, it is not
++                    # necessarily the only one we were given
++                    yield get_status_dict(
++                        ds=ds,
++                        status='error',
++                        message=message,
++                        **_archive_res_kwargs(archive_path, key, origin),
++                        **res_kwargs)
++                    return
++                elif existing == 'overwrite':
++                    # the only branch which actually destroys what is there:
++                    # the suffix ones below rename the incoming file instead
++                    if prior_archive is not None:
++                        if overwrite_prior_check == 'error':
++                            yield get_status_dict(
++                                ds=ds,
++                                status='error',
++                                message=(
++                                    "%s was added from %s earlier in this "
++                                    "very call and would be overwritten by "
++                                    "%s of %s. Use "
++                                    "--existing=archive-suffix to keep both, "
++                                    "or --overwrite-prior-check=stats to "
++                                    "permit the overwrite",
++                                    target_file_path, prior_archive,
++                                    extracted_file, archive),
++                                **_archive_res_kwargs(archive_path, key,
++                                                      origin),
++                                **res_kwargs)
++                            return
++                        stats.overwritten_prior += 1
++                    stats.overwritten += 1
++                    # to make sure it doesn't conflict -- might have been a
++                    # tree
++                    rmtree(target_file_path)
++                else:
++                    # an elaborate dance to piece together new archive names
++                    target_file_path_orig_ = target_file_path
++
++                    # To keep extension intact -- operate on the base of the
++                    # filename
++                    p, fn = os.path.split(target_file_path)
++                    ends_with_dot = fn.endswith('.')
++                    fn_base, fn_ext = file_basename(fn, return_ext=True)
++
++                    if existing == 'archive-suffix':
++                        fn_base += '-%s' % archive_basename
++                    elif existing == 'numeric-suffix':
++                        pass  # archive-suffix will have the same logic
++                    else:
++                        # we shouldn't get here, argparse should catch a
++                        # non-existing value for --existing right away
++                        raise ValueError(existing)
++                    # keep incrementing index in the suffix until file
++                    # doesn't collide
++                    suf, i = '', 0
++                    while True:
++                        connector = \
++                            ('.' if (fn_ext or ends_with_dot) else '')
++                        file = fn_base + suf + connector + fn_ext
++                        target_file_path_new =  \
++                            Path(p) / Path(file)
++                        if not lexists(target_file_path_new):
++                            # we found a file name that is not yet taken
++                            break
++                        lgr.debug("Iteration %i of file name finding. "
++                                  "File %s already exists", i,
++                                  target_file_path_new)
++                        i += 1
++                        suf = '.%d' % i
++                    target_file_path = target_file_path_new
++                    lgr.debug("Original file %s will be saved into %s"
++                              % (target_file_path_orig_, target_file_path))
++                    # TODO: should we reserve smth like
++                    # stats.clobbed += 1
++
++            if target_file_path != target_file_path_orig:
++                stats.renamed += 1
++
++            if copy:
++                raise NotImplementedError(
++                    "Not yet copying from 'persistent' cache"
++                )
++
++            lgr.debug("Adding %s to annex pointing to %s and with options "
++                      "%r", target_file_path, url, annex_options)
++
++            try:
++                out_json = annex.add_url_to_file(
++                    target_file_path,
++                    url, options=annex_options,
++                    batch=True)
++            except AnnexBatchCommandError as exc:
++                if '.gitignored' in str(exc):
++                    lgr.warning(
++                        "%s matches .gitignore; skipping "
++                        "(file not added to dataset)",
++                        target_file_path)
++                    stats.skipped += 1
++                    continue
++                raise
++
++            if track_added:
++                # only what actually landed, so that excluded, gitignored and
++                # otherwise skipped files do not claim a path
++                added_paths[str(target_file_path)] = archive
++
++            if 'key' in out_json and out_json['key'] is not None:
++                # annex.is_under_annex(target_file, batch=True):
++                # due to http://git-annex.branchable.com/bugs/annex_drop_is_not___34__in_effect__34___for_load_which_was___34__addurl_--batch__34__ed_but_not_yet_committed/?updated
++                # we need to maintain a list of those to be dropped files
++                if drop_after:
++                    # drop extracted files after adding to annex
++                    annex.drop_key(out_json['key'], batch=True)
++                    stats.dropped += 1
++                stats.add_annex += 1
++            else:
++                lgr.debug("File %s was added to git, not adding url",
++                    target_file_path)
++                stats.add_git += 1
++
++            if delete_after:
++                # we count the removal here, but don't yet perform it
++                # to not interfere with batched processes - any pure Git
++                # action invokes precommit which closes batched processes.
++                stats.removed += 1
++
++            # Done with target_file -- just to have clear end of the loop
++            del target_file
++
++        lgr.info("Finished adding %s: %s", archive, stats.as_str(mode='line'))
++
++        total_stats += stats
++        # only now, so that a collision within this very archive stays a
++        # matter of --existing alone
++        prior_paths.update(added_paths)
++
++        if delete_after:
++            # force since not committed. r=True for -r (passed into git call
++            # to recurse)
++            delete_after_rpath = opj(extract_rpath, prefix_dir) \
++                if extract_rpath else prefix_dir
++            lgr.debug(
++                "Removing extracted and annexed files under %s",
++                delete_after_rpath
++            )
++            annex.remove(str(ds.pathobj / delete_after_rpath), r=True,
++                         force=True)
++    finally:
++        # take down the progress bar
++        log_progress(
++            lgr.info, pbar_id,
++            'Finished extraction',
++            noninteractive_level=logging.INFO)
++
++        if delete_after_rpath:
++            delete_after_path = str(ds.pathobj / delete_after_rpath)
++            if exists(delete_after_path):  # should not be there
++                # but for paranoid yoh
++                lgr.warning(
++                    "Removing temporary directory under which extracted "
++                    "files were annexed and should have been removed: %s",
++                    delete_after_path)
++                rmtree(delete_after_path)
++
++        # remove what is left and/or everything upon failure
++        earchive.clean(force=True)
++        # remove tempfile directories (not cleaned up automatically):
++        if prefix_dir is not None:
++            # it was created under the root of the dataset
++            prefix_path = ds.pathobj / prefix_dir
++            if lexists(prefix_path):
++                try:
++                    os.rmdir(prefix_path)
++                except OSError as exc:
++                    # do not mask an exception which brought us here in the
++                    # first place, and which likely explains the leftovers
++                    lgr.warning("Failed to remove temporary directory %s: %s",
++                                prefix_path, CapturedException(exc))
++
++    yield get_status_dict(
++        ds=ds,
++        status='ok',
++        message=("added content of key %s", key) if origin == 'key' else None,
++        **_archive_res_kwargs(archive_path, key, origin),
++        **res_kwargs)
++
++
++@with_result_progress("Adding archives", unit=" Archives")
++def _add_archives_content(todo, **kwargs):
++    """Add the content of each archive of `todo`, stopping at the first failure
++
++    `todo` is a list of `_ArchiveSpec` instances, the remaining arguments are
++    passed on to `_add_archive_content()`.
++    """
++    # paths added by the archives processed so far, mapped to the archive they
++    # came from, so that a later one clobbering any of them can be reported
++    prior_paths = {}
++    for spec in todo:
++        failed = False
++        for res in _add_archive_content(
++                spec.archive,
++                key=spec.key,
++                key_rpath=spec.key_rpath,
++                archive_path=spec.path,
++                extract_rpath=spec.extract_rpath,
++                prior_paths=prior_paths,
++                **kwargs):
++            failed = failed or res['status'] not in ('ok', 'notneeded')
++            yield res
++        if failed:
++            # do not touch the remaining archives: the caller will not commit,
++            # and it is up to the user to decide how to continue
++            return
++
++
++# what needs to be done for a single archive, as established by the vetting
++_ArchiveSpec = namedtuple(
++    '_ArchiveSpec', 'archive path key key_rpath extract_rpath')
++
++
++
++def _archive_res_kwargs(archive_path, key, origin):
++    """Result record fields to identify the archive (or key) acted on"""
++    if origin == 'key':
++        # there is no meaningful path to point to, but the key identifies it
++        return dict(type='key', key=key)
++    return dict(path=str(archive_path), type='file')
++
++
++def _get_commit_message(origin, archives):
++    """Compose a commit message for the content of the given archives/keys"""
++    if len(archives) == 1:
++        return "Added content extracted from %s %s" % (origin, archives[0])
++    return "Added content extracted from %d %ss:\n\n%s" % (
++        len(archives), origin,
++        "\n".join("- %s" % a for a in archives))
++
++
+ @build_doc
+ class AddArchiveContent(Interface):
+     """Add content of an archive under git annex control.
+@@ -82,20 +574,54 @@ class AddArchiveContent(Interface):
+     Given an already annex'ed archive, extract and add its files to the
+     dataset, and reference the original archive as a custom special remote.
+ 
++    Multiple archives can be given in a single invocation. They are processed
++    in the given order, and their content is added within a single commit,
++    which is substantially faster than invoking the command once per archive.
++
++    All given archives are checked before any of them is acted on: if any one
++    of them cannot be used (it is untracked, absent, not under annex control,
++    or its content is not available locally), nothing is added at all.
++    Should adding the content of an archive fail nevertheless, the remaining
++    archives are not processed, and nothing is committed: the content added
++    up to that point is left staged for inspection, and a subsequent
++    invocation will refuse to operate on such a dirty dataset until those
++    changes are dealt with. Original archives are removed
++    ([PY: `delete=True` PY][CMD: --delete CMD]) only once all of them were
++    added successfully.
++
++    A file which one archive adds and a later one would overwrite is a
++    likely mistake, since the content of the earlier one would be lost.
++    Such an overwrite is only possible with
++    [PY: `existing='overwrite'` PY][CMD: --existing=overwrite CMD], and
++    leads to an error unless
++    [PY: `overwrite_prior_check` PY][CMD: --overwrite-prior-check CMD]
++    says otherwise.
++
++    .. versionchanged:: 1.7
++       More than one archive can be given. A result record is now yielded for
++       each given archive, in addition to the one for the dataset.
++       [PY: `overwrite_prior_check` PY][CMD: --overwrite-prior-check CMD]
++       was added, to guard the content of an archive against the archives
++       which follow it.
++
+     """
+     _examples_ = [
+         dict(text="""Add files from the archive 'big_tarball.tar.gz', but
+                      keep big_tarball.tar.gz in the index""",
+-             code_py="add_archive_content(path='big_tarball.tar.gz')",
++             code_py="add_archive_content(archive='big_tarball.tar.gz')",
+              code_cmd="datalad add-archive-content big_tarball.tar.gz"),
+-        dict(text="""Add files from the archive 'tarball.tar.gz', and
++        dict(text="""Add files from the archive 'big_tarball.tar.gz', and
+                      remove big_tarball.tar.gz from the index""",
+-             code_py="add_archive_content(path='big_tarball.tar.gz', delete=True)",
++             code_py="add_archive_content(archive='big_tarball.tar.gz', delete=True)",
+              code_cmd="datalad add-archive-content big_tarball.tar.gz --delete"),
+         dict(text="""Add files from the archive 's3.zip' but remove the leading
+                      directory""",
+-             code_py="add_archive_content(path='s3.zip', strip_leading_dirs=True)",
++             code_py="add_archive_content(archive='s3.zip', strip_leading_dirs=True)",
+              code_cmd="datalad add-archive-content s3.zip --strip-leading-dirs"),
++        dict(text="""Add files from multiple archives, resulting in a single
++                     commit""",
++             code_py="add_archive_content(archive=['1.zip', '2.zip'])",
++             code_cmd="datalad add-archive-content 1.zip 2.zip"),
+         ]
+ 
+     # XXX prevent common args from being added to the docstring
+@@ -103,13 +629,14 @@ class AddArchiveContent(Interface):
+     _params_ = dict(
+         dataset=Parameter(
+             args=("-d", "--dataset"),
+-            doc=""""specify the dataset to save""",
++            doc="""specify the dataset to operate on""",
+             constraints=EnsureDataset() | EnsureNone()),
+         delete=Parameter(
+             args=("-D", "--delete"),
+             action="store_true",
+-            doc="""delete original archive from the filesystem/Git in current
+-            tree. %s""" % _KEY_OPT_NOTE),
++            doc="""delete original archives from the filesystem/Git in current
++            tree, once the content of all of them was added. %s"""
++            % _KEY_OPT_NOTE),
+         add_archive_leading_dir=Parameter(
+             args=("--add-archive-leading-dir",),
+             action="store_true",
+@@ -154,6 +681,29 @@ class AddArchiveContent(Interface):
+             addition, when incremental numeric suffix (prefixed with a '.') is
+             added until no name collision is longer detected"""
+         ),
++        overwrite_prior_check=Parameter(
++            args=("--overwrite-prior-check",),
++            constraints=EnsureChoice('error', 'stats', 'ignore'),
++            default='error',
++            doc="""how to react when a file extracted from an archive would
++            overwrite a file which one of the *preceding* archives of the same
++            invocation had just added.  Such an overwrite discards the content
++            contributed by that earlier archive, so by default ('error') it
++            leads to an error result, and nothing is committed.  'stats'
++            permits the overwrite and reports the number of files it affected
++            as 'overwritten prior' in the statistics.  'ignore' permits it
++            without keeping track of the paths added, at a marginal saving of
++            memory.  This option is orthogonal to [CMD: --existing CMD][PY:
++            `existing` PY], which governs collisions with content which was
++            already in the dataset: only [CMD: --existing=overwrite CMD][PY:
++            `existing='overwrite'` PY] can discard the contribution of a
++            preceding archive, while the suffix modes rename the incoming file
++            instead and are thus never reported here.  Files with identical
++            content are not overwrites, and are never reported either.  Has no
++            effect if [CMD: --delete-after CMD][PY: `delete_after=True` PY] is
++            given, where each archive is extracted into its own temporary
++            directory and no two of them can collide."""
++        ),
+         exclude=Parameter(
+             args=("-e", "--exclude"),
+             action='append',
+@@ -186,9 +736,9 @@ class AddArchiveContent(Interface):
+         key=Parameter(
+             args=("--key",),
+             action="store_true",
+-            doc="""signal if provided archive is not actually a filename on its
+-            own but an annex key. The archive will be extracted in the current
+-            directory."""),
++            doc="""signal that the provided archives are not filenames on
++            their own but annex keys. Such archives are extracted in the
++            current directory."""),
+         copy=Parameter(
+             args=("--copy",),
+             action="store_true",
+@@ -215,7 +765,11 @@ class AddArchiveContent(Interface):
+         # TODO: interaction with archives cache whenever we make it persistent across runs
+         archive=Parameter(
+             args=("archive",),
+-            doc="archive file or a key (if %s specified)" % _KEY_OPT,
++            metavar='ARCHIVE',
++            nargs="+",
++            doc="""archive file or a key (if %s specified). More than one can
++            be given; the content of all of them is added within a single
++            commit""" % _KEY_OPT,
+             constraints=EnsureStr()),
+     )
+ 
+@@ -237,6 +791,7 @@ def __call__(
+             exclude=None,
+             rename=None,
+             existing='fail',
++            overwrite_prior_check='error',
+             annex_options=None,
+             copy=False,
+             commit=True,
+@@ -249,6 +804,8 @@ def __call__(
+             exclude = ensure_tuple_or_list(exclude)
+         if rename:
+             rename = ensure_tuple_or_list(rename)
++        # a single archive (or key), or any number of them
++        archives = ensure_list(archive)
+         ds = require_dataset(dataset,
+                              check_installed=True,
+                              purpose='add-archive-content')
+@@ -274,449 +831,230 @@ def __call__(
+                 "Use the 'dataset' parameter instead.",
+                 DeprecationWarning)
+         annex = ds.repo
+-        # get the archive path relative from the ds root
+-        archive_path = resolve_path(archive, ds=dataset)
+-        # let Status decide whether we can act on the given file
+-        for s in ds.status(
+-                path=archive_path,
+-                on_failure='ignore',
+-                result_renderer='disabled'):
+-            if s['status'] == 'error':
+-                if 'path not underneath the reference dataset %s' in s['message']:
+-                    yield get_status_dict(
+-                        ds=ds,
+-                        status='impossible',
+-                        message='Can not add archive outside of the dataset',
+-                        **res_kwargs)
+-                    return
+-                # status errored & we haven't anticipated the cause. Bubble up
+-                yield s
+-                return
+-            elif s['state'] == 'untracked':
+-                # we can't act on an untracked file
+-                message = (
+-                    "Can not add an untracked archive. "
+-                    "Run 'datalad save {}'".format(archive)
+-                )
+-                yield get_status_dict(
+-                           ds=ds,
+-                           status='impossible',
+-                           message=message,
+-                           **res_kwargs)
+-                return
+ 
+-        if not allow_dirty and annex.dirty:
+-            # error out here if the dataset contains untracked changes
+-            yield get_status_dict(
+-                ds=ds,
+-                status='impossible',
+-                message=(
+-                    'clean dataset required. '
+-                    'Use `datalad status` to inspect unsaved changes'),
+-                **res_kwargs
+-            )
+-            return
++        # what kind of thing we were given, used for result records and the
++        # commit message
++        origin = 'key' if key else 'archive'
+ 
+-        # ensure the archive exists, status doesn't error on a non-existing file
+-        if not key and not lexists(archive_path):
++        if not archives or not all(str(a) for a in archives):
+             yield get_status_dict(
+                 ds=ds,
+                 status='impossible',
+-                message=(
+-                    'No such file: {}'.format(archive_path),
+-                ),
++                message='No archive was specified',
+                 **res_kwargs
+             )
+             return
+ 
+-        if not key:
+-            check_path = archive_path.relative_to(ds.pathobj)
+-            # TODO: support adding archives content from outside the annex/repo
+-            origin = 'archive'
+-            # can become get_file_annexinfo once #6104 is merged
+-            key = annex.get_file_annexinfo(check_path)['key']
+-            if not key:
+-                raise RuntimeError(
+-                    f"Archive must be an annexed file in {ds}")
+-            archive_dir = Path(archive_path).parent
+-        else:
+-            origin = 'key'
+-            key = archive
+-            # We must not have anything to do with the location under .git/annex
+-            archive_dir = None
+-            # instead, we will go from the current directory
+-            use_current_dir = True
++        # Vet all archives before modifying the dataset in any way, so that
++        # nothing is added whenever any one of them can not be used
++        problems = False
++        archive_paths = list(zip(
++            archives, resolve_path(archives, ds=dataset, ds_resolved=ds)))
+ 
+-        archive_basename = file_basename(archive)
+-
+-        if not key:
+-            # if we didn't manage to get a key, the file must be in Git
+-            raise NotImplementedError(
+-                "Provided file %s does not seem to be under annex control. "
+-                "We don't support adding everything straight to Git" % archive
+-            )
++        if key:
++            # we must not have anything to do with the location under
++            # .git/annex, so we will go from the current directory
++            use_current_dir = True
+ 
+         # figure out our location
+         pwd = getpwd()
+-        # are we in a subdirectory of the repository?
+-        pwd_in_root = annex.path == archive_dir
+-        # then we should add content under that subdirectory,
+-        # get the path relative to the repo top
+-        if use_current_dir:
+-            # extract the archive under the current directory, not the directory
+-            # where the archive is located
+-            extract_rpath = Path(pwd).relative_to(ds.path) \
+-                if not pwd_in_root \
+-                else None
+-        else:
+-            extract_rpath = archive_dir.relative_to(ds.path)
+-
+-        # relpath might return '.' as the relative path to curdir, which then normalize_paths
+-        # would take as instructions to really go from cwd, so we need to sanitize
+-        if extract_rpath == curdir:
+-            extract_rpath = None
+-
+-        try:
+-            key_rpath = annex.get_contentlocation(key)
+-        except:
+-            # the only probable reason for this to fail is that there is no
+-            # content present
+-            raise RuntimeError(
+-                "Content of %s seems to be N/A.  Fetch it first" % key
+-            )
+-
+-        # now we simply need to go through every file in that archive and
+-        lgr.info(
+-            "Adding content of the archive %s into annex %s", archive, annex
+-        )
+-
+-        from datalad.customremotes.archives import ArchiveAnnexCustomRemote
+-
+-        # TODO: shouldn't we be able just to pass existing AnnexRepo instance?
+-        # TODO: we will use persistent cache so we could just (ab)use possibly extracted archive
+-        # OK, let's ignore that the following class is actually a special
+-        # remote implementation, and use it only to work with its cache
+-        annexarchive = ArchiveAnnexCustomRemote(annex=None,
+-                                                path=annex.path,
+-                                                persistent_cache=True)
+-        # We will move extracted content so it must not exist prior running
+-        annexarchive.cache.allow_existing = True
+-        earchive = annexarchive.cache[key_rpath]
+-        # make sure there is an enabled datalad-archives special remote
+-        ensure_datalad_remote(ds.repo, remote=ARCHIVES_SPECIAL_REMOTE,
+-                              autoenable=True)
+ 
+         precommitted = False
++        failed = False
+         old_always_commit = annex.always_commit
+         # batch mode is disabled when faking dates, we want to always commit
+         annex.always_commit = annex.fake_dates_enabled
+-        if annex_options:
+-            if isinstance(annex_options, str):
+-                annex_options = split_cmdline(annex_options)
+-        delete_after_rpath = None
+-
+-        prefix_dir = basename(tempfile.mkdtemp(prefix=".datalad",
+-                                               dir=annex.path)) \
+-            if delete_after \
+-            else None
+-
+-        # dedicated stats which would be added to passed in (if any)
+-        outside_stats = stats
+-        stats = ActivityStats()
+-
+-        # start a progress bar for extraction
+-        pbar_id = f'add-archive-{archive_path}'
++        # from here on batched git-annex processes may be in use, they are
++        # closed by the precommit() in the `finally`
+         try:
+-            # keep track of extracted files for progress bar logging
+-            file_counter = 0
+-            # iterative over all files in the archive
+-            extracted_files = list(earchive.get_extracted_files())
+-            log_progress(
+-                lgr.info, pbar_id, 'Extracting archive',
+-                label="Extracting archive",
+-                unit=' Files',
+-                total = len(extracted_files),
+-                noninteractive_level = logging.INFO)
+-            for extracted_file in extracted_files:
+-                file_counter += 1
+-                files_left = len(extracted_files) - file_counter
+-                log_progress(
+-                    lgr.info, pbar_id,
+-                    "Files to extract %i ", files_left,
+-                    update=1,
+-                    increment=True,
+-                    noninteractive_level=logging.DEBUG)
+-                stats.files += 1
+-                extracted_path = Path(earchive.path) / Path(extracted_file)
+-
+-                if extracted_path.is_symlink():
+-                    link_path = str(extracted_path.resolve())
+-                    if not exists(link_path):
+-                        # TODO: config  addarchive.symlink-broken='skip'
+-                        lgr.warning(
+-                            "Path %s points to non-existing file %s" %
+-                            (extracted_path, link_path)
+-                        )
+-                        stats.skipped += 1
+-                        continue
+-                        # TODO: check if points outside of archive - warn & skip
+-
+-                url = annexarchive.get_file_url(
+-                    archive_key=key,
+-                    file=extracted_file,
+-                    size=os.stat(extracted_path).st_size)
+-
+-                # preliminary target name which might get modified by renames
+-                target_file_orig = target_file = Path(extracted_file)
+-
+-                # stream archives would not have had the original filename
+-                # information in them, so would be extracted under a name
+-                # derived from their annex key.
+-                # Provide ad-hoc handling for such cases
+-                if (len(extracted_files) == 1 and
+-                    Path(archive).suffix in ('.xz', '.gz', '.lzma') and
+-                        Path(key_rpath).name.startswith(Path(
+-                            extracted_file).name)):
+-                    # take archive's name without extension for filename & place
+-                    # where it was originally extracted
+-                    target_file = \
+-                        Path(extracted_file).parent / Path(archive).stem
+-
+-                if strip_leading_dirs:
+-                    leading_dir = earchive.get_leading_directory(
+-                        depth=leading_dirs_depth, exclude=exclude,
+-                        consider=leading_dirs_consider)
+-                    leading_dir_len = \
+-                        len(leading_dir) + len(opsep) if leading_dir else 0
+-                    target_file = str(target_file)[leading_dir_len:]
+-
+-                if add_archive_leading_dir:
+-                    # place extracted content under a directory corresponding to
+-                    # the archive name with suffix stripped.
+-                    target_file = Path(archive_basename) / target_file
+-
+-                if rename:
+-                    target_file = apply_replacement_rules(rename,
+-                                                          str(target_file))
+-
+-                # continue to next iteration if extracted_file in excluded
+-                if exclude:
+-                    try:  # since we need to skip outside loop from inside loop
+-                        for regexp in exclude:
+-                            if re.search(regexp, extracted_file):
+-                                lgr.debug(
+-                                    "Skipping %s since contains %s pattern",
+-                                    extracted_file, regexp)
+-                                stats.skipped += 1
+-                                raise StopIteration
+-                    except StopIteration:
+-                        continue
+-
+-                if delete_after:
+-                    # place target file in a temporary directory
+-                    target_file = Path(prefix_dir) / Path(target_file)
+-                    # but also allow for it in the orig
+-                    target_file_orig = Path(prefix_dir) / Path(target_file_orig)
+-
+-                target_file_path_orig = annex.pathobj / target_file_orig
+-
+-                # If we were invoked in a subdirectory, patch together the
+-                # correct path
+-                target_file_path = extract_rpath / target_file \
+-                    if extract_rpath else target_file
+-                target_file_path = annex.pathobj / target_file_path
+-
+-                # when the file already exists...
+-                if lexists(target_file_path):
+-                    handle_existing = True
+-                    if md5sum(str(target_file_path)) == \
+-                            md5sum(str(extracted_path)):
+-                        if not annex.is_under_annex(str(extracted_path)):
+-                            # if under annex -- must be having the same content,
+-                            # we should just add possibly a new extra URL
+-                            # but if under git -- we cannot/should not do
+-                            # anything about it ATM
+-                            if existing != 'overwrite':
+-                                continue
++            # a single `status` query tells us everything we need to know about
++            # all archives at once: whether we can act on them at all, their
++            # annex key, and where the content of that key is
++            status_records = {}
++            if not key:
++                for s in ds.status(
++                        path=[p for _, p in archive_paths],
++                        annex='availability',
++                        on_failure='ignore',
++                        result_renderer='disabled'):
++                    status_records.setdefault(str(s['path']), s)
++
++            todo = []
++            for a, archive_path in archive_paths:
++                akey = key_rpath = archive_dir = None
++                # a message for a problem which prevents us from using this
++                # archive, or a result record to bubble up as is
++                problem = bubbled = None
++                if key:
++                    # a key has no path to inspect, we can only ask for the
++                    # location of its content
++                    akey = a
++                    key_rpath = annex.get_contentlocation(akey, batch=True)
++                    if not key_rpath:
++                        problem = (
++                            'Content of %s is not available, get it first', a)
++                else:
++                    s = status_records.get(str(archive_path))
++                    message = (s or {}).get('message')
++                    if s is None or s['status'] == 'error':
++                        if message and \
++                                'path not underneath the reference dataset %s' \
++                                in message:
++                            problem = \
++                                'Can not add archive outside of the dataset'
++                        elif s is None or s.get('state') == 'unknown':
++                            problem = 'No such file: {}'.format(archive_path)
+                         else:
+-                            handle_existing = False
+-                    if not handle_existing:
+-                        pass  # nothing... just to avoid additional indentation
+-                    elif existing == 'fail':
+-                        message = \
+-                            "{} exists, but would be overwritten by new file " \
+-                            "{}. Consider adjusting --existing".format\
+-                            (target_file_path, extracted_file)
+-                        yield get_status_dict(
+-                            ds=ds,
+-                            status='error',
+-                            message=message,
+-                            **res_kwargs)
+-                        return
+-                    elif existing == 'overwrite':
+-                        stats.overwritten += 1
+-                        # to make sure it doesn't conflict -- might have been a
+-                        # tree
+-                        rmtree(target_file_path)
++                            # errored for a cause we have not anticipated
++                            bubbled = s
++                    elif s['state'] == 'untracked':
++                        # we can't act on an untracked file
++                        problem = ("Can not add an untracked archive. "
++                                   "Run 'datalad save {}'".format(a))
++                    elif not s.get('key'):
++                        # no key -- the archive is in Git
++                        problem = (
++                            'Archive must be an annexed file, %s is not', a)
++                    elif not s.get('objloc'):
++                        problem = (
++                            'Content of %s is not available, get it first', a)
+                     else:
+-                        # an elaborate dance to piece together new archive names
+-                        target_file_path_orig_ = target_file_path
+-
+-                        # To keep extension intact -- operate on the base of the
+-                        # filename
+-                        p, fn = os.path.split(target_file_path)
+-                        ends_with_dot = fn.endswith('.')
+-                        fn_base, fn_ext = file_basename(fn, return_ext=True)
+-
+-                        if existing == 'archive-suffix':
+-                            fn_base += '-%s' % archive_basename
+-                        elif existing == 'numeric-suffix':
+-                            pass  # archive-suffix will have the same logic
+-                        else:
+-                            # we shouldn't get here, argparse should catch a
+-                            # non-existing value for --existing right away
+-                            raise ValueError(existing)
+-                        # keep incrementing index in the suffix until file
+-                        # doesn't collide
+-                        suf, i = '', 0
+-                        while True:
+-                            connector = \
+-                                ('.' if (fn_ext or ends_with_dot) else '')
+-                            file = fn_base + suf + connector + fn_ext
+-                            target_file_path_new =  \
+-                                Path(p) / Path(file)
+-                            if not lexists(target_file_path_new):
+-                                # we found a file name that is not yet taken
+-                                break
+-                            lgr.debug("Iteration %i of file name finding. "
+-                                      "File %s already exists", i,
+-                                      target_file_path_new)
+-                            i += 1
+-                            suf = '.%d' % i
+-                        target_file_path = target_file_path_new
+-                        lgr.debug("Original file %s will be saved into %s"
+-                                  % (target_file_path_orig_, target_file_path))
+-                        # TODO: should we reserve smth like
+-                        # stats.clobbed += 1
+-
+-                if target_file_path != target_file_path_orig:
+-                    stats.renamed += 1
+-
+-                if copy:
+-                    raise NotImplementedError(
+-                        "Not yet copying from 'persistent' cache"
+-                    )
+-
+-                lgr.debug("Adding %s to annex pointing to %s and with options "
+-                          "%r", target_file_path, url, annex_options)
++                        akey, key_rpath = s['key'], s['objloc']
++                        archive_dir = Path(archive_path).parent
++                if problem or bubbled:
++                    yield bubbled or get_status_dict(
++                        ds=ds,
++                        status='impossible',
++                        message=problem,
++                        **_archive_res_kwargs(archive_path, a, origin),
++                        **res_kwargs)
++                    problems = True
++                    continue
+ 
+-                try:
+-                    out_json = annex.add_url_to_file(
+-                        target_file_path,
+-                        url, options=annex_options,
+-                        batch=True)
+-                except AnnexBatchCommandError as exc:
+-                    if '.gitignored' in str(exc):
+-                        lgr.warning(
+-                            "%s matches .gitignore; skipping "
+-                            "(file not added to dataset)",
+-                            target_file_path)
+-                        stats.skipped += 1
+-                        continue
+-                    raise
+-
+-                if 'key' in out_json and out_json['key'] is not None:
+-                    # annex.is_under_annex(target_file, batch=True):
+-                    # due to http://git-annex.branchable.com/bugs/annex_drop_is_not___34__in_effect__34___for_load_which_was___34__addurl_--batch__34__ed_but_not_yet_committed/?updated
+-                    # we need to maintain a list of those to be dropped files
+-                    if drop_after:
+-                        # drop extracted files after adding to annex
+-                        annex.drop_key(out_json['key'], batch=True)
+-                        stats.dropped += 1
+-                    stats.add_annex += 1
++                # are we in a subdirectory of the repository?
++                pwd_in_root = annex.path == archive_dir
++                # then we should add content under that subdirectory,
++                # get the path relative to the repo top
++                if use_current_dir:
++                    # extract the archive under the current directory, not the
++                    # directory where the archive is located
++                    extract_rpath = Path(pwd).relative_to(ds.path) \
++                        if not pwd_in_root \
++                        else None
+                 else:
+-                    lgr.debug("File %s was added to git, not adding url",
+-                        target_file_path)
+-                    stats.add_git += 1
++                    extract_rpath = archive_dir.relative_to(ds.path)
+ 
+-                if delete_after:
+-                    # we count the removal here, but don't yet perform it
+-                    # to not interfere with batched processes - any pure Git
+-                    # action invokes precommit which closes batched processes.
+-                    stats.removed += 1
++                # relpath might return '.' as the relative path to curdir,
++                # which then normalize_paths would take as instructions to
++                # really go from cwd, so we need to sanitize
++                if extract_rpath == curdir:
++                    extract_rpath = None
+ 
+-                # Done with target_file -- just to have clear end of the loop
+-                del target_file
++                todo.append(_ArchiveSpec(
++                    a, archive_path, akey, key_rpath, extract_rpath))
++            if problems:
++                return
+ 
+-            if delete and archive and origin != 'key':
+-                lgr.debug("Removing the original archive %s", archive)
+-                # force=True since some times might still be staged and fail
+-                annex.remove(str(archive_path), force=True)
++            if not allow_dirty and annex.dirty:
++                # error out here if the dataset contains untracked changes.
++                # This comes after the vetting above, so that a problem with
++                # an archive itself (an untracked one in particular) is
++                # reported in its own terms
++                yield get_status_dict(
++                    ds=ds,
++                    status='impossible',
++                    message=(
++                        'clean dataset required. '
++                        'Use `datalad status` to inspect unsaved changes'),
++                    **res_kwargs
++                )
++                return
+ 
+-            lgr.info("Finished adding %s: %s", archive, stats.as_str(mode='line'))
++            from datalad.customremotes.archives import ArchiveAnnexCustomRemote
+ 
+-            if outside_stats:
+-                outside_stats += stats
+-            if delete_after:
+-                # force since not committed. r=True for -r (passed into git call
+-                # to recurse)
+-                delete_after_rpath = opj(extract_rpath, prefix_dir) \
+-                    if extract_rpath else prefix_dir
+-                delete_after_rpath = resolve_path(delete_after_rpath,
+-                                                  ds=dataset)
+-                lgr.debug(
+-                    "Removing extracted and annexed files under %s",
+-                    delete_after_rpath
+-                )
+-                annex.remove(str(delete_after_rpath), r=True, force=True)
+-            if commit:
+-                archive_rpath = archive_path.relative_to(ds.path)
+-                commit_stats = outside_stats if outside_stats else stats
+-                # so batched ones close and files become annex symlinks etc
+-                annex.precommit()
+-                precommitted = True
+-                if any(r.get('state', None) != 'clean'
+-                       for p, r in annex.status(untracked='no').items()):
+-                    annex.commit(
+-                        "Added content extracted from %s %s\n\n%s" %
+-                        (origin, archive_rpath,
+-                         commit_stats.as_str(mode='full')),
+-                        _datalad_msg=True
+-                    )
+-                    commit_stats.reset()
+-            else:
+-                # don't commit upon completion
+-                pass
++            # TODO: shouldn't we be able just to pass existing AnnexRepo instance?
++            # TODO: we will use persistent cache so we could just (ab)use possibly extracted archive
++            # OK, let's ignore that the following class is actually a special
++            # remote implementation, and use it only to work with its cache
++            annexarchive = ArchiveAnnexCustomRemote(annex=None,
++                                                    path=annex.path,
++                                                    persistent_cache=True)
++            # We will move extracted content so it must not exist prior running
++            annexarchive.cache.allow_existing = True
++            # make sure there is an enabled datalad-archives special remote
++            ensure_datalad_remote(ds.repo, remote=ARCHIVES_SPECIAL_REMOTE,
++                                  autoenable=True)
++
++            if annex_options and isinstance(annex_options, str):
++                annex_options = split_cmdline(annex_options)
++
++            # dedicated stats which would be added to passed in (if any)
++            outside_stats = stats
++            stats = ActivityStats()
++
++            for res in _add_archives_content(
++                    todo,
++                    ds=ds,
++                    annex=annex,
++                    annexarchive=annexarchive,
++                    origin=origin,
++                    total_stats=stats,
++                    res_kwargs=res_kwargs,
++                    add_archive_leading_dir=add_archive_leading_dir,
++                    strip_leading_dirs=strip_leading_dirs,
++                    leading_dirs_depth=leading_dirs_depth,
++                    leading_dirs_consider=leading_dirs_consider,
++                    exclude=exclude,
++                    rename=rename,
++                    existing=existing,
++                    overwrite_prior_check=overwrite_prior_check,
++                    annex_options=annex_options,
++                    copy=copy,
++                    drop_after=drop_after,
++                    delete_after=delete_after):
++                failed = failed or res['status'] not in ('ok', 'notneeded')
++                yield res
++
++            if not failed:
++                if delete and origin != 'key':
++                    # only now, when the content of all archives was added: a
++                    # failure should not leave a removal behind, and removing
++                    # tears down the batched processes we reuse across archives
++                    lgr.debug("Removing the original archives")
++                    # force=True since some times might still be staged and fail
++                    annex.remove([str(s.path) for s in todo], force=True)
++                if outside_stats:
++                    outside_stats += stats
++                if commit:
++                    commit_stats = outside_stats if outside_stats else stats
++                    # so batched ones close and files become annex symlinks etc
++                    annex.precommit()
++                    precommitted = True
++                    if any(r.get('state', None) != 'clean'
++                           for p, r in annex.status(untracked='no').items()):
++                        annex.commit(
++                            "%s\n\n%s" % (
++                                _get_commit_message(origin, [
++                                    s.key if origin == 'key'
++                                    else s.path.relative_to(ds.path)
++                                    for s in todo]),
++                                commit_stats.as_str(mode='full')),
++                            _datalad_msg=True
++                        )
++                        commit_stats.reset()
+         finally:
+-            # take down the progress bar
+-            log_progress(
+-                lgr.info, pbar_id,
+-                'Finished extraction',
+-                noninteractive_level=logging.INFO)
+             # since we batched addurl, we should close those batched processes
+             # if haven't done yet.  explicitly checked to avoid any possible
+             # "double-action"
+             if not precommitted:
+                 annex.precommit()
+ 
+-            if delete_after_rpath:
+-                delete_after_path = opj(annex.path, delete_after_rpath)
+-                delete_after_rpath = resolve_path(delete_after_rpath,
+-                                                  ds=dataset)
+-                if exists(delete_after_path):  # should not be there
+-                    # but for paranoid yoh
+-                    lgr.warning(
+-                        "Removing temporary directory under which extracted "
+-                        "files were annexed and should have been removed: %s",
+-                        delete_after_path)
+-                    rmtree(delete_after_path)
+-
+             annex.always_commit = old_always_commit
+-            # remove what is left and/or everything upon failure
+-            earchive.clean(force=True)
+-            # remove tempfile directories (not cleaned up automatically):
+-            if prefix_dir is not None and lexists(prefix_dir):
+-                os.rmdir(prefix_dir)
++
++        if failed:
++            # the problem was reported already, do not pretend that all is
++            # good with the dataset
++            return
+         yield get_status_dict(
+             ds=ds,
+             status='ok',
+diff --git a/datalad/local/tests/test_add_archive_content.py b/datalad/local/tests/test_add_archive_content.py
+index 396206834c..f16e23cc0c 100644
+--- a/datalad/local/tests/test_add_archive_content.py
++++ b/datalad/local/tests/test_add_archive_content.py
+@@ -26,12 +26,16 @@
+     pardir,
+ )
+ from pathlib import Path
++from unittest.mock import patch
++
++import pytest
+ 
+ from datalad.api import (
+     Dataset,
+     add_archive_content,
+     clean,
+ )
++from datalad.cli.tests.test_main import run_main
+ from datalad.consts import (
+     ARCHIVES_SPECIAL_REMOTE,
+     DATALAD_SPECIAL_REMOTES_UUIDS,
+@@ -40,7 +44,9 @@
+     CommandError,
+     NoDatasetFound,
+ )
++from datalad.support.annexrepo import AnnexRepo
+ from datalad.support.external_versions import external_versions
++from datalad.support.stats import ActivityStats
+ from datalad.tests.utils_pytest import (
+     assert_cwd_unchanged,
+     assert_equal,
+@@ -50,6 +56,7 @@
+     assert_not_in,
+     assert_raises,
+     assert_repo_status,
++    assert_result_count,
+     assert_result_values_cond,
+     assert_true,
+     create_tree,
+@@ -222,7 +229,9 @@ def test_add_archive_content(path_orig=None, url=None, repo_path=None):
+             res,
+             action='add-archive-content',
+             status='impossible',
+-            type="dataset",
++            # the result record points to the archive we could not use,
++            # not to the dataset
++            type="file",
+             message="Can not add archive outside of the dataset"
+         )
+ 
+@@ -488,6 +497,346 @@ def test_add_archive_single_file(repo_path=None):
+             ok_file_has_content(archive_name, archive_content)
+ 
+ 
++multi_tree_args = dict(
++    tree={
++        '1.tar.gz': {'1 f.txt': '1 f load'},
++        '2.tar.gz': {'2 f.txt': '2 f load'},
++        'd': {'3.tar.gz': {'3 f.txt': '3 f load'}},
++        # content of this one gets dropped
++        '4.tar.gz': {'4 f.txt': '4 f load'},
++        # these two carry the same filename, so extracting both into the
++        # same directory collides
++        'c1.tar.gz': {'c f.txt': 'c1 load'},
++        'c2.tar.gz': {'c f.txt': 'c2 load'},
++        # this one is added to Git, not to the annex
++        'ingit.tar.gz': {'g f.txt': 'g f load'},
++    }
++)
++
++
++overwrite_prior_tree_args = dict(
++    tree={
++        # these two carry the same filename with different content, so
++        # extracting both into the same directory collides
++        'c1.tar.gz': {'c f.txt': 'c1 load'},
++        'c2.tar.gz': {'c f.txt': 'c2 load'},
++        # same filename as c1.tar.gz, and the very same content, so nothing
++        # would be lost by "overwriting" it
++        'c3.tar.gz': {'c f.txt': 'c1 load'},
++        # two members which --rename can collapse onto a single name, to
++        # collide within one and the same archive
++        'm.tar.gz': {'a.txt': 'a load', 'b.txt': 'b load'},
++    }
++)
++
++
++def _get_ncommits(ds):
++    return len(list(ds.repo.get_branch_commits_()))
++
++
++@assert_cwd_unchanged(ok_to_chdir=True)
++@with_tree(**multi_tree_args)
++@pytest.mark.ai_generated
++def test_add_archive_content_multiple(repo_path=None):
++    ds = Dataset(repo_path).create(force=True)
++    with swallow_outputs():
++        # 2.tar.gz is left untracked, and ingit.tar.gz goes into Git, for the
++        # "unusable archive" checks below
++        ds.save([a for a in ('1.tar.gz', opj('d', '3.tar.gz'), '4.tar.gz',
++                             'c1.tar.gz', 'c2.tar.gz')],
++                message="added archives")
++        ds.save('ingit.tar.gz', to_git=True, message="added to git")
++    # ... and 4.tar.gz has no content around
++    ds.repo.drop('4.tar.gz', options=['--force'])
++
++    def check_unusable(archives, **kwargs):
++        """If any archive can not be used, nothing is added or committed"""
++        ncommits_prior = _get_ncommits(ds)
++        res = add_archive_content(archives, allow_dirty=True,
++                                  on_failure='ignore', **kwargs)
++        assert_false(exists(opj(repo_path, '1')))
++        assert_equal(_get_ncommits(ds), ncommits_prior)
++        return res
++
++    with chpwd(repo_path):
++        # an untracked archive
++        assert_in_results(
++            check_unusable(['1.tar.gz', '2.tar.gz']),
++            action='add-archive-content',
++            status='impossible',
++            type='file',
++            path=opj(repo_path, '2.tar.gz'),
++            message="Can not add an untracked archive. "
++                    "Run 'datalad save 2.tar.gz'")
++        # an archive which is not there at all
++        assert_in_results(
++            check_unusable(['1.tar.gz', 'nonexisting.tar.gz']),
++            action='add-archive-content',
++            status='impossible',
++            message='No such file: {}'.format(opj(repo_path,
++                                                  'nonexisting.tar.gz')))
++        # an archive which is not under annex control
++        assert_in_results(
++            check_unusable(['1.tar.gz', 'ingit.tar.gz']),
++            action='add-archive-content',
++            status='impossible',
++            path=opj(repo_path, 'ingit.tar.gz'),
++            message=('Archive must be an annexed file, %s is not',
++                     'ingit.tar.gz'))
++        # an archive the content of which is not available locally
++        assert_in_results(
++            check_unusable(['1.tar.gz', '4.tar.gz']),
++            action='add-archive-content',
++            status='impossible',
++            path=opj(repo_path, '4.tar.gz'),
++            message=('Content of %s is not available, get it first',
++                     '4.tar.gz'))
++        # no archive at all (not reachable via the command line, where
++        # argparse would not accept an empty list)
++        assert_in_results(
++            add_archive_content([], on_failure='ignore'),
++            action='add-archive-content',
++            status='impossible',
++            message='No archive was specified')
++
++        with swallow_outputs():
++            ds.save('2.tar.gz', message="added the remaining archive")
++        # a single archive, to have a baseline for the number of times the
++        # batched git-annex processes are taken down (see below)
++        with patch.object(AnnexRepo, 'precommit', autospec=True,
++                          side_effect=AnnexRepo.precommit) as precommit:
++            res = add_archive_content(['1.tar.gz'], delete=True)
++        precommits_single = precommit.call_count
++        # one record for the archive, and one for the dataset
++        assert_result_count(res, 2, action='add-archive-content', status='ok')
++        assert_in_results(res, status='ok', type='file',
++                          path=opj(repo_path, '1.tar.gz'))
++        ok_file_under_git(repo_path, opj('1', '1 f.txt'), annexed=True)
++
++        archives = ['2.tar.gz', opj('d', '3.tar.gz')]
++        ncommits_prior = _get_ncommits(ds)
++        with patch.object(AnnexRepo, 'precommit', autospec=True,
++                          side_effect=AnnexRepo.precommit) as precommit:
++            res = add_archive_content(archives, delete=True)
++        # a result record per archive, and one for the dataset
++        assert_result_count(
++            res, len(archives) + 1, action='add-archive-content', status='ok')
++        for archive in archives:
++            assert_in_results(
++                res,
++                action='add-archive-content',
++                status='ok',
++                type='file',
++                path=opj(repo_path, archive))
++        ok_file_under_git(repo_path, opj('2', '2 f.txt'), annexed=True)
++        # archives within a subdirectory are extracted next to them
++        ok_file_under_git(repo_path, opj('d', '3', '3 f.txt'), annexed=True)
++        ok_archives_caches(repo_path, 0)
++        # --delete removed all of them, and only upon success
++        for archive in archives + ['1.tar.gz']:
++            assert_false(lexists(opj(repo_path, archive)))
++        assert_repo_status(repo_path)
++
++        # all the content ended up in a single commit ...
++        assert_equal(_get_ncommits(ds), ncommits_prior + 1)
++        commit_msg = ds.repo.format_commit("%B")
++        # ... which mentions all archives and the stats across them
++        for archive in archives:
++            assert_in(archive, commit_msg)
++        assert_in('Files processed: 2', commit_msg)
++        # Performance guard, not a behavioral one: adding more archives must
++        # not cost more take downs of the batched git-annex processes than
++        # adding a single one -- that is what makes a single invocation
++        # faster than one invocation per archive
++        assert_equal(precommit.call_count, precommits_single)
++
++    # adding multiple archives while being in a subdirectory should not leave
++    # any temporary directory behind
++    with chpwd(opj(repo_path, 'd')):
++        res = add_archive_content([opj(pardir, 'c1.tar.gz'),
++                                   opj(pardir, 'c2.tar.gz')],
++                                  delete_after=True, drop_after=True)
++        # both archives were processed
++        assert_result_count(res, 3, action='add-archive-content', status='ok')
++    assert_equal(
++        list(find_files(r'\.datalad..*', repo_path, exclude='config',
++                        dirs=True)),
++        [])
++    assert_repo_status(repo_path)
++
++    with chpwd(repo_path):
++        # a failure for one archive stops the processing of the remaining
++        # ones, and nothing is committed
++        ncommits_prior = _get_ncommits(ds)
++        res = add_archive_content(['c1.tar.gz', 'c2.tar.gz'],
++                                  strip_leading_dirs=True, delete=True,
++                                  on_failure='ignore')
++        # the first archive was added, the second one collides with it
++        assert_result_count(res, 1, status='ok', type='file',
++                            path=opj(repo_path, 'c1.tar.gz'))
++        assert_result_count(res, 1, status='error', type='file',
++                            path=opj(repo_path, 'c2.tar.gz'))
++        # no dataset-level 'ok' -- the dataset is not in the desired state
++        assert_result_count(res, 0, status='ok', type='dataset')
++        # nothing was committed, the content added so far is left staged
++        assert_equal(_get_ncommits(ds), ncommits_prior)
++        assert_true(ds.repo.dirty)
++        # and --delete did not remove any archive, since we did not get
++        # through all of them
++        assert_true(lexists(opj(repo_path, 'c1.tar.gz')))
++        assert_true(lexists(opj(repo_path, 'c2.tar.gz')))
++
++
++@assert_cwd_unchanged(ok_to_chdir=True)
++@with_tree(**multi_tree_args)
++@pytest.mark.ai_generated
++def test_add_archive_content_multiple_cmdline_and_keys(repo_path=None):
++    ds = Dataset(repo_path).create(force=True)
++    with swallow_outputs():
++        ds.save(message="added archives")
++    with chpwd(repo_path):
++        # multiple archives could be provided on the command line
++        out, _ = run_main(['add-archive-content', '1.tar.gz', '2.tar.gz'],
++                          expect_stderr=True)
++        # a result was rendered for both of them
++        assert_in('1.tar.gz', out)
++        assert_in('2.tar.gz', out)
++        ok_file_under_git(repo_path, opj('1', '1 f.txt'), annexed=True)
++        ok_file_under_git(repo_path, opj('2', '2 f.txt'), annexed=True)
++        assert_repo_status(repo_path)
++
++        keys = [ds.repo.get_file_annexinfo(a)['key']
++                for a in ('1.tar.gz', '2.tar.gz')]
++    # ... and so could be multiple keys, which are extracted under the
++    # current directory
++    with chpwd(opj(repo_path, 'sub'), mkdir=True):
++        res = add_archive_content(keys, key=True, dataset=ds.path)
++        assert_result_count(
++            res, len(keys) + 1, action='add-archive-content', status='ok')
++        for key in keys:
++            # for a key there is no path to point to, so it identifies the
++            # record instead
++            assert_in_results(res, status='ok', type='key', key=key)
++        ok_file_under_git(repo_path, opj('sub', '1', '1 f.txt'), annexed=True)
++        ok_file_under_git(repo_path, opj('sub', '2', '2 f.txt'), annexed=True)
++        assert_repo_status(repo_path)
++        commit_msg = ds.repo.format_commit("%B")
++        for key in keys:
++            assert_in(key, commit_msg)
++
++
++@assert_cwd_unchanged(ok_to_chdir=True)
++@with_tree(**overwrite_prior_tree_args)
++@pytest.mark.ai_generated
++def test_add_archive_content_overwrite_prior(repo_path=None):
++    ds = Dataset(repo_path).create(force=True)
++    with swallow_outputs():
++        ds.save(message="added archives")
++    base = ds.repo.get_hexsha()
++
++    def start_over():
++        # back to just the archives, so that every scenario below meets the
++        # same dataset -- in particular one where 'c f.txt' is not yet
++        # present, and a collision is thus with a preceding archive rather
++        # than with committed content
++        ds.repo.call_git(['reset', '--hard', base])
++        ds.repo.call_git(['clean', '-fd'])
++
++    with chpwd(repo_path):
++        # 'overwrite' would discard what c1.tar.gz just added, which is an
++        # error by default
++        ncommits_prior = _get_ncommits(ds)
++        res = add_archive_content(['c1.tar.gz', 'c2.tar.gz'],
++                                  strip_leading_dirs=True,
++                                  existing='overwrite',
++                                  on_failure='ignore')
++        assert_result_count(res, 1, status='ok', type='file',
++                            path=opj(repo_path, 'c1.tar.gz'))
++        assert_in_results(res, status='error', type='file',
++                          path=opj(repo_path, 'c2.tar.gz'))
++        # and it errors out *before* destroying anything
++        ok_file_has_content(opj(repo_path, 'c f.txt'), 'c1 load')
++        assert_equal(_get_ncommits(ds), ncommits_prior)
++        assert_true(ds.repo.dirty)
++        start_over()
++
++        # 'stats' permits the overwrite and counts it
++        st = ActivityStats()
++        res = add_archive_content(['c1.tar.gz', 'c2.tar.gz'],
++                                  strip_leading_dirs=True,
++                                  existing='overwrite',
++                                  overwrite_prior_check='stats',
++                                  stats=st)
++        assert_result_count(res, 3, action='add-archive-content', status='ok')
++        # last archive wins
++        ok_file_has_content(opj(repo_path, 'c f.txt'), 'c2 load')
++        # reported in the commit message ...
++        assert_in('overwritten prior: 1', ds.repo.format_commit("%B"))
++        # ... and in the stats handed to us.  Note: the current ones are
++        # reset once committed, the totals are what survives
++        assert_equal(st.get_total().overwritten_prior, 1)
++        start_over()
++
++        # 'ignore' permits it silently, but the plain 'overwritten' count
++        # is a matter of --existing and stays
++        add_archive_content(['c1.tar.gz', 'c2.tar.gz'],
++                            strip_leading_dirs=True,
++                            existing='overwrite',
++                            overwrite_prior_check='ignore')
++        commit_msg = ds.repo.format_commit("%B")
++        assert_not_in('overwritten prior', commit_msg)
++        assert_in('overwritten: 1', commit_msg)
++        start_over()
++
++        # the suffix modes rename the incoming file, so nothing of the
++        # preceding archive is lost and nothing is reported -- despite the
++        # check being at its default 'error'
++        res = add_archive_content(['c1.tar.gz', 'c2.tar.gz'],
++                                  strip_leading_dirs=True,
++                                  existing='archive-suffix')
++        assert_result_count(res, 3, action='add-archive-content', status='ok')
++        ok_file_has_content(opj(repo_path, 'c f.txt'), 'c1 load')
++        ok_file_has_content(opj(repo_path, 'c f-c2.txt'), 'c2 load')
++        assert_not_in('overwritten prior', ds.repo.format_commit("%B"))
++        start_over()
++
++        # identical content is not a loss, so it is no overwrite at all
++        res = add_archive_content(['c1.tar.gz', 'c3.tar.gz'],
++                                  strip_leading_dirs=True,
++                                  existing='overwrite')
++        assert_result_count(res, 3, action='add-archive-content', status='ok')
++        ok_file_has_content(opj(repo_path, 'c f.txt'), 'c1 load')
++        start_over()
++
++        # a single archive is never its own "prior" one: two of its members
++        # renamed onto the same name remain a matter of --existing
++        res = add_archive_content('m.tar.gz', strip_leading_dirs=True,
++                                  rename=[r'/[ab]\.txt/same.txt'],
++                                  existing='overwrite')
++        assert_result_count(res, 2, action='add-archive-content', status='ok')
++        commit_msg = ds.repo.format_commit("%B")
++        assert_in('overwritten: 1', commit_msg)
++        assert_not_in('overwritten prior', commit_msg)
++        start_over()
++
++        # content of an archive added by an *earlier call* is committed
++        # content, and thus --existing territory again
++        add_archive_content('c1.tar.gz', strip_leading_dirs=True)
++        res = add_archive_content('c2.tar.gz', strip_leading_dirs=True,
++                                  existing='overwrite')
++        assert_result_count(res, 2, action='add-archive-content', status='ok')
++        ok_file_has_content(opj(repo_path, 'c f.txt'), 'c2 load')
++        start_over()
++
++        # with --delete-after each archive extracts into its own temporary
++        # directory, so no two of them can collide
++        res = add_archive_content(['c1.tar.gz', 'c2.tar.gz'],
++                                  strip_leading_dirs=True,
++                                  existing='overwrite',
++                                  delete_after=True, drop_after=True)
++        assert_result_count(res, 3, action='add-archive-content', status='ok')
++
++
+ class TestAddArchiveOptions():
+     # few tests bundled with a common setup/teardown to minimize boiler plate
+     # nothing here works on windows, no even teardown(), prevent failure at the
+diff --git a/datalad/runner/protocol.py b/datalad/runner/protocol.py
+index 1526d9ce97..ca40ee1c99 100644
+--- a/datalad/runner/protocol.py
++++ b/datalad/runner/protocol.py
+@@ -200,10 +200,20 @@ def _prepare_result(self) -> dict:
+             8,
+             'Process %i exited with return code %i',
+             self.process.pid, return_code)
+-        # give captured process output back to the runner as string(s)
++        # give captured process output back to the runner as string(s).
++        # Decode with 'surrogateescape': output of a command is not
++        # guaranteed to be valid in `encoding` -- POSIX file names are
++        # arbitrary byte strings, and 3rd party libraries (e.g. libmagic
++        # used by git-annex) may echo raw bytes into their messages.  A
++        # strict decode would fail the entire command over such output,
++        # even when it is a mere warning on stderr, and would discard the
++        # very output needed to tell what happened.  'surrogateescape'
++        # keeps those bytes recoverable via
++        # `.encode(encoding, 'surrogateescape')`, the same way Python
++        # itself handles undecodable file names.
+         results: dict[str, Any] = {
+             name: (
+-                bytes(byt).decode(self.encoding)
++                bytes(byt).decode(self.encoding, errors='surrogateescape')
+                 if byt is not None
+                 else '')
+             for name, byt in self.fd_infos.values()
+diff --git a/datalad/runner/tests/test_witless_runner.py b/datalad/runner/tests/test_witless_runner.py
+index eaca5ea651..eeb3823464 100644
+--- a/datalad/runner/tests/test_witless_runner.py
++++ b/datalad/runner/tests/test_witless_runner.py
+@@ -16,6 +16,7 @@
+ import signal
+ import sys
+ import unittest.mock
++from locale import getpreferredencoding
+ from threading import (
+     Lock,
+     Thread,
+@@ -101,6 +102,25 @@ def test_runner_stdout_capture() -> None:
+     ok_(not res['stderr'])
+ 
+ 
++@pytest.mark.ai_generated
++def test_runner_undecodable_output() -> None:
++    # command output is not guaranteed to be valid in the target encoding:
++    # POSIX file names are arbitrary byte strings, and 3rd party libraries
++    # may echo raw bytes into their messages.  Such output must not fail
++    # the command, and must remain recoverable.
++    encoding = getpreferredencoding(do_setlocale=False)
++    payload = b'before \xf1 after'
++    runner = Runner()
++    res = runner.run(py2cmd(
++        'import sys; sys.stdout.buffer.write(%r); sys.stderr.buffer.write(%r)'
++        % (payload, payload)),
++        protocol=StdOutErrCapture,
++    )
++    assert isinstance(res, dict)
++    for stream in ('stdout', 'stderr'):
++        eq_(res[stream].encode(encoding, 'surrogateescape'), payload)
++
++
+ def test_runner_failure() -> None:
+     runner = Runner()
+     with assert_raises(CommandError) as cme:
+diff --git a/datalad/support/stats.py b/datalad/support/stats.py
+index 3b57287652..4ff4b63992 100644
+--- a/datalad/support/stats.py
++++ b/datalad/support/stats.py
+@@ -18,7 +18,7 @@
+ _COUNTS = (
+     'files', 'urls',
+     'add_git', 'add_annex', 'dropped',
+-    'skipped', 'overwritten', 'renamed', 'removed',
++    'skipped', 'overwritten', 'overwritten_prior', 'renamed', 'removed',
+     'downloaded', 'downloaded_size', 'downloaded_time',
+     'datasets_crawled',
+     'datasets_crawl_failed',
+@@ -170,6 +170,7 @@ def as_str(self, mode='full'):
+             (" renamed", "renamed"),
+             (" removed", "removed"),
+             (" overwritten", "overwritten"),
++            (" overwritten prior", "overwritten_prior"),
+             (" +git",  "add_git"),
+             (" +annex", "add_annex"),
+             ("Branches merged", "merges"),
+diff --git a/datalad/support/tests/test_stats.py b/datalad/support/tests/test_stats.py
+index 2715ec1470..176243868d 100644
+--- a/datalad/support/tests/test_stats.py
++++ b/datalad/support/tests/test_stats.py
+@@ -7,6 +7,8 @@
+ #
+ # ## ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ##
+ 
++import pytest
++
+ from ...tests.utils_pytest import (
+     assert_equal,
+     assert_in,
+@@ -62,6 +64,15 @@ def test_ActivityStats_basic():
+     stats.downloaded_size += 123456789  # will invoke formatter
+     assert_in("size: 123.5 MB", stats.as_str())
+ 
++@pytest.mark.ai_generated
++def test_ActivityStats_overwritten_prior_rendered():
++    # the set of counters and the table which renders them are maintained
++    # separately, so a counter can easily end up incremented but never shown
++    stats = ActivityStats()
++    stats.overwritten_prior += 1
++    assert_in("overwritten prior: 1", stats.as_str())
++
++
+ def test_ActivityStats_comparisons():
+     stats1 = ActivityStats()
+     stats2 = ActivityStats()

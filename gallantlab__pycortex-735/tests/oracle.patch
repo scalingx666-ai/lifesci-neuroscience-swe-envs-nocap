@@ -1,0 +1,1000 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 38b4c8f61..87ec51b1b 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -28,6 +28,7 @@ uv run pytest -p no:cacheprovider --no-cov -x cortex/tests/test_formats.py  # qu
+ 
+ - `pytest.ini` sets a 240 s per-test timeout (via `pytest-timeout`) because headless browser sessions can hang; override per-test with `@pytest.mark.timeout(N)`.
+ - Tests self-skip based on available tools: Inkscape (quickflat/dataset overlay tests), Playwright Chromium (`cortex/tests/testing_utils.py:has_playwright` — WebGL headless tests), and FreeSurfer's `mri_surf2surf`.
++- `pytest.ini` deselects `-m slow` by default. The one slow test, `cortex/tests/test_autoflatten.py:test_autoflatten_subject_end_to_end`, really runs autoflatten (15-30 min); it needs FreeSurfer sourced with `fsaverage` in `$SUBJECTS_DIR`, autoflatten installed, and `$PYCORTEX_TEST_FS_SUBJECT` naming a recon-all'd subject — the bundled S1 is a pycortex filestore entry, not a FreeSurfer subject directory, so it cannot be flattened. Run it with `pytest -m slow`.
+ - Nearly all tests use the stub subject `S1` bundled in `filestore/db/S1` (transform `fullhead`, 304380 vertices, volume shape `(31, 100, 100)`).
+ - CI (`.github/workflows/run_tests.yml`) runs `pytest --cov=./` on a matrix of Python versions, with Inkscape and Playwright Chromium installed. The only enforced lint is codespell (config in `pyproject.toml`). mypy is configured in `pyproject.toml` and installed with the dev group but not run in CI — new Python code should still carry type annotations.
+ 
+@@ -80,7 +81,7 @@ Each subject has one `overlays.svg` whose Inkscape layers (`rois`, `sulci`, …)
+ 
+ ### Subject import and geometry
+ 
+-`cortex/freesurfer.py` is the main path for importing real subjects (`import_subj`, `import_flat`, plus FreeSurfer binary format parsers). `cortex/blender/` drives headless Blender for flatmap cutting (`blendlib.py` executes inside Blender). `cortex/polyutils/Surface` is the geometry workhorse (geodesics, curvature, laplace operators, subsurfaces).
++`cortex/freesurfer.py` is the main path for importing real subjects (`import_subj`, `import_flat`, plus FreeSurfer binary format parsers). By default `import_subj` finishes by calling `autoflatten_subject`, which lives in the private `cortex/_autoflatten.py` (re-exported from `cortex.freesurfer`) and shells out to the optional [autoflatten](https://gallantlab.org/autoflatten) package (`python -m autoflatten.cli run <fs subject dir>`) to cut and flatten the surfaces, then imports the resulting `?h.autoflatten.flat.patch.3d` patches with `import_flat`; pass `autoflatten=False` to skip it. `_autoflatten.py` imports `freesurfer` lazily inside its functions, since `freesurfer` imports it at module level. `cortex/blender/` drives headless Blender for manual flatmap cutting (`blendlib.py` executes inside Blender). `cortex/polyutils/Surface` is the geometry workhorse (geodesics, curvature, laplace operators, subsurfaces).
+ 
+ ## Gotchas
+ 
+diff --git a/README.md b/README.md
+index b9c2e72db..e03bcc4db 100644
+--- a/README.md
++++ b/README.md
+@@ -23,6 +23,10 @@ pip install -U setuptools wheel numpy cython
+ pip install -U pycortex
+ # or, with headless rendering support:
+ pip install -U 'pycortex[headless]'
++# or, with automatic surface flattening support (see autoflatten):
++pip install -U 'pycortex[autoflatten]'
++# or, with all optional features:
++pip install -U 'pycortex[all]'
+ ```
+ 
+ If you wish to install the development version of pycortex, you can install it directly from Github.
+diff --git a/cortex/_autoflatten.py b/cortex/_autoflatten.py
+new file mode 100644
+index 000000000..9764cc01a
+--- /dev/null
++++ b/cortex/_autoflatten.py
+@@ -0,0 +1,265 @@
++"""Automatic cutting and flattening of cortical surfaces with ``autoflatten``.
++
++`autoflatten <https://gallantlab.org/autoflatten>`_ projects a template set of
++cuts onto a freesurfer subject's surfaces and flattens the resulting patches,
++which removes the need to cut the surfaces by hand (see
++:doc:`/segmentation_guide` for the manual workflow). It is an optional
++dependency of pycortex, installed with ``pip install "pycortex[autoflatten]"``.
++
++`cortex.freesurfer.import_subj` calls `autoflatten_subject` at the end of the
++import, unless it is called with ``autoflatten=False``. This module is private;
++`autoflatten_subject` is re-exported as `cortex.freesurfer.autoflatten_subject`.
++"""
++
++import importlib.util
++import os
++import subprocess as sp
++import sys
++import warnings
++from typing import Optional, Sequence
++
++#: Base name that ``autoflatten`` gives to the patch files it writes into the
++#: freesurfer subject's ``surf/`` directory, i.e. ``?h.autoflatten.patch.3d`` for
++#: the cut patch and ``?h.autoflatten.flat.patch.3d`` for the flattened patch.
++PATCH_NAME = "autoflatten"
++
++#: Warning issued before starting a run, since it takes a long time. It is issued
++#: by `autoflatten_subject`, which is also called by `import_subj`, so it cannot
++#: refer to the `autoflatten` argument as if it were always available.
++RUNTIME_WARNING = (
++    "Flattening the surfaces with autoflatten takes a while, typically 15-30 "
++    "minutes for both hemispheres. `cortex.freesurfer.import_subj` takes an "
++    "`autoflatten=False` argument to skip this step, so that the surfaces can "
++    "be flattened later with `cortex.freesurfer.autoflatten_subject(...)`."
++)
++
++#: Error message used when the optional `autoflatten` package is missing.
++MISSING_MESSAGE = (
++    "The `autoflatten` package is not installed, so the surfaces cannot be "
++    "automatically cut and flattened. Install it with "
++    '`pip install "pycortex[autoflatten]"` (or `pip install autoflatten`).'
++)
++
++
++def get_command() -> Optional[list[str]]:
++    """Command prefix that invokes the autoflatten command line interface.
++
++    Returns
++    -------
++    cmd : list of str or None
++        The command to run autoflatten with the interpreter that is running
++        pycortex, or None if the `autoflatten` package is not installed.
++    """
++    if importlib.util.find_spec("autoflatten") is None:
++        return None
++    return [sys.executable, "-m", "autoflatten.cli"]
++
++
++def is_available() -> bool:
++    """Whether the optional `autoflatten` package is installed."""
++    return get_command() is not None
++
++
++def check_autoflatten_available() -> bool:
++    """Whether autoflatten can run, warning with install instructions if it cannot.
++
++    Used by `cortex.freesurfer.import_subj` to decide whether to skip the
++    automatic flattening step, without failing the whole import.
++
++    Returns
++    -------
++    available : bool
++        True if the `autoflatten` package is installed. If it is not, a warning
++        is issued and False is returned.
++    """
++    if is_available():
++        return True
++    warnings.warn(
++        MISSING_MESSAGE + " The surfaces will be imported without flatmaps; once "
++        "autoflatten is installed, create them with "
++        "`cortex.freesurfer.autoflatten_subject(...)`. Pass `autoflatten=False` to "
++        "silence this warning."
++    )
++    return False
++
++
++def _get_hemispheres(
++    autoflatten_args: Optional[Sequence[str]] = None,
++) -> tuple[str, ...]:
++    """Hemispheres that ``autoflatten run`` will flatten, given its extra arguments.
++
++    ``autoflatten`` flattens both hemispheres unless it is told otherwise with
++    ``--hemispheres lh`` (or ``--hemispheres=lh``), so the patch files to expect
++    afterwards depend on `autoflatten_args`.
++
++    Parameters
++    ----------
++    autoflatten_args : list of str, optional
++        Extra command line arguments passed to ``autoflatten run``.
++
++    Returns
++    -------
++    hemis : tuple of str
++        ``("lh", "rh")``, or a single hemisphere if one was selected.
++    """
++    both = ("lh", "rh")
++    if autoflatten_args is None:
++        return both
++    args = list(autoflatten_args)
++    value = None
++    for i, arg in enumerate(args):
++        if arg == "--hemispheres" and i + 1 < len(args):
++            value = args[i + 1]
++        elif arg.startswith("--hemispheres="):
++            value = arg.split("=", 1)[1]
++    if value in both:
++        return (value,)
++    return both
++
++
++def _forces_overwrite(
++    autoflatten_args: Optional[Sequence[str]] = None,
++) -> bool:
++    """Whether `autoflatten_args` makes ``autoflatten run`` redo existing patches.
++
++    ``autoflatten`` skips patches that are already on disk unless it is passed
++    ``--overwrite``, so this is what decides whether a run that finds the flat
++    patches already in place is slow or returns almost immediately.
++
++    Parameters
++    ----------
++    autoflatten_args : list of str, optional
++        Extra command line arguments passed to ``autoflatten run``.
++
++    Returns
++    -------
++    overwrite : bool
++        True if ``--overwrite`` is among the arguments.
++    """
++    if autoflatten_args is None:
++        return False
++    return "--overwrite" in list(autoflatten_args)
++
++
++def autoflatten_subject(
++    freesurfer_subject: str,
++    pycortex_subject: Optional[str] = None,
++    freesurfer_subject_dir: Optional[str] = None,
++    autoflatten_args: Optional[Sequence[str]] = None,
++    import_flatmaps: bool = True,
++) -> dict[str, str]:
++    """Automatically cut and flatten a freesurfer subject with ``autoflatten``.
++
++    This runs the `autoflatten <https://gallantlab.org/autoflatten>`_ pipeline on
++    the freesurfer subject, which projects a template set of cuts onto the
++    subject's surfaces and flattens the resulting patches, and then imports the
++    flatmaps into the pycortex database with `cortex.freesurfer.import_flat`.
++
++    ``autoflatten`` is an optional dependency; install it with
++    ``pip install "pycortex[autoflatten]"``.
++
++    Parameters
++    ----------
++    freesurfer_subject : str
++        Freesurfer subject name.
++    pycortex_subject : str, optional
++        Pycortex subject name to import the flatmaps into. By default it uses
++        the freesurfer subject name.
++    freesurfer_subject_dir : str, optional
++        Freesurfer subjects directory to work in. By default uses the directory
++        given by the environment variable ``$SUBJECTS_DIR``.
++    autoflatten_args : list of str, optional
++        Extra command line arguments passed to ``autoflatten run``, for example
++        ``["--backend", "freesurfer"]`` or ``["--n-cores", "4"]``. See
++        ``autoflatten run --help`` for the available options. Note that
++        ``--output-dir`` must not be changed, since the flat patches are
++        expected in the freesurfer subject's ``surf/`` directory.
++    import_flatmaps : bool, optional
++        Whether to import the resulting flatmaps into the pycortex database
++        (True by default). Note that importing the flatmaps deletes the
++        overlays.svg file and all cached files for the pycortex subject, since
++        the flatmaps change.
++
++    Returns
++    -------
++    flat_files : dict
++        Mapping from hemisphere (``lh``, ``rh``, or just one of them if
++        ``autoflatten_args`` selects a single hemisphere) to the flat patch file
++        that ``autoflatten`` produced.
++
++    Notes
++    -----
++    This function requires freesurfer to be sourced, and takes a while to run
++    (typically 15-30 minutes for both hemispheres). Patches that already exist
++    are not recomputed; pass ``autoflatten_args=["--overwrite"]`` to force
++    ``autoflatten`` to flatten the surfaces again.
++    """
++    # imported here rather than at the module level, since cortex.freesurfer
++    # imports this module
++    from . import freesurfer
++
++    cmd = get_command()
++    if cmd is None:
++        raise ImportError(MISSING_MESSAGE)
++
++    freesurfer_subject_dir = freesurfer._get_freesurfer_subject_dir(
++        freesurfer_subject_dir
++    )
++    subject_dir = os.path.join(freesurfer_subject_dir, freesurfer_subject)
++    if not os.path.isdir(subject_dir):
++        raise IOError(
++            "Freesurfer subject directory not found: {}".format(subject_dir)
++        )
++    if pycortex_subject is None:
++        pycortex_subject = freesurfer_subject
++
++    # autoflatten writes its patches into the freesurfer subject's surf/ directory
++    patch_template = freesurfer.get_paths(
++        freesurfer_subject,
++        "{hemi}",
++        type="patch",
++        freesurfer_subject_dir=freesurfer_subject_dir,
++    )
++    hemis = _get_hemispheres(autoflatten_args)
++    flat_files = {
++        hemi: patch_template.format(hemi=hemi, name=PATCH_NAME + ".flat")
++        for hemi in hemis
++    }
++    # autoflatten skips patches that already exist, so there is nothing slow to
++    # warn about if both hemispheres have already been flattened -- unless
++    # `--overwrite` forces it to flatten them again anyway
++    if _forces_overwrite(autoflatten_args) or any(
++        not os.path.exists(path) for path in flat_files.values()
++    ):
++        warnings.warn(RUNTIME_WARNING)
++
++    cmd = cmd + ["run", subject_dir]
++    if autoflatten_args is not None:
++        cmd = cmd + list(autoflatten_args)
++    print("Calling:\n{}".format(" ".join(cmd)))
++    # autoflatten resolves the subject (and the fsaverage template it maps the
++    # cuts from) by name through $SUBJECTS_DIR in the subprocess, so it has to
++    # agree with `freesurfer_subject_dir`, which may have been passed explicitly.
++    env = dict(os.environ, SUBJECTS_DIR=freesurfer_subject_dir)
++    # Let autoflatten write its progress directly to stdout/stderr, since this
++    # takes a long time and the user will want to see how far along it is.
++    sp.check_call(cmd, env=env)
++
++    missing = [path for path in flat_files.values() if not os.path.exists(path)]
++    if missing:
++        raise IOError(
++            "autoflatten did not produce the expected flat patch file(s): "
++            "{}".format(", ".join(missing))
++        )
++
++    if import_flatmaps:
++        freesurfer.import_flat(
++            freesurfer_subject,
++            PATCH_NAME,
++            hemis=list(hemis),
++            cx_subject=pycortex_subject,
++            flat_type="freesurfer",
++            auto_overwrite=True,
++            freesurfer_subject_dir=freesurfer_subject_dir,
++        )
++    return flat_files
+diff --git a/cortex/freesurfer.py b/cortex/freesurfer.py
+index 0fc7f42e9..08a6d6d09 100644
+--- a/cortex/freesurfer.py
++++ b/cortex/freesurfer.py
+@@ -5,10 +5,9 @@
+ import functools
+ import os
+ import shlex
+-import shutil
+ import struct
+ import subprocess as sp
+-import tempfile
++import sys
+ import warnings
+ from collections.abc import Mapping
+ from tempfile import NamedTemporaryFile
+@@ -21,7 +20,9 @@
+ from scipy.sparse import coo_matrix
+ from scipy.spatial import KDTree
+ 
+-from . import anat, appdirs, database
++from . import appdirs, database
++# autoflatten_subject is re-exported here as the public name for it
++from ._autoflatten import autoflatten_subject, check_autoflatten_available
+ 
+ 
+ def get_paths(fs_subject, hemi, type="patch", freesurfer_subject_dir=None):
+@@ -155,11 +156,41 @@ def flatten(fs_subject, hemi, patch, freesurfer_subject_dir=None, save_every=Non
+         return False
+ 
+ 
++def _get_freesurfer_subject_dir(
++    freesurfer_subject_dir: Optional[str] = None,
++) -> str:
++    """Resolve the freesurfer subjects directory.
++
++    Parameters
++    ----------
++    freesurfer_subject_dir : str or None
++        Freesurfer subjects directory. If None, the value of the environment
++        variable ``$SUBJECTS_DIR`` is used.
++
++    Returns
++    -------
++    freesurfer_subject_dir : str
++        The resolved directory. Raises `ValueError` if it is None and
++        ``$SUBJECTS_DIR`` is not set.
++    """
++    if freesurfer_subject_dir is not None:
++        return freesurfer_subject_dir
++    if "SUBJECTS_DIR" in os.environ:
++        return os.environ["SUBJECTS_DIR"]
++    raise ValueError(
++        "Please source freesurfer before running this function, "
++        "or pass a path to the freesurfer subjects directory in "
++        "`freesurfer_subject_dir`"
++    )
++
++
+ def import_subj(
+     freesurfer_subject,
+     pycortex_subject=None,
+     freesurfer_subject_dir=None,
+     whitematter_surf="smoothwm",
++    autoflatten=True,
++    autoflatten_args=None,
+ ):
+     """Imports a subject from freesurfer
+ 
+@@ -184,6 +215,16 @@ def import_subj(
+         Which whitematter surface to import as 'wm'. By default uses 'smoothwm', but 
+         that surface is smoothed and may not be appropriate. 
+         A good alternative is 'white'.
++    autoflatten : bool, optional
++        Whether to automatically cut and flatten the surfaces with `autoflatten`
++        after importing them (True by default), see `autoflatten_subject`. This
++        step takes a while, typically 15-30 minutes for both hemispheres; set it
++        to False to skip it and cut and flatten the surfaces yourself (or run
++        `autoflatten_subject` later). `autoflatten` is an optional dependency; if
++        it is not installed, a warning is issued and this step is skipped.
++    autoflatten_args : list of str, optional
++        Extra command line arguments passed to ``autoflatten run``, for example
++        ``["--backend", "freesurfer"]``. Ignored if `autoflatten` is False.
+     
+     Notes
+     -----
+@@ -200,9 +241,11 @@ def import_subj(
+     Only the files listed below are copied over. They are read from the freesurfer
+     subject directory, ``{freesurfer_subject_dir}/{freesurfer_subject}/``, and written
+     into the pycortex filestore entry for the subject,
+-    ``{pycortex_filestore}/{pycortex_subject}/``. Flat surfaces are *not* imported by
+-    this function; use `import_flat` for those. Labels and annotations are not imported
+-    either; use `get_label` for those.
++    ``{pycortex_filestore}/{pycortex_subject}/``. Flat surfaces are created and
++    imported by `autoflatten_subject` at the end of this function, unless
++    `autoflatten` is False; to import flat surfaces that were cut and flattened by
++    hand, use `import_flat`. Labels and annotations are not imported; use
++    `get_label` for those.
+ 
+     Anatomical volumes, converted with ``mri_convert``:
+ 
+@@ -243,15 +286,11 @@ def import_subj(
+     ==========================  ================================  ==================
+     """
+     # Check if freesurfer is sourced or if subjects dir is passed
+-    if freesurfer_subject_dir is None:
+-        if "SUBJECTS_DIR" in os.environ:
+-            freesurfer_subject_dir = os.environ["SUBJECTS_DIR"]
+-        else:
+-            raise ValueError(
+-                "Please source freesurfer before running this function, "
+-                "or pass a path to the freesurfer subjects directory in "
+-                "`freesurfer_subject_dir`"
+-            )
++    freesurfer_subject_dir = _get_freesurfer_subject_dir(freesurfer_subject_dir)
++    # Check that autoflatten is importable before doing any work, so that we do not
++    # import the subject only to fail at the very last (and slowest) step.
++    if autoflatten and not check_autoflatten_available():
++        autoflatten = False
+     fs_mri_path = os.path.join(freesurfer_subject_dir, freesurfer_subject, "mri")
+     fs_surf_path = os.path.join(freesurfer_subject_dir, freesurfer_subject, "surf")
+     fs_anat_template = os.path.join(fs_mri_path, "{name}.mgz")
+@@ -320,9 +359,19 @@ def import_subj(
+             left=-lh, 
+             right=-rh
+         )
+-    # Finally update the database by re-initializing it
++    # Update the database by re-initializing it
+     database.db = database.Database()
+ 
++    # Automatically cut and flatten the surfaces. This is by far the slowest step,
++    # so it is done last, once everything else has been imported successfully.
++    if autoflatten:
++        autoflatten_subject(
++            freesurfer_subject,
++            pycortex_subject=pycortex_subject,
++            freesurfer_subject_dir=freesurfer_subject_dir,
++            autoflatten_args=autoflatten_args,
++        )
++
+ 
+ def import_flat(fs_subject, patch, hemis=['lh', 'rh'], cx_subject=None,
+                 flat_type='freesurfer', auto_overwrite=False,
+@@ -1260,7 +1309,7 @@ def iter_surfedges(tris):
+             l = np.sqrt(((pts[a] - pts[b])**2).sum(-1))
+             lengths.append(l)
+             fp.write("%s -- %s [len=%f];\n"%(a, b, l))
+-        fp.write("maxiter=1000000;\n");
++        fp.write("maxiter=1000000;\n")
+         fp.write("}")
+ 
+ 
+diff --git a/cortex/tests/test_autoflatten.py b/cortex/tests/test_autoflatten.py
+new file mode 100644
+index 000000000..0d2dcf288
+--- /dev/null
++++ b/cortex/tests/test_autoflatten.py
+@@ -0,0 +1,321 @@
++import os
++import shutil
++import sys
++import warnings
++
++import numpy as np
++import pytest
++
++import cortex._autoflatten as af
++import cortex.freesurfer as fs
++
++
++def _make_freesurfer_subject(tmp_path, subject="S1"):
++    """Create a minimal freesurfer subject directory with an empty surf/ folder."""
++    surf_dir = tmp_path / "fs_subjects" / subject / "surf"
++    surf_dir.mkdir(parents=True)
++    return str(tmp_path / "fs_subjects"), surf_dir
++
++
++def _patch_autoflatten_run(monkeypatch, calls, surf_dir=None):
++    """Pretend autoflatten is installed, and record the command it is invoked with.
++
++    If `surf_dir` is given, the flat patch files that autoflatten would create are
++    written there when the (fake) command runs.
++    """
++    monkeypatch.setattr(af, "get_command", lambda: ["fake-autoflatten"])
++
++    def fake_check_call(cmd, env=None, **kwargs):
++        calls["cmd"] = cmd
++        calls["env"] = env
++        if surf_dir is not None:
++            for hemi in ("lh", "rh"):
++                (surf_dir / (hemi + ".autoflatten.flat.patch.3d")).write_bytes(b"")
++
++    monkeypatch.setattr(af.sp, "check_call", fake_check_call)
++
++    def fake_import_flat(*args, **kwargs):
++        calls["import_flat"] = (args, kwargs)
++
++    monkeypatch.setattr(fs, "import_flat", fake_import_flat)
++
++
++def test_get_command_uses_the_current_interpreter():
++    cmd = af.get_command()
++    if cmd is None:  # autoflatten is an optional dependency
++        assert af.is_available() is False
++    else:
++        assert cmd == [sys.executable, "-m", "autoflatten.cli"]
++        assert af.is_available() is True
++
++
++def test_get_command_is_none_when_autoflatten_is_not_installed(monkeypatch):
++    find_spec = af.importlib.util.find_spec
++    monkeypatch.setattr(
++        af.importlib.util, "find_spec",
++        lambda name, *args, **kwargs: (
++            None if name == "autoflatten" else find_spec(name, *args, **kwargs)
++        ),
++    )
++    assert af.get_command() is None
++    assert af.is_available() is False
++
++
++def test_autoflatten_subject_raises_when_not_installed(tmp_path, monkeypatch):
++    subjects_dir, _ = _make_freesurfer_subject(tmp_path)
++    monkeypatch.setattr(af, "get_command", lambda: None)
++    with pytest.raises(ImportError, match="autoflatten"):
++        af.autoflatten_subject("S1", freesurfer_subject_dir=subjects_dir)
++
++
++def test_autoflatten_subject_raises_on_missing_subject_dir(tmp_path, monkeypatch):
++    subjects_dir, _ = _make_freesurfer_subject(tmp_path)
++    monkeypatch.setattr(af, "get_command", lambda: ["fake-autoflatten"])
++    with pytest.raises(IOError, match="not found"):
++        af.autoflatten_subject("nosuchsubject", freesurfer_subject_dir=subjects_dir)
++
++
++def test_autoflatten_subject_runs_cli_and_imports_flatmaps(tmp_path, monkeypatch):
++    subjects_dir, surf_dir = _make_freesurfer_subject(tmp_path)
++    calls = {}
++    _patch_autoflatten_run(monkeypatch, calls, surf_dir=surf_dir)
++
++    with pytest.warns(UserWarning, match="15-30 minutes"):
++        flat_files = af.autoflatten_subject(
++            "S1",
++            pycortex_subject="cx_S1",
++            freesurfer_subject_dir=subjects_dir,
++            autoflatten_args=["--backend", "freesurfer"],
++        )
++
++    # the extra arguments are appended to `autoflatten run <subject_dir>`
++    assert calls["cmd"] == ["fake-autoflatten", "run",
++                            os.path.join(subjects_dir, "S1"),
++                            "--backend", "freesurfer"]
++
++    # the flat patches are expected in the freesurfer subject's surf/ directory
++    for hemi in ("lh", "rh"):
++        assert flat_files[hemi] == str(
++            surf_dir / (hemi + ".autoflatten.flat.patch.3d")
++        )
++
++    args, kwargs = calls["import_flat"]
++    assert args == ("S1", "autoflatten")
++    assert kwargs["cx_subject"] == "cx_S1"
++    assert kwargs["flat_type"] == "freesurfer"
++    assert kwargs["auto_overwrite"] is True
++    assert kwargs["freesurfer_subject_dir"] == subjects_dir
++    assert kwargs["hemis"] == ["lh", "rh"]
++
++    # autoflatten resolves the subject and fsaverage by name through
++    # $SUBJECTS_DIR in the subprocess, so it must match what was passed in
++    assert calls["env"]["SUBJECTS_DIR"] == subjects_dir
++
++
++def test_autoflatten_subject_no_runtime_warning_if_already_flattened(
++        tmp_path, monkeypatch):
++    subjects_dir, surf_dir = _make_freesurfer_subject(tmp_path)
++    for hemi in ("lh", "rh"):
++        (surf_dir / (hemi + ".autoflatten.flat.patch.3d")).write_bytes(b"")
++    calls = {}
++    _patch_autoflatten_run(monkeypatch, calls)
++
++    # autoflatten skips existing patches, so there is nothing slow to warn about
++    with warnings.catch_warnings():
++        warnings.simplefilter("error")
++        af.autoflatten_subject("S1", freesurfer_subject_dir=subjects_dir)
++
++    # the existing flatmaps are still imported into the pycortex database
++    assert "import_flat" in calls
++
++
++def test_autoflatten_subject_warns_if_overwrite_forces_a_rerun(
++        tmp_path, monkeypatch):
++    subjects_dir, surf_dir = _make_freesurfer_subject(tmp_path)
++    for hemi in ("lh", "rh"):
++        (surf_dir / (hemi + ".autoflatten.flat.patch.3d")).write_bytes(b"")
++    calls = {}
++    _patch_autoflatten_run(monkeypatch, calls)
++
++    # the patches are already there, but --overwrite makes autoflatten redo them,
++    # so the run is slow again and has to be warned about
++    with pytest.warns(UserWarning, match="15-30 minutes"):
++        af.autoflatten_subject("S1", freesurfer_subject_dir=subjects_dir,
++                               autoflatten_args=["--overwrite"])
++
++
++def test_runtime_warning_does_not_promise_an_autoflatten_argument():
++    # the warning is issued by autoflatten_subject, which has no `autoflatten`
++    # argument, so it must point at import_subj for that option
++    assert "import_subj" in af.RUNTIME_WARNING
++    assert "autoflatten=False" in af.RUNTIME_WARNING
++
++
++def test_forces_overwrite_parses_autoflatten_args():
++    assert af._forces_overwrite(None) is False
++    assert af._forces_overwrite([]) is False
++    assert af._forces_overwrite(["--backend", "freesurfer"]) is False
++    assert af._forces_overwrite(["--overwrite"]) is True
++    assert af._forces_overwrite(["--n-cores", "4", "--overwrite"]) is True
++
++
++def test_autoflatten_subject_can_skip_import(tmp_path, monkeypatch):
++    subjects_dir, surf_dir = _make_freesurfer_subject(tmp_path)
++    calls = {}
++    _patch_autoflatten_run(monkeypatch, calls, surf_dir=surf_dir)
++
++    with pytest.warns(UserWarning):
++        af.autoflatten_subject("S1", freesurfer_subject_dir=subjects_dir,
++                               import_flatmaps=False)
++
++    assert "import_flat" not in calls
++
++
++def test_autoflatten_subject_raises_when_no_flatmap_produced(tmp_path, monkeypatch):
++    subjects_dir, _ = _make_freesurfer_subject(tmp_path)
++    calls = {}
++    # surf_dir=None: the fake command does not write any flat patch file
++    _patch_autoflatten_run(monkeypatch, calls, surf_dir=None)
++
++    with pytest.warns(UserWarning):
++        with pytest.raises(IOError, match="did not produce"):
++            af.autoflatten_subject("S1", freesurfer_subject_dir=subjects_dir)
++
++    assert "import_flat" not in calls
++
++
++# ---------------------------------------------------------------------------
++# End-to-end run against a real freesurfer subject
++#
++# The bundled S1 subject is a pycortex filestore entry (gifti surfaces), not a
++# freesurfer subject directory, so it cannot be flattened: autoflatten needs
++# `?h.sphere.reg` and freesurfer's `mri_label2label` to map the fsaverage
++# template cuts onto the subject. Point $PYCORTEX_TEST_FS_SUBJECT at a real
++# recon-all'd subject in $SUBJECTS_DIR to run this for real, e.g.
++#
++#     PYCORTEX_TEST_FS_SUBJECT=sub-01 pytest -m slow cortex/tests/test_autoflatten.py
++#
++# It is marked `slow` (deselected by default) because a full run takes 15-30
++# minutes for both hemispheres.
++# ---------------------------------------------------------------------------
++
++FS_TEST_SUBJECT = os.environ.get("PYCORTEX_TEST_FS_SUBJECT")
++
++
++def _freesurfer_is_sourced():
++    return "SUBJECTS_DIR" in os.environ and all(
++        shutil.which(binary) is not None
++        for binary in ("mri_label2label", "mri_info")
++    )
++
++
++def _link_subject(src_dir, dst_dir):
++    """Mirror a freesurfer subject into `dst_dir` without writing to the original.
++
++    Everything is symlinked, except that ``surf/`` is a real directory holding
++    symlinks to the individual surface files, so that the patches autoflatten
++    writes there land in `dst_dir` rather than in the real subject.
++    """
++    os.makedirs(dst_dir)
++    for name in os.listdir(src_dir):
++        src = os.path.join(src_dir, name)
++        dst = os.path.join(dst_dir, name)
++        if name == "surf":
++            os.makedirs(dst)
++            for surf_file in os.listdir(src):
++                os.symlink(os.path.join(src, surf_file),
++                           os.path.join(dst, surf_file))
++        else:
++            os.symlink(src, dst)
++
++
++@pytest.mark.slow
++@pytest.mark.timeout(5400)
++@pytest.mark.skipif(FS_TEST_SUBJECT is None,
++                    reason="set $PYCORTEX_TEST_FS_SUBJECT to a freesurfer subject")
++@pytest.mark.skipif(not af.is_available(), reason="autoflatten is not installed")
++@pytest.mark.skipif(not _freesurfer_is_sourced(), reason="freesurfer is not sourced")
++def test_autoflatten_subject_end_to_end(tmp_path, monkeypatch):
++    """Really run autoflatten, and check that it produces usable flat patches."""
++    from cortex import freesurfer
++
++    subjects_dir = os.environ["SUBJECTS_DIR"]
++    assert os.path.isdir(os.path.join(subjects_dir, "fsaverage")), (
++        "autoflatten maps the template cuts from fsaverage, which must be in "
++        "$SUBJECTS_DIR"
++    )
++
++    # run against a throwaway $SUBJECTS_DIR so the real subject is not modified
++    test_subjects_dir = tmp_path / "subjects"
++    test_subjects_dir.mkdir()
++    _link_subject(os.path.join(subjects_dir, FS_TEST_SUBJECT),
++                  str(test_subjects_dir / FS_TEST_SUBJECT))
++    os.symlink(os.path.join(subjects_dir, "fsaverage"),
++               str(test_subjects_dir / "fsaverage"))
++    # mri_label2label resolves subjects through $SUBJECTS_DIR in the subprocess
++    monkeypatch.setenv("SUBJECTS_DIR", str(test_subjects_dir))
++
++    # import_flatmaps=False: the flatmaps are checked here directly rather than
++    # written into the user's filestore, which this test must not touch
++    flat_files = af.autoflatten_subject(
++        FS_TEST_SUBJECT,
++        freesurfer_subject_dir=str(test_subjects_dir),
++        import_flatmaps=False,
++    )
++
++    assert sorted(flat_files) == ["lh", "rh"]
++    for hemi, flat_file in flat_files.items():
++        assert os.path.exists(flat_file), hemi
++        # get_surf returns the whole smoothwm surface, with the patch vertices
++        # replaced by their flattened positions; idx marks which those are
++        pts, polys, idx = freesurfer.get_surf(
++            FS_TEST_SUBJECT, hemi, "patch", "autoflatten.flat",
++            freesurfer_subject_dir=str(test_subjects_dir),
++        )
++        in_patch = idx != 0
++        # a cut hemisphere keeps most of its vertices, and every triangle left
++        # in the patch is made of patch vertices
++        assert in_patch.sum() > 10000, hemi
++        assert len(polys) > 10000, hemi
++        assert in_patch[polys].all(), hemi
++        # the patch really is flat: it is spread out over two axes, and has no
++        # thickness at all along the third
++        spread = np.ptp(pts[in_patch], axis=0)
++        assert (np.sort(spread)[-2:] > 1.0).all(), (hemi, spread)
++        assert np.sort(spread)[0] < 1e-3, (hemi, spread)
++
++
++def test_autoflatten_subject_respects_a_single_hemisphere(tmp_path, monkeypatch):
++    subjects_dir, surf_dir = _make_freesurfer_subject(tmp_path)
++    calls = {}
++    monkeypatch.setattr(af, "get_command", lambda: ["fake-autoflatten"])
++
++    def fake_check_call(cmd, env=None, **kwargs):
++        # autoflatten only writes the hemisphere it was asked for
++        (surf_dir / "lh.autoflatten.flat.patch.3d").write_bytes(b"")
++
++    monkeypatch.setattr(af.sp, "check_call", fake_check_call)
++    monkeypatch.setattr(
++        fs, "import_flat",
++        lambda *args, **kwargs: calls.setdefault("import_flat", (args, kwargs)),
++    )
++
++    with pytest.warns(UserWarning):
++        flat_files = af.autoflatten_subject(
++            "S1",
++            freesurfer_subject_dir=subjects_dir,
++            autoflatten_args=["--hemispheres", "lh"],
++        )
++
++    assert list(flat_files) == ["lh"]
++    assert calls["import_flat"][1]["hemis"] == ["lh"]
++
++
++def test_get_hemispheres_parses_autoflatten_args():
++    assert af._get_hemispheres(None) == ("lh", "rh")
++    assert af._get_hemispheres([]) == ("lh", "rh")
++    assert af._get_hemispheres(["--hemispheres", "both"]) == ("lh", "rh")
++    assert af._get_hemispheres(["--hemispheres", "rh"]) == ("rh",)
++    assert af._get_hemispheres(["--hemispheres=lh"]) == ("lh",)
++    # a trailing flag with no value must not blow up
++    assert af._get_hemispheres(["--hemispheres"]) == ("lh", "rh")
+diff --git a/cortex/tests/test_freesurfer.py b/cortex/tests/test_freesurfer.py
+index 19d7283f8..a9b1faf9f 100644
+--- a/cortex/tests/test_freesurfer.py
++++ b/cortex/tests/test_freesurfer.py
+@@ -4,6 +4,7 @@
+ import numpy as np
+ import pytest
+ 
++import cortex._autoflatten as af
+ import cortex.freesurfer as fs
+ from cortex.freesurfer import (
+     _remove_disconnected_polys,
+@@ -207,3 +208,101 @@ def test_surf2surf_matches_freesurfer_downsample():
+ 
+     corr = np.corrcoef(reference.ravel(), got.ravel())[0, 1]
+     assert corr > 0.99
++
++
++# ---------------------------------------------------------------------------
++# freesurfer subjects directory
++# ---------------------------------------------------------------------------
++
++def test_get_freesurfer_subject_dir_prefers_explicit_argument(monkeypatch):
++    monkeypatch.setenv("SUBJECTS_DIR", "/from/env")
++    assert fs._get_freesurfer_subject_dir("/explicit") == "/explicit"
++
++
++def test_get_freesurfer_subject_dir_falls_back_to_env(monkeypatch):
++    monkeypatch.setenv("SUBJECTS_DIR", "/from/env")
++    assert fs._get_freesurfer_subject_dir() == "/from/env"
++
++
++def test_get_freesurfer_subject_dir_raises_without_env(monkeypatch):
++    monkeypatch.delenv("SUBJECTS_DIR", raising=False)
++    with pytest.raises(ValueError):
++        fs._get_freesurfer_subject_dir()
++
++
++
++# ---------------------------------------------------------------------------
++# autoflatten step of import_subj (see test_autoflatten.py for the step itself)
++# ---------------------------------------------------------------------------
++
++def _stub_import_subj(tmp_path, monkeypatch, subject="S1"):
++    """Stub out everything `import_subj` shells out to, and the filestore."""
++    filestore = tmp_path / "filestore"
++    for folder in ("anatomicals", "surfaces", "surface-info"):
++        (filestore / subject / folder).mkdir(parents=True)
++
++    class _FakeDatabase(object):
++        def make_subj(self, subject):
++            pass
++
++    monkeypatch.setattr(fs.database, "default_filestore", str(filestore))
++    monkeypatch.setattr(fs.database, "db", _FakeDatabase(), raising=False)
++    monkeypatch.setattr(fs.database, "Database", _FakeDatabase)
++    monkeypatch.setattr(fs.sp, "check_output", lambda *args, **kwargs: b"")
++    monkeypatch.setattr(fs, "make_fiducial", lambda *args, **kwargs: None)
++    monkeypatch.setattr(fs, "parse_curv", lambda path: np.zeros(3))
++
++    calls = []
++    # import_subj calls the name re-exported into cortex.freesurfer, so that is
++    # what has to be patched
++    monkeypatch.setattr(
++        fs, "autoflatten_subject",
++        lambda *args, **kwargs: calls.append((args, kwargs)),
++    )
++    return calls
++
++
++def test_import_subj_runs_autoflatten_by_default(tmp_path, monkeypatch):
++    calls = _stub_import_subj(tmp_path, monkeypatch)
++    monkeypatch.setattr(af, "is_available", lambda: True)
++
++    fs.import_subj("S1", freesurfer_subject_dir=str(tmp_path / "fs_subjects"))
++
++    assert len(calls) == 1
++    args, kwargs = calls[0]
++    assert args == ("S1",)
++    assert kwargs["pycortex_subject"] == "S1"
++    assert kwargs["freesurfer_subject_dir"] == str(tmp_path / "fs_subjects")
++    assert kwargs["autoflatten_args"] is None
++
++
++def test_import_subj_passes_autoflatten_args(tmp_path, monkeypatch):
++    calls = _stub_import_subj(tmp_path, monkeypatch)
++    monkeypatch.setattr(af, "is_available", lambda: True)
++
++    fs.import_subj("S1", freesurfer_subject_dir=str(tmp_path / "fs_subjects"),
++                   autoflatten_args=["--n-cores", "4"])
++
++    _, kwargs = calls[0]
++    assert kwargs["autoflatten_args"] == ["--n-cores", "4"]
++
++
++def test_import_subj_can_disable_autoflatten(tmp_path, monkeypatch):
++    calls = _stub_import_subj(tmp_path, monkeypatch)
++    # even when autoflatten is available, it must not run when disabled
++    monkeypatch.setattr(af, "is_available", lambda: True)
++
++    fs.import_subj("S1", freesurfer_subject_dir=str(tmp_path / "fs_subjects"),
++                   autoflatten=False)
++
++    assert calls == []
++
++
++def test_import_subj_warns_and_skips_when_autoflatten_missing(tmp_path, monkeypatch):
++    calls = _stub_import_subj(tmp_path, monkeypatch)
++    monkeypatch.setattr(af, "is_available", lambda: False)
++
++    with pytest.warns(UserWarning, match="not installed"):
++        fs.import_subj("S1", freesurfer_subject_dir=str(tmp_path / "fs_subjects"))
++
++    assert calls == []
+diff --git a/docs/api_reference_flat.rst b/docs/api_reference_flat.rst
+index ff356b9cb..f49ceef96 100644
+--- a/docs/api_reference_flat.rst
++++ b/docs/api_reference_flat.rst
+@@ -124,6 +124,7 @@ freesurfer
+     flatten
+     import_subj
+     import_flat
++    autoflatten_subject
+     show_surf
+ 	make_fiducial
+ 	parse_surf
+diff --git a/docs/database.rst b/docs/database.rst
+index d84ab3f38..3d2c4ab7d 100644
+--- a/docs/database.rst
++++ b/docs/database.rst
+@@ -127,7 +127,8 @@ already been segmented with Freesurfer_::
+     import cortex
+     cortex.freesurfer.import_subj(freesurfer_subject, pycortex_subject=None,
+                                   freesurfer_subject_dir=None,
+-                                  whitematter_surf='smoothwm')
++                                  whitematter_surf='smoothwm',
++                                  autoflatten=True)
+ 
+ This reads from the Freesurfer subject directory,
+ ``$SUBJECTS_DIR/{freesurfer_subject}/``, and writes into the pycortex filestore entry
+@@ -184,15 +185,51 @@ matter and the pial surfaces, which are used for cutting and flattening. Those a
+ written back into the *Freesurfer* subject directory as ``surf/?h.fiducial``, not into
+ the pycortex filestore.
+ 
+-Nothing else is imported. In particular, flat surfaces are not imported by
+-``import_subj``; once a surface has been cut and flattened in Freesurfer, import it
+-separately with::
++Labels and annotations are not imported; see ``cortex.freesurfer.get_label``.
++
++
++.. _database-autoflatten:
++
++Flattening the surfaces
++-----------------------
++
++Pycortex needs flat surfaces to make flatmaps, and creating them requires cutting the
++cortical surface open. By default, ``import_subj`` does this for you at the end of the
++import by calling autoflatten_, which projects a template set of cuts onto the
++subject's surfaces, flattens the resulting patches, and imports the flatmaps into the
++pycortex database. autoflatten_ is an optional dependency, installed with the
++``autoflatten`` extra::
++
++    pip install "pycortex[autoflatten]"
++
++If autoflatten_ is not installed, ``import_subj`` warns and skips this step. Note that
++flattening takes a while, typically 15-30 minutes for both hemispheres, so you may
++want to skip it and flatten the surfaces later (or by hand)::
++
++    cortex.freesurfer.import_subj(freesurfer_subject, autoflatten=False)
++
++You can then run the same step on its own at any time::
++
++    cortex.freesurfer.autoflatten_subject(freesurfer_subject, pycortex_subject=None,
++                                          freesurfer_subject_dir=None)
++
++Extra command line arguments for autoflatten_ can be passed through the
++``autoflatten_args`` argument of either function, for instance
++``autoflatten_args=['--backend', 'freesurfer']`` to flatten with Freesurfer's
++``mris_flatten`` instead of the default JAX-accelerated backend, or
++``autoflatten_args=['--overwrite']`` to redo patches that already exist.
++
++If you would rather cut the surfaces by hand, see :doc:`segmentation_guide`, and
++then import the flatmaps with::
+ 
+     cortex.freesurfer.import_flat(fs_subject, patch, hemis=['lh', 'rh'],
+                                   cx_subject=None)
+ 
+-which writes ``surfaces/flat_lh.gii`` and ``surfaces/flat_rh.gii``. Labels and
+-annotations are not imported either; see ``cortex.freesurfer.get_label``.
++which writes ``surfaces/flat_lh.gii`` and ``surfaces/flat_rh.gii``. Both
++``autoflatten_subject`` and ``import_flat`` delete the subject's ``overlays.svg``
++file and all of its cached files, since the flatmaps fundamentally change.
++
++.. _autoflatten: https://gallantlab.org/autoflatten
+ 
+ 
+ Transforms
+diff --git a/pyproject.toml b/pyproject.toml
+index ef7574e9e..41d9577da 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -32,6 +32,12 @@ types = [
+ headless = [
+     "playwright>=1.58.0"
+ ]
++autoflatten = [
++    "autoflatten>=1.0.0"
++]
++all = [
++    "pycortex[headless,autoflatten]"
++]
+ 
+ [tool.setuptools_scm]
+ version_file = "cortex/_version.py"

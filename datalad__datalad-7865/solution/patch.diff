@@ -1,0 +1,618 @@
+diff --git a/changelog.d/pr-7865.md b/changelog.d/pr-7865.md
+new file mode 100644
+index 0000000000..c20e1f976b
+--- /dev/null
++++ b/changelog.d/pr-7865.md
+@@ -0,0 +1,4 @@
++### 🐛 Bug Fixes
++
++- Fix the dataset-level "Total" progress bar of `datalad get` (and other JSON-progress annex commands): advance it on per-file `byte-progress` deltas (throttled to 0.5s) instead of only on completion, surface errored files in the bar label (`[errored: N / <human-size>]`) and remove their key-sizes from the effective total, and roll back any provisional credit when a partially-streamed file errors.  The bar now tracks cumulative on-disk bytes for non-errored files; resumed-from-disk bytes are tracked as a separate anchor pushed to `tqdm` via `initial=` so the rate / ETA display reflects session work only.  [PR #7865](https://github.com/datalad/datalad/pull/7865) (by [@yarikoptic](https://github.com/yarikoptic))
++- Fix `tqdmProgressBar.update` so a changed `total=` is applied directly rather than via `tqdm.reset()`, which used to zero the elapsed-time and EMA state and produce momentary nonsense rates (e.g. `[00:00<00:00, 16.0T Bytes/s]`).  [PR #7865](https://github.com/datalad/datalad/pull/7865) (by [@yarikoptic](https://github.com/yarikoptic))
+diff --git a/datalad/log.py b/datalad/log.py
+index 32d71e0e46..ce72446174 100644
+--- a/datalad/log.py
++++ b/datalad/log.py
+@@ -318,6 +318,13 @@ def emit(self, record):
+             label = getattr(record, 'dlm_progress_label', None)
+             if label is not None:
+                 self.pbars[pid].set_desc(label)
++            # Adjust the "initial" anchor used for rate / ETA computation:
++            # callers (e.g. AnnexJsonProtocol's Total bar) advance this in
++            # sync with already-on-disk bytes so resumed transfers do not
++            # bias the displayed rate.
++            initial = getattr(record, 'dlm_progress_initial', None)
++            if initial is not None:
++                self.pbars[pid].set_initial(initial)
+             # an update
+             self.pbars[pid].update(
+                 update,
+diff --git a/datalad/support/annexrepo.py b/datalad/support/annexrepo.py
+index 629e76f226..1ef7a10510 100644
+--- a/datalad/support/annexrepo.py
++++ b/datalad/support/annexrepo.py
+@@ -16,6 +16,7 @@
+ import logging
+ import os
+ import re
++import time
+ import warnings
+ from itertools import chain
+ from multiprocessing import cpu_count
+@@ -69,6 +70,7 @@
+     Path,
+     PurePosixPath,
+     auto_repr,
++    bytes2human,
+     ensure_list,
+     on_windows,
+     split_cmdline,
+@@ -3705,6 +3707,9 @@ class AnnexJsonProtocol(WitlessProtocol):
+     proc_out = True
+     proc_err = True
+ 
++    # throttle for byte-progress-driven Total-bar updates
++    _total_pbar_min_interval = 0.5
++
+     def __init__(self, done_future=None, total_nbytes=None):
+         if done_future is not None:
+             warnings.warn("`done_future` argument is ignored "
+@@ -3720,18 +3725,50 @@ def __init__(self, done_future=None, total_nbytes=None):
+     def add_to_output(self, json_object):
+         self.json_out.append(json_object)
+ 
+-    def connection_made(self, transport):
+-        super().connection_made(transport)
++    def _init_total_pbar_state(self):
++        # progress-tracking state for the dataset-level "Total" bar.
++        # Factored out so tests can mirror it without running connection_made.
+         self._pbars = set()
+-        # overall counter of processed bytes (computed from key reports)
++        # cumulative on-disk bytes for non-errored files in this run.
++        # Grows by byte-progress deltas (incl. the resume offset on the
++        # first emission of each file) and the residual at completion;
++        # is rolled back if a file later errors out.
+         self._byte_count = 0
++        # last byte-progress credited to _byte_count per active file --
++        # the base for computing the next delta
++        self._inflight_credited = {}
++        # per-active-file resume offset (first observed byte-progress);
++        # these bytes were on disk before this session, so the rate /
++        # ETA computation must exclude them. The invariant is
++        # `_resumed_bytes == sum(_file_resume_offset.values())` plus
++        # contributions from files that have since completed successfully
++        # (still on disk).
++        self._file_resume_offset = {}
++        self._resumed_bytes = 0
++        self._last_total_emit_ts = 0.0
++        # bytes from records with success=false; shrink effective total
++        # and feed the bar label
++        self._error_count = 0
++        self._error_bytes = 0
++        # last `total=` we forwarded; only forward changes (each write
++        # would otherwise repaint the bar)
++        self._last_effective_total = self.total_nbytes
++        # `_total_pbar_finished` prevents a late stray emit from re-emitting
++        # against a bar we have already taken down
++        self._total_pbar_finished = False
++
++    def connection_made(self, transport):
++        super().connection_made(transport)
++        self._init_total_pbar_state()
+         if self.total_nbytes:
+-            # init global pbar, do here to be on top of first file
++            # create the Total pbar eagerly so it sits ABOVE per-file bars
++            # (tqdm orders bars by creation time). The rate spike from
++            # resume offsets is suppressed by `set_initial` on subsequent
++            # emits (see `_emit_total_pbar_update`).
+             log_progress(
+                 lgr.info,
+                 self._global_pbar_id,
+                 'Start annex operation',
+-                # do not crash if no command is reported
+                 unit=' Bytes',
+                 label='Total',
+                 total=self.total_nbytes,
+@@ -3784,6 +3821,55 @@ def _get_pbar_id(self, record):
+             hash(frozenset((k, info.get(k))
+                            for k in ["command", "key", "file"])))
+ 
++    def _effective_total(self):
++        # exclude full key-sizes for errored files; the bar's target is
++        # bytes on disk at end-of-run for non-errored files
++        return max(0, self.total_nbytes - self._error_bytes)
++
++    def _credit_byte_progress(self, pbar_id, byte_progress):
++        # apply a per-file byte-progress event to the Total bar's
++        # bookkeeping: the very first event records a resume offset (those
++        # bytes were already on disk), subsequent events credit only the
++        # delta. Paired with `_inflight_credited.pop` / `_file_resume_offset
++        # .pop` in the non-progress branch on completion or error.
++        if pbar_id not in self._inflight_credited:
++            self._file_resume_offset[pbar_id] = byte_progress
++            self._resumed_bytes += byte_progress
++        self._byte_count += byte_progress - self._inflight_credited.get(pbar_id, 0)
++        self._inflight_credited[pbar_id] = byte_progress
++
++    def _emit_total_pbar_update(self, file_msg, byte_count):
++        """Update the dataset-level "Total" pbar with current effective state.
++
++        Forwards ``initial=_resumed_bytes`` on every emit so tqdm's rate
++        fallback ``(n - initial) / elapsed`` excludes resumed-from-disk
++        bytes credited to ``n``. Forwards ``total=`` only when the
++        effective total has changed (each write otherwise repaints the
++        bar). Adds an ``[errored: N / <human-size>]`` suffix to the label
++        while there are errors.
++
++        Single-threaded: called from the asyncio reader callback only.
++        """
++        if not self.total_nbytes or self._total_pbar_finished:
++            return
++        effective_total = self._effective_total()
++        label = (
++            'Total [errored: {} / {}]'.format(
++                self._error_count, bytes2human(self._error_bytes))
++            if self._error_count
++            else 'Total'
++        )
++        kwargs = dict(
++            label=label,
++            update=byte_count,
++            initial=self._resumed_bytes,
++            noninteractive_level=5,
++        )
++        if effective_total != self._last_effective_total:
++            kwargs['total'] = effective_total
++            self._last_effective_total = effective_total
++        log_progress(lgr.info, self._global_pbar_id, file_msg, **kwargs)
++
+     def _get_pbar_label(self, action):
+         # do not crash if no command is reported
+         label = action.get('command', '').capitalize()
+@@ -3835,9 +3921,12 @@ def _proc_json_record(self, j):
+                 return
+ 
+         if is_progress:
++            byte_progress = float(j.get('byte-progress', 0))
+             if not known_pbar:
+-                # init the pbar, the is some progress left to be made
+-                # worth it
++                # first byte-progress for this file. Pass byte_progress as
++                # `initial=` so tqdm's per-file rate/ETA start from the
++                # resume offset rather than jumping 0 -> byte_progress in
++                # zero elapsed.
+                 log_progress(
+                     lgr.info,
+                     pbar_id,
+@@ -3845,6 +3934,7 @@ def _proc_json_record(self, j):
+                     label=self._get_pbar_label(action),
+                     unit=' Bytes',
+                     total=float(j.get('total-size', 0)),
++                    initial=byte_progress,
+                     noninteractive_level=5,
+                 )
+                 self._pbars.add(pbar_id)
+@@ -3852,40 +3942,67 @@ def _proc_json_record(self, j):
+                 lgr.info,
+                 pbar_id,
+                 j.get('percent-progress', 0),
+-                update=float(j.get('byte-progress', 0)),
++                update=byte_progress,
+                 noninteractive_level=5,
+             )
++            if self.total_nbytes and not self._total_pbar_finished:
++                self._credit_byte_progress(pbar_id, byte_progress)
++                now = time.monotonic()
++                if now - self._last_total_emit_ts >= self._total_pbar_min_interval:
++                    self._last_total_emit_ts = now
++                    self._emit_total_pbar_update(
++                        file_msg=j.get('file', ''),
++                        byte_count=self._byte_count,
++                    )
+             # do not let progress reports leak into the return value
+             return
+         # update overall progress, do not crash when there is no key property
+         # in the report (although there should be one)
+         key_bytes = AnnexRepo.get_size_from_key(j.get('key', None))
+-        if key_bytes:
+-            self._byte_count += key_bytes
++        # non-progress records carry 'success'; default True matches the
++        # historical behaviour (every non-progress record credited the bar)
++        # and avoids silently rolling back a real transfer's bytes if a
++        # future annex JSON omits the field.
++        succeeded = bool(j.get('success', True))
++        last_credited = self._inflight_credited.pop(pbar_id, 0)
++        resume_offset = self._file_resume_offset.pop(pbar_id, 0)
++        if key_bytes and succeeded:
++            # credit the residual that arrived without a final byte-progress
++            # tick (e.g. the last MB or a file too small to ever emit one)
++            self._byte_count += max(0, key_bytes - last_credited)
++        elif key_bytes and not succeeded:
++            # roll back any provisional credit -- those bytes are still on
++            # disk but no longer count toward the (now-shrunk) target. Also
++            # remove the file's resume contribution so tqdm's rate anchor
++            # follows along.
++            self._byte_count -= last_credited
++            self._resumed_bytes -= resume_offset
++            self._error_count += 1
++            self._error_bytes += key_bytes
+         # don't do anything to the results for now in terms of normalization
+         # TODO the protocol could be made aware of the runner's CWD and
+         # also any dataset the annex command is operating on. This would
+         # enable 'file' property conversion to absolute paths
+         self.add_to_output(j)
+ 
+-        if self.total_nbytes:
+-            if self.total_nbytes <= self._byte_count:
+-                # discard global pbar
+-                log_progress(
+-                    lgr.info,
+-                    self._global_pbar_id,
+-                    'Finished annex {}'.format(j.get('command', '')),
+-                    noninteractive_level=5,
+-                )
+-                self._pbars.discard(self._global_pbar_id)
++        if self.total_nbytes and not self._total_pbar_finished:
++            if self._effective_total() <= self._byte_count:
++                # take the global pbar down if it was ever created; skip the
++                # emit when it was not, so the handler does not lazily spawn
++                # an empty pbar at the very end of a no-progress run
++                if self._global_pbar_id in self._pbars:
++                    log_progress(
++                        lgr.info,
++                        self._global_pbar_id,
++                        'Finished annex {}'.format(j.get('command', '')),
++                        noninteractive_level=5,
++                    )
++                    self._pbars.discard(self._global_pbar_id)
++                self._total_pbar_finished = True
+             else:
+-                # log actual progress
+-                log_progress(
+-                    lgr.info,
+-                    self._global_pbar_id,
+-                    j.get('file', ''),
+-                    update=self._byte_count,
+-                    noninteractive_level=5,
++                self._emit_total_pbar_update(
++                    file_msg=j.get('file', ''),
++                    byte_count=self._byte_count,
+                 )
+ 
+     def _prepare_result(self):
+diff --git a/datalad/support/tests/test_annexrepo.py b/datalad/support/tests/test_annexrepo.py
+index bc84e30a3b..5389523a47 100644
+--- a/datalad/support/tests/test_annexrepo.py
++++ b/datalad/support/tests/test_annexrepo.py
+@@ -2674,6 +2674,266 @@ def test_done_deprecation():
+         warn_mock.assert_not_called()
+ 
+ 
++def _make_annex_json_protocol(total_nbytes):
++    # Construct an AnnexJsonProtocol with state equivalent to a finished
++    # connection_made(), but without going through WitlessProtocol plumbing
++    # (avoids needing a real transport). Shares `_init_total_pbar_state`
++    # with the real connection_made so new fields stay in sync.
++    proto = AnnexJsonProtocol(total_nbytes=total_nbytes)
++    proto._init_total_pbar_state()
++    if total_nbytes:
++        proto._pbars.add(proto._global_pbar_id)
++    proto._unprocessed = None
++    proto.json_out = []
++    # disable throttle so the test can assert on every emit deterministically
++    proto._total_pbar_min_interval = 0.0
++    return proto
++
++
++@pytest.mark.ai_generated
++def test_annex_json_protocol_total_progress_inflight():
++    # The Total bar advances on per-file byte-progress events (not only at
++    # completion). It tracks cumulative on-disk bytes, so the first event
++    # contributes its full byte_progress (resume offset, or just bytes
++    # streamed before annex's first emission), subsequent events contribute
++    # deltas, and completion credits any residual to key_bytes.
++    from datalad.support import annexrepo as ar_mod
++
++    proto = _make_annex_json_protocol(total_nbytes=20_000)
++
++    action = {"command": "get", "key": "MD5E-s10000--abc.dat", "file": "big.dat"}
++    with patch.object(ar_mod, "log_progress") as mock_lp:
++        for bp in (1_000, 3_000, 6_000):
++            proto._proc_json_record({
++                "action": action,
++                "byte-progress": bp,
++                "total-size": 10_000,
++                "percent-progress": "{}%".format(bp // 100),
++            })
++        proto._proc_json_record({
++            "command": "get",
++            "key": "MD5E-s10000--abc.dat",
++            "file": "big.dat",
++            "success": True,
++        })
++
++    pid = proto._global_pbar_id
++    pbar_calls = [c for c in mock_lp.call_args_list if c.args[1] == pid]
++    total_updates = [c.kwargs.get("update")
++                     for c in pbar_calls if "update" in c.kwargs]
++    # cumulative on-disk: first event credits 1_000, then 3_000, 6_000,
++    # completion adds the 4_000 residual to reach 10_000
++    assert_equal(total_updates, [1_000, 3_000, 6_000, 10_000])
++    # every update carries initial=warm_start (1_000 -- only one file's
++    # first bp) so tqdm's rate excludes already-on-disk bytes
++    initials = [c.kwargs.get("initial")
++                for c in pbar_calls if "update" in c.kwargs]
++    assert_equal(initials, [1_000, 1_000, 1_000, 1_000])
++    assert_equal(proto._inflight_credited, {})
++    assert_equal(proto._file_resume_offset, {})
++    assert_equal(proto._byte_count, 10_000)
++    assert_equal(proto._resumed_bytes, 1_000)
++
++
++@pytest.mark.ai_generated
++def test_annex_json_protocol_total_progress_skips_failures():
++    # A failed transfer (e.g. `get` from a remote that does not have the key)
++    # must not advance the dataset-level "Total" bar by the missing file's
++    # size, and its key-size should be tracked as errored so the effective
++    # total / bar label reflect reality.
++    from datalad.support import annexrepo as ar_mod
++
++    proto = _make_annex_json_protocol(total_nbytes=20_000)
++
++    with patch.object(ar_mod, "log_progress") as mock_lp:
++        # failed final record: no preceding byte-progress, success is False
++        proto._proc_json_record({
++            "command": "get",
++            "key": "MD5E-s10000--missing.dat",
++            "file": "missing.dat",
++            "success": False,
++            "note": "not found",
++        })
++
++    # _byte_count must not advance for an unsuccessful transfer
++    assert_equal(proto._byte_count, 0)
++    # error accounting picked up the missing file's key-size
++    assert_equal(proto._error_count, 1)
++    assert_equal(proto._error_bytes, 10_000)
++    assert_equal(proto._inflight_credited, {})
++    pid = proto._global_pbar_id
++    pbar_calls = [c for c in mock_lp.call_args_list if c.args[1] == pid]
++    assert len(pbar_calls) == 1
++    call = pbar_calls[0]
++    # single update emit: byte_count still 0, effective total shrunk by
++    # the errored key-size, label carries the errored summary
++    assert_equal(call.kwargs.get("update"), 0)
++    assert_equal(call.kwargs.get("initial"), 0)
++    assert_equal(call.kwargs.get("total"), 10_000)
++    assert "errored: 1" in call.kwargs.get("label", "")
++
++
++@pytest.mark.ai_generated
++def test_annex_json_protocol_total_progress_completion_includes_inflight():
++    # With -J>1, file B's per-file completion arrives while file A is still
++    # streaming. The completion emit must include A's in-flight contribution,
++    # else the Total bar visibly dips on every per-file completion.
++    from datalad.support import annexrepo as ar_mod
++
++    proto = _make_annex_json_protocol(total_nbytes=30_000)
++
++    action_a = {"command": "get", "key": "MD5E-s10000--a.dat", "file": "a.dat"}
++    action_b = {"command": "get", "key": "MD5E-s10000--b.dat", "file": "b.dat"}
++    with patch.object(ar_mod, "log_progress") as mock_lp:
++        # both files start streaming
++        proto._proc_json_record({"action": action_a, "byte-progress": 4_000,
++                                 "total-size": 10_000, "percent-progress": "40%"})
++        proto._proc_json_record({"action": action_b, "byte-progress": 2_000,
++                                 "total-size": 10_000, "percent-progress": "20%"})
++        # B completes; A is still mid-transfer at 4_000
++        proto._proc_json_record({"command": "get", "key": "MD5E-s10000--b.dat",
++                                 "file": "b.dat", "success": True})
++
++    pid = proto._global_pbar_id
++    total_updates = [
++        c.kwargs.get("update")
++        for c in mock_lp.call_args_list
++        if c.args[1] == pid and "update" in c.kwargs
++    ]
++    # A's first event credits 4_000 (warm-start), B's first event adds
++    # another 2_000 (warm-start) for 6_000, B-completion adds 8_000
++    # residual to reach 14_000. Strictly non-decreasing.
++    assert_equal(total_updates, [4_000, 6_000, 14_000])
++    assert total_updates == sorted(total_updates)
++    # initial= tracks warm_start_bytes (4_000 for A alone, then 6_000 once B
++    # also started). At B's completion, B's warm-start (2_000) is kept (not
++    # rolled back) so initial stays at 6_000.
++    initials = [c.kwargs.get("initial") for c in mock_lp.call_args_list
++                if c.args[1] == pid and "update" in c.kwargs]
++    assert_equal(initials, [4_000, 6_000, 6_000])
++
++
++@pytest.mark.ai_generated
++def test_annex_json_protocol_total_progress_resume_from_disk():
++    # When `git annex` resumes a previously-partial download, the first
++    # `byte-progress` event already reports the on-disk byte count (e.g.
++    # 5_000 of a 10_000 file). Those bytes were not transferred in this
++    # session and must not credit the Total bar or be included in the
++    # effective total.
++    from datalad.support import annexrepo as ar_mod
++
++    proto = _make_annex_json_protocol(total_nbytes=10_000)
++
++    action = {"command": "get", "key": "MD5E-s10000--r.dat", "file": "r.dat"}
++    with patch.object(ar_mod, "log_progress") as mock_lp:
++        # first emission already at 5_000 -- resumed from disk
++        proto._proc_json_record({"action": action, "byte-progress": 5_000,
++                                 "total-size": 10_000, "percent-progress": "50%"})
++        proto._proc_json_record({"action": action, "byte-progress": 7_500,
++                                 "total-size": 10_000, "percent-progress": "75%"})
++        proto._proc_json_record({"command": "get",
++                                 "key": "MD5E-s10000--r.dat",
++                                 "file": "r.dat", "success": True})
++
++    pid = proto._global_pbar_id
++    total_updates = [
++        c.kwargs.get("update")
++        for c in mock_lp.call_args_list
++        if c.args[1] == pid and "update" in c.kwargs
++    ]
++    # first event credits 5_000 (warm-start), next adds 2_500 (session,
++    # the bp delta 7_500-5_000), completion adds the 2_500 residual to
++    # reach 10_000 -- which equals effective_total, so the bar finishes
++    # cleanly without an extra update
++    assert_equal(total_updates, [5_000, 7_500])
++    assert_equal(proto._byte_count, 10_000)
++    assert proto._global_pbar_id not in proto._pbars
++    # every Total update carries initial=5_000 (the warm-start) so tqdm's
++    # rate fallback `(n - initial) / elapsed` excludes the resumed bytes
++    initials = [c.kwargs.get("initial") for c in mock_lp.call_args_list
++                if c.args[1] == pid and "update" in c.kwargs]
++    assert_equal(initials, [5_000, 5_000])
++    # the per-file pbar create call carried `initial=5_000` so tqdm starts
++    # from the resume point and rate/ETA are realistic
++    file_create_call = [
++        c for c in mock_lp.call_args_list
++        if c.args[1] != pid and "total" in c.kwargs and "update" not in c.kwargs
++    ]
++    assert len(file_create_call) == 1
++    assert_equal(file_create_call[0].kwargs.get("initial"), 5_000.0)
++
++
++@pytest.mark.ai_generated
++def test_annex_json_protocol_total_progress_rollback_on_partial_error():
++    # A file that streams partway then errors must roll back its provisional
++    # credit -- those bytes are still on disk but no longer count toward
++    # the (now-shrunk) target, otherwise the bar would visibly desync from
++    # `total - error_bytes`.
++    from datalad.support import annexrepo as ar_mod
++
++    proto = _make_annex_json_protocol(total_nbytes=30_000)
++
++    action = {"command": "get", "key": "MD5E-s10000--p.dat", "file": "p.dat"}
++    with patch.object(ar_mod, "log_progress") as mock_lp:
++        # streams 4_000 of 10_000 then fails
++        proto._proc_json_record({"action": action, "byte-progress": 4_000,
++                                 "total-size": 10_000, "percent-progress": "40%"})
++        proto._proc_json_record({
++            "command": "get",
++            "key": "MD5E-s10000--p.dat",
++            "file": "p.dat",
++            "success": False,
++            "note": "remote not available",
++        })
++
++    # provisional 4_000 was rolled back -> byte_count is back to 0
++    assert_equal(proto._byte_count, 0)
++    assert_equal(proto._error_count, 1)
++    assert_equal(proto._error_bytes, 10_000)
++    assert_equal(proto._inflight_credited, {})
++    pid = proto._global_pbar_id
++    total_updates = [
++        c.kwargs.get("update")
++        for c in mock_lp.call_args_list
++        if c.args[1] == pid and "update" in c.kwargs
++    ]
++    # first emit credits 4_000 (warm-start), error rolls it back to 0 and
++    # also rolls back the warm-start anchor so tqdm's rate stays sensible
++    assert_equal(total_updates, [4_000, 0])
++    initials = [c.kwargs.get("initial") for c in mock_lp.call_args_list
++                if c.args[1] == pid and "update" in c.kwargs]
++    assert_equal(initials, [4_000, 0])
++    assert_equal(proto._resumed_bytes, 0)
++
++
++@pytest.mark.ai_generated
++def test_annex_json_protocol_total_progress_finishes_on_all_errored():
++    # If every file errors out the effective total reaches the byte_count
++    # boundary (0 == 0) and the global pbar should finish cleanly without
++    # leaving a stale "Total" hanging around.
++    from datalad.support import annexrepo as ar_mod
++
++    proto = _make_annex_json_protocol(total_nbytes=10_000)
++
++    with patch.object(ar_mod, "log_progress") as mock_lp:
++        proto._proc_json_record({
++            "command": "get",
++            "key": "MD5E-s10000--missing.dat",
++            "file": "missing.dat",
++            "success": False,
++            "note": "not found",
++        })
++
++    assert_equal(proto._error_bytes, 10_000)
++    # effective_total (0) <= _byte_count (0) -> finish the eagerly-created
++    # bar; one log_progress call (no update kwarg) emitted to take it down
++    assert proto._global_pbar_id not in proto._pbars
++    pid = proto._global_pbar_id
++    pbar_calls = [c for c in mock_lp.call_args_list if c.args[1] == pid]
++    assert len(pbar_calls) == 1
++    assert "update" not in pbar_calls[0].kwargs
++
++
+ def test_generator_annex_json_protocol():
+ 
+     runner = Runner()
+diff --git a/datalad/ui/progressbars.py b/datalad/ui/progressbars.py
+index f466265f23..4191bd8c91 100644
+--- a/datalad/ui/progressbars.py
++++ b/datalad/ui/progressbars.py
+@@ -82,6 +82,18 @@ def clear(self):
+     def set_desc(self, value):
+         pass  # to override in subclass on how to handle description
+ 
++    def set_initial(self, value):
++        """Adjust the "initial" anchor used for rate / ETA computation.
++
++        Backends compute the displayed rate as roughly
++        ``(n - initial) / elapsed`` (this is tqdm's fallback when
++        ``smoothing == 0``). Callers that credit bytes to ``n`` that were
++        never transferred during this session -- e.g. a partially-on-disk
++        file resumed by ``git annex`` -- can advance ``initial`` in
++        lockstep so those bytes do not pollute the rate display. No-op
++        for backends that do not separately track an initial anchor.
++        """
++
+ 
+ class SilentProgressBar(ProgressBarBase):
+     def __init__(self, label='', fill_text=None, total=None, unit='B', out=sys.stdout):
+@@ -264,19 +276,15 @@ def _create(self, initial=0):
+ 
+         def update(self, size, increment=False, total=None):
+             self._create()
+-            if total is not None:
+-                # only a reset can change the total of an existing pbar
+-                self._pbar.reset(total)
+-                # we need to (re-)advance the pbar back to the old state
+-                self._pbar.update(self.current)
+-                # an update() does not (reliably) trigger a refresh, hence
+-                # without the next, the pbar may still show zero progress
++            if total is not None and total != self._pbar.total:
++                # adjust the total without going through tqdm.reset(), which
++                # zeroes the iteration count and start time and produces
++                # bogus rates (e.g. "[00:00<00:00, 16.0T Bytes/s]") on the
++                # next paint
++                self._pbar.total = total
+                 if not size:
+-                    # whenever a total is changed, we need a refresh. If there is
+-                    # no progress update, we do it here, else we'll do it after
+-                    # the progress update
++                    # no follow-up update to trigger a redraw
+                     self._pbar.refresh()
+-                # if we set a new total and also advance the progress bar:
+             if not size:
+                 return
+             inc = size - self.current
+@@ -344,6 +352,15 @@ def clear(self):
+         def set_desc(self, value):
+             self._pbar.desc = value
+ 
++        def set_initial(self, value):
++            # tqdm uses `(n - initial) / elapsed` as the fallback rate when
++            # smoothing == 0 (the mode used for "Total" bars). Updating
++            # `initial` in sync with already-on-disk bytes credited to n
++            # keeps the rate display centred on session work rather than
++            # the warm-start jump.
++            if self._pbar is not None:
++                self._pbar.initial = value
++
+ 
+     progressbars['tqdm'] = tqdmProgressBar
+ except ImportError:  # pragma: no cover

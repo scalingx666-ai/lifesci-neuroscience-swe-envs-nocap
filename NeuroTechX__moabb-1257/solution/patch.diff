@@ -1,0 +1,228 @@
+diff --git a/docs/source/whats_new.rst b/docs/source/whats_new.rst
+index b9983654c1..0ff4748a12 100644
+--- a/docs/source/whats_new.rst
++++ b/docs/source/whats_new.rst
+@@ -29,6 +29,7 @@ Enhancements
+ - ``nemar_subject_template`` on :class:`moabb.datasets.base.BaseDataset` now also accepts an explicit ``{moabb_subject: bids_label}`` mapping, so NEMAR deposits whose BIDS subject labels no format template can produce (``sub-zdvm``, ``sub-A01``, non-contiguous ids) are declared as data instead of by overriding ``_nemar_subject``; string templates keep working unchanged. :class:`moabb.datasets.Lioi2020_XP2` drops its ``_nemar_subject`` override for the mapping, with the same labels (:gh:`1098` by `Bruno Aristimunha`_).
+ - Evaluations now log datasets they drop from the paradigm's default list (``datasets=None``) at INFO instead of WARNING, so a default benchmark run no longer floods the console with expected incompatibilities; datasets passed explicitly still warn when removed (:gh:`862` by `Bruno Aristimunha`_).
+ - Evaluations now save results as soon as they are computed instead of once per dataset: in :meth:`~moabb.evaluations.base.BaseEvaluation.process`, each ``(pipeline, subject)`` is written to the HDF5 file as soon as all of its folds have finished, so a crash later in a dataset no longer loses the subjects already evaluated. The file layout, the saved values and the ``overwrite`` / resume behaviour are unchanged: a rerun skips the saved subjects and computes only the missing ones. Writes still happen only in the main process, also with ``n_jobs > 1`` (:gh:`419` by `Bruno Aristimunha`_).
++- Fetch PhysioNet ``/files/`` downloads (:class:`moabb.datasets.PhysionetMI`, :class:`~moabb.datasets.mainsah2025.Mainsah2025`) from the byte-identical AWS Open Data mirror ``physionet-open.s3.amazonaws.com`` first, falling back to ``physionet.org`` on any mirror error; ``physionet.org`` often serves ``eegmmidb`` at 10-40 kB/s and times out mid-file. Set ``MOABB_S3_MIRROR=0`` to disable (:gh:`1245` by `Bruno Aristimunha`_).
+ - Add :class:`moabb.datasets.Wang2026Handwriting`, a Chinese handwriting-imagery dataset from Wang et al. (2026, Scientific Data, CC-BY 4.0; figshare, BIDS): 21 healthy adults in two handwriting-imagery tasks -- CCS-HI (five Chinese character strokes) and SV-HI (six Pinyin vowels) -- each recorded in two sessions, 40 trials of 4 s per class, 32-channel 10-10 EEG at 1 kHz. The two BIDS tasks share a session and carry no run entity, so the loader keys them by task; the release's ``trial_type`` labels are normalized to the class names and the two sessions with fewer valid trials (sub-06 ses-02 SV-HI, sub-13 ses-02 CCS-HI) are kept as released (:gh:`1244` by `LiQing`_).
+ - Add standalone :class:`moabb.paradigms.CognitiveTask` for non-motor endogenous tasks (handwriting/stroke imagery, mental arithmetic, mental rotation, word generation, music imagery). It subclasses :class:`~moabb.paradigms.base.BaseParadigm` directly — not motor imagery — with MotorImagery-matching 8-32 Hz defaults, N-class event logic, and validity on both ``paradigm="cognitive"`` and the existing ``paradigm="imagery"`` tag (follows the Cued Cognitive Tasks branch of :gh:`1056`). :class:`moabb.datasets.Shin2017B` (mental arithmetic vs rest), :class:`moabb.datasets.BNCI2024_001` (10-letter handwritten character task) and :class:`moabb.datasets.Wang2026Handwriting` (Chinese stroke/vowel handwriting imagery) flip to ``paradigm="cognitive"`` with a new ``summary_cognitive.csv`` table, updated docstrings/METADATA, and runtime/docs/test allowlists (neural-signature handler, bubble-plot colormap, metadata catalog checks).
+ - :class:`moabb.datasets.Dreyer2023` (and its ``A``/``B``/``C`` subclasses) now load their EEG from NEMAR's ``nm000250`` ``sourcedata/`` store when the download provider allows it, falling back to the OSF host exactly like other NEMAR-mirrored datasets; this stops MOABB's docs/example builds from failing on OSF's ``files.de-1.osf.io`` 429 rate limiting. ``get_subject_info()`` reads the demographic ``performance.csv`` from the store once it is published there, else falls back to OSF (:gh:`1237` by `Bruno Aristimunha`_).
+diff --git a/moabb/datasets/download.py b/moabb/datasets/download.py
+index 62696944ea..bca6e4bbbd 100644
+--- a/moabb/datasets/download.py
++++ b/moabb/datasets/download.py
+@@ -120,6 +120,94 @@ def _set_user_agent(downloader):
+     headers.setdefault("User-Agent", get_user_agent())
+ 
+ 
++#: HTTPS mirror of PhysioNet's ``/files/`` tree on the AWS Open Data
++#: registry. Verified byte-identical for ``eegmmidb`` and ``bigp3bci``
++#: (spot-checked EDFs plus ``.event``/``SHA256SUMS.txt`` probes, Oct 2026).
++#: ``s3://physionet-open/...`` and this HTTPS endpoint serve the same
++#: objects; HTTPS is used because pooch only speaks http(s)/ftp/sftp/doi.
++PHYSIONET_S3_MIRROR_BASE = "https://physionet-open.s3.amazonaws.com"
++_PHYSIONET_UPSTREAM_PREFIX = "https://physionet.org/files/"
++
++
++def _s3_mirror_enabled() -> bool:
++    """Whether the PhysioNet S3 HTTPS mirror may be tried first.
++
++    Enabled by default; set ``MOABB_S3_MIRROR=0`` (or ``false``/``off``/
++    ``disabled``) to force direct upstream downloads.
++    """
++    return os.environ.get("MOABB_S3_MIRROR", "1").lower() not in (
++        "0",
++        "false",
++        "off",
++        "no",
++        "disabled",
++    )
++
++
++def physionet_s3_mirror(url: str) -> str | None:
++    """Return the AWS Open Data HTTPS mirror for a PhysioNet ``/files/`` URL.
++
++    Only rewrites the ``https://physionet.org/files/<dataset>/...`` tree,
++    which the ``physionet-open`` bucket mirrors 1:1. Returns ``None`` for
++    any other URL (including ``archive.physionet.org``), so callers can
++    fall back to the upstream host untouched.
++    """
++    if not isinstance(url, str):
++        return None
++    if not url.startswith(_PHYSIONET_UPSTREAM_PREFIX):
++        return None
++    rest = url[len(_PHYSIONET_UPSTREAM_PREFIX) :]
++    if not rest or ".." in rest.split("/"):
++        return None
++    return PHYSIONET_S3_MIRROR_BASE + "/" + rest
++
++
++def _retrieve_with_physionet_fallback(
++    url, *, fname, path, known_hash=None, progressbar=True, downloader=None
++):
++    """Retrieve ``url`` preferring the PhysioNet S3 mirror on failure-prone hosts.
++
++    The destination is always ``path/fname`` (derived from the upstream URL
++    by the caller), so a mirror hit lands exactly where the loader expects
++    and pooch skips re-download afterwards. On any mirror transport failure
++    this warns once and retries the upstream URL; the upstream error (if it
++    also fails) is the one raised.
++    """
++    mirror = physionet_s3_mirror(url) if _s3_mirror_enabled() else None
++    if mirror is not None:
++        # TLS verification stays on: the ``verify=False`` workaround the
++        # callers apply is for upstream hosts with broken chains, not AWS.
++        mirror_downloader = choose_downloader(mirror, progressbar=progressbar)
++        _set_user_agent(mirror_downloader)
++        try:
++            return retrieve(
++                mirror,
++                known_hash,
++                fname=fname,
++                path=path,
++                progressbar=progressbar,
++                downloader=mirror_downloader,
++            )
++        except Exception as exc:
++            # warnings.warn, not mne.utils.warn: the latter is silent when the
++            # MNE log level is above WARNING, and users should see the fallback.
++            warnings.warn(
++                f"S3 mirror download failed for {mirror} ({exc!r}); "
++                f"falling back to upstream {url}. Set MOABB_S3_MIRROR=0 to "
++                "skip the mirror.",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++    return retrieve(
++        url,
++        known_hash,
++        fname=fname,
++        path=path,
++        progressbar=progressbar,
++        downloader=downloader,
++    )
++
++
+ def _sanitize_path(path: Path) -> Path:
+     path = Path(path)
+     table = {ord(c): "-" for c in '~:*?"<>|'}
+@@ -323,11 +411,11 @@ def data_dl(url, sign, path=None, force_update=False, verbose=None, fname=None):
+         known_hash = None
+     else:
+         known_hash = file_hash(str(destination))
+-    dlpath = retrieve(
++    dlpath = _retrieve_with_physionet_fallback(
+         url,
+-        known_hash,
+         fname=destination.name,
+         path=str(destination.parent),
++        known_hash=known_hash,
+         progressbar=True,
+         downloader=downloader,
+     )
+@@ -844,9 +932,8 @@ def download_if_missing(
+             downloader.kwargs.setdefault("verify", False)
+         _set_user_agent(downloader)
+ 
+-        path = retrieve(
++        path = _retrieve_with_physionet_fallback(
+             url,
+-            None,
+             fname=osp.basename(file_path),
+             path=osp.dirname(file_path),
+             downloader=downloader,
+diff --git a/moabb/datasets/physionet_mi.py b/moabb/datasets/physionet_mi.py
+index 2ee28d9e79..4420d13711 100644
+--- a/moabb/datasets/physionet_mi.py
++++ b/moabb/datasets/physionet_mi.py
+@@ -64,6 +64,17 @@ class PhysionetMI(BaseDataset):
+         this, exclude subject 88 when loading the full dataset, e.g.
+         ``PhysionetMI(subjects=[s for s in range(1, 110) if s != 88])``.
+ 
++    .. note::
++        Files are fetched from the byte-identical AWS Open Data mirror
++        (``https://physionet-open.s3.amazonaws.com``) first, because
++        ``physionet.org`` often serves this dataset at tens of kB/s and times
++        out. On any mirror error the loader falls back to ``physionet.org``.
++        Set ``MOABB_S3_MIRROR=0`` to always use ``physionet.org``. For a full
++        bulk copy, ``s5cmd --no-sign-request sync
++        "s3://physionet-open/eegmmidb/1.0.0/*"
++        $MNE_DATA/MNE-eegbci-data/files/eegmmidb/1.0.0/`` fills the same
++        layout the loader expects.
++
+     Parameters
+     ----------
+ 
+diff --git a/moabb/tests/test_physionet_mirror.py b/moabb/tests/test_physionet_mirror.py
+new file mode 100644
+index 0000000000..cc594507b9
+--- /dev/null
++++ b/moabb/tests/test_physionet_mirror.py
+@@ -0,0 +1,64 @@
++"""Offline tests for the PhysioNet AWS Open Data mirror fallback (#1245)."""
++
++from types import SimpleNamespace
++
++import pytest
++
++import moabb.datasets.download as dl
++
++
++UP = "https://physionet.org/files/eegmmidb/1.0.0/S001/S001R04.edf"
++MIRROR = "https://physionet-open.s3.amazonaws.com/eegmmidb/1.0.0/S001/S001R04.edf"
++
++
++def test_mirror_url_mapping():
++    assert dl.physionet_s3_mirror(UP) == MIRROR
++    # Only the /files/ tree is mirrored.
++    assert dl.physionet_s3_mirror("https://physionet.org/content/eegmmidb/") is None
++    assert dl.physionet_s3_mirror("https://archive.physionet.org/x.edf") is None
++    assert dl.physionet_s3_mirror("https://zenodo.org/x.edf") is None
++    assert dl.physionet_s3_mirror("https://physionet.org/files/../x") is None
++
++
++@pytest.fixture
++def calls(monkeypatch):
++    state = SimpleNamespace(urls=[], fail_mirror=False)
++
++    def fake_retrieve(url, known_hash, **kwargs):
++        state.urls.append(url)
++        if url.startswith(dl.PHYSIONET_S3_MIRROR_BASE) and state.fail_mirror:
++            raise ConnectionError("mirror down")
++        return f"{kwargs['path']}/{kwargs['fname']}"
++
++    monkeypatch.setattr(dl, "retrieve", fake_retrieve)
++    monkeypatch.delenv("MOABB_S3_MIRROR", raising=False)
++    return state
++
++
++def _fetch():
++    return dl._retrieve_with_physionet_fallback(UP, fname="S001R04.edf", path="/d")
++
++
++def test_mirror_first(calls):
++    assert _fetch() == "/d/S001R04.edf"
++    assert calls.urls == [MIRROR]
++
++
++def test_falls_back_to_upstream(calls):
++    calls.fail_mirror = True
++    with pytest.warns(RuntimeWarning, match="falling back to upstream"):
++        assert _fetch() == "/d/S001R04.edf"
++    assert calls.urls == [MIRROR, UP]
++
++
++def test_env_disables_mirror(calls, monkeypatch):
++    monkeypatch.setenv("MOABB_S3_MIRROR", "0")
++    _fetch()
++    assert calls.urls == [UP]
++
++
++def test_non_physionet_url_untouched(calls):
++    dl._retrieve_with_physionet_fallback(
++        "https://zenodo.org/x.edf", fname="x.edf", path="/d"
++    )
++    assert calls.urls == ["https://zenodo.org/x.edf"]

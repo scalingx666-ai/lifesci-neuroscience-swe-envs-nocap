@@ -1,0 +1,646 @@
+diff --git a/e2e_workflow/e2e_workflow.js b/e2e_workflow/e2e_workflow.js
+index 70ba8746f..3fddc9244 100644
+--- a/e2e_workflow/e2e_workflow.js
++++ b/e2e_workflow/e2e_workflow.js
+@@ -476,7 +476,10 @@ const EXTRACT_OP_SCHEMA = obj({
+ const OPBENCH_SCHEMA = obj({
+   short_name: { type: 'string' }, op_kind: { type: 'string' }, provenance_ok: { type: 'boolean' },
+   winner_backend: { type: 'string' }, winner_kind: { type: 'string' },
+-  isolated_speedup: { type: 'number' }, winner_editable: { type: 'boolean' },
++  // null when nothing was timed -- a speedup is a measurement, and 0.0 read as
++  // 'benched, not faster'. `measured` is the discriminator; gate on it, not on the number.
++  isolated_speedup: { type: ['number', 'null'] }, measured: { type: 'boolean' },
++  winner_editable: { type: 'boolean' },
+   best_known_ms: { type: 'number' },
+   recommend_tier_c: { type: 'boolean' }, author_plan: arrObj, tuning_artifact: { type: 'string' },
+   apply_env: { type: 'string' }, apply_flags: { type: 'string' }, code_patch: { type: 'string' },
+diff --git a/e2e_workflow/roles/op_benchmarker.md b/e2e_workflow/roles/op_benchmarker.md
+index a583da50b..25fa6e9d0 100644
+--- a/e2e_workflow/roles/op_benchmarker.md
++++ b/e2e_workflow/roles/op_benchmarker.md
+@@ -301,6 +301,7 @@ Return JSON:
+   "winner_backend": "aiter|hipblaslt|triton|flydsl|ck|none",
+   "winner_kind": "env|flag|patch|none",
+   "isolated_speedup": 1.0,
++  "measured": true,
+   "winner_editable": false,
+   "best_known_ms": 0.0,
+   "recommend_tier_c": false,
+@@ -321,6 +322,10 @@ Return JSON:
+   "reason": "the route decision: direct_light winner and/or which languages to author, with Amdahl headroom"
+ }
+ ```
++- `measured` / `isolated_speedup` — copy BOTH straight from `opbench_result.json`; never fill one in
++  yourself. `measured:false` means no backend produced a timing, and then `isolated_speedup` is `null`,
++  not `0.0`. `0.0` means the bake-off ran and nothing was faster — a different fact, and the acceptance
++  gate needs to tell them apart.
+ - `gate:"have_winner"` — a direct_light (env/flag) winner is ready to integrate now.
+ - `gate:"author_recommended"` — no direct win, but `author_plan` is non-empty: the orchestrator should
+   run `kernel_workflow` per the plan and integrate the fastest authored result that beats `best_known_ms`.
+diff --git a/e2e_workflow/scripts/harness_lib.py b/e2e_workflow/scripts/harness_lib.py
+index 44538a567..d28fcdb8f 100644
+--- a/e2e_workflow/scripts/harness_lib.py
++++ b/e2e_workflow/scripts/harness_lib.py
+@@ -685,6 +685,8 @@ def amdahl_ceiling(pct_gpu, isolated_speedup):
+     if p > 1.0:
+         p /= 100.0
+     p = min(max(p, 0.0), 1.0)
++    if isolated_speedup is None:
++        return 0.0        # no measurement -> no attributable ceiling; same answer as a non-win
+     s = float(isolated_speedup)
+     if s <= 0:
+         return 0.0
+@@ -741,6 +743,56 @@ def served_regimes(meta):
+     return {str(r).strip().lower() for r in sr if str(r).strip()}
+ 
+ 
++def served_buckets(meta):
++    """The M buckets this kernel actually SERVES, with their analytic per-wave pass counts.
++
++    `op_bench` benched at `max(m_buckets)`, on the premise that the largest bucket carries the
++    GPU-time mass. It does not. Mass = per-launch time x LAUNCHES, and the analytic call model
++    (`serving_weight_model.analytic_calls`) counts prefill = CONC*ceil(ISL/chunk) passes against
++    decode = OSL passes. Neither bucket dominates universally -- prefill runs few large passes,
++    decode runs many small ones -- so a single bucket cannot represent the served mix, and the
++    LARGEST one is routinely the least-served shape.
++
++    Decode's M is the concurrency (snapped to a graph capture size); prefill's is the chunk, or
++    ISL when the server does not chunk. Each is matched to the nearest profiled `m_buckets` entry
++    when one exists, so the bench runs on a shape the profile actually saw.
++
++    Returns [(phase, M, calls), ...] ordered by descending calls, de-duplicated by M. Returns []
++    when meta carries no serving model (offline / unit-test metas), which leaves callers on their
++    previous single-bucket behaviour."""
++    swm = ((meta or {}).get("workload") or {}).get("serving_weight_model") or {}
++    calls = swm.get("analytic_calls") or {}
++    if not calls:
++        return []
++    buckets = [int(b) for b in (meta.get("m_buckets") or [])
++               if str(b).strip().lstrip("-").isdigit()]
++    served = served_regimes(meta)
++    want = {"decode": swm.get("conc"),
++            "prefill": swm.get("prefill_chunk") or swm.get("isl")}
++    out = {}
++    for phase, n in calls.items():
++        ph = str(phase).strip().lower()
++        if served and ph not in served:
++            continue                      # a phase this kernel does not run in carries no weight
++        m, n = want.get(ph), _int_or_none(n)
++        m = _int_or_none(m)
++        if not m or not n or n <= 0:
++            continue
++        if buckets:
++            m = min(buckets, key=lambda b: abs(b - m))
++        prev = out.get(m)
++        if prev is None or n > prev[2]:
++            out[m] = (ph, m, n)
++    return sorted(out.values(), key=lambda t: -t[2])
++
++
++def _int_or_none(x):
++    try:
++        return int(x)
++    except (TypeError, ValueError):
++        return None
++
++
+ def serving_weighted_speedup(per_case, meta, *, identity_eps=1e-4, geomean=True):
+     """Centralized PRIMARY-metric weighting for the immutable unittests — replaces the per-kernel
+     hand-rolled `_serving_calls`/`weight` blocks so every UT applies the SAME audited rule. Enforces:
+diff --git a/e2e_workflow/scripts/op_bench.py b/e2e_workflow/scripts/op_bench.py
+index 82f7a3158..939043c5f 100644
+--- a/e2e_workflow/scripts/op_bench.py
++++ b/e2e_workflow/scripts/op_bench.py
+@@ -139,16 +139,19 @@ def _dtype(torch, name):
+             }.get(str(name).lower(), torch.bfloat16)
+ 
+ 
+-def _resolve_shape(shape, meta):
++def _resolve_shape(shape, meta, m_override=None):
+     """Resolve a shape that may carry SYMBOLIC dims (e.g. "M" for a dynamic GEMM row count) into
+     concrete ints. String dims are mapped via meta: "M"/"m*"/"-1"/None -> a representative value from
+-    meta["m_buckets"] (the dominant = LARGEST profiled bucket). Raises a CLEAR error if a symbolic dim
++    meta["m_buckets"] -- `m_override` when the caller is benching a specific served bucket, else the
++    largest profiled one. Raises a CLEAR error if a symbolic dim
+     cannot be resolved, so the caller records a meaningful harness error instead of a cryptic
+     `randn(str, int, ...)` TypeError (the exact bug this guards against)."""
+     if not shape:
+         raise ValueError("empty/None shape")
+     buckets = [int(b) for b in (meta.get("m_buckets") or []) if str(b).strip().lstrip("-").isdigit()]
+-    rep_m = max(buckets) if buckets else None
++    # `m_override` is the bucket the caller is currently benching (see bench_gemm's served sweep).
++    # Without one, fall back to the largest profiled bucket.
++    rep_m = int(m_override) if m_override else (max(buckets) if buckets else None)
+     out = []
+     for d in shape:
+         if isinstance(d, bool):
+@@ -247,18 +250,18 @@ def _synth_blockscale_case(torch, meta, M, device, seed):
+     return {"x": x_q, "w": w_q, "x_scale": x_scale, "w_scale": w_scale, "ref": ref, "M": M, "out_dt": out_dt}
+ 
+ 
+-def bench_blockscale_gemm(args, meta):
++def bench_blockscale_gemm(args, meta, m_override=None):
+     """Bake-off for an fp8 a8w8 blockscale GEMM head. The generic dense torch-BLAS backends cannot
+     represent this op (fp8 + per-block scales), so the candidates are the meta callable(s):
+     the live baseline blockscale path + its bpreshuffle variant (same signature
+-    fn(x, w, x_scale, w_scale, dtype=out)). Benched at the DOMINANT (largest) m_bucket — the GPU-time
+-    mass. Returns the standard per-backend results list."""
++    fn(x, w, x_scale, w_scale, dtype=out)). Benched at `m_override` — the served bucket the caller is
++    sweeping — else the largest profiled bucket. Returns the standard per-backend results list."""
+     torch = _torch()
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+     buckets = [int(b) for b in (meta.get("m_buckets") or []) if str(b).strip().lstrip("-").isdigit()]
+     if not buckets:
+-        buckets = [int(_resolve_shape(meta.get("a_shape") or ["M"], meta)[0])]
+-    M = max(buckets)
++        buckets = [int(_resolve_shape(meta.get("a_shape") or ["M"], meta, m_override)[0])]
++    M = int(m_override) if m_override else max(buckets)
+     case = _synth_blockscale_case(torch, meta, M, device, args.seed)
+     out_dt = case["out_dt"]
+ 
+@@ -309,7 +312,7 @@ def record(name, fn, note=""):
+     return results
+ 
+ 
+-def _load_or_synth_gemm(torch, task, meta, device, seed):
++def _load_or_synth_gemm(torch, task, meta, device, seed, m_override=None):
+     """Return (A, B, bias, transpose_b, ref). Prefer the recorded oracle; else synthesize + compute ref
+     with the default backend (perf is value-independent; this only fixes the correctness target)."""
+     dt = _dtype(torch, meta.get("dtype", "bf16"))
+@@ -335,8 +338,8 @@ def _load_or_synth_gemm(torch, task, meta, device, seed):
+     a_shape0 = meta.get("a_shape"); b_shape0 = meta.get("b_shape")
+     if not (a_shape0 and b_shape0):
+         raise ValueError("gemm task has neither reference_io.pt nor a_shape/b_shape in meta.json")
+-    a_shape = _resolve_shape(a_shape0, meta)
+-    b_shape = _resolve_shape(b_shape0, meta)
++    a_shape = _resolve_shape(a_shape0, meta, m_override)
++    b_shape = _resolve_shape(b_shape0, meta, m_override)
+     g = torch.Generator(device="cpu").manual_seed(int(seed))
+     A = (torch.randn(*a_shape, generator=g) * 0.1).to(device=device, dtype=dt)
+     B = (torch.randn(*b_shape, generator=g) * 0.1).to(device=device, dtype=dt)
+@@ -385,13 +388,75 @@ def _tunableop(torch, enable, tuning, filename=None):
+         return False
+ 
+ 
++def _merge_served(per_bucket):
++    """Collapse one results-list per served bucket into ONE results list whose `ms` is the
++    SERVED-weighted per-launch time.
++
++    A kernel is not one shape. Benching a single bucket reports a speedup at a shape the workload
++    may barely run; the served mix is what moves e2e. Weighting by the analytic pass counts,
++
++        ms_served = sum(ms_bucket * calls_bucket) / sum(calls_bucket)
++
++    makes the ratio baseline/candidate exactly the served-weighted speedup, so every downstream
++    consumer (winner pick, isolated_speedup, the Amdahl ceiling) becomes served-weighted with no
++    further change. `ms_by_bucket` keeps the per-shape numbers visible for audit.
++
++    A backend is only credited where it ran correctly EVERYWHERE it is served: a bucket that raised
++    or failed correctness makes the merged entry incorrect, so a candidate that wins at one shape
++    and breaks at another cannot be selected.
++
++    `per_bucket`: [(phase, M, calls, results), ...]."""
++    merged, order = {}, []
++    for phase, M, calls, results in per_bucket:
++        for r in results or []:
++            name = r.get("backend")
++            e = merged.get(name)
++            if e is None:
++                e = merged[name] = dict(r)
++                e["ms_by_bucket"], e["_num"], e["_den"] = {}, 0.0, 0.0
++                order.append(name)
++            e["ms_by_bucket"][f"{phase}:M={M}"] = r.get("ms")
++            e["available"] = bool(e.get("available")) and bool(r.get("available"))
++            e["correct"] = bool(e.get("correct")) and bool(r.get("correct"))
++            e["raised"] = bool(e.get("raised")) or bool(r.get("raised"))
++            if r.get("ms") and r.get("correct"):
++                e["_num"] += float(r["ms"]) * calls
++                e["_den"] += calls
++            if not r.get("correct") and r.get("note"):
++                e["note"] = f"[{phase} M={M}] {r.get('note')}"
++    out = []
++    for name in order:
++        e = merged[name]
++        num, den = e.pop("_num"), e.pop("_den")
++        e["ms"] = round(num / den, 4) if (den and e.get("correct")) else None
++        e["note"] = (f"{e.get('note') or ''} | served-weighted over "
++                     f"{len(e['ms_by_bucket'])} buckets {e['ms_by_bucket']}").strip(" |")
++        out.append(e)
++    return out
++
++
+ def bench_gemm(args, meta):
++    """Bake-off across the SERVED buckets, not just the largest one. Falls back to the historical
++    single-bucket bench only when meta names no served shape at all.
++
++    One served bucket is still a served shape, and it is the case that matters most: a decode-only
++    kernel resolves to exactly one bucket, and falling back there benched it at ``max(m_buckets)``
++    -- a prefill shape the kernel never runs. ``_merge_served`` over a single bucket is the identity
++    on ``ms``, so routing one and many down the same path needs no special case and gains the
++    ``ms_by_bucket`` audit trail."""
++    buckets = _hlib.served_buckets(meta) if _hlib is not None else []
++    if not buckets:
++        return _bench_gemm_at(args, meta)
++    return _merge_served([(ph, M, n, _bench_gemm_at(args, meta, M)) for ph, M, n in buckets])
++
++
++def _bench_gemm_at(args, meta, m_override=None):
+     torch = _torch()
+     # Quantized block-scaled GEMM (fp8 a8w8 blockscale, …) takes the dedicated path — the generic dense
+     # torch-BLAS backends below cannot represent fp8 + per-block scales (this is the head that used to die
+     # on `randn(str,int,...)`; it is now benched with the immutable-oracle construction).
+     if _is_blockscale_gemm(meta):
+-        return bench_blockscale_gemm(args, meta)
++        return bench_blockscale_gemm(args, meta, m_override)
+     # Grouped/packed-quant MoE GEMM (int4_w4a16 / awq / gptq / 3D [E,N,K] / structured shape:{E,..}):
+     # the dense torch-BLAS bake-off below cannot represent packed/3D weights — it would raise ValueError
+     # (no a_shape/b_shape) or RuntimeError (.t() on a 3D weight). Record a clean, non-raising skip so the
+@@ -407,7 +472,7 @@ def bench_gemm(args, meta):
+                      % (meta.get("kernel_class"), meta.get("dtype"))),
+         }]
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+-    A, B, bias, transpose_b, ref = _load_or_synth_gemm(torch, args.task, meta, device, args.seed)
++    A, B, bias, transpose_b, ref = _load_or_synth_gemm(torch, args.task, meta, device, args.seed, m_override)
+     ref = ref.to(device)
+     # Default excludes the experimental triton stub (it's a placeholder; real triton GEMM is a Tier-C
+     # kernel-squad rewrite, not a bake-off candidate). Request it explicitly with --backends if wanted.
+@@ -680,9 +745,15 @@ def bench_attn(args, meta):
+     if not os.path.exists(iopath):
+         return [{"backend": "current", "available": False, "correct": False, "ms": None,
+                  "note": "attn bake-off needs reference_io.pt (captured q/k/v/meta); none found"}]
++    # A recorded SKIP, not a verdict. This path takes no timing at all, so `available: True,
++    # correct: True, ms: None` claimed a result it never measured -- which is exactly the
++    # self-contradiction main() now flags. Attention is not a contradictory row; it is a deliberate
++    # delegation, so it says so and stays out of the fault signal. This keeps the shipped attention
++    # cards true (`harness_suspect=false expected`) and leaves that rule for rows that really do
++    # contradict themselves.
+     note = ("attention backend comparison is a SERVER-level flag (--attention-backend) -> delegated to "
+-            "the Config Tuner fast path; op-level here only validates the oracle")
+-    return [{"backend": "current", "available": True, "correct": True, "ms": None,
++            "the Config Tuner fast path; op-level bake-off skipped (no timing taken here)")
++    return [{"backend": "current", "available": False, "correct": False, "ms": None,
+              "note": note, "artifact": iopath}]
+ 
+ 
+@@ -732,13 +803,24 @@ def main():
+     ran_any = any(r.get("ms") for r in results)
+     raised = [r for r in results if r.get("raised") or r.get("backend") == "ERROR"
+               or "raised" in str(r.get("note", "")) or "failed:" in str(r.get("note", ""))]
+-    harness_suspect = bool(results) and (not ran_any) and len(raised) > 0
++    # A row that claims it was AVAILABLE and CORRECT while carrying no ``ms`` contradicts
++    # itself: it reports a verdict on a timing it never took. Requiring an exception missed
++    # this quiet form, and the quiet form is the common one. A recorded skip
++    # (``available: False``) asserts nothing and stays out of the fault signal.
++    unmeasured_claim = [r for r in results
++                        if r.get("available") and r.get("correct") and r.get("ms") is None]
++    harness_suspect = bool(results) and (not ran_any) and bool(raised or unmeasured_claim)
+     harness_error = ""
+     if harness_suspect:
+-        r0 = raised[0]
+-        harness_error = str(r0.get("note") or r0.get("trace") or "unknown harness error")[:400]
+-    speedup = (baseline["ms"] / winner["ms"]) if (winner and baseline and winner["ms"]) else (
+-        1.0 if winner else 0.0)
++        r0 = (raised or unmeasured_claim)[0]
++        harness_error = str(r0.get("note") or r0.get("trace")
++                            or "backend reported available+correct but produced no timing")[:400]
++    # A speedup is a MEASUREMENT, so absent a measurement there is no number to publish.
++    # Reporting 0.0 for "never timed" made it indistinguishable from "timed, not faster",
++    # and the acceptance gate cannot tell a kernel it declined from one it never ran.
++    measured = bool(ran_any)
++    speedup = ((baseline["ms"] / winner["ms"]) if (winner and baseline and winner["ms"])
++               else (1.0 if winner else (0.0 if measured else None)))
+     wb = winner["backend"] if winner else None
+     # Only triton/hip are source-editable (-> Tier-C kernel-squad rewrite). ck is a library backend.
+     editable = bool(wb in ("triton", "hip"))
+@@ -779,7 +861,8 @@ def main():
+         "winner_ms": winner["ms"] if winner else None,
+         "baseline_backend": baseline["backend"] if baseline else None,
+         "baseline_ms": baseline["ms"] if baseline else None,
+-        "isolated_speedup": round(speedup, 4),
++        "measured": measured,
++        "isolated_speedup": round(speedup, 4) if speedup is not None else None,
+         "pct_gpu_time": pct_gpu,
+         "amdahl_ceiling_e2e_pct": amdahl_ceiling_pct,
+         "winner_editable": editable,
+diff --git a/e2e_workflow/scripts/tests/test_harness_lib.py b/e2e_workflow/scripts/tests/test_harness_lib.py
+index 5aff61e1c..619a3cba5 100644
+--- a/e2e_workflow/scripts/tests/test_harness_lib.py
++++ b/e2e_workflow/scripts/tests/test_harness_lib.py
+@@ -1468,6 +1468,7 @@ def test_a_one_x_speedup_buys_nothing(self):
+         self.assertEqual(hl.amdahl_ceiling(0.5, 1.0), 0.0)
+ 
+     def test_a_zero_or_negative_speedup_is_no_ceiling_at_all(self):
++        self.assertEqual(hl.amdahl_ceiling(0.5, None), 0.0)   # unmeasured -> no attributable ceiling
+         self.assertEqual(hl.amdahl_ceiling(0.5, 0.0), 0.0)
+         self.assertEqual(hl.amdahl_ceiling(0.5, -3.0), 0.0)
+ 
+@@ -1988,5 +1989,64 @@ def test_the_seed_changes_the_mapping_reproducibly(self):
+             a, hl.shuffled_block_table(1, 2, seed=1, torch=self.torch, device="cpu").tolist())
+ 
+ 
++def _swm_meta(**kw):
++    swm = {"isl": 16384, "osl": 1024, "conc": 64, "prefill_chunk": 8192,
++           "analytic_calls": {"prefill": 64, "decode": 1024}}
++    swm.update(kw.pop("swm", {}))
++    meta = {"m_buckets": [64, 1024, 8192], "workload": {"serving_weight_model": swm}}
++    meta.update(kw)
++    return meta
++
++
++class ServedBucketsTest(unittest.TestCase):
++    """`served_buckets` replaces `max(m_buckets)` as the answer to "what shape do we bench?".
++
++    The old premise -- largest bucket == the GPU-time mass -- is false: mass is per-launch time x
++    LAUNCHES, and decode runs OSL passes at the small bucket against prefill's CONC*ceil(ISL/chunk)
++    passes at the large one. These pin the mapping from the serving model to the shapes to bench."""
++
++    def test_both_served_phases_are_returned_ordered_by_pass_count(self):
++        self.assertEqual(hl.served_buckets(_swm_meta()),
++                         [("decode", 64, 1024), ("prefill", 8192, 64)])
++
++    def test_the_largest_bucket_is_not_the_most_served_one(self):
++        # the exact defect: max(m_buckets) is 8192, but 1024 of the 1088 served passes are at M=64.
++        buckets = hl.served_buckets(_swm_meta())
++        self.assertEqual(max(m for _, m, _ in buckets), 8192)
++        self.assertEqual(buckets[0][1], 64)
++
++    def test_a_phase_m_snaps_to_the_nearest_profiled_bucket(self):
++        # conc=100 was never profiled; the closest shape the profile actually saw is 64.
++        m = _swm_meta(swm={"conc": 100})
++        self.assertEqual(dict((p, b) for p, b, _ in hl.served_buckets(m))["decode"], 64)
++
++    def test_a_phase_the_kernel_does_not_serve_carries_no_weight(self):
++        m = _swm_meta(served_regimes=["decode"])
++        self.assertEqual(hl.served_buckets(m), [("decode", 64, 1024)])
++
++    def test_prefill_falls_back_to_isl_when_the_server_does_not_chunk(self):
++        m = _swm_meta(swm={"prefill_chunk": None}, m_buckets=[64, 16384])
++        self.assertEqual(dict((p, b) for p, b, _ in hl.served_buckets(m))["prefill"], 16384)
++
++    def test_one_shape_serving_both_phases_is_reported_once(self):
++        # conc == chunk: both phases land on the same bucket; it must not be benched twice.
++        m = _swm_meta(swm={"conc": 8192}, m_buckets=[8192])
++        self.assertEqual(hl.served_buckets(m), [("decode", 8192, 1024)])
++
++    def test_no_serving_model_leaves_the_caller_on_its_old_behaviour(self):
++        self.assertEqual(hl.served_buckets({"m_buckets": [8192]}), [])
++        self.assertEqual(hl.served_buckets({}), [])
++        self.assertEqual(hl.served_buckets(None), [])
++
++    def test_unusable_call_counts_are_dropped_not_guessed(self):
++        m = _swm_meta(swm={"analytic_calls": {"prefill": 0, "decode": "x", "edge": 5}})
++        self.assertEqual(hl.served_buckets(m), [])
++
++    def test_buckets_are_used_only_to_snap_never_to_invent_a_phase(self):
++        # a profiled bucket with no serving phase behind it is not benched.
++        m = _swm_meta(m_buckets=[64, 512, 8192])
++        self.assertNotIn(512, [b for _, b, _ in hl.served_buckets(m)])
++
++
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)
+diff --git a/e2e_workflow/scripts/tests/test_op_bench.py b/e2e_workflow/scripts/tests/test_op_bench.py
+index 0ae442bcb..f4efaf637 100644
+--- a/e2e_workflow/scripts/tests/test_op_bench.py
++++ b/e2e_workflow/scripts/tests/test_op_bench.py
+@@ -1501,15 +1501,22 @@ def test_missing_capture_is_reported_as_unavailable(self):
+         self.assertIsNone(res[0]["ms"])
+         self.assertIn("needs reference_io.pt", res[0]["note"])
+ 
+-    def test_captured_oracle_is_validated_and_backend_swaps_are_delegated(self):
++    def test_a_captured_oracle_is_a_recorded_skip_and_says_where_the_race_happens(self):
++        """No timing is taken here, so the row must not claim one.
++
++        Reporting ``available+correct`` with ``ms: None`` asserted a verdict on a measurement that
++        never happened -- the same self-contradiction ``main()`` flags as a harness fault. Attention
++        is not a contradictory row, it is a deliberate delegation to the server-level flag, so it
++        records a skip. That also keeps the shipped attention cards true.
++        """
+         d = self._task_dir()
+         io_path = os.path.join(d, "reference_io.pt")
+         open(io_path, "w").close()
+         res = ob.bench_attn(self._args(task=d), {"op_kind": "attn"})
+-        self.assertTrue(res[0]["available"])
+-        self.assertTrue(res[0]["correct"])
++        self.assertFalse(res[0]["available"])
++        self.assertFalse(res[0]["correct"])
+         self.assertIsNone(res[0]["ms"])                     # op-level attention is not raced here
+-        self.assertEqual(res[0]["artifact"], io_path)
++        self.assertEqual(res[0]["artifact"], io_path)       # the capture is still handed downstream
+         self.assertIn("--attention-backend", res[0]["note"])
+         self.assertIn("Config Tuner", res[0]["note"])
+ 
+@@ -1758,5 +1765,197 @@ def test_out_file_carries_the_task_dir_and_full_result_list(self):
+         self.assertEqual(summary["apply_flags"], "")
+ 
+ 
++def _r(backend, ms, correct=True, **kw):
++    d = {"backend": backend, "available": True, "correct": correct, "ms": ms}
++    d.update(kw)
++    return d
++
++
++class MergeServedTest(unittest.TestCase):
++    """`_merge_served` collapses a per-bucket sweep into ONE served-weighted number.
++
++    The point of the sweep is that a candidate's speedup is shape-dependent: a large-M prefill
++    tile can be much faster at M=8192 and no better -- or worse -- at the M=64 the workload spends
++    94% of its passes on. Benching one shape reported the first number and hid the second."""
++
++    def test_ms_is_the_pass_weighted_mean_not_the_largest_buckets(self):
++        merged = ob._merge_served([("decode", 64, 1024, [_r("cand", 1.0)]),
++                                   ("prefill", 8192, 64, [_r("cand", 10.0)])])
++        self.assertEqual(len(merged), 1)
++        # (1.0*1024 + 10.0*64) / 1088 == 1.5294 ; the single-bucket bench would have said 10.0
++        self.assertAlmostEqual(merged[0]["ms"], 1.5294, places=3)
++
++    def test_a_win_only_at_the_unserved_shape_no_longer_wins(self):
++        """The regression this fix exists for: `cand` is 5x faster at the big prefill bucket and
++        2x SLOWER at the decode bucket the workload runs 1024 of its 1088 passes on. Benching
++        max(m_buckets) alone reports 5x. Served-weighted it is a net LOSS, because the decode
++        penalty (1.0ms x 1024 passes) dwarfs the prefill saving (8.0ms x 64 passes)."""
++        sweep = [("decode", 64, 1024, [_r("base", 1.0), _r("cand", 2.0)]),
++                 ("prefill", 8192, 64, [_r("base", 10.0), _r("cand", 2.0)])]
++        merged = {r["backend"]: r for r in ob._merge_served(sweep)}
++        big_bucket_speedup = 10.0 / 2.0
++        served_speedup = merged["base"]["ms"] / merged["cand"]["ms"]
++        self.assertEqual(big_bucket_speedup, 5.0)
++        self.assertLess(served_speedup, 1.0)
++
++    def test_the_per_bucket_numbers_stay_visible_for_audit(self):
++        merged = ob._merge_served([("decode", 64, 1024, [_r("cand", 1.0)]),
++                                   ("prefill", 8192, 64, [_r("cand", 10.0)])])
++        self.assertEqual(merged[0]["ms_by_bucket"], {"decode:M=64": 1.0, "prefill:M=8192": 10.0})
++        self.assertIn("served-weighted over 2 buckets", merged[0]["note"])
++
++    def test_a_candidate_that_breaks_at_one_served_shape_is_not_correct_anywhere(self):
++        merged = ob._merge_served([("decode", 64, 1024, [_r("cand", 1.0)]),
++                                   ("prefill", 8192, 64, [_r("cand", None, correct=False,
++                                                             note="wrong at large M")])])
++        self.assertFalse(merged[0]["correct"])
++        self.assertIsNone(merged[0]["ms"])                 # never selectable as a winner
++        self.assertIn("[prefill M=8192] wrong at large M", merged[0]["note"])
++
++    def test_a_bucket_that_raised_propagates_and_does_not_poison_the_mean(self):
++        merged = ob._merge_served([("decode", 64, 1024, [_r("cand", 1.0)]),
++                                   ("prefill", 8192, 64, [_r("cand", None, correct=False,
++                                                             raised=True)])])
++        self.assertTrue(merged[0]["raised"])
++        self.assertIsNone(merged[0]["ms"])
++
++    def test_backend_order_is_preserved_so_the_baseline_lookup_still_works(self):
++        merged = ob._merge_served([("decode", 64, 1024, [_r("hipblaslt", 1.0), _r("ck", 2.0)]),
++                                   ("prefill", 8192, 64, [_r("hipblaslt", 3.0), _r("ck", 4.0)])])
++        self.assertEqual([r["backend"] for r in merged], ["hipblaslt", "ck"])
++
++    def test_a_backend_missing_from_one_bucket_is_still_merged(self):
++        merged = {r["backend"]: r for r in
++                  ob._merge_served([("decode", 64, 1024, [_r("a", 1.0), _r("b", 2.0)]),
++                                    ("prefill", 8192, 64, [_r("a", 3.0)])])}
++        self.assertEqual(merged["b"]["ms"], 2.0)
++        self.assertEqual(set(merged["a"]["ms_by_bucket"]), {"decode:M=64", "prefill:M=8192"})
++
++
++class ServedSweepDispatchTest(unittest.TestCase):
++    """bench_gemm sweeps the served buckets; with nothing to sweep it must behave exactly as before."""
++
++    def setUp(self):
++        self.calls = []
++        self._orig = ob._bench_gemm_at
++        ob._bench_gemm_at = lambda args, meta, m=None: (self.calls.append(m) or [_r("x", 1.0)])
++        self.addCleanup(lambda: setattr(ob, "_bench_gemm_at", self._orig))
++
++    def test_two_served_buckets_are_each_benched(self):
++        ob.bench_gemm(None, _swm_meta_ob())
++        self.assertEqual(sorted(c for c in self.calls if c), [64, 8192])
++
++    def test_no_serving_model_benches_once_at_the_old_shape(self):
++        ob.bench_gemm(None, {"m_buckets": [8192]})
++        self.assertEqual(self.calls, [None])
++
++    def test_a_decode_only_kernel_is_benched_at_its_decode_shape(self):
++        """One served bucket is still a served shape.
++
++        A decode-only kernel resolves to exactly one bucket, ``('decode', 64, 1024)``.
++        Falling back to the historical path benched it at ``max(m_buckets)`` = 8192 --
++        a prefill shape it never runs. That is the defect this PR exists to fix, so the
++        single-bucket case must take the served M, not the largest one.
++        """
++        ob.bench_gemm(None, _swm_meta_ob(served_regimes=["decode"]))
++        self.assertEqual(self.calls, [64])
++
++    def test_a_prefill_only_kernel_is_benched_at_its_prefill_shape(self):
++        ob.bench_gemm(None, _swm_meta_ob(served_regimes=["prefill"]))
++        self.assertEqual(self.calls, [8192])
++
++    def test_a_single_bucket_sweep_reports_the_bucket_timing_unchanged(self):
++        """``_merge_served`` over one bucket is the identity on ``ms`` -- collapsing the
++        special case must not perturb the number, only record the shape it came from."""
++        out = ob.bench_gemm(None, _swm_meta_ob(served_regimes=["decode"]))
++        self.assertEqual(out[0]["ms"], 1.0)
++        self.assertEqual(list(out[0]["ms_by_bucket"]), ["decode:M=64"])
++
++
++def _swm_meta_ob(**kw):
++    meta = {"m_buckets": [64, 1024, 8192],
++            "workload": {"serving_weight_model": {
++                "isl": 16384, "osl": 1024, "conc": 64, "prefill_chunk": 8192,
++                "analytic_calls": {"prefill": 64, "decode": 1024}}}}
++    meta.update(kw)
++    return meta
++
++
++class TestUnmeasuredIsNotZero(unittest.TestCase):
++    """``isolated_speedup`` is a measurement, so an unmeasured bake-off publishes none.
++
++    Reporting ``0.0`` for "never timed" made it read exactly like "timed, and not
++    faster". Every attention bake-off in the campaign took that path, so the gate
++    declined kernels it had never benched. Regression cover for that whole class.
++    """
++
++    def setUp(self):
++        self.h = TestMainSummary()
++        self.h.setUp()
++        self._run_main = self.h._run_main
++
++    def tearDown(self):
++        self.h.tearDown()
++
++    @staticmethod
++    def _claims_ran(backend, note=""):
++        """A row asserting available+correct while carrying no timing (bench_attn)."""
++        return {"backend": backend, "available": True, "correct": True, "ms": None, "note": note}
++
++    def test_a_bakeoff_that_timed_nothing_publishes_a_null_speedup(self):
++        summary, _ = self._run_main(
++            {"op_kind": "attn"},
++            results=[self._claims_ran("current", "delegated to the Config Tuner fast path")])
++        self.assertIsNone(summary["isolated_speedup"])
++        self.assertFalse(summary["measured"])
++
++    def test_a_row_claiming_it_ran_without_a_timing_is_a_harness_fault(self):
++        summary, _ = self._run_main(
++            {"op_kind": "attn"}, results=[self._claims_ran("current")])
++        self.assertTrue(summary["harness_suspect"])
++        self.assertIn("no timing", summary["harness_error"])
++
++    def test_a_recorded_skip_still_is_not_a_harness_fault(self):
++        """``available: False`` asserts nothing; only a self-contradicting row does."""
++        summary, _ = self._run_main(
++            {"op_kind": "gemm"},
++            results=[{"backend": "grouped_quant_gemm", "available": False,
++                      "correct": False, "ms": None, "note": "not a candidate"}])
++        self.assertFalse(summary["harness_suspect"])
++
++    def test_the_real_bench_attn_row_is_unmeasured_but_not_a_fault(self):
++        """The two rules together, on the row bench_attn actually emits.
++
++        Every attention bake-off in the campaign flows through here. It must publish no speedup
++        (nothing was timed) AND raise no fault (nothing was claimed) -- 318 silent zeros must not
++        become 318 false alarms.
++        """
++        summary, _ = self._run_main(
++            {"op_kind": "attn"},
++            results=[{"backend": "current", "available": False, "correct": False, "ms": None,
++                      "note": "delegated to the Config Tuner fast path; op-level bake-off skipped"}])
++        self.assertIsNone(summary["isolated_speedup"])
++        self.assertFalse(summary["measured"])
++        self.assertFalse(summary["harness_suspect"])
++
++    def test_a_measured_bakeoff_with_no_correct_backend_still_reports_zero(self):
++        """Timed but all-incorrect is a real verdict and must keep its 0.0."""
++        summary, _ = self._run_main(
++            {"op_kind": "gemm"},
++            results=[{"backend": "triton", "available": True, "correct": False, "ms": 1.5}])
++        self.assertEqual(summary["isolated_speedup"], 0.0)
++        self.assertTrue(summary["measured"])
++        self.assertFalse(summary["harness_suspect"])
++
++    def test_a_real_win_is_unchanged(self):
++        summary, _ = self._run_main(
++            {"op_kind": "gemm"},
++            results=[{"backend": "hipblaslt", "available": True, "correct": True, "ms": 2.0},
++                     {"backend": "triton", "available": True, "correct": True, "ms": 1.0}])
++        self.assertEqual(summary["isolated_speedup"], 2.0)
++        self.assertTrue(summary["measured"])
++        self.assertFalse(summary["harness_suspect"])
++
++
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)
+diff --git a/kernel_workflow/kernel_workflow.js b/kernel_workflow/kernel_workflow.js
+index 4dedc4c3a..87c4fb2ec 100644
+--- a/kernel_workflow/kernel_workflow.js
++++ b/kernel_workflow/kernel_workflow.js
+@@ -110,7 +110,10 @@ const FREEZE_SCHEMA = obj({
+ const OPBENCH_SCHEMA = obj({
+   short_name: { type: 'string' }, op_kind: { type: 'string' }, provenance_ok: { type: 'boolean' },
+   winner_backend: { type: 'string' }, winner_kind: { type: 'string' },
+-  isolated_speedup: { type: 'number' }, winner_editable: { type: 'boolean' },
++  // null when nothing was timed -- a speedup is a measurement, and 0.0 read as
++  // 'benched, not faster'. `measured` is the discriminator; gate on it, not on the number.
++  isolated_speedup: { type: ['number', 'null'] }, measured: { type: 'boolean' },
++  winner_editable: { type: 'boolean' },
+   best_known_ms: { type: 'number' },
+   baseline_ms: { type: 'number' },     // ms of the FROZEN input kernel (baseline_src/) on the same oracle
+   tuned_speedup: { type: 'number' },   // best tuned env backend's speedup vs the FROZEN baseline (baseline_ms/tuned_ms)

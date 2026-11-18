@@ -1,0 +1,230 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 5cb1a99123..a578310c57 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -136,6 +136,9 @@ sortingcomponents = [
+     # `torch` is an optional heavy dep used by neural-network peak detection,
+     # motion estimation, and template matching. Install separately if needed:
+     # pip install torch
++    # `medicine-neuro` is likewise optional (and itself depends on torch), needed only
++    # for the "medicine" motion estimation method. Install separately if needed:
++    # pip install medicine-neuro
+ ]
+ 
+ sorters_internal = [
+@@ -309,6 +312,7 @@ test-exporters = [{include-group = "test-common"}]
+ test-sortingcomponents = [
+     {include-group = "test-common"},
+     "torch",  # neural network peak detection, motion, matching
++    "medicine-neuro",  # "medicine" motion estimation method
+     "huggingface_hub", # for `test_single_channel_toy_denoiser_in_peak_pipeline`
+ ]
+ test-generation = [
+diff --git a/src/spikeinterface/sortingcomponents/motion/medicine.py b/src/spikeinterface/sortingcomponents/motion/medicine.py
+index 8349a79369..0d1edeb1c9 100644
+--- a/src/spikeinterface/sortingcomponents/motion/medicine.py
++++ b/src/spikeinterface/sortingcomponents/motion/medicine.py
+@@ -14,7 +14,37 @@ class MedicineRegistration:
+     name = "medicine"
+     need_peak_location = True
+     params_doc = """
+-
++    output_dir : str | Path | None, default: None
++        Directory to save MEDiCINe outputs (parameters, figures, motion arrays). If None, nothing is saved to disk.
++    plot_figures : bool, default: False
++        Whether MEDiCINe should plot and save figures summarizing the model results.
++    num_depth_bins : int | None, default: None
++        Number of depth bins for motion estimation, passed to MEDiCINe. If None, this defaults to MEDiCINe's own
++        recommended default: 1 if `rigid` else 2. Note this is intentionally independent of the generic
++        `win_scale_um` / `win_step_um` / `win_margin_um` windowing parameters used by other motion estimation
++        methods, since MEDiCINe is not tuned for the number of depth bins those would otherwise imply.
++    motion_bound : float, default: 800
++        Bound on the maximum absolute motion allowed, in the same units as the spike depths (typically microns).
++    time_kernel_width : float, default: 30
++        Width of the temporal smoothing kernel, in the same units as the spike times (typically seconds).
++    activity_network_hidden_features : tuple, default: (256, 256)
++        Hidden layer sizes for MEDiCINe's activity network.
++    amplitude_threshold_quantile : float, default: 0.0
++        Cutoff quantile in [-1, 1] for peak amplitudes. See MEDiCINe's documentation for details.
++    batch_size : int, default: 4096
++        Batch size used for training.
++    training_steps : int, default: 10000
++        Number of optimization steps to take.
++    initial_motion_noise : float, default: 0.1
++        Initial magnitude of noise added to the motion function output, annealed to 0 over `motion_noise_steps`.
++    motion_noise_steps : int, default: 2000
++        Number of training steps over which `initial_motion_noise` is annealed to 0.
++    optimizer : torch.optim.Optimizer | None, default: None
++        Optimizer class used for training. If None, `torch.optim.Adam` is used.
++    learning_rate : float, default: 0.0005
++        Learning rate used for training.
++    epsilon : float, default: 1e-3
++        Small value to prevent divide-by-zero instabilities.
+     """
+ 
+     @classmethod
+@@ -48,26 +78,17 @@ def run(
+         optimizer=None,
+         learning_rate=0.0005,
+         epsilon=1e-3,
++        num_depth_bins=None,
+     ):
+ 
+         from medicine import run_medicine
+ 
+-        # folder = Path(tempfile.gettempdir())
+-
+-        if rigid:
+-            # force one bin
+-            num_depth_bins = 1
+-        else:
+-
+-            # we use the spatial window mechanism only to estimate the number one spatial bins
+-            dim = ["x", "y", "z"].index(direction)
+-            contact_depths = recording.get_channel_locations()[:, dim]
+-
+-            deph_range = max(contact_depths) - min(contact_depths)
+-            if win_margin_um is not None:
+-                deph_range = deph_range - 2 * win_margin_um
+-            num_depth_bins = max(int(np.round(deph_range / win_scale_um)), 1)
+-            print("num_depth_bins", num_depth_bins)
++        if num_depth_bins is None:
++            # MEDiCINe's own recommended default (see medicine.run.run_medicine) is 2 non-rigid depth bins.
++            # We intentionally do not derive this from win_scale_um/win_margin_um (the generic windowing
++            # parameters used by other motion estimation methods), since those are tuned for different
++            # algorithms and would otherwise silently produce far more depth bins than MEDiCINe expects.
++            num_depth_bins = 1 if rigid else 2
+ 
+         if optimizer is None:
+             import torch
+diff --git a/src/spikeinterface/sortingcomponents/motion/tests/test_medicine.py b/src/spikeinterface/sortingcomponents/motion/tests/test_medicine.py
+new file mode 100644
+index 0000000000..4db1d8bfd7
+--- /dev/null
++++ b/src/spikeinterface/sortingcomponents/motion/tests/test_medicine.py
+@@ -0,0 +1,125 @@
++import numpy as np
++import pytest
++
++torch = pytest.importorskip("torch")
++medicine = pytest.importorskip("medicine")
++
++from spikeinterface import get_noise_levels
++from spikeinterface.core.node_pipeline import ExtractDenseWaveforms, run_node_pipeline
++from spikeinterface.sortingcomponents.motion import estimate_motion
++from spikeinterface.sortingcomponents.peak_detection import detect_peak_methods
++from spikeinterface.sortingcomponents.peak_localization.method_list import LocalizeCenterOfMass
++from spikeinterface.sortingcomponents.tests.common import make_dataset
++
++# Kept tiny so the model trains in a fraction of a second. Not representative of settings
++# one would use for real motion estimation.
++_FAST_TRAINING_KWARGS = dict(batch_size=32, training_steps=15, motion_noise_steps=5)
++
++
++@pytest.fixture(scope="module", name="peaks_and_locations")
++def peaks_and_locations_fixture():
++    recording, _ = make_dataset()
++    noise_levels = get_noise_levels(recording, return_in_uV=False)
++    peak_detector_class = detect_peak_methods["locally_exclusive"]
++    peak_detector = peak_detector_class(
++        recording,
++        noise_levels=noise_levels,
++        peak_sign="neg",
++        detect_threshold=5,
++        exclude_sweep_ms=1.0,
++        return_output=True,
++    )
++    extract_dense_waveforms = ExtractDenseWaveforms(
++        recording, ms_before=0.1, ms_after=0.3, return_output=False, parents=[peak_detector]
++    )
++    peak_localizer = LocalizeCenterOfMass(
++        recording,
++        parents=[peak_detector, extract_dense_waveforms],
++        radius_um=60.0,
++    )
++    peaks, peak_locations = run_node_pipeline(
++        recording,
++        nodes=[peak_detector, extract_dense_waveforms, peak_localizer],
++        job_kwargs=dict(chunk_size=10000, progress_bar=False),
++    )
++    return recording, peaks, peak_locations
++
++
++@pytest.mark.parametrize(
++    "rigid, win_scale_um, expected_num_depth_bins",
++    [
++        # non-rigid: MEDiCINe's own recommended default of 2 depth bins, regardless of win_scale_um
++        # (win_scale_um/win_margin_um are generic windowing parameters used by other motion estimation
++        # methods and should have no bearing on MEDiCINe's num_depth_bins).
++        (False, 300.0, 2),
++        (False, 1000.0, 2),
++        # rigid: a single depth bin, same as MEDiCINe's own rigid convention.
++        (True, 300.0, 1),
++    ],
++)
++def test_medicine_default_num_depth_bins(peaks_and_locations, rigid, win_scale_um, expected_num_depth_bins):
++    """The spikeinterface `medicine` estimate_motion method should resolve num_depth_bins to MEDiCINe's own
++    recommended default, independent of the generic non-rigid window parameters used by other methods."""
++    recording, peaks, peak_locations = peaks_and_locations
++
++    motion = estimate_motion(
++        recording,
++        peaks,
++        peak_locations,
++        direction="y",
++        rigid=rigid,
++        method="medicine",
++        win_scale_um=win_scale_um,
++        **_FAST_TRAINING_KWARGS,
++    )
++
++    assert motion.displacement[0].shape[1] == expected_num_depth_bins
++
++
++def test_medicine_wrapper_matches_original_package(peaks_and_locations):
++    """Calling the spikeinterface `medicine` estimate_motion method (with its default num_depth_bins) should
++    give the exact same outputs as calling the original medicine.run_medicine() with its own default
++    num_depth_bins directly, given the same peaks and RNG state."""
++    recording, peaks, peak_locations = peaks_and_locations
++
++    peak_times = peaks["sample_index"] / recording.get_sampling_frequency()
++    peak_depths = peak_locations["y"]
++    peak_amplitudes = peaks["amplitude"]
++
++    # Run the original MEDiCINe package directly, relying on its own default num_depth_bins.
++    torch.manual_seed(0)
++    np.random.seed(0)
++    _, ref_time_bins, ref_depth_bins, ref_pred_motion = medicine.run_medicine(
++        peak_times=peak_times,
++        peak_depths=peak_depths,
++        peak_amplitudes=peak_amplitudes,
++        output_dir=None,
++        plot_figures=False,
++        **_FAST_TRAINING_KWARGS,
++    )
++
++    # Run through the spikeinterface wrapper without specifying num_depth_bins, letting it fall back to
++    # its default, and check it lands on the exact same settings and outputs.
++    torch.manual_seed(0)
++    np.random.seed(0)
++    motion = estimate_motion(
++        recording,
++        peaks,
++        peak_locations,
++        direction="y",
++        rigid=False,
++        method="medicine",
++        **_FAST_TRAINING_KWARGS,
++    )
++
++    np.testing.assert_array_equal(motion.temporal_bins_s[0], ref_time_bins)
++    np.testing.assert_array_equal(motion.spatial_bins_um, ref_depth_bins)
++    np.testing.assert_array_equal(motion.displacement[0], ref_pred_motion)
++
++
++if __name__ == "__main__":
++    fixture = peaks_and_locations_fixture()
++    test_medicine_default_num_depth_bins(fixture, False, 300.0, 2)
++    test_medicine_default_num_depth_bins(fixture, False, 1000.0, 2)
++    test_medicine_default_num_depth_bins(fixture, True, 300.0, 1)
++    test_medicine_wrapper_matches_original_package(fixture)

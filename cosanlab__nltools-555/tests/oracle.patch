@@ -1,0 +1,1358 @@
+diff --git a/.gitignore b/.gitignore
+index daec0206..c8257412 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -96,3 +96,6 @@ docs/tutorials/workflows/[0-9]*_*.md
+ # page outputs docs_show replays (pages/). Deliberately not under .cache/, which
+ # is zensical's and which `zensical build -c` wipes whole.
+ /.tutorial-cache/
++
++# Local planning artifacts (specs, plans, SDD workspaces)
++.superpowers/
+diff --git a/development/ridge-internals.md b/development/ridge-internals.md
+index 365a3d87..c471b230 100644
+--- a/development/ridge-internals.md
++++ b/development/ridge-internals.md
+@@ -29,7 +29,7 @@ Code: `nltools/models/ridge.py`, with the device and memory layer in
+ | SVD, resolution matrices, alpha and target batching | Himalaya |
+ | Negative-MSE fold scores, conservative rule, tie-breaking | Himalaya |
+ | Dirichlet search over feature-space weights | Himalaya |
+-| Coefficient refitting at fixed hyperparameters | Himalaya (`solve_ridge_svd`) |
++| Coefficient refitting at fixed hyperparameters | Himalaya (`solve_ridge_svd`, or `solve_kernel_ridge_eigenvalues` when wide) |
+ | Public argument names, defaults, and validation | nltools |
+ | Named feature spaces and prediction-time alignment | nltools |
+ | Candidate-weight validation and the underflow floor | nltools |
+@@ -61,11 +61,56 @@ translated for the caller.
+ 
+ ## Which solver runs
+ 
+-| `X` | `alpha` | `cv` | Himalaya entry point |
+-|---|---|---|---|
+-| 2-D array | scalar | `None` | `solve_ridge_svd` |
+-| 2-D array | sequence | int or splitter | `solve_ridge_cv_svd` |
+-| name → 2-D mapping | sequence | int or splitter | `solve_group_ridge_random_search` |
++| `X` | `alpha` | `cv` | shape | Himalaya entry point |
++|---|---|---|---|---|
++| 2-D array | scalar | `None` | `n_samples >= n_features` | `solve_ridge_svd` |
++| 2-D array | scalar | `None` | `n_samples < n_features` | `solve_kernel_ridge_eigenvalues` |
++| 2-D array | sequence | int or splitter | `n_samples >= n_features` | `solve_ridge_cv_svd` |
++| 2-D array | sequence | int or splitter | `n_samples < n_features` | `solve_kernel_ridge_cv_eigenvalues` |
++| name → 2-D mapping | sequence | int or splitter | `n_spaces * n_samples >= n_features` | `solve_group_ridge_random_search` |
++| name → 2-D mapping | sequence | int or splitter | `n_spaces * n_samples < n_features` | `solve_multiple_kernel_ridge_random_search` |
++
++The shape column is Himalaya's flowchart, applied by `_solver_form` with
++`n_features` summed across spaces. A banded fit holds one `(n_samples,
++n_samples)` kernel per space, so it compares the feature count against
++`n_spaces * n_samples`: the kernel form pays off when the average space is
++wider than the sample count, not when the total is. Himalaya itself never
++switches; its primal solvers only warn when a design is wide, and the adapter
++suppresses that warning because it acts on the rule instead. The primal
++cross-validation loop builds `(n_alphas, n_features, n_samples_train)`
++resolution matrices per fold, the kernel loop `(n_alphas, n_samples_test,
++n_samples_train)`, so a wide encoding model would otherwise pay roughly
++`n_features / n_samples` more per alpha per fold. The chosen form is recorded
++as `solver_form_`, and both it and `backend_` are assigned only after the
++solve succeeds, so a fit that raises leaves the previous fitted state intact.
++
++Both forms give the same solution in float64. In float32 the linear kernel
++squares the design's condition number, so the Gram matrix of a rank-deficient
++or near-singular design carries rounding eigenvalues of either sign. Himalaya's
++kernel solvers diagonalize with `eigh` and refuse every candidate alpha below
++twice the magnitude of the most negative one, where a float32 primal solve is
++itself rounding noise, and their selection stays noise-limited for a few
++decades above that floor. With candidates clear of it the two forms select the
++same grid points and agree to working precision; a grid entirely below it makes
++Himalaya score every candidate at its `-1e5` sentinel and return the first.
++Diagonalizing with `svd` instead does not help: it removes the guard without
++removing the noise, and on well-conditioned float32 designs it agrees with the
++primal form less closely than `eigh` does.
++
++The kernel methods build one linear kernel per space with `_linear_kernels`
++inside the same scoped backend as the solve, so a kernel lives on the device
++that consumes it; the ordinary kernel fit releases its device copy of the
++design once the kernel exists. Both kernel fits ask Himalaya for dual weights
++and recover `coef_` once on the host with Himalaya's own functions, which is
++where Himalaya keeps primal weights because they can be large:
++`primal_weights_kernel_ridge` for the ordinary fit and
++`primal_weights_weighted_kernel_ridge` for the banded one, exactly as
++`KernelRidgeCV.get_primal_coef` and `MultipleKernelRidgeCV.get_primal_coef`
++do. The banded solver's own `return_weights="primal"` option is not used: it
++rebuilds the gamma-scaled design on the device and copies it to the host for
++every candidate that improves any target. Both banded fits share
++`_draw_feature_space_candidates` and `_store_banded_state`, so the candidate
++preparation below and the deltas recovery apply to either form.
+ 
+ `search_iterations` and `dirichlet_concentration` are the banded-only
+ arguments: a non-default value of either raises during an ordinary fit rather
+@@ -108,9 +153,11 @@ clamped on the host anyway, so they are drawn under an explicit `numpy` scope.
+ to be finite and strictly positive and every row to sum to one, converts to the
+ feature dtype, and only then raises weights below `np.finfo(dtype).tiny` to
+ `tiny`. That floor is a numerical boundary, not a validation relaxation: the
+-random search scales each space by `sqrt(gamma)` and divides the same buffer
+-back afterwards, and on a float32 device a subnormal weight destroys the buffer
+-on the way back. A zero or negative weight is still an error. Upstream
++primal random search scales each space by `sqrt(gamma)` and divides the same
++buffer back afterwards, and on a float32 device a subnormal weight destroys
++the buffer on the way back. The kernel search scales each kernel by `gamma`
++instead and never divides back, so the floor is harmless there and both forms
++share it. A zero or negative weight is still an error. Upstream
+ [gallantlab/himalaya#107](https://github.com/gallantlab/himalaya/pull/107)
+ proposes the same clamp inside the solver; applying it on the nltools side of
+ the call makes a fork unnecessary.
+@@ -185,8 +232,14 @@ remains correct and is retained for CUDA hosts and larger designs.
+ 
+ It accepts a scalar or per-target `alpha` and optional shared or per-target
+ feature-space weights, promotes the inputs to a floating working dtype, scales
+-space `k` by `sqrt(gamma[k])`, delegates the solve to `solve_ridge_svd`, and
+-scales the coefficients back into the original feature coordinates. The dtype
++space `k` by `sqrt(gamma[k])`, delegates the solve to Himalaya, and scales the
++coefficients back into the original feature coordinates. The scaled design is
++one ordinary ridge system, so the solve follows Himalaya's flowchart with one
++space: `solve_ridge_svd` when the design is tall or square, and when it is
++wide the linear kernel, `solve_kernel_ridge_eigenvalues` with the same scalar
++or per-target alpha, and `primal_weights_kernel_ridge` on the host. A wide fit
++therefore selects its hyperparameters and refits its bootstrap replicates in
++the same solver family. The dtype
+ promotion is load-bearing rather than cosmetic: Himalaya solves in the dtype it
+ is handed, so an integer design matrix — one-hot or binary event regressors, an
+ ordinary thing in this domain — would truncate the shrinkage arithmetic and
+@@ -202,9 +255,12 @@ grouping is an implementation detail and never changes the result — a test
+ compares the grouped solve against one call per target. Weights shared by every
+ target (the common case) short-circuit to a single group without sorting.
+ 
+-The banded path does not double-refit: `solve_group_ridge_random_search` with
+-`return_weights=True` already multiplies its primal weights by `sqrt(gamma)`,
+-so `coef_` comes back in original coordinates.
++Neither banded path double-refits. `solve_group_ridge_random_search` with
++`return_weights=True` multiplies its primal weights by `sqrt(gamma)`. The
++kernel search returns dual weights scaled by the selected alpha together with
++`deltas = log(gamma / alpha)`, and `primal_weights_weighted_kernel_ridge`
++multiplies each space's product by `exp(deltas)`, so `coef_` comes back in
++original coordinates from either solver.
+ 
+ ## Device and memory
+ 
+@@ -244,16 +300,25 @@ dominant allocation depends on whether the targets share an alpha:
+ 
+ | Function | Batch | Dominant allocation |
+ |---|---|---|
+-| `_batch_sizes` | `n_alphas_batch` | decomposition matrices, `(n_alphas_batch, n_features, n_samples)` |
++| `_batch_sizes` | `n_alphas_batch` | decomposition matrices, `(n_alphas_batch, n_features, n_samples)`; kernel form `(n_alphas_batch, n_samples, n_samples)` |
+ | `_batch_sizes` | `n_targets_batch` | fold predictions, `(n_alphas_batch, n_samples, n_targets_batch)` |
+-| `_batch_sizes` | `n_targets_batch_refit` | refit weights, `(n_alphas_batch, n_features, n_targets_batch)` |
+-| `_refit_targets_batch` | `per_target_alpha=True` | `solve_ridge_svd`'s `(n_targets_batch, n_samples, n_samples)` block |
++| `_batch_sizes` | `n_targets_batch_refit` | refit weights, `(n_alphas_batch, n_features, n_targets_batch)`; kernel form `(n_alphas_batch, n_samples, n_targets_batch)` |
++| `_refit_targets_batch` | `per_target_alpha=True` | one square matrix per target: `(n_targets_batch, n_samples, n_samples)` in the kernel form, `(n_targets_batch, n_features, n_samples)` with `n_features <= n_samples` in the primal form |
+ | `_refit_targets_batch` | `per_target_alpha=False` | one shared shrinkage operator, so `(n_samples + n_features)` per target |
+ 
+ All budget arithmetic, the saturation ceiling, and OOM recovery live in
+ `backends.py`. That is a hard invariant: an algorithm may estimate its own
+ working set but must never compute a budget.
+ 
++`_batch_sizes` charges the arrays that stay resident for the whole fit before
++sizing any batch from what remains: the `(n_samples, n_features)` design and
++the targets in both forms, plus in the kernel form `n_spaces` kernels of
++`(n_samples, n_samples)` and one more of that size for the kernel Himalaya
++sums or slices per fold. When the residents alone exceed the budget the fit
++raises before allocating anything.
++The estimates cover the per-item working set and `_WORKING_SET_OVERHEAD`
++supplies the headroom.
++
+ ## Backend abstraction
+ 
+ The nltools `_Backend` in `nltools/algorithms/backends.py` remains the device
+diff --git a/development/specs/ridge.md b/development/specs/ridge.md
+index a2313072..118d84b8 100644
+--- a/development/specs/ridge.md
++++ b/development/specs/ridge.md
+@@ -173,6 +173,42 @@ keyword that both estimators share.
+ The banded-only arguments are `search_iterations` and `dirichlet_concentration`.
+ For ordinary Ridge, non-default values of those two must raise an error.
+ 
++## Solver form
++
++Himalaya's primal solvers (`solve_ridge_cv_svd`,
++`solve_group_ridge_random_search`) and its kernel solvers
++(`solve_kernel_ridge_cv_eigenvalues`,
++`solve_multiple_kernel_ridge_random_search` over linear kernels) solve the
++same problem. Their cost differs: the primal cross-validation working set
++scales with the feature count, the kernel one with the sample count. Himalaya
++does not switch between them; its flowchart asks the user to.
++
++The adapter switches for the user. When the total feature count across spaces
++exceeds the sample count times the number of spaces, a cross-validated or
++banded fit runs in the kernel form; otherwise, and on a tie, it runs in the
++primal form. The choice is a pure function of the design shape, is recorded as
++`solver_form_`, and is not exposed as a keyword.
++
++The kernel form changes nothing the caller can observe apart from
++`solver_form_`: `coef_` is returned in feature coordinates, and every other
++fitted attribute keeps its shape, dtype, and meaning. In float64 the fitted
++values agree with the primal result to floating-point tolerance. In float32
++the kernel form squares the design's condition number, so on a rank-deficient
++or near-singular design it refuses candidate alphas below the Gram matrix's
++rounding floor and may select a different grid point within a few decades
++above it; with candidates clear of that floor the two forms select the same
++grid points and agree to working precision. Where two candidates tie in
++cross-validation score at working precision, the two forms may snap to
++different grid points; the coefficients and scores still agree to that
++precision.
++
++The fixed-alpha fit and every bootstrap replicate go through the same
++fixed-hyperparameter refit, which applies the same rule to its one scaled
++design: `solve_ridge_svd` when the design is tall or square,
++`solve_kernel_ridge_eigenvalues` followed by Himalaya's host-side primal
++recovery when it is wide. A wide fit therefore selects its hyperparameters and
++refits its bootstrap replicates in the same solver family.
++
+ ## Numerical behavior
+ 
+ The model solves Ridge regression without adding an intercept:
+@@ -211,7 +247,10 @@ After `fit`, the model exposes:
+   order.
+ - `alpha_`: a scalar for a fixed or shared alpha, otherwise shape
+   `(n_targets,)`.
+-- `cv_scores_`: `None` for a fixed-alpha fit. For ordinary Ridge it is the
++- `cv_scores_`: `None` for a fixed-alpha fit. Scores are stored as Himalaya
++  reports them; in the kernel form a candidate alpha below the float32
++  rounding floor of the linear kernel scores `-1e5`, and a target whose every
++  candidate scored that way keeps the first. For ordinary Ridge it is the
+   fold-averaged negative-MSE score at the selected alpha: a `float` for
+   one-dimensional `y`, otherwise shape `(n_targets,)`. For banded Ridge its
+   shape is `(search_iterations,)` for one-dimensional `y`, otherwise
+@@ -225,6 +264,8 @@ After `fit`, the model exposes:
+ - `feature_space_sizes_`: `None` for ordinary Ridge, otherwise a tuple of
+   feature counts aligned with `feature_space_names_`.
+ - `backend_`: the resolved execution backend.
++- `solver_form_`: `"primal"` or `"kernel"`, the Himalaya solver family the fit
++  ran.
+ - `n_samples_`: the fitted sample count.
+ - `n_features_in_`: the total fitted feature count across all spaces.
+ - `is_fitted_`: `True` after a successful fit.
+@@ -317,6 +358,9 @@ Tests must cover:
+   and dtype-specific underflow protection on NumPy and MPS;
+ - deterministic banded search under a fixed `random_state`;
+ - CPU and GPU parity within explicit tolerances;
++- kernel-form routing for wide ordinary, wide banded, and wide fixed-alpha
++  fits, primal routing for tall and square ones, and fitted-state parity
++  between the two forms;
+ - unavailable explicit GPU execution;
+ - every fitted attribute and its shape;
+ - banded prediction with reordered, missing, and additional feature spaces;
+diff --git a/nltools/models/ridge.py b/nltools/models/ridge.py
+index 1c49c8d2..ee5d113b 100644
+--- a/nltools/models/ridge.py
++++ b/nltools/models/ridge.py
+@@ -12,7 +12,7 @@
+ from collections.abc import Mapping, Sequence
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+-from typing import Any
++from typing import Any, Literal
+ 
+ import numpy as np
+ 
+@@ -71,6 +71,31 @@ def _scoped_himalaya_backend(name: str):
+         set_backend(previous, on_error="raise")
+ 
+ 
++def _solver_form(
++    n_samples: int, n_features: int, n_spaces: int = 1
++) -> Literal["primal", "kernel"]:
++    """Return `'kernel'` when the design is wide, otherwise `'primal'`.
++
++    Himalaya's flowchart routes designs with more features than samples to its
++    kernel-form solvers, whose cross-validation working set scales with the
++    sample count instead of the feature count. Both forms solve the same
++    problem; only the cost differs. A banded fit holds one `(n_samples,
++    n_samples)` kernel per space, so it is only cheaper in the kernel form when
++    the average space is wider than the sample count, not when the total is. A
++    tie stays primal, which for one space is also the threshold of Himalaya's
++    own "slower than kernel ridge" warning.
++
++    Args:
++        n_samples (int): Rows of the design.
++        n_features (int): Total columns across every feature space.
++        n_spaces (int): Number of feature spaces. Defaults to 1.
++
++    Returns:
++        str: `'kernel'` or `'primal'`.
++    """
++    return "kernel" if n_spaces * n_samples < n_features else "primal"
++
++
+ def _himalaya_backend_name(backend) -> str:
+     """Map a resolved nltools `_Backend` to its Himalaya backend name.
+ 
+@@ -100,26 +125,62 @@ def _batch_sizes(
+     n_targets: int,
+     n_alphas: int,
+     itemsize: int,
++    *,
++    solver_form: str = "primal",
++    n_spaces: int = 1,
+ ) -> dict[str, int]:
+     """Size the batches of a whole cross-validated or banded fit.
+ 
+     Only the per-item working-set estimates live here; the budget itself and
+     the batch arithmetic come from `nltools.algorithms.backends`. The estimates
+-    follow Himalaya's dominant allocations: decomposition matrices of
+-    `(n_alphas_batch, n_features, n_samples)`, cross-validated predictions of
+-    `(n_alphas_batch, n_samples, n_targets_batch)`, and refit weights of
+-    `(n_features, n_targets_batch_refit)`.
++    follow Himalaya's dominant allocations. In the primal form they are
++    decomposition matrices of `(n_alphas_batch, n_features, n_samples)`,
++    cross-validated predictions of `(n_alphas_batch, n_samples,
++    n_targets_batch)`, and refit weights of `(n_alphas_batch, n_features,
++    n_targets_batch_refit)`. In the kernel form every `n_features` above
++    becomes `n_samples`: the decomposition is of the `(n_samples, n_samples)`
++    kernel and the refit weights are dual.
++
++    The arrays that stay on the device for the whole fit are charged first,
++    and the batches are sized from what remains: the design and targets in
++    both forms, plus in the kernel form one `(n_samples, n_samples)` kernel per
++    space and the same-sized kernel Himalaya sums or slices per fold.
++
++    Args:
++        backend (Backend): Backend returned by `_resolve_backend`.
++        memory_budget_gb (float | None): Explicit budget, or None to measure.
++        n_samples (int): Rows of the design.
++        n_features (int): Total columns across every feature space.
++        n_targets (int): Columns of `y`.
++        n_alphas (int): Candidate alphas.
++        itemsize (int): Bytes per element of the working dtype.
++        solver_form (str): `'primal'` or `'kernel'`, from `_solver_form`.
++        n_spaces (int): Number of feature spaces. Defaults to 1.
+ 
+     Returns:
+         dict[str, int]: `n_targets_batch`, `n_targets_batch_refit`, and
+             `n_alphas_batch`.
++
++    Raises:
++        ValueError: If the resident arrays alone exceed the budget, or one
++            batch item does.
+     """
+     budget_gb = _device_memory_budget(
+         backend, max_gpu_memory_gb=memory_budget_gb, cap_for_batching=True
+     )
++    resident_bytes = (n_samples * n_features + n_samples * n_targets) * itemsize
++    if solver_form == "kernel":
++        resident_bytes += (n_spaces + 1) * n_samples * n_samples * itemsize
++    budget_gb -= resident_bytes / 1e9
++    if budget_gb <= 0:
++        raise ValueError(
++            f"the resident design, targets and kernels need "
++            f"{resident_bytes / 1e9:.6g} GB, exceeding the budget"
++        )
++    weight_rows = n_samples if solver_form == "kernel" else n_features
+     n_alphas_batch, _ = _auto_batch_size(
+         n_alphas,
+-        n_features * n_samples * itemsize,
++        weight_rows * n_samples * itemsize,
+         budget_gb=budget_gb,
+         overhead=_WORKING_SET_OVERHEAD,
+     )
+@@ -131,7 +192,7 @@ def _batch_sizes(
+     )
+     n_targets_batch_refit, _ = _auto_batch_size(
+         n_targets,
+-        n_alphas_batch * n_features * itemsize,
++        n_alphas_batch * weight_rows * itemsize,
+         budget_gb=budget_gb,
+         overhead=_WORKING_SET_OVERHEAD,
+     )
+@@ -156,8 +217,11 @@ def _refit_targets_batch(
+ 
+     With one shared alpha Himalaya reuses a single shrinkage operator, so a
+     target costs only its own columns of `Y` and of the weights. With a
+-    per-target alpha it instead holds an `(n_targets_batch, n_samples,
+-    n_samples)` block, which dominates everything else.
++    per-target alpha it instead holds one square matrix per target, which
++    dominates everything else: `(n_samples, n_samples)` in the kernel form a
++    wide design runs, and `(n_features, n_samples)` with `n_features <=
++    n_samples` in the primal form a tall one runs, so the sample-count square
++    bounds both.
+ 
+     Returns:
+         int: Target batch size in `[1, n_targets]`.
+@@ -401,6 +465,12 @@ def _refit_fixed_hyperparameters(
+     `sqrt(gamma[k])` before the solve and the resulting coefficients are scaled
+     back, which is equivalent to the per-space penalty `alpha / gamma[k]`.
+ 
++    The scaled design is one ordinary ridge system, so it follows Himalaya's
++    flowchart with one space: a tall design runs `solve_ridge_svd`, a wide one
++    forms its linear kernel, runs `solve_kernel_ridge_eigenvalues`, and turns
++    the dual weights back into coefficients with Himalaya's own host-side
++    `primal_weights_kernel_ridge`.
++
+     Targets that selected the same weight vector share one decomposition. The
+     grouping is an implementation detail and does not change the result.
+ 
+@@ -427,6 +497,10 @@ def _refit_fixed_hyperparameters(
+         np.ndarray: Coefficients of shape `(n_features, n_targets)` in the
+             original, unscaled feature coordinates, as CPU NumPy.
+     """
++    from himalaya.kernel_ridge import (
++        primal_weights_kernel_ridge,
++        solve_kernel_ridge_eigenvalues,
++    )
+     from himalaya.ridge import solve_ridge_svd
+ 
+     if isinstance(feature_spaces, _ResidentDesign):
+@@ -444,6 +518,7 @@ def _refit_fixed_hyperparameters(
+ 
+     alphas = np.broadcast_to(np.asarray(alpha, dtype=np.float64), (n_targets,))
+     coef = np.zeros((n_features, n_targets), dtype=np.float64)
++    solver_form = _solver_form(n_samples, n_features)
+ 
+     with _scoped_himalaya_backend(resident.backend_name):
+         stacked = _take_rows(resident.design, row_indices)
+@@ -459,8 +534,8 @@ def _refit_fixed_hyperparameters(
+                 ).astype(dtype)
+                 design = stacked * _on_active_backend(scale)[0]
+             # A shared alpha needs one shrinkage vector; a per-target alpha
+-            # makes Himalaya hold an (n_targets_batch, n_samples, n_samples)
+-            # block instead, so the two paths get different batch estimates.
++            # makes Himalaya hold a block of one square matrix per target
++            # instead, so the two paths get different batch estimates.
+             group_alphas = alphas[columns]
+             shared_alpha = bool(np.all(group_alphas == group_alphas[0]))
+             batch = n_targets_batch
+@@ -479,16 +554,29 @@ def _refit_fixed_hyperparameters(
+                 if len(columns) == n_targets
+                 else _take_columns(all_targets, columns)
+             )
+-            solved = solve_ridge_svd(
+-                design,
+-                targets,
+-                alpha=dtype.type(group_alphas[0])
++            group_alpha = (
++                dtype.type(group_alphas[0])
+                 if shared_alpha
+-                else group_alphas.astype(dtype),
+-                fit_intercept=False,
+-                n_targets_batch=batch,
+-                warn=False,
++                else group_alphas.astype(dtype)
+             )
++            if solver_form == "kernel":
++                dual = solve_kernel_ridge_eigenvalues(
++                    _linear_kernel(design),
++                    targets,
++                    alpha=group_alpha,
++                    fit_intercept=False,
++                    n_targets_batch=batch,
++                )
++                solved = primal_weights_kernel_ridge(dual, design)
++            else:
++                solved = solve_ridge_svd(
++                    design,
++                    targets,
++                    alpha=group_alpha,
++                    fit_intercept=False,
++                    n_targets_batch=batch,
++                    warn=False,
++                )
+             solved = np.asarray(_to_cpu_numpy(solved), dtype=np.float64)
+             if scale is not None:
+                 solved = solved * scale[:, None]
+@@ -516,6 +604,62 @@ def _on_active_backend(*arrays):
+     return [backend.asarray(array) for array in arrays]
+ 
+ 
++def _to_backend_arrays(spaces, targets, alphas, dtype):
++    """Move a fit's inputs onto Himalaya's active backend in the working dtype.
++
++    The designs come back as a list even when there is one, because Himalaya's
++    banded solvers take a list of spaces: their `check_arrays` converts a list
++    element by element, which is what lets spaces of differing widths through,
++    whereas a tuple would be handed to `asarray` whole and fail as ragged.
++
++    Args:
++        spaces (Sequence[np.ndarray]): Feature matrices in coefficient order,
++            already contiguous in `dtype`.
++        targets (np.ndarray): `(n_samples, n_targets)` targets in `dtype`.
++        alphas (np.ndarray): Candidate alphas, float64.
++        dtype (np.dtype): Working dtype for the alpha grid.
++
++    Returns:
++        tuple: `(designs, targets, alphas)` on the active backend, with
++            `designs` a list holding one entry per space.
++    """
++    converted = _on_active_backend(*spaces, targets, alphas.astype(dtype))
++    return converted[:-2], converted[-2], converted[-1]
++
++
++def _linear_kernel(space):
++    """Form the linear kernel `X @ X.T` of one feature space on the active backend.
++
++    Called inside the same `_scoped_himalaya_backend` block as the solver that
++    consumes the kernel, so it is built on the device and in the dtype the
++    solve runs in and never crosses devices.
++
++    Args:
++        space: A `(n_samples, n_features)` matrix already on the active backend.
++
++    Returns:
++        Array: The `(n_samples, n_samples)` kernel on the active backend.
++    """
++    from himalaya.backend import get_backend
++
++    return get_backend().matmul(space, space.T)
++
++
++def _linear_kernels(spaces):
++    """Stack the linear kernels of several feature spaces for the banded solver.
++
++    Args:
++        spaces (Sequence): Feature matrices already on the active backend,
++            each `(n_samples, n_features_k)`.
++
++    Returns:
++        Array: Shape `(n_spaces, n_samples, n_samples)` on the active backend.
++    """
++    from himalaya.backend import get_backend
++
++    return get_backend().stack([_linear_kernel(space) for space in spaces])
++
++
+ def _to_cpu_numpy(array) -> np.ndarray:
+     """Return `array` as CPU NumPy, whatever backend produced it.
+ 
+@@ -663,7 +807,10 @@ class _Ridge:
+         cv_scores_ (float | np.ndarray | None): None for a fixed-alpha fit. For
+             ordinary Ridge, the fold-averaged negative-MSE score at the selected
+             alpha. For banded Ridge, `(search_iterations,)` or
+-            `(search_iterations, n_targets)` fold-averaged scores.
++            `(search_iterations, n_targets)` fold-averaged scores. Stored as
++            Himalaya reports them: in the kernel form a candidate alpha below
++            the float32 rounding floor of the linear kernel scores `-1e5`, and
++            a target whose every candidate scored that way keeps the first.
+         feature_space_weights_ (np.ndarray | None): None for ordinary Ridge.
+             Strictly positive weights whose columns sum to one, shaped
+             `(n_spaces,)` or `(n_spaces, n_targets)`.
+@@ -672,6 +819,8 @@ class _Ridge:
+         feature_space_sizes_ (tuple[int, ...] | None): Feature counts aligned
+             with `feature_space_names_`; None for ordinary Ridge.
+         backend_ (Backend): The resolved execution backend.
++        solver_form_ (str): `'primal'` or `'kernel'`, the Himalaya solver family
++            the fit ran. Chosen from the design shape by `_solver_form`.
+         n_samples_ (int): Fitted sample count.
+         n_features_in_ (int): Total fitted feature count across spaces.
+         is_fitted_ (bool): True after a successful fit.
+@@ -1010,12 +1159,15 @@ def fit(self, X, y) -> _Ridge:
+         n_targets = targets.shape[1]
+         alphas = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
+ 
+-        self.backend_ = backend
++        # Every fitted attribute is assigned only once the solve has succeeded,
++        # so a fit that raises leaves the previous fitted state intact.
+         if scalar_alpha:
+             # The fixed-alpha refit sizes its own batch from the same budget; it
+             # never runs the cross-validation or alpha loops the others measure.
+-            self._fit_fixed_alpha(spaces, targets, float(alpha))
++            solver_form = _solver_form(n_samples, n_features)
++            self._fit_fixed_alpha(backend, spaces, targets, float(alpha))
+         else:
++            solver_form = _solver_form(n_samples, n_features, len(spaces))
+             try:
+                 batches = _batch_sizes(
+                     backend,
+@@ -1025,6 +1177,8 @@ def fit(self, X, y) -> _Ridge:
+                     n_targets=n_targets,
+                     n_alphas=alphas.size,
+                     itemsize=dtype.itemsize,
++                    solver_form=solver_form,
++                    n_spaces=len(spaces),
+                 )
+             except ValueError as error:
+                 raise ValueError(
+@@ -1032,11 +1186,21 @@ def fit(self, X, y) -> _Ridge:
+                     f"fit with n_samples={n_samples}, n_features={n_features}, "
+                     f"n_targets={n_targets}, n_alphas={alphas.size} ({error})"
+                 ) from error
+-            if is_banded:
+-                self._fit_banded(spaces, targets, alphas, dtype, batches)
++            if is_banded and solver_form == "kernel":
++                self._fit_banded_kernel(
++                    backend, spaces, targets, alphas, dtype, batches
++                )
++            elif is_banded:
++                self._fit_banded(backend, spaces, targets, alphas, dtype, batches)
++            elif solver_form == "kernel":
++                self._fit_ordinary_cv_kernel(
++                    backend, spaces, targets, alphas, dtype, batches
++                )
+             else:
+-                self._fit_ordinary_cv(spaces, targets, alphas, dtype, batches)
++                self._fit_ordinary_cv(backend, spaces, targets, alphas, dtype, batches)
+ 
++        self.backend_ = backend
++        self.solver_form_ = solver_form
+         self.feature_space_names_ = names
+         self.feature_space_sizes_ = sizes if is_banded else None
+         self.n_samples_ = int(n_samples)
+@@ -1046,10 +1210,11 @@ def fit(self, X, y) -> _Ridge:
+         self.is_fitted_ = True
+         return self
+ 
+-    def _fit_fixed_alpha(self, spaces, targets, alpha) -> None:
++    def _fit_fixed_alpha(self, backend, spaces, targets, alpha) -> None:
+         """Solve a fixed-alpha ordinary Ridge and store the fitted state.
+ 
+         Args:
++            backend (Backend): Resolved execution backend.
+             spaces (list[np.ndarray]): One feature matrix.
+             targets (np.ndarray): `(n_samples, n_targets)` targets.
+             alpha (float): The fixed regularization strength.
+@@ -1058,17 +1223,41 @@ def _fit_fixed_alpha(self, spaces, targets, alpha) -> None:
+             spaces,
+             targets,
+             alpha,
+-            backend=self.backend_,
++            backend=backend,
+             memory_budget_gb=self.memory_budget_gb,
+         )
+         self.alpha_ = float(alpha)
+         self.cv_scores_ = None
+         self.feature_space_weights_ = None
+ 
+-    def _fit_ordinary_cv(self, spaces, targets, alphas, dtype, batches) -> None:
++    def _store_ordinary_state(self, coef, best_alphas, cv_scores, alphas) -> None:
++        """Normalize an ordinary cross-validated solve into the fitted state.
++
++        Shared by the primal and kernel forms, whose solvers differ only in how
++        `coef` is obtained. The selected alphas are snapped back onto the
++        candidate grid, and every array is stored as CPU float64.
++
++        Args:
++            coef: `(n_features, n_targets)` coefficients, on any backend.
++            best_alphas: `(n_targets,)` selected alphas, on any backend.
++            cv_scores: Fold-averaged scores at the selected alpha, on any backend.
++            alphas (np.ndarray): Candidate alphas.
++        """
++        self.coef_ = np.asarray(_to_cpu_numpy(coef), dtype=np.float64)
++        selected = _snap_to_grid(_to_cpu_numpy(best_alphas), alphas)
++        self.alpha_ = float(selected[0]) if not self.per_target_alpha else selected
++        self.cv_scores_ = np.asarray(
++            _to_cpu_numpy(cv_scores), dtype=np.float64
++        ).reshape(-1)
++        self.feature_space_weights_ = None
++
++    def _fit_ordinary_cv(
++        self, backend, spaces, targets, alphas, dtype, batches
++    ) -> None:
+         """Select an alpha by cross-validation and store the fitted state.
+ 
+         Args:
++            backend (Backend): Resolved execution backend.
+             spaces (list[np.ndarray]): One feature matrix.
+             targets (np.ndarray): `(n_samples, n_targets)` targets.
+             alphas (np.ndarray): Candidate alphas.
+@@ -1078,12 +1267,12 @@ def _fit_ordinary_cv(self, spaces, targets, alphas, dtype, batches) -> None:
+         from himalaya.ridge import solve_ridge_cv_svd
+         from himalaya.scoring import l2_neg_loss
+ 
+-        with _scoped_himalaya_backend(_himalaya_backend_name(self.backend_)):
+-            design, y_device, alpha_device = _on_active_backend(
+-                spaces[0], targets, alphas.astype(dtype)
++        with _scoped_himalaya_backend(_himalaya_backend_name(backend)):
++            designs, y_device, alpha_device = _to_backend_arrays(
++                spaces, targets, alphas, dtype
+             )
+             best_alphas, coefs, cv_scores = solve_ridge_cv_svd(
+-                design,
++                designs[0],
+                 y_device,
+                 alphas=alpha_device,
+                 fit_intercept=False,
+@@ -1095,49 +1284,131 @@ def _fit_ordinary_cv(self, spaces, targets, alphas, dtype, batches) -> None:
+                 **batches,
+             )
+ 
+-        self.coef_ = np.asarray(_to_cpu_numpy(coefs), dtype=np.float64)
+-        selected = _snap_to_grid(_to_cpu_numpy(best_alphas), alphas)
+-        self.alpha_ = float(selected[0]) if not self.per_target_alpha else selected
+-        self.cv_scores_ = np.asarray(
+-            _to_cpu_numpy(cv_scores), dtype=np.float64
+-        ).reshape(-1)
+-        self.feature_space_weights_ = None
++        self._store_ordinary_state(coefs, best_alphas, cv_scores, alphas)
++
++    def _fit_ordinary_cv_kernel(
++        self, backend, spaces, targets, alphas, dtype, batches
++    ) -> None:
++        """Select an alpha by cross-validation in the kernel form and store the state.
+ 
+-    def _fit_banded(self, spaces, targets, alphas, dtype, batches) -> None:
+-        """Run the banded random search and store the fitted state.
++        The wide-design counterpart of `_fit_ordinary_cv`. Himalaya solves on the
++        `(n_samples, n_samples)` linear kernel and returns dual weights on the
++        host; its own `primal_weights_kernel_ridge` turns them back into `coef_`
++        on the host, which is where Himalaya keeps primal weights because they
++        can be large. The device copy of the design is released once the kernel
++        exists, so only the kernel stays resident through the solve.
+ 
+         Args:
+-            spaces (list[np.ndarray]): Feature matrices in coefficient order.
++            backend (Backend): Resolved execution backend.
++            spaces (list[np.ndarray]): One feature matrix.
+             targets (np.ndarray): `(n_samples, n_targets)` targets.
+             alphas (np.ndarray): Candidate alphas.
+             dtype (np.dtype): Working dtype.
+             batches (dict[str, int]): Himalaya batch sizes.
+         """
+-        from himalaya.kernel_ridge import generate_dirichlet_samples
+-        from himalaya.ridge import solve_group_ridge_random_search
++        from himalaya.kernel_ridge import (
++            primal_weights_kernel_ridge,
++            solve_kernel_ridge_cv_eigenvalues,
++        )
+         from himalaya.scoring import l2_neg_loss
+ 
+-        # Himalaya's sampler ends with `get_backend().asarray(gammas)`, so the
+-        # candidates would otherwise take the dtype and device of whatever
+-        # backend happened to be globally active. They are validated and clamped
+-        # on the host, so draw them under an explicit numpy scope.
++        with _scoped_himalaya_backend(_himalaya_backend_name(backend)):
++            designs, y_device, alpha_device = _to_backend_arrays(
++                spaces, targets, alphas, dtype
++            )
++            kernel = _linear_kernel(designs[0])
++            del designs
++            best_alphas, dual_weights, cv_scores = solve_kernel_ridge_cv_eigenvalues(
++                kernel,
++                y_device,
++                alphas=alpha_device,
++                fit_intercept=False,
++                score_func=l2_neg_loss,
++                cv=self._resolved_cv(),
++                local_alpha=self.per_target_alpha,
++                conservative=self.prefer_conservative_alpha,
++                **batches,
++            )
++
++        dual = np.asarray(_to_cpu_numpy(dual_weights), dtype=dtype)
++        with _scoped_himalaya_backend("numpy"):
++            coef = primal_weights_kernel_ridge(dual, spaces[0])
++        self._store_ordinary_state(coef, best_alphas, cv_scores, alphas)
++
++    def _draw_feature_space_candidates(self, n_spaces: int, dtype) -> np.ndarray:
++        """Draw and condition the Dirichlet candidates for a banded search.
++
++        Himalaya's sampler ends with `get_backend().asarray(gammas)`, so the
++        candidates would otherwise take the dtype and device of whatever
++        backend happened to be globally active. They are validated and clamped
++        on the host, so they are drawn under an explicit numpy scope.
++
++        Args:
++            n_spaces (int): Number of feature spaces.
++            dtype (np.dtype): Working dtype, which sets the underflow floor.
++
++        Returns:
++            np.ndarray: `(search_iterations, n_spaces)` weights, each row on
++                the simplex and every entry at least `finfo(dtype).tiny`.
++        """
++        from himalaya.kernel_ridge import generate_dirichlet_samples
++
+         with _scoped_himalaya_backend("numpy"):
+             candidates = _to_cpu_numpy(
+                 generate_dirichlet_samples(
+                     n_samples=self.search_iterations,
+-                    n_kernels=len(spaces),
++                    n_kernels=n_spaces,
+                     concentration=self._concentration_for_himalaya(),
+                     random_state=self.random_state,
+                 )
+             )
+-        candidates = _prepare_feature_space_weights(candidates, dtype)
+-
+-        with _scoped_himalaya_backend(_himalaya_backend_name(self.backend_)):
+-            converted = _on_active_backend(*spaces, targets, alphas.astype(dtype))
+-            designs, y_device, alpha_device = (
+-                converted[:-2],
+-                converted[-2],
+-                converted[-1],
++        return _prepare_feature_space_weights(candidates, dtype)
++
++    def _store_banded_state(self, deltas, refit_weights, cv_scores, alphas) -> None:
++        """Normalize a banded random search into the fitted state.
++
++        Shared by the primal and kernel forms. Himalaya reports the banded
++        solution as `deltas = log(gamma / alpha)` with each gamma column summing
++        to one, so the simplex weights and the selected alpha both fall out of a
++        log-sum-exp over the spaces. The recovered alpha is snapped back onto
++        the candidate grid, and every array is stored as CPU float64.
++
++        Args:
++            deltas: `(n_spaces, n_targets)` deltas, on any backend.
++            refit_weights: `(n_features, n_targets)` coefficients in original
++                feature coordinates, on any backend.
++            cv_scores: `(search_iterations, n_targets)` scores, on any backend.
++            alphas (np.ndarray): Candidate alphas.
++        """
++        deltas = np.asarray(_to_cpu_numpy(deltas), dtype=np.float64)
++        self.coef_ = np.asarray(_to_cpu_numpy(refit_weights), dtype=np.float64)
++        self.cv_scores_ = np.asarray(_to_cpu_numpy(cv_scores), dtype=np.float64)
++        shifted = deltas - deltas.max(axis=0, keepdims=True)
++        weights = np.exp(shifted)
++        self.feature_space_weights_ = weights / weights.sum(axis=0, keepdims=True)
++        log_total = deltas.max(axis=0) + np.log(np.exp(shifted).sum(axis=0))
++        selected = _snap_to_grid(np.exp(-log_total), alphas)
++        self.alpha_ = selected if self.per_target_alpha else float(selected[0])
++
++    def _fit_banded(self, backend, spaces, targets, alphas, dtype, batches) -> None:
++        """Run the banded random search in the primal form and store the fitted state.
++
++        Args:
++            backend (Backend): Resolved execution backend.
++            spaces (list[np.ndarray]): Feature matrices in coefficient order.
++            targets (np.ndarray): `(n_samples, n_targets)` targets.
++            alphas (np.ndarray): Candidate alphas.
++            dtype (np.dtype): Working dtype.
++            batches (dict[str, int]): Himalaya batch sizes.
++        """
++        from himalaya.ridge import solve_group_ridge_random_search
++        from himalaya.scoring import l2_neg_loss
++
++        candidates = self._draw_feature_space_candidates(len(spaces), dtype)
++
++        with _scoped_himalaya_backend(_himalaya_backend_name(backend)):
++            designs, y_device, alpha_device = _to_backend_arrays(
++                spaces, targets, alphas, dtype
+             )
+             deltas, refit_weights, cv_scores = solve_group_ridge_random_search(
+                 designs,
+@@ -1156,19 +1427,68 @@ def _fit_banded(self, spaces, targets, alphas, dtype, batches) -> None:
+                 **batches,
+             )
+ 
+-        deltas = np.asarray(_to_cpu_numpy(deltas), dtype=np.float64)
+-        self.coef_ = np.asarray(_to_cpu_numpy(refit_weights), dtype=np.float64)
+-        self.cv_scores_ = np.asarray(_to_cpu_numpy(cv_scores), dtype=np.float64)
++        self._store_banded_state(deltas, refit_weights, cv_scores, alphas)
+ 
+-        # deltas = log(gamma / alpha) with each gamma column summing to one, so
+-        # the simplex weights and the selected alpha both fall out of a
+-        # log-sum-exp over the spaces.
+-        shifted = deltas - deltas.max(axis=0, keepdims=True)
+-        weights = np.exp(shifted)
+-        self.feature_space_weights_ = weights / weights.sum(axis=0, keepdims=True)
+-        log_total = deltas.max(axis=0) + np.log(np.exp(shifted).sum(axis=0))
+-        selected = _snap_to_grid(np.exp(-log_total), alphas)
+-        self.alpha_ = selected if self.per_target_alpha else float(selected[0])
++    def _fit_banded_kernel(
++        self, backend, spaces, targets, alphas, dtype, batches
++    ) -> None:
++        """Run the banded random search in the kernel form and store the fitted state.
++
++        The wide-design counterpart of `_fit_banded`. Himalaya searches over one
++        linear kernel per feature space and returns dual weights, as its own
++        `MultipleKernelRidgeCV` asks it to; its `primal_weights_weighted_kernel_ridge`
++        then recovers `coef_` once on the host from the raw spaces and the
++        deltas. Asking the solver for primal weights instead would rebuild the
++        gamma-scaled design on the device for every improving candidate. The
++        deltas carry the same meaning as in the primal search and go through
++        the same recovery.
++
++        Args:
++            backend (Backend): Resolved execution backend.
++            spaces (list[np.ndarray]): Feature matrices in coefficient order.
++            targets (np.ndarray): `(n_samples, n_targets)` targets.
++            alphas (np.ndarray): Candidate alphas.
++            dtype (np.dtype): Working dtype.
++            batches (dict[str, int]): Himalaya batch sizes.
++        """
++        from himalaya.kernel_ridge import (
++            primal_weights_weighted_kernel_ridge,
++            solve_multiple_kernel_ridge_random_search,
++        )
++        from himalaya.scoring import l2_neg_loss
++
++        candidates = self._draw_feature_space_candidates(len(spaces), dtype)
++
++        with _scoped_himalaya_backend(_himalaya_backend_name(backend)):
++            designs, y_device, alpha_device = _to_backend_arrays(
++                spaces, targets, alphas, dtype
++            )
++            kernels = _linear_kernels(designs)
++            deltas, refit_weights, cv_scores = (
++                solve_multiple_kernel_ridge_random_search(
++                    kernels,
++                    y_device,
++                    n_iter=candidates,
++                    alphas=alpha_device,
++                    fit_intercept=False,
++                    score_func=l2_neg_loss,
++                    cv=self._resolved_cv(),
++                    return_weights="dual",
++                    local_alpha=self.per_target_alpha,
++                    random_state=self.random_state,
++                    progress_bar=self.progress_bar,
++                    conservative=self.prefer_conservative_alpha,
++                    **batches,
++                )
++            )
++
++        deltas = np.asarray(_to_cpu_numpy(deltas), dtype=np.float64)
++        dual = np.asarray(_to_cpu_numpy(refit_weights), dtype=dtype)
++        with _scoped_himalaya_backend("numpy"):
++            per_space = primal_weights_weighted_kernel_ridge(dual, deltas, spaces)
++        self._store_banded_state(
++            deltas, np.concatenate(per_space, axis=0), cv_scores, alphas
++        )
+ 
+     def _concentration_for_himalaya(self):
+         """Return `dirichlet_concentration` in the form Himalaya's sampler takes.
+diff --git a/nltools/tests/data/braindata/test_braindata_bootstrap.py b/nltools/tests/data/braindata/test_braindata_bootstrap.py
+index 44641c41..ad8766aa 100644
+--- a/nltools/tests/data/braindata/test_braindata_bootstrap.py
++++ b/nltools/tests/data/braindata/test_braindata_bootstrap.py
+@@ -369,6 +369,49 @@ def test_banded_bootstrap_resamples_every_space_with_one_index_draw(self, masked
+         )
+         np.testing.assert_allclose(result.samples[0], expected, atol=1e-8)
+ 
++    def test_kernel_form_fit_bootstraps_through_the_shared_refit(self, masked):
++        """A wide banded fit picks the kernel form; each replicate still runs the one refit."""
++        from nltools.algorithms.inference.bootstrap import (
++            _bootstrap_design,
++            _refit_resample,
++        )
++        from nltools.algorithms.inference.random import _generate_bootstrap_indices
++
++        rng = np.random.default_rng(2)
++        n_obs = len(masked)
++        spaces = {
++            "a": rng.standard_normal((n_obs, n_obs // 2 + 3)),
++            "b": rng.standard_normal((n_obs, n_obs // 2 + 4)),
++        }
++        masked.fit(
++            model="ridge",
++            X=spaces,
++            ridge_alpha=[1.0, 10.0],
++            ridge_cv=3,
++            ridge_search_iterations=4,
++            random_state=0,
++        )
++        estimator = masked.model._estimator
++        assert estimator.solver_form_ == "kernel"
++
++        result = masked.bootstrap(
++            "weights",
++            X=spaces,
++            n_samples=3,
++            return_samples=True,
++            random_state=11,
++            n_jobs=1,
++        )
++
++        indices = _generate_bootstrap_indices(n_obs, 3, random_state=11)
++        expected = _refit_resample(
++            _bootstrap_design([spaces["a"], spaces["b"]], masked.data),
++            indices[0],
++            estimator.alpha_,
++            estimator.feature_space_weights_,
++        )
++        np.testing.assert_allclose(result.samples[0], expected, atol=1e-8)
++
+ 
+ class TestRidgeBootstrapOnGpu:
+     """Explicit `device='gpu'` runs the refits on the accelerator, or raises."""
+diff --git a/nltools/tests/models/test_ridge.py b/nltools/tests/models/test_ridge.py
+index d1f609c5..dd9184f8 100644
+--- a/nltools/tests/models/test_ridge.py
++++ b/nltools/tests/models/test_ridge.py
+@@ -12,8 +12,10 @@
+ 
+ from nltools.models import _Ridge
+ from nltools.models.ridge import (
++    _batch_sizes,
+     _prepare_feature_space_weights,
+     _refit_fixed_hyperparameters,
++    _solver_form,
+ )
+ 
+ 
+@@ -111,6 +113,32 @@ def kfold(n_splits=4):
+     return KFold(n_splits=n_splits, shuffle=False)
+ 
+ 
++def spy_kwargs(monkeypatch, module, name, seen):
++    """Replace `module.<name>` with a wrapper that records each call's kwargs."""
++    real = getattr(module, name)
++
++    def wrapper(*args, **kwargs):
++        seen.append(kwargs)
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(module, name, wrapper)
++
++
++def spy_on(monkeypatch, module, name, calls):
++    """Replace `module.<name>` with a wrapper that records each call in `calls`.
++
++    The adapter imports each Himalaya solver inside the method that uses it, so
++    patching the module attribute is enough to see which solver a fit ran.
++    """
++    real = getattr(module, name)
++
++    def wrapper(*args, **kwargs):
++        calls.append(name)
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(module, name, wrapper)
++
++
+ # --------------------------------------------------------------------- signature
+ 
+ 
+@@ -228,6 +256,7 @@ def test_ordinary_fixed_alpha_state(self):
+         assert model.n_features_in_ == X.shape[1]
+         assert model.is_fitted_ is True
+         assert model.backend_.name == "numpy"
++        assert model.solver_form_ == "primal"
+ 
+     def test_ordinary_cv_state(self):
+         X, Y = make_data()
+@@ -405,6 +434,34 @@ def test_shared_gamma_equals_generalized_ridge(self):
+         expected = self._generalized_ridge(matrices, Y, 3.0, gamma)
+         np.testing.assert_allclose(coef, expected, rtol=1e-6, atol=1e-8)
+ 
++    def test_wide_design_refits_in_the_kernel_form(self, monkeypatch):
++        """Himalaya's flowchart sends a wide fixed-alpha solve to kernel ridge."""
++        import himalaya.kernel_ridge
++
++        calls = []
++        spy_on(
++            monkeypatch, himalaya.kernel_ridge, "solve_kernel_ridge_eigenvalues", calls
++        )
++        X, Y = make_data(n_samples=20, n_features=50, n_targets=3)
++        alphas = np.array([0.5, 5.0, 50.0])
++        coef = _refit_fixed_hyperparameters([X], Y, alphas)
++        assert calls == ["solve_kernel_ridge_eigenvalues"]
++        for index, alpha in enumerate(alphas):
++            expected = np.linalg.solve(
++                X.T @ X + alpha * np.eye(X.shape[1]), X.T @ Y[:, index]
++            )
++            np.testing.assert_allclose(coef[:, index], expected, rtol=1e-6, atol=1e-8)
++
++    def test_wide_shared_gamma_equals_generalized_ridge(self):
++        spaces, Y = make_spaces(n_samples=20, sizes=(15, 25), n_targets=2)
++        matrices = list(spaces.values())
++        gamma = np.array([0.25, 0.75])
++        coef = _refit_fixed_hyperparameters(
++            matrices, Y, 3.0, feature_space_weights=gamma
++        )
++        expected = self._generalized_ridge(matrices, Y, 3.0, gamma)
++        np.testing.assert_allclose(coef, expected, rtol=1e-6, atol=1e-8)
++
+     def test_refit_does_not_mutate_the_feature_spaces(self):
+         spaces, Y = make_spaces(sizes=(3, 5))
+         matrices = list(spaces.values())
+@@ -505,3 +562,306 @@ def test_cpu_gpu_parity_cross_validated(self):
+         gpu = _Ridge(alpha=ALPHAS, cv=kfold(), device="gpu").fit(X, Y)
+         np.testing.assert_array_equal(gpu.alpha_, cpu.alpha_)
+         np.testing.assert_allclose(gpu.coef_, cpu.coef_, rtol=1e-2, atol=1e-3)
++
++
++# ------------------------------------------------------------------- solver form
++
++
++class TestSolverFormRule:
++    """Wide designs pick the kernel form; ties and tall designs stay primal."""
++
++    def test_kernel_only_when_features_exceed_samples(self):
++        assert _solver_form(n_samples=80, n_features=12) == "primal"
++        assert _solver_form(n_samples=20, n_features=20) == "primal"
++        assert _solver_form(n_samples=20, n_features=50) == "kernel"
++
++    def test_banded_fit_compares_features_against_one_kernel_per_space(self):
++        """A banded kernel fit holds `n_spaces` kernels, so it needs a wide average space."""
++        assert _solver_form(n_samples=1000, n_features=1200, n_spaces=20) == "primal"
++        assert _solver_form(n_samples=100, n_features=1200, n_spaces=2) == "kernel"
++        assert _solver_form(n_samples=100, n_features=200, n_spaces=2) == "primal"
++
++    def test_kernel_form_sizes_batches_from_the_sample_count(self):
++        """With 5000 features and 50 samples, the kernel estimates are 100x smaller."""
++        from nltools.algorithms.backends import _resolve_backend
++
++        backend = _resolve_backend("cpu")
++        shape = {
++            "n_samples": 50,
++            "n_features": 5000,
++            "n_targets": 1000,
++            "n_alphas": 8,
++            "itemsize": 8,
++        }
++        primal = _batch_sizes(backend, 0.015, **shape)
++        kernel = _batch_sizes(backend, 0.015, **shape, solver_form="kernel")
++        assert primal["n_alphas_batch"] == 1
++        assert kernel["n_alphas_batch"] == 8
++        assert kernel["n_targets_batch_refit"] > primal["n_targets_batch_refit"]
++
++    def test_kernel_form_charges_its_resident_arrays_against_the_budget(self):
++        """The designs, the kernel stack and Himalaya's kernel sum stay live all fit."""
++        from nltools.algorithms.backends import _resolve_backend
++
++        backend = _resolve_backend("cpu")
++        shape = {
++            "n_samples": 1000,
++            "n_features": 4000,
++            "n_targets": 100,
++            "n_alphas": 4,
++            "itemsize": 4,
++            "solver_form": "kernel",
++        }
++        # One alpha item is 5 x 4 MB. The design and targets (16.4 MB) plus one
++        # kernel and its sum (8 MB) leave 75.6 MB of a 0.1 GB budget: 3 alphas.
++        assert _batch_sizes(backend, 0.1, **shape, n_spaces=1)["n_alphas_batch"] == 3
++        # Ten kernels (40 MB) leave 39.6 MB: 1 alpha.
++        assert _batch_sizes(backend, 0.1, **shape, n_spaces=10)["n_alphas_batch"] == 1
++        # Thirty kernels (120 MB) exceed the budget before any batch exists.
++        with pytest.raises(ValueError, match="resident"):
++            _batch_sizes(backend, 0.1, **shape, n_spaces=30)
++
++
++class TestSolverFormDispatch:
++    """Which Himalaya solver a fit runs, and that both forms agree."""
++
++    def test_wide_ordinary_design_runs_kernel_ridge_with_primal_parity(
++        self, monkeypatch
++    ):
++        import himalaya.kernel_ridge
++        from himalaya.ridge import solve_ridge_cv_svd
++        from himalaya.scoring import l2_neg_loss
++
++        calls = []
++        spy_on(
++            monkeypatch,
++            himalaya.kernel_ridge,
++            "solve_kernel_ridge_cv_eigenvalues",
++            calls,
++        )
++        X, Y = make_data(n_samples=30, n_features=60)
++        model = _Ridge(alpha=ALPHAS, cv=kfold()).fit(X, Y)
++
++        assert model.solver_form_ == "kernel"
++        assert calls == ["solve_kernel_ridge_cv_eigenvalues"]
++        best_alphas, coefs, cv_scores = solve_ridge_cv_svd(
++            X,
++            Y,
++            alphas=np.asarray(ALPHAS),
++            fit_intercept=False,
++            score_func=l2_neg_loss,
++            cv=kfold(),
++            local_alpha=True,
++            warn=False,
++        )
++        np.testing.assert_allclose(model.alpha_, best_alphas, rtol=1e-6)
++        np.testing.assert_allclose(model.coef_, coefs, rtol=1e-6, atol=1e-8)
++        np.testing.assert_allclose(
++            model.cv_scores_, cv_scores.reshape(-1), rtol=1e-6, atol=1e-8
++        )
++
++    def test_wide_float32_rank_deficient_design_keeps_primal_parity_above_the_floor(
++        self,
++    ):
++        """On a float32 design with a singular Gram matrix, both forms still agree.
++
++        The linear kernel squares the design's condition number, so a float32
++        Gram matrix of a rank-deficient design carries rounding eigenvalues of
++        either sign. Himalaya's kernel solver refuses every candidate alpha
++        below twice their magnitude, and its selection is noise-limited for a
++        few decades above it. With candidates clear of that floor the kernel
++        form selects the same grid points as the primal solve and recovers the
++        same coefficients.
++        """
++        from himalaya.ridge import solve_ridge_cv_svd
++        from himalaya.scoring import l2_neg_loss
++
++        rng = np.random.default_rng(3)
++        X = 100.0 * (rng.standard_normal((40, 5)) @ rng.standard_normal((5, 200)))
++        X = X.astype(np.float32)
++        Y = X @ rng.standard_normal((200, 3)) + 50.0 * rng.standard_normal((40, 3))
++        Y = Y.astype(np.float32)
++        alphas = [1e3, 1e4, 1e5, 1e6]
++        model = _Ridge(alpha=alphas, cv=kfold()).fit(X, Y)
++
++        assert model.solver_form_ == "kernel"
++        best_alphas, coefs, _ = solve_ridge_cv_svd(
++            X,
++            Y,
++            alphas=np.asarray(alphas, dtype=np.float32),
++            fit_intercept=False,
++            score_func=l2_neg_loss,
++            cv=kfold(),
++            local_alpha=True,
++            warn=False,
++        )
++        np.testing.assert_allclose(model.alpha_, best_alphas, rtol=1e-5)
++        assert np.linalg.norm(model.coef_ - coefs) <= 1e-2 * np.linalg.norm(coefs)
++
++    def test_wide_ordinary_fit_recovers_coefficients_with_himalaya(self, monkeypatch):
++        """`coef_` comes from Himalaya's own host-side dual-to-primal recovery."""
++        import himalaya.kernel_ridge
++
++        calls = []
++        spy_on(monkeypatch, himalaya.kernel_ridge, "primal_weights_kernel_ridge", calls)
++        X, Y = make_data(n_samples=30, n_features=60)
++        _Ridge(alpha=ALPHAS, cv=kfold()).fit(X, Y)
++        assert calls == ["primal_weights_kernel_ridge"]
++
++    def test_wide_float32_design_keeps_float64_coefficients(self):
++        """The dual-to-primal product runs in float32; the stored state is float64."""
++        from himalaya.ridge import solve_ridge_cv_svd
++        from himalaya.scoring import l2_neg_loss
++
++        X, Y = make_data(n_samples=30, n_features=60, dtype=np.float32)
++        model = _Ridge(alpha=ALPHAS, cv=kfold()).fit(X, Y)
++
++        assert model.solver_form_ == "kernel"
++        assert model.coef_.dtype == np.float64
++        best_alphas, coefs, _ = solve_ridge_cv_svd(
++            X,
++            Y,
++            alphas=np.asarray(ALPHAS, dtype=np.float32),
++            fit_intercept=False,
++            score_func=l2_neg_loss,
++            cv=kfold(),
++            local_alpha=True,
++            warn=False,
++        )
++        np.testing.assert_allclose(model.alpha_, best_alphas, rtol=1e-5)
++        np.testing.assert_allclose(model.coef_, coefs, rtol=1e-3, atol=1e-4)
++
++    def test_failed_refit_leaves_the_previous_solver_form_and_backend(self):
++        """A fit that raises before solving must not relabel the earlier fitted state."""
++        X, Y = make_data(n_samples=40, n_features=90)
++        model = _Ridge(alpha=ALPHAS, cv=kfold()).fit(X, Y)
++        assert model.solver_form_ == "kernel"
++        first_backend = model.backend_
++
++        model.memory_budget_gb = 1e-9
++        tall_X, tall_Y = make_data(n_samples=200, n_features=50)
++        with pytest.raises(ValueError, match="memory_budget_gb"):
++            model.fit(tall_X, tall_Y)
++
++        assert model.solver_form_ == "kernel"
++        assert model.backend_ is first_backend
++        assert model.coef_.shape == (90, 4)
++
++    def test_tall_ordinary_design_stays_primal(self, monkeypatch):
++        import himalaya.ridge
++
++        calls = []
++        spy_on(monkeypatch, himalaya.ridge, "solve_ridge_cv_svd", calls)
++        X, Y = make_data()
++        model = _Ridge(alpha=ALPHAS, cv=kfold()).fit(X, Y)
++        assert model.solver_form_ == "primal"
++        assert calls == ["solve_ridge_cv_svd"]
++
++    def test_fixed_alpha_fit_runs_kernel_ridge_when_wide(self, monkeypatch):
++        import himalaya.kernel_ridge
++
++        calls = []
++        spy_on(
++            monkeypatch, himalaya.kernel_ridge, "solve_kernel_ridge_eigenvalues", calls
++        )
++        X, Y = make_data(n_samples=20, n_features=50)
++        model = _Ridge(alpha=1.0).fit(X, Y)
++        assert model.solver_form_ == "kernel"
++        assert calls == ["solve_kernel_ridge_eigenvalues"]
++        expected = np.linalg.solve(X.T @ X + np.eye(X.shape[1]), X.T @ Y)
++        np.testing.assert_allclose(model.coef_, expected, rtol=1e-6, atol=1e-8)
++
++    def test_fixed_alpha_fit_stays_primal_when_tall(self, monkeypatch):
++        import himalaya.ridge
++
++        calls = []
++        spy_on(monkeypatch, himalaya.ridge, "solve_ridge_svd", calls)
++        X, Y = make_data(n_samples=50, n_features=20)
++        model = _Ridge(alpha=1.0).fit(X, Y)
++        assert model.solver_form_ == "primal"
++        assert calls == ["solve_ridge_svd"]
++
++    @requires_torch
++    def test_kernel_path_restores_the_backend_when_the_solver_raises(
++        self, foreign_ambient_backend, monkeypatch
++    ):
++        import himalaya.kernel_ridge
++
++        def explode(*args, **kwargs):
++            raise RuntimeError("solver exploded")
++
++        monkeypatch.setattr(
++            himalaya.kernel_ridge, "solve_kernel_ridge_cv_eigenvalues", explode
++        )
++        X, Y = make_data(n_samples=30, n_features=60)
++        with pytest.raises(RuntimeError, match="solver exploded"):
++            _Ridge(alpha=ALPHAS, cv=kfold()).fit(X, Y)
++        assert current_himalaya_backend() == foreign_ambient_backend
++
++    def test_wide_banded_design_runs_multiple_kernel_ridge_with_primal_parity(
++        self, monkeypatch
++    ):
++        import himalaya.kernel_ridge
++        from himalaya.ridge import solve_group_ridge_random_search
++        from himalaya.scoring import l2_neg_loss
++
++        calls = []
++        spy_on(
++            monkeypatch,
++            himalaya.kernel_ridge,
++            "solve_multiple_kernel_ridge_random_search",
++            calls,
++        )
++        seen = []
++        spy_kwargs(
++            monkeypatch,
++            himalaya.kernel_ridge,
++            "solve_multiple_kernel_ridge_random_search",
++            seen,
++        )
++        recoveries = []
++        spy_on(
++            monkeypatch,
++            himalaya.kernel_ridge,
++            "primal_weights_weighted_kernel_ridge",
++            recoveries,
++        )
++        spaces, Y = make_spaces(n_samples=30, sizes=(30, 40))
++        model = _Ridge(
++            alpha=ALPHAS, cv=kfold(), search_iterations=6, random_state=3
++        ).fit(spaces, Y)
++
++        assert model.solver_form_ == "kernel"
++        assert calls == ["solve_multiple_kernel_ridge_random_search"]
++        # Himalaya's own estimator fits dual weights and converts once; the
++        # solver's primal path would rebuild the design per improving candidate.
++        assert seen[0]["return_weights"] == "dual"
++        assert seen[0].get("Xs") is None
++        assert recoveries == ["primal_weights_weighted_kernel_ridge"]
++        candidates = model._draw_feature_space_candidates(
++            len(spaces), np.dtype(np.float64)
++        )
++        deltas, coef, cv_scores = solve_group_ridge_random_search(
++            list(spaces.values()),
++            Y,
++            n_iter=candidates,
++            alphas=np.asarray(ALPHAS),
++            fit_intercept=False,
++            score_func=l2_neg_loss,
++            cv=kfold(),
++            return_weights=True,
++            local_alpha=True,
++            random_state=3,
++            progress_bar=False,
++            warn=False,
++        )
++        gammas = np.exp(deltas)
++        np.testing.assert_allclose(
++            model.feature_space_weights_,
++            gammas / gammas.sum(axis=0, keepdims=True),
++            rtol=1e-6,
++            atol=1e-8,
++        )
++        np.testing.assert_allclose(model.alpha_, 1.0 / gammas.sum(axis=0), rtol=1e-6)
++        np.testing.assert_allclose(model.coef_, coef, rtol=1e-5, atol=1e-7)
++        np.testing.assert_allclose(model.cv_scores_, cv_scores, rtol=1e-6, atol=1e-8)

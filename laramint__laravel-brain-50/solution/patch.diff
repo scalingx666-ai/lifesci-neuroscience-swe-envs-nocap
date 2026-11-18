@@ -1,0 +1,1236 @@
+diff --git a/config/laravel-brain.php b/config/laravel-brain.php
+index 5dbbc302..ea9f6d1b 100644
+--- a/config/laravel-brain.php
++++ b/config/laravel-brain.php
+@@ -90,20 +90,63 @@
+     // -------------------------------------------------------------------------
+     // Security Analysis
+     // -------------------------------------------------------------------------
+-    // Extra middleware aliases or FQCN prefixes that Brain should treat as
+-    // authentication middleware. Entries are matched as case-insensitive
+-    // prefixes, so 'auth.custom' matches 'auth.custom:api'.
++    // Override / extend the SecurityAnalyzer heuristics that classify each
++    // route's exposure and decide what counts as throttled or trusted.
+     //
+-    // Add your application's custom auth middleware here to prevent
+-    // false "Public Route" warnings.
++    // The analyzer always starts from a conservative built-in default list
++    // and *adds* anything declared here on top — it never replaces the
++    // defaults. Entries are matched as case-insensitive prefixes; a plain
++    // name like 'auth.custom' matches 'auth.custom' and 'auth.custom:api'.
+     //
+-    // Example:
+-    //   'auth_middleware' => [
+-    //       'App\\Http\\Middleware\\CustomAuth',
+-    //   ],
++    // When in doubt, leave everything empty. The defaults catch the
++    // standard Laravel middleware (`auth`, `auth:sanctum`, `signed`,
++    // `throttle`, etc.).
+     //
+     'security' => [
++
++        // Extra middleware aliases or FQCN prefixes that Brain should treat
++        // as authentication. Add your application's custom HMAC / api-key
++        // / bearer-token middleware here so routes guarded by it stop
++        // being reported as "public" / PUBLIC_WRITE.
++        //
++        // Examples:
++        //   'auth.custom',
++        //   'merchant.hmac',
++        //   App\Http\Middleware\AuthenticateMerchant::class,
++        //
+         'auth_middleware' => [],
++
++        // Extra middleware aliases or FQCN prefixes that Brain should treat
++        // as rate-limiting. The default list already covers `throttle:` and
++        // ThrottleRequests; add any custom throttle middleware here.
++        //
++        'throttle_middleware' => [],
++
++        // Route names whose routes are trusted (PUBLIC_WRITE will be
++        // suppressed even when no recognised auth middleware is present).
++        //
++        // Use this for endpoints whose authentication is enforced *outside*
++        // of Laravel's middleware system — typically a webhook with HMAC
++        // verification done in the controller, or an endpoint authenticated
++        // by a token in the URL.
++        //
++        // Supports glob patterns (`*` and `?`), matched case-insensitively.
++        //
++        // Examples:
++        //   'webhooks.*',
++        //   'portal.*',
++        //
++        'trusted_route_names' => [],
++
++        // Route URI globs whose routes are trusted, same semantics as
++        // `trusted_route_names`. Matched against the route's URI without
++        // a leading slash. Useful when routes are unnamed.
++        //
++        // Examples:
++        //   'webhooks/*',
++        //   'portal/*/cancel',
++        //
++        'trusted_route_uris' => [],
+     ],
+ 
+     // -------------------------------------------------------------------------
+diff --git a/src/Analysis/ProjectAnalyzer.php b/src/Analysis/ProjectAnalyzer.php
+index 5314442c..386aef0b 100644
+--- a/src/Analysis/ProjectAnalyzer.php
++++ b/src/Analysis/ProjectAnalyzer.php
+@@ -80,9 +80,11 @@ classPaths: $cmdConfig['class_paths'] ?? ['app/Console/Commands/*/*.php'],
+         $this->modelAnalyzer = new ModelAnalyzer(is_array($modelPaths) ? $modelPaths : []);
+         $this->filamentAnalyzer = new FilamentAnalyzer;
+         $this->queryTracer = new QueryTracer;
+-        $authMiddleware = config('laravel-brain.security.auth_middleware', []);
+         $this->securityAnalyzer = new SecurityAnalyzer(
+-            extraAuthPatterns: is_array($authMiddleware) ? $authMiddleware : [],
++            extraAuthPatterns: $this->stringList(config('laravel-brain.security.auth_middleware', [])),
++            extraThrottlePatterns: $this->stringList(config('laravel-brain.security.throttle_middleware', [])),
++            trustedRouteNames: $this->stringList(config('laravel-brain.security.trusted_route_names', [])),
++            trustedRouteUris: $this->stringList(config('laravel-brain.security.trusted_route_uris', [])),
+         );
+         $this->graphBuilder = new GraphBuilder;
+         $livewirePaths = config('laravel-brain.livewire.component_paths', []);
+@@ -313,4 +315,28 @@ private function emit(string $event, array $data = []): void
+     {
+         ($this->onProgress)($event, $data);
+     }
++
++    /**
++     * Coerce the result of a config() lookup into a list of non-empty
++     * strings. Anything else (a non-array value, a key with mixed contents,
++     * an empty string) is dropped silently so a typo in the user's config
++     * can't crash the scan.
++     *
++     * @param  mixed  $value
++     * @return list<string>
++     */
++    private function stringList($value): array
++    {
++        if (! is_array($value)) {
++            return [];
++        }
++        $out = [];
++        foreach ($value as $item) {
++            if (is_string($item) && $item !== '') {
++                $out[] = $item;
++            }
++        }
++
++        return $out;
++    }
+ }
+diff --git a/src/Analysis/SecurityAnalyzer.php b/src/Analysis/SecurityAnalyzer.php
+index 6ffea171..110df7ea 100644
+--- a/src/Analysis/SecurityAnalyzer.php
++++ b/src/Analysis/SecurityAnalyzer.php
+@@ -35,6 +35,10 @@ class SecurityAnalyzer
+      * Middleware aliases / FQCN prefixes that imply authentication is required.
+      * Matched as prefix (case-insensitive) so `auth:sanctum` and
+      * `Illuminate\Auth\Middleware\Authenticate` both match.
++     *
++     * `signed` and `ValidateSignature` are included because Laravel's signed
++     * URL middleware verifies a cryptographic HMAC of the URL — that's
++     * authentication of the request, even though it isn't tied to a user.
+      */
+     private const AUTH_PATTERNS = [
+         'auth',
+@@ -42,7 +46,9 @@ class SecurityAnalyzer
+         'jwt',
+         'passport',
+         'verified',
++        'signed',
+         'Illuminate\\Auth\\Middleware\\Authenticate',
++        'Illuminate\\Routing\\Middleware\\ValidateSignature',
+     ];
+ 
+     /** Middleware that redirects authenticated users away (login/register pages). */
+@@ -100,9 +106,48 @@ class SecurityAnalyzer
+     /** @var array<string, list<array<string, mixed>>>|null */
+     private ?array $externalByFile = null;
+ 
+-    public function __construct(private array $extraAuthPatterns = [])
+-    {
++    /**
++     * Effective auth-middleware patterns (defaults + $extraAuthPatterns),
++     * pre-computed so classifyExposure() doesn't re-merge per route.
++     *
++     * @var list<string>
++     */
++    private array $authPatterns;
++
++    /**
++     * Effective throttle-middleware patterns (defaults + $extraThrottlePatterns).
++     *
++     * @var list<string>
++     */
++    private array $throttlePatterns;
++
++    /**
++     * @param  list<string>  $extraAuthPatterns  User-configured extra auth middleware
++     *                                           (from `laravel-brain.security.auth_middleware`).
++     * @param  list<string>  $extraThrottlePatterns  User-configured extra throttle middleware
++     *                                               (from `laravel-brain.security.throttle_middleware`).
++     * @param  list<string>  $trustedRouteNames  Route-name glob patterns whose routes
++     *                                           authenticate outside of Laravel's middleware system —
++     *                                           webhooks with HMAC verification, token-in-URL flows,
++     *                                           custom api-key middleware. PUBLIC_WRITE is
++     *                                           suppressed for matching routes.
++     * @param  list<string>  $trustedRouteUris  Route-URI glob patterns, same semantics as
++     *                                          $trustedRouteNames. Matched against the route URI
++     *                                          with the leading slash stripped.
++     */
++    public function __construct(
++        private array $extraAuthPatterns = [],
++        private array $extraThrottlePatterns = [],
++        private array $trustedRouteNames = [],
++        private array $trustedRouteUris = [],
++    ) {
+         $this->parser = new PhpFileParser;
++        $this->authPatterns = array_values(array_unique(
++            array_merge(self::AUTH_PATTERNS, $this->extraAuthPatterns),
++        ));
++        $this->throttlePatterns = array_values(array_unique(
++            array_merge(self::THROTTLE_PATTERNS, $this->extraThrottlePatterns),
++        ));
+     }
+ 
+     // ── Public API ───────────────────────────────────────────────────────────
+@@ -138,10 +183,17 @@ public function analyze(
+             $exposure = $this->classifyExposure($resolvedMw);
+             $issues = [];
+ 
++            $isTrusted = $this->isTrustedRoute($route);
++            $hasThrottleMiddleware = $this->hasMiddlewareMatching($resolvedMw, $this->throttlePatterns);
++            $controllerDef = ($route->controller !== '' && $route->controller !== 'Closure')
++                ? ($controllers[$route->controller] ?? null)
++                : null;
++
+             // ── 1. Missing throttle on sensitive endpoints ───────────────────
+             if (in_array($route->method, ['POST', 'PUT', 'PATCH'], true)
+                 && $this->isSensitiveUri($route->uri)
+-                && ! $this->hasMiddlewareMatching($resolvedMw, self::THROTTLE_PATTERNS)
++                && ! $hasThrottleMiddleware
++                && ! $this->hasInCodeThrottle($route, $controllerDef)
+             ) {
+                 $issues[] = (new SecurityIssue(
+                     type: 'MISSING_THROTTLE',
+@@ -153,6 +205,7 @@ public function analyze(
+             // ── 2. Unauthenticated write operations ─────────────────────────
+             if (in_array($route->method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)
+                 && $exposure === 'public'
++                && ! $isTrusted
+             ) {
+                 $severity = $route->method === 'DELETE' ? 'high' : 'medium';
+                 $issues[] = (new SecurityIssue(
+@@ -229,9 +282,8 @@ private function classifyExposure(array $middlewares): string
+             }
+         }
+         // Auth check
+-        $authPatterns = array_merge(self::AUTH_PATTERNS, $this->extraAuthPatterns);
+         foreach ($middlewares as $mw) {
+-            if ($this->middlewareMatches($mw, $authPatterns)) {
++            if ($this->middlewareMatches($mw, $this->authPatterns)) {
+                 return 'authed';
+             }
+         }
+@@ -257,6 +309,237 @@ private function isSensitiveUri(string $uri): bool
+         return false;
+     }
+ 
++    /**
++     * A route is "trusted" when the user has declared (via config) that its
++     * authentication is enforced outside of Laravel's middleware system —
++     * typically a webhook with HMAC verification in the controller, or an
++     * endpoint authenticated by a token in the URL.
++     *
++     * When trusted, PUBLIC_WRITE is suppressed for the route.
++     */
++    private function isTrustedRoute(RouteDefinition $route): bool
++    {
++        if ($route->name !== '') {
++            foreach ($this->trustedRouteNames as $pattern) {
++                if ($this->globMatches($pattern, $route->name)) {
++                    return true;
++                }
++            }
++        }
++        $uri = ltrim($route->uri, '/');
++        foreach ($this->trustedRouteUris as $pattern) {
++            if ($this->globMatches(ltrim($pattern, '/'), $uri)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    private function globMatches(string $pattern, string $subject): bool
++    {
++        // Match 'webhooks.*' against 'webhooks.stripe' and 'webhooks/*' against
++        // 'webhooks/stripe/123'. fnmatch supports both * and ? without the
++        // regex caveats.
++        return fnmatch($pattern, $subject, FNM_CASEFOLD);
++    }
++
++    /**
++     * Detect rate-limiting performed in PHP instead of via middleware:
++     *   • RateLimiter::tooManyAttempts / ::hit / ::for / ::attempt / ::availableIn
++     *     in the controller method or any FormRequest used by it.
++     *   • Use of the Illuminate\Foundation\Auth\ThrottlesLogins trait on the
++     *     controller class (Laravel's classic Breeze/Fortify pattern).
++     */
++    private function hasInCodeThrottle(RouteDefinition $route, ?ControllerDefinition $controllerDef): bool
++    {
++        // Closure routes: scan the closure body for the same patterns.
++        if ($controllerDef === null) {
++            if ($route->closureNode === null) {
++                return false;
++            }
++
++            return $this->astHasRateLimiterCall($route->closureNode);
++        }
++
++        if (! is_file($controllerDef->file)) {
++            return false;
++        }
++
++        $parsed = $this->cachedParse($controllerDef->file);
++        if ($parsed['ast'] === null) {
++            return false;
++        }
++
++        if ($this->astUsesThrottlesLoginsTrait($parsed['ast'], $parsed['useMap'] ?? [])) {
++            return true;
++        }
++
++        $methodNode = $this->findClassMethod($parsed['ast'], $route->action);
++        if ($methodNode === null) {
++            return false;
++        }
++
++        if ($this->astHasRateLimiterCall($methodNode)) {
++            return true;
++        }
++
++        // Walk into any FormRequest type-hinted parameters and scan them too.
++        $useMap = array_merge($controllerDef->useMap, $parsed['useMap'] ?? []);
++        foreach ($this->resolveFormRequestFiles($methodNode, $useMap) as $requestFile) {
++            $requestParsed = $this->cachedParse($requestFile);
++            if ($requestParsed['ast'] !== null && $this->astHasRateLimiterCall($requestParsed['ast'])) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    private function astHasRateLimiterCall($node): bool
++    {
++        $found = false;
++        $traverser = new NodeTraverser;
++        $traverser->addVisitor(new class($found) extends NodeVisitorAbstract
++        {
++            public function __construct(public bool &$found) {}
++
++            public function enterNode(Node $node): ?int
++            {
++                if ($this->found) {
++                    return NodeTraverser::STOP_TRAVERSAL;
++                }
++
++                // RateLimiter::tooManyAttempts(...) / ::hit(...) / ::for(...) / ::attempt(...) / ::availableIn(...)
++                if ($node instanceof Node\Expr\StaticCall
++                    && $node->name instanceof Node\Identifier
++                    && in_array($node->name->toString(), [
++                        'tooManyAttempts', 'hit', 'for', 'attempt', 'availableIn', 'clear',
++                    ], true)
++                    && $node->class instanceof Node\Name
++                    && str_contains(strtolower($node->class->toString()), 'ratelimiter')
++                ) {
++                    $this->found = true;
++
++                    return NodeTraverser::STOP_TRAVERSAL;
++                }
++
++                // $this->limiter()->tooManyAttempts(...), $r->hitRateLimit(...), etc.
++                if ($node instanceof Node\Expr\MethodCall
++                    && $node->name instanceof Node\Identifier
++                    && in_array($node->name->toString(), ['tooManyAttempts', 'hitRateLimit'], true)
++                ) {
++                    $this->found = true;
++
++                    return NodeTraverser::STOP_TRAVERSAL;
++                }
++
++                return null;
++            }
++        });
++        $traverser->traverse(is_array($node) ? $node : [$node]);
++
++        return $found;
++    }
++
++    /**
++     * Detect ThrottlesLogins (Laravel <=8 / Fortify) used on a controller class.
++     *
++     * @param  Node\Stmt[]  $ast
++     * @param  array<string, string>  $useMap
++     */
++    private function astUsesThrottlesLoginsTrait(array $ast, array $useMap): bool
++    {
++        $found = false;
++        $traverser = new NodeTraverser;
++        $traverser->addVisitor(new class($found, $useMap) extends NodeVisitorAbstract
++        {
++            public function __construct(public bool &$found, private array $useMap) {}
++
++            public function enterNode(Node $node): ?int
++            {
++                if ($node instanceof Node\Stmt\TraitUse) {
++                    foreach ($node->traits as $trait) {
++                        $name = $trait->toString();
++                        $fqcn = $this->useMap[$name] ?? $name;
++                        if (str_contains($fqcn, 'ThrottlesLogins')) {
++                            $this->found = true;
++
++                            return NodeTraverser::STOP_TRAVERSAL;
++                        }
++                    }
++                }
++
++                return null;
++            }
++        });
++        $traverser->traverse($ast);
++
++        return $found;
++    }
++
++    /**
++     * Resolve every FormRequest typed parameter of a controller method to the
++     * absolute file path of its class declaration. Used so the throttle scan
++     * can follow `ensureIsNotRateLimited()` in a LoginRequest etc.
++     *
++     * @param  array<string, string>  $useMap
++     * @return list<string>
++     */
++    private function resolveFormRequestFiles(Node\Stmt\ClassMethod $method, array $useMap): array
++    {
++        $files = [];
++        foreach ($method->params as $param) {
++            if ($param->type === null) {
++                continue;
++            }
++            $typeName = $this->extractTypeName($param->type);
++            if ($typeName === null) {
++                continue;
++            }
++            $fqcn = $useMap[$typeName] ?? $typeName;
++            if (! str_ends_with($fqcn, 'Request') && ! str_contains($fqcn, 'FormRequest')) {
++                continue;
++            }
++            $file = $this->locateClassFile($fqcn);
++            if ($file !== null) {
++                $files[] = $file;
++            }
++        }
++
++        return $files;
++    }
++
++    /**
++     * Best-effort file lookup for a FQCN inside the project. Walks the
++     * conventional PSR-4 `App\...` mapping plus a Composer-classmap fallback.
++     */
++    private function locateClassFile(string $fqcn): ?string
++    {
++        if ($this->projectRoot === '') {
++            return null;
++        }
++
++        if (class_exists($fqcn, false) || class_exists($fqcn)) {
++            try {
++                $file = (new \ReflectionClass($fqcn))->getFileName();
++                if (is_string($file) && is_file($file)) {
++                    return $file;
++                }
++            } catch (\Throwable) {
++                // fall through
++            }
++        }
++
++        // PSR-4 convention: App\Http\Requests\LoginRequest → app/Http/Requests/LoginRequest.php
++        $candidate = rtrim($this->projectRoot, '/').'/'.str_replace(['App\\', '\\'], ['app/', '/'], ltrim($fqcn, '\\')).'.php';
++        if (is_file($candidate)) {
++            return $candidate;
++        }
++
++        return null;
++    }
++
+     private function hasMiddlewareMatching(array $middlewares, array $patterns): bool
+     {
+         foreach ($middlewares as $mw) {
+@@ -480,6 +763,136 @@ private function extractTypeName(Node $type): ?string
+         return null;
+     }
+ 
++    /**
++     * Returns true when `$node` is a method call of the form `$req->all()` or
++     * `$req->input()` whose receiver is known to be an HTTP Request — either
++     * a parameter typed as `Illuminate\Http\Request` (or any subclass /
++     * FormRequest) in the enclosing function/method, or the `request()`
++     * global helper.
++     *
++     * Static so the anonymous visitors inside scanAstNode() can call it
++     * without needing a reference to the SecurityAnalyzer instance.
++     *
++     * @param  array<string, true>  $requestVars  variable names known to hold a Request
++     */
++    public static function isRequestAllCall(Node $node, array $requestVars): bool
++    {
++        if (! ($node instanceof Node\Expr\MethodCall)
++            || ! ($node->name instanceof Node\Identifier)
++        ) {
++            return false;
++        }
++        $method = $node->name->toString();
++        if (! in_array($method, ['all', 'input'], true)) {
++            return false;
++        }
++        if ($method === 'input' && count($node->args) !== 0) {
++            return false;
++        }
++
++        $var = $node->var;
++        if ($var instanceof Node\Expr\Variable
++            && is_string($var->name)
++            && isset($requestVars[$var->name])
++        ) {
++            return true;
++        }
++        if ($var instanceof Node\Expr\FuncCall
++            && $var->name instanceof Node\Name
++            && $var->name->toString() === 'request'
++            && count($var->args) === 0
++        ) {
++            return true;
++        }
++
++        return false;
++    }
++
++    /**
++     * Find every parameter in the enclosing function/method whose type-hint
++     * looks like an HTTP Request (FQCN resolves to Illuminate\Http\Request
++     * or matches the Request/FormRequest convention) and return their names.
++     *
++     * @param  array<string, string>  $useMap
++     * @return array<string, true>
++     */
++    private function collectRequestParamNames(Node $node, array $useMap): array
++    {
++        $names = [];
++        $traverser = new NodeTraverser;
++        $traverser->addVisitor(new class($names, $useMap) extends NodeVisitorAbstract
++        {
++            public function __construct(public array &$names, private array $useMap) {}
++
++            public function enterNode(Node $node): ?int
++            {
++                if (! ($node instanceof Node\FunctionLike)) {
++                    return null;
++                }
++                foreach ($node->getParams() as $param) {
++                    if ($param->type === null || ! ($param->var instanceof Node\Expr\Variable)) {
++                        continue;
++                    }
++                    $varName = is_string($param->var->name) ? $param->var->name : null;
++                    if ($varName === null) {
++                        continue;
++                    }
++                    foreach ($this->extractTypeNames($param->type) as $typeName) {
++                        $fqcn = $this->useMap[$typeName] ?? $typeName;
++                        if ($this->looksLikeRequestType($fqcn)) {
++                            $this->names[$varName] = true;
++                            break;
++                        }
++                    }
++                }
++
++                return null;
++            }
++
++            /** @return list<string> */
++            private function extractTypeNames(Node $type): array
++            {
++                if ($type instanceof Node\Name || $type instanceof Node\Identifier) {
++                    return [$type->toString()];
++                }
++                if ($type instanceof Node\NullableType) {
++                    return $this->extractTypeNames($type->type);
++                }
++                if ($type instanceof Node\UnionType || $type instanceof Node\IntersectionType) {
++                    $names = [];
++                    foreach ($type->types as $sub) {
++                        foreach ($this->extractTypeNames($sub) as $n) {
++                            $names[] = $n;
++                        }
++                    }
++
++                    return $names;
++                }
++
++                return [];
++            }
++
++            private function looksLikeRequestType(string $fqcn): bool
++            {
++                $fqcn = ltrim($fqcn, '\\');
++                if (str_contains($fqcn, 'Illuminate\\Http\\Request')) {
++                    return true;
++                }
++                if (str_contains($fqcn, 'FormRequest')) {
++                    return true;
++                }
++                if (str_contains($fqcn, '\\Http\\Requests\\') || str_ends_with($fqcn, 'Request')) {
++                    return true;
++                }
++
++                return false;
++            }
++        });
++        $traverser->traverse([$node]);
++
++        return $names;
++    }
++
+     /**
+      * Walk any AST node and collect security issues.
+      *
+@@ -498,16 +911,18 @@ private function scanAstNode(
+     ): array {
+         $issues = [];
+         $hasValidation = $hasFormRequest;
++        $requestVars = $this->collectRequestParamNames($node, $useMap);
+ 
+         // ── Pass 1: mass-assignment + validation detection ───────────────────
+         $traverser = new NodeTraverser;
+-        $traverser->addVisitor(new class($issues, $hasValidation, $useMap, $file) extends NodeVisitorAbstract
++        $traverser->addVisitor(new class($issues, $hasValidation, $useMap, $file, $requestVars) extends NodeVisitorAbstract
+         {
+             public function __construct(
+                 public array &$issues,
+                 public bool &$hasValidation,
+                 private array $useMap,
+                 private ?string $file,
++                private array $requestVars,
+             ) {}
+ 
+             public function enterNode(Node $node): ?int
+@@ -541,7 +956,7 @@ public function enterNode(Node $node): ?int
+                     ], true)
+                 ) {
+                     foreach ($node->args as $arg) {
+-                        if ($this->isRequestAll($arg->value)) {
++                        if (SecurityAnalyzer::isRequestAllCall($arg->value, $this->requestVars)) {
+                             $this->issues[] = (new SecurityIssue(
+                                 type: 'MASS_ASSIGNMENT',
+                                 severity: 'critical',
+@@ -559,7 +974,7 @@ public function enterNode(Node $node): ?int
+                     && in_array($node->name->toString(), ['fill', 'forceFill'], true)
+                 ) {
+                     foreach ($node->args as $arg) {
+-                        if ($this->isRequestAll($arg->value)) {
++                        if (SecurityAnalyzer::isRequestAllCall($arg->value, $this->requestVars)) {
+                             $this->issues[] = (new SecurityIssue(
+                                 type: 'MASS_ASSIGNMENT',
+                                 severity: 'critical',
+@@ -573,14 +988,6 @@ public function enterNode(Node $node): ?int
+ 
+                 return null;
+             }
+-
+-            private function isRequestAll(Node $node): bool
+-            {
+-                return $node instanceof Node\Expr\MethodCall
+-                    && $node->name instanceof Node\Identifier
+-                    && in_array($node->name->toString(), ['all', 'input'], true)
+-                    && ($node->name->toString() !== 'input' || count($node->args) === 0);
+-            }
+         });
+         $traverser->traverse([$node]);
+ 
+@@ -588,19 +995,17 @@ private function isRequestAll(Node $node): bool
+         if (! $hasValidation) {
+             $unvalidatedTraverser = new NodeTraverser;
+             $unvalidatedTraverser->addVisitor(
+-                new class($issues, $file) extends NodeVisitorAbstract
++                new class($issues, $file, $requestVars) extends NodeVisitorAbstract
+                 {
+                     public function __construct(
+                         public array &$issues,
+                         private ?string $file,
++                        private array $requestVars,
+                     ) {}
+ 
+                     public function enterNode(Node $node): ?int
+                     {
+-                        if ($node instanceof Node\Expr\MethodCall
+-                            && $node->name instanceof Node\Identifier
+-                            && $node->name->toString() === 'all'
+-                        ) {
++                        if (SecurityAnalyzer::isRequestAllCall($node, $this->requestVars)) {
+                             $this->issues[] = (new SecurityIssue(
+                                 type: 'UNVALIDATED_INPUT',
+                                 severity: 'high',
+diff --git a/tests/Unit/SecurityAnalyzerTest.php b/tests/Unit/SecurityAnalyzerTest.php
+index c35a531c..0f360851 100644
+--- a/tests/Unit/SecurityAnalyzerTest.php
++++ b/tests/Unit/SecurityAnalyzerTest.php
+@@ -76,3 +76,363 @@ function exposure(RouteDefinition $route, MiddlewareRegistry $registry, array $e
+ 
+     expect(exposure($route, $registry, ['App\Http\Middleware\CustomAuth']))->toBe('authed');
+ });
++
++// =============================================================================
++// False-positive fixes for UNVALIDATED_INPUT, PUBLIC_WRITE and MISSING_THROTTLE
++// =============================================================================
++
++use LaraMint\LaravelBrain\Analysis\ControllerAnalyzer;
++use LaraMint\LaravelBrain\Analysis\ControllerDefinition;
++use LaraMint\LaravelBrain\Analysis\RouteAnalyzer;
++use LaraMint\LaravelBrain\Parser\PhpFileParser;
++
++// RouteDefinition and ControllerDefinition are declared as secondary classes
++// inside RouteAnalyzer.php and ControllerAnalyzer.php; touching the parent
++// classes forces PSR-4 to include those files so the helpers below can
++// instantiate the definitions directly.
++class_exists(RouteAnalyzer::class);
++class_exists(ControllerAnalyzer::class);
++
++/**
++ * Build a ControllerDefinition from a fixture file so we can hand the
++ * analyzer real AST plus the file path it would normally compute itself.
++ */
++function securityFixtureController(string $relativePath, string $fqcn): ControllerDefinition
++{
++    $file = fixture('security-project/'.$relativePath);
++    $parsed = (new PhpFileParser)->parse($file);
++
++    return new ControllerDefinition(
++        fqcn: $fqcn,
++        file: $file,
++        constructorDeps: [],
++        methods: [],
++        useMap: $parsed['useMap'] ?? [],
++    );
++}
++
++function securityProjectRoot(): string
++{
++    return fixture('security-project');
++}
++
++function emptyMiddlewareRegistry(): MiddlewareRegistry
++{
++    return new MiddlewareRegistry([], [], []);
++}
++
++/**
++ * @param  array<string, array>  $analysis
++ * @return list<string>
++ */
++function issueTypes(array $analysis, string $routeId): array
++{
++    return array_values(array_map(
++        fn (array $i) => $i['type'],
++        $analysis[$routeId]['issues'] ?? [],
++    ));
++}
++
++// ─── Bug 1 — UNVALIDATED_INPUT must require a Request receiver ───────────────
++
++it('does not flag Collection->values()->all() as UNVALIDATED_INPUT', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'GET',
++        uri: '/admin/developers',
++        controller: 'App\\Http\\Controllers\\CollectionAllController',
++        action: 'indexCollectionOnly',
++        middlewares: ['auth'],
++        name: 'developers.index',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\CollectionAllController' => securityFixtureController(
++            'app/Http/Controllers/CollectionAllController.php',
++            'App\\Http\\Controllers\\CollectionAllController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::GET::/admin/developers'))
++        ->not->toContain('UNVALIDATED_INPUT');
++});
++
++it('does not flag Eloquent Collection ->all() as UNVALIDATED_INPUT', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'GET',
++        uri: '/users',
++        controller: 'App\\Http\\Controllers\\CollectionAllController',
++        action: 'indexEloquentCollection',
++        middlewares: ['auth'],
++        name: 'users.index',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\CollectionAllController' => securityFixtureController(
++            'app/Http/Controllers/CollectionAllController.php',
++            'App\\Http\\Controllers\\CollectionAllController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::GET::/users'))
++        ->not->toContain('UNVALIDATED_INPUT');
++});
++
++it('still flags request()->all() (helper) as UNVALIDATED_INPUT', function () {
++    // Action takes no FormRequest type-hint, so the existing
++    // methodHasFormRequest heuristic does not short-circuit Pass 2.
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/store-helper',
++        controller: 'App\\Http\\Controllers\\CollectionAllController',
++        action: 'storeWithRequestHelper',
++        middlewares: ['auth'],
++        name: 'store.helper',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\CollectionAllController' => securityFixtureController(
++            'app/Http/Controllers/CollectionAllController.php',
++            'App\\Http\\Controllers\\CollectionAllController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::POST::/store-helper'))
++        ->toContain('UNVALIDATED_INPUT');
++});
++
++// ─── Bug 2 — signed / trusted routes ─────────────────────────────────────────
++
++it('treats `signed` middleware as authentication, not public', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/downloads/{file}',
++        controller: 'App\\Http\\Controllers\\SignedDownloadController',
++        action: 'download',
++        middlewares: ['signed'],
++        name: 'downloads.show',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\SignedDownloadController' => securityFixtureController(
++            'app/Http/Controllers/SignedDownloadController.php',
++            'App\\Http\\Controllers\\SignedDownloadController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect($analysis['route::POST::/downloads/{file}']['exposure'])->toBe('authed')
++        ->and(issueTypes($analysis, 'route::POST::/downloads/{file}'))->not->toContain('PUBLIC_WRITE');
++});
++
++it('treats `ValidateSignature` FQCN middleware as authentication', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/downloads/{file}',
++        controller: 'App\\Http\\Controllers\\SignedDownloadController',
++        action: 'download',
++        middlewares: ['Illuminate\\Routing\\Middleware\\ValidateSignature'],
++        name: 'downloads.show',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\SignedDownloadController' => securityFixtureController(
++            'app/Http/Controllers/SignedDownloadController.php',
++            'App\\Http\\Controllers\\SignedDownloadController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect($analysis['route::POST::/downloads/{file}']['exposure'])->toBe('authed');
++});
++
++it('suppresses PUBLIC_WRITE on routes matching trusted_route_names glob', function () {
++    $analyzer = new SecurityAnalyzer(trustedRouteNames: ['webhooks.*']);
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/webhooks/stripe',
++        controller: 'App\\Http\\Controllers\\WebhookController',
++        action: 'stripe',
++        middlewares: [],
++        name: 'webhooks.stripe',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\WebhookController' => securityFixtureController(
++            'app/Http/Controllers/WebhookController.php',
++            'App\\Http\\Controllers\\WebhookController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::POST::/webhooks/stripe'))
++        ->not->toContain('PUBLIC_WRITE');
++});
++
++it('suppresses PUBLIC_WRITE on routes matching trusted_route_uris glob', function () {
++    $analyzer = new SecurityAnalyzer(trustedRouteUris: ['webhooks/*']);
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/webhooks/stripe/tenant-1',
++        controller: 'App\\Http\\Controllers\\WebhookController',
++        action: 'stripe',
++        middlewares: [],
++        name: '', // no name → trusted_route_names cannot match
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\WebhookController' => securityFixtureController(
++            'app/Http/Controllers/WebhookController.php',
++            'App\\Http\\Controllers\\WebhookController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::POST::/webhooks/stripe/tenant-1'))
++        ->not->toContain('PUBLIC_WRITE');
++});
++
++it('still flags public mutating routes that are NOT trusted', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/articles',
++        controller: 'App\\Http\\Controllers\\WebhookController',
++        action: 'stripe',
++        middlewares: [],
++        name: 'articles.store',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\WebhookController' => securityFixtureController(
++            'app/Http/Controllers/WebhookController.php',
++            'App\\Http\\Controllers\\WebhookController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::POST::/articles'))
++        ->toContain('PUBLIC_WRITE');
++});
++
++// ─── Bug 3 — in-controller / in-FormRequest throttle detection ───────────────
++
++it('does not flag MISSING_THROTTLE when controller uses RateLimiter::tooManyAttempts', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/login',
++        controller: 'App\\Http\\Controllers\\LoginController',
++        action: 'store',
++        middlewares: [], // no throttle middleware
++        name: 'login.store',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\LoginController' => securityFixtureController(
++            'app/Http/Controllers/LoginController.php',
++            'App\\Http\\Controllers\\LoginController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::POST::/login'))
++        ->not->toContain('MISSING_THROTTLE');
++});
++
++it('does not flag MISSING_THROTTLE when the action FormRequest throttles', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/login',
++        controller: 'App\\Http\\Controllers\\LoginController',
++        action: 'loginViaRequest',
++        middlewares: [],
++        name: 'login.via-request',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\LoginController' => securityFixtureController(
++            'app/Http/Controllers/LoginController.php',
++            'App\\Http\\Controllers\\LoginController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::POST::/login'))
++        ->not->toContain('MISSING_THROTTLE');
++});
++
++it('still flags MISSING_THROTTLE on sensitive routes with no rate-limiting', function () {
++    $analyzer = new SecurityAnalyzer;
++
++    $route = new RouteDefinition(
++        method: 'POST',
++        uri: '/login-noop',
++        controller: 'App\\Http\\Controllers\\WebhookController',
++        action: 'stripe', // does not call RateLimiter / has no FormRequest
++        middlewares: [],
++        name: 'login.noop',
++        file: '',
++        line: 0,
++    );
++
++    $controllers = [
++        'App\\Http\\Controllers\\WebhookController' => securityFixtureController(
++            'app/Http/Controllers/WebhookController.php',
++            'App\\Http\\Controllers\\WebhookController',
++        ),
++    ];
++
++    $analysis = $analyzer->analyze([$route], emptyMiddlewareRegistry(), $controllers, securityProjectRoot());
++
++    expect(issueTypes($analysis, 'route::POST::/login-noop'))
++        ->toContain('MISSING_THROTTLE');
++});
+diff --git a/tests/fixtures/security-project/app/Http/Controllers/CollectionAllController.php b/tests/fixtures/security-project/app/Http/Controllers/CollectionAllController.php
+new file mode 100644
+index 00000000..2584cb40
+--- /dev/null
++++ b/tests/fixtures/security-project/app/Http/Controllers/CollectionAllController.php
+@@ -0,0 +1,38 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Models\User;
++use Illuminate\Http\Request;
++
++/**
++ * Reproduces Bug 1: `->all()` on a Collection / Eloquent result should NOT
++ * be flagged as UNVALIDATED_INPUT — only `$request->all()` should.
++ */
++class CollectionAllController
++{
++    public function indexCollectionOnly(): array
++    {
++        return collect([1, 2, 3])->values()->all();
++    }
++
++    public function indexEloquentCollection(): array
++    {
++        return User::query()->get(['id'])->all();
++    }
++
++    public function storeWithRequestAll(Request $request): array
++    {
++        return $request->all();
++    }
++
++    /**
++     * The classic real-world false negative we still want to catch: a
++     * controller action with no FormRequest type-hint that pulls input via
++     * the `request()` helper.
++     */
++    public function storeWithRequestHelper(): array
++    {
++        return request()->all();
++    }
++}
+diff --git a/tests/fixtures/security-project/app/Http/Controllers/LoginController.php b/tests/fixtures/security-project/app/Http/Controllers/LoginController.php
+new file mode 100644
+index 00000000..d8fc2435
+--- /dev/null
++++ b/tests/fixtures/security-project/app/Http/Controllers/LoginController.php
+@@ -0,0 +1,35 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Http\Requests\LoginRequest;
++use Illuminate\Http\Request;
++use Illuminate\Support\Facades\RateLimiter;
++
++/**
++ * Reproduces Bug 3 (controller-side throttle):
++ * `POST /login` uses RateLimiter::tooManyAttempts() directly in the controller
++ * — Breeze 2.x pattern — instead of the `throttle:` middleware.
++ */
++class LoginController
++{
++    public function store(Request $request): array
++    {
++        $key = 'login|'.$request->ip();
++        if (RateLimiter::tooManyAttempts($key, 5)) {
++            abort(429);
++        }
++        RateLimiter::hit($key);
++
++        return ['ok' => true];
++    }
++
++    /**
++     * Reproduces Bug 3 (FormRequest-side throttle):
++     * Breeze's LoginRequest::authenticate() throttles inside the FormRequest.
++     */
++    public function loginViaRequest(LoginRequest $request): array
++    {
++        return ['ok' => true];
++    }
++}
+diff --git a/tests/fixtures/security-project/app/Http/Controllers/SignedDownloadController.php b/tests/fixtures/security-project/app/Http/Controllers/SignedDownloadController.php
+new file mode 100644
+index 00000000..4e1e1b3a
+--- /dev/null
++++ b/tests/fixtures/security-project/app/Http/Controllers/SignedDownloadController.php
+@@ -0,0 +1,17 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use Illuminate\Http\Request;
++
++/**
++ * Reproduces Bug 2: route guarded only by `signed` (cryptographic URL
++ * signature). Must be classified as `authed`, not `public`.
++ */
++class SignedDownloadController
++{
++    public function download(Request $request): array
++    {
++        return ['ok' => true];
++    }
++}
+diff --git a/tests/fixtures/security-project/app/Http/Controllers/WebhookController.php b/tests/fixtures/security-project/app/Http/Controllers/WebhookController.php
+new file mode 100644
+index 00000000..f879d77b
+--- /dev/null
++++ b/tests/fixtures/security-project/app/Http/Controllers/WebhookController.php
+@@ -0,0 +1,19 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use Illuminate\Http\Request;
++
++/**
++ * Reproduces Bug 2: webhook authenticated by HMAC signature in the
++ * controller (not via the standard `auth` middleware). With `trusted_route_*`
++ * config set, PUBLIC_WRITE must be suppressed.
++ */
++class WebhookController
++{
++    public function stripe(Request $request): array
++    {
++        // Signature verification omitted for fixture brevity.
++        return ['ok' => true];
++    }
++}
+diff --git a/tests/fixtures/security-project/app/Http/Requests/LoginRequest.php b/tests/fixtures/security-project/app/Http/Requests/LoginRequest.php
+new file mode 100644
+index 00000000..12f20104
+--- /dev/null
++++ b/tests/fixtures/security-project/app/Http/Requests/LoginRequest.php
+@@ -0,0 +1,27 @@
++<?php
++
++namespace App\Http\Requests;
++
++use Illuminate\Foundation\Http\FormRequest;
++use Illuminate\Support\Facades\RateLimiter;
++
++class LoginRequest extends FormRequest
++{
++    public function rules(): array
++    {
++        return ['email' => ['required', 'email']];
++    }
++
++    public function ensureIsNotRateLimited(): void
++    {
++        if (RateLimiter::tooManyAttempts($this->throttleKey(), 5)) {
++            abort(429);
++        }
++        RateLimiter::hit($this->throttleKey());
++    }
++
++    public function throttleKey(): string
++    {
++        return 'login|'.$this->ip();
++    }
++}
+diff --git a/tests/fixtures/security-project/app/Models/User.php b/tests/fixtures/security-project/app/Models/User.php
+new file mode 100644
+index 00000000..8d988c01
+--- /dev/null
++++ b/tests/fixtures/security-project/app/Models/User.php
+@@ -0,0 +1,7 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Model;
++
++class User extends Model {}

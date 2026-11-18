@@ -1,0 +1,1347 @@
+diff --git a/bmtk/simulator/dpointnet/cell_models/glif3_cell.py b/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
+index 4669241c..d9019f61 100644
+--- a/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
++++ b/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
+@@ -86,6 +86,20 @@ def _synapse_type_range(glif_network, inputs):
+     return int(min(array.min() for array in arrays)), int(max(array.max() for array in arrays))
+ 
+ 
++def _input_index_dtype(indices, bound):
++    """int32 for small signed (or narrow unsigned) input indices whose delayed range fits, else int64.
++
++    The host copy of a large input's ``[edges, 2]`` indices is then half the
++    size; CSR construction and the canonical int64 index variable accept both.
++    """
++    dtype = np.asarray(indices).dtype
++    narrow = (
++        np.issubdtype(dtype, np.signedinteger) and dtype.itemsize <= 4
++        or np.issubdtype(dtype, np.unsignedinteger) and dtype.itemsize <= 2
++    )
++    return np.int32 if narrow and int(bound) <= np.iinfo(np.int32).max else np.int64
++
++
+ def _canonical_index_variable(indices, prepared=None):
+     if prepared is None:
+         return tf.Variable(indices, dtype=tf.int64, trainable=False)
+@@ -2209,7 +2223,7 @@ def __init__(
+             input_dense_shape = (self._n_neurons, n_input_nodes)
+ 
+             input_props["input_dim"] = n_input_nodes
+-            input_indices = np.array(input_network["indices"], dtype=np.int64)
++            input_index_dtype = np.int64
+             input_props["history_start"] = self._input_history_size
+             input_props["uniform_delay_steps"] = None
+             if dynamics_mode == "nest":
+@@ -2220,6 +2234,11 @@ def __init__(
+                     )
+                 input_steps = time_steps(input_delays, dt)
+                 history_steps = int(input_steps.max(initial=1)) - 1
++                input_index_dtype = _input_index_dtype(
++                    input_network["indices"], max(self._n_neurons, n_input_nodes * (history_steps + 1)),
++                )
++            input_indices = np.array(input_network["indices"], dtype=input_index_dtype)
++            if dynamics_mode == "nest":
+                 uniform_delay = (
+                     input_steps.size > 0
+                     and np.all(input_steps == input_steps.flat[0])
+diff --git a/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py b/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py
+index e28cb348..de62adf3 100644
+--- a/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py
++++ b/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py
+@@ -348,11 +348,109 @@ def _uint8_type_options(connectivity):
+     return {"uint8_types": True}
+ 
+ 
++# Host connectivity construction works on chunks of this many edges where a
++# whole-array temporary would otherwise be materialized.
++_HOST_CHUNK_EDGES = 1 << 24
++# Compact (target, type) pairs use a dense key table up to this many entries
++# (or twice the edge count, if larger) instead of sorting all edge keys.
++_DENSE_PAIR_TABLE_MIN = 1 << 20
++
++
++def _narrow_integer_view(values):
++    """``values`` itself when its integer dtype is at most 32 bits or int64, else as int64.
++
++    Indices and types are validated non-negative and below int64 range, so any
++    of these dtypes holds them exactly; widening a billion-edge array to int64
++    would only add a full-size copy.
++    """
++    if values.dtype == np.int64 or (
++        np.issubdtype(values.dtype, np.integer) and values.dtype.itemsize <= 4
++    ):
++        return values
++    return values.astype(np.int64)
++
++
++def _as_index_dtype(values, dtype):
++    """``values`` in ``dtype``; a same-width signed/unsigned reinterpretation needs no copy.
++
++    Callers guarantee non-negative values, whose bits are identical in both.
++    """
++    dtype = np.dtype(dtype)
++    if values.dtype == dtype:
++        return values
++    if (
++        np.issubdtype(values.dtype, np.integer) and np.issubdtype(dtype, np.integer)
++        and values.dtype.itemsize == dtype.itemsize
++    ):
++        return values.view(dtype)
++    return values.astype(dtype)
++
++
++def _chunked_bincount(values, minlength):
++    """``np.bincount(values, minlength)`` without converting all of ``values`` to intp at once."""
++    counts = np.zeros(minlength, dtype=np.int64)
++    for start in range(0, values.size, _HOST_CHUNK_EDGES):
++        part = np.bincount(values[start:start + _HOST_CHUNK_EDGES], minlength=minlength)
++        if part.size > counts.size:
++            counts = np.concatenate((counts, np.zeros(part.size - counts.size, np.int64)))
++        counts[:part.size] += part
++    return counts
++
++
++def _composite_keys(major, minor, stride):
++    """``major * stride + minor`` as uint64 with a single full-size allocation."""
++    keys = major.astype(np.uint64)
++    keys *= np.uint64(stride)
++    np.add(keys, minor, out=keys, dtype=np.uint64, casting="unsafe")
++    return keys
++
++
++def _unique_pairs(post_ids, pair_types, n_synapse_types, numpy_index_dtype):
++    """``(pairs, pair_ids)`` equal to ``np.unique`` of ``post * types + type`` with its inverse.
++
++    When the key range is small (it is ``n_post * n_synapse_types``) the
++    distinct keys are marked in a dense table and the inverse is gathered in
++    chunks, instead of sorting a full-size key array.
++    """
++    stride = int(n_synapse_types)
++    key_range = int(post_ids.max(initial=0)) * stride + stride
++    if key_range > max(2 * post_ids.size, _DENSE_PAIR_TABLE_MIN) or key_range > np.iinfo(np.int64).max:
++        keys = _composite_keys(post_ids, pair_types, stride)
++        unique_keys, pair_ids = np.unique(keys, return_inverse=True)
++        del keys
++        pair_ids = pair_ids.reshape(-1)
++    else:
++        present = np.zeros(key_range, dtype=bool)
++        for start in range(0, post_ids.size, _HOST_CHUNK_EDGES):
++            stop = start + _HOST_CHUNK_EDGES
++            present[_composite_keys(post_ids[start:stop], pair_types[start:stop], stride)] = True
++        unique_keys = np.flatnonzero(present).astype(np.uint64)
++        del present
++        code = np.zeros(key_range, dtype=numpy_index_dtype)
++        code[unique_keys] = np.arange(unique_keys.size, dtype=numpy_index_dtype)
++        pair_ids = np.empty(post_ids.size, dtype=numpy_index_dtype)
++        for start in range(0, post_ids.size, _HOST_CHUNK_EDGES):
++            stop = start + _HOST_CHUNK_EDGES
++            pair_ids[start:stop] = code[_composite_keys(post_ids[start:stop], pair_types[start:stop], stride)]
++        del code
++    stride = np.uint64(stride)
++    pairs = np.column_stack((unique_keys // stride, unique_keys % stride)).astype(
++        numpy_index_dtype, copy=False
++    )
++    return pairs, _as_index_dtype(pair_ids, numpy_index_dtype)
++
++
+ def _scalar_target_type_map(post_ids, synapse_types, n_post):
+     if not post_ids.size:
+         return None
+     result = np.zeros(n_post, np.int64)
+-    np.maximum.at(result, post_ids, synapse_types)
++    # Matching index/value dtypes keep ufunc.at on its fast path; chunks bound the casts.
++    for start in range(0, post_ids.size, _HOST_CHUNK_EDGES):
++        stop = start + _HOST_CHUNK_EDGES
++        np.maximum.at(
++            result, post_ids[start:stop].astype(np.intp, copy=False),
++            synapse_types[start:stop].astype(np.int64, copy=False),
++        )
+     for start in range(0, post_ids.size, 1 << 20):
+         stop = start + (1 << 20)
+         if np.any(result[post_ids[start:stop]] != synapse_types[start:stop]):
+@@ -409,17 +507,22 @@ def build_csr_connectivity(
+             "synapse_types must contain one value per edge, got "
+             f"{synapse_types.shape} for {indices.shape[0]} edges."
+         )
++    int64_info = np.iinfo(np.int64)
+     for values, name in ((indices, "indices"), (synapse_types, "synapse_types")):
+         if not np.issubdtype(values.dtype, np.number):
+             raise TypeError(f"{name} must contain numeric integer values.")
++        if np.issubdtype(values.dtype, np.integer):
++            # Integer values are finite and integral; only uint64 can leave int64 range.
++            if np.iinfo(values.dtype).max > int64_info.max and np.any(values > int64_info.max):
++                raise ValueError(f"{name} values must be within the int64 range.")
++            continue
+         if not np.all(np.isfinite(values)) or not np.all(values == np.floor(values)):
+             raise ValueError(f"{name} must contain finite integer values.")
+-        int64_info = np.iinfo(np.int64)
+         if np.any(values < int64_info.min) or np.any(values > int64_info.max):
+             raise ValueError(f"{name} values must be within the int64 range.")
+ 
+-    indices = indices.astype(np.int64, copy=False)
+-    synapse_types = synapse_types.astype(np.int64, copy=False)
++    indices = _narrow_integer_view(indices)
++    synapse_types = _narrow_integer_view(synapse_types)
+     pre_ids = indices[:, 1]
+     if np.any(pre_ids < 0) or np.any(pre_ids >= n_source_neurons):
+         raise ValueError(
+@@ -457,42 +560,40 @@ def build_csr_connectivity(
+             and int(n_source_neurons) * int(n_target_neurons) * int(n_synapse_types)
+             <= 2**64
+         ):
+-            keys = pre_ids.astype(np.uint64) * np.uint64(n_target_neurons)
+-            keys += post_ids.astype(np.uint64, copy=False)
++            keys = _composite_keys(pre_ids, post_ids, n_target_neurons)
+             keys *= np.uint64(n_synapse_types)
+-            keys += synapse_types.astype(np.uint64, copy=False)
+-            edge_ids = np.argsort(keys, kind="stable").astype(
+-                numpy_index_dtype, copy=False
+-            )
++            np.add(keys, synapse_types, out=keys, dtype=np.uint64, casting="unsafe")
++            edge_ids = np.argsort(keys, kind="stable")
++            del keys
++            edge_ids = _as_index_dtype(edge_ids, numpy_index_dtype)
+         else:
+             edge_ids = np.lexsort((synapse_types, post_ids, pre_ids)).astype(
+                 numpy_index_dtype, copy=False
+             )
+     else:
+-        edge_ids = np.argsort(pre_ids, kind="stable").astype(
+-            numpy_index_dtype, copy=False
+-        )
+-    sorted_pre_ids = pre_ids[edge_ids]
+-    counts = np.bincount(sorted_pre_ids, minlength=n_source_neurons)
++        edge_ids = _as_index_dtype(np.argsort(pre_ids, kind="stable"), numpy_index_dtype)
++    counts = _chunked_bincount(pre_ids, n_source_neurons)
+     row_splits = np.empty(n_source_neurons + 1, dtype=numpy_index_dtype)
+     row_splits[0] = 0
+     np.cumsum(counts, dtype=np.int64, out=row_splits[1:])
++    sorted_posts = post_ids[edge_ids]
+     has_repeated_targets = False
+     if sort_by_target and post_ids.size > 1:
+-        ordered_posts_for_runs = post_ids[edge_ids]
+-        has_repeated_targets = bool(
+-            np.any(
+-                (sorted_pre_ids[1:] == sorted_pre_ids[:-1])
+-                & (ordered_posts_for_runs[1:] == ordered_posts_for_runs[:-1])
+-            )
+-        )
++        # Equal adjacent (pre, post) pairs in CSR order, chunk by chunk with
++        # one element of overlap; the sorted sources are re-gathered per chunk.
++        for start in range(0, post_ids.size - 1, _HOST_CHUNK_EDGES):
++            stop = min(start + _HOST_CHUNK_EDGES + 1, post_ids.size)
++            pre = pre_ids[edge_ids[start:stop]]
++            post = sorted_posts[start:stop]
++            if np.any((pre[1:] == pre[:-1]) & (post[1:] == post[:-1])):
++                has_repeated_targets = True
++                break
+ 
+     device = "/GPU:0" if tf.config.get_visible_devices("GPU") else "/CPU:0"
+     with tf.device(device):
+-        post_ids = indices[edge_ids, 0].astype(numpy_index_dtype, copy=False)
+-        sorted_synapse_types = synapse_types[edge_ids].astype(
+-            numpy_index_dtype, copy=False
+-        )
++        post_ids = _as_index_dtype(sorted_posts, numpy_index_dtype)
++        del sorted_posts
++        sorted_synapse_types = _as_index_dtype(synapse_types[edge_ids], numpy_index_dtype)
+         incoming_pre_ids = np.empty(0, dtype=numpy_index_dtype)
+         incoming_edge_ids = np.empty(0, dtype=numpy_index_dtype)
+         incoming_types = np.empty(0, dtype=numpy_index_dtype)
+@@ -528,13 +629,10 @@ def build_csr_connectivity(
+                 int(n_synapse_types) < 2**64
+                 and int(n_target_neurons) * int(n_synapse_types) <= 2**64
+             ):
+-                stride = np.uint64(n_synapse_types)
+-                keys = post_ids.astype(np.uint64) * stride
+-                keys += pair_types.astype(np.uint64, copy=False)
+-                unique_keys, pair_ids = np.unique(keys, return_inverse=True)
+-                pairs = np.column_stack(
+-                    (unique_keys // stride, unique_keys % stride)
+-                ).astype(numpy_index_dtype, copy=False)
++                pairs, pair_ids = _unique_pairs(
++                    post_ids, pair_types, n_synapse_types, numpy_index_dtype,
++                )
++                del pair_types
+             else:
+                 pairs, pair_ids = np.unique(
+                     np.column_stack((post_ids, pair_types)),
+@@ -554,17 +652,25 @@ def build_csr_connectivity(
+         if uint8_types:
+             # All index sections precede the byte tail, so no index is unaligned.
+             index_parts = [metadata_parts[0], *metadata_parts[2:]]
+-            wide = np.concatenate(index_parts)
+-            type_byte_offset = int(wide.nbytes)
++            type_byte_offset = sum(int(part.size) for part in index_parts) * index_dtype.size
+             padding_bytes = (-int(sorted_synapse_types.size)) % index_dtype.size
+-            packed = np.concatenate((
+-                wide.view(np.uint8),
+-                sorted_synapse_types.astype(np.uint8),
+-                np.zeros(padding_bytes, np.uint8),
+-            ))
+-            metadata = packed.view(numpy_index_dtype)
++            metadata = np.empty(
++                (type_byte_offset + sorted_synapse_types.size + padding_bytes) // index_dtype.size,
++                dtype=numpy_index_dtype,
++            )
++            offset = 0
++            for part in index_parts:
++                metadata[offset:offset + part.size] = part
++                offset += part.size
++            tail = metadata.view(np.uint8)[type_byte_offset:]
++            tail[:sorted_synapse_types.size] = sorted_synapse_types
++            tail[sorted_synapse_types.size:] = 0
+         else:
+-            metadata = np.concatenate(metadata_parts)
++            metadata = np.empty(sum(int(part.size) for part in metadata_parts), dtype=numpy_index_dtype)
++            offset = 0
++            for part in metadata_parts:
++                metadata[offset:offset + part.size] = part
++                offset += part.size
+         metadata_schema = (
+             "csr_live_uint8_type_tail_v1" if uint8_types else
+             "csr_live_without_edge_ids_v1" if host_lifecycle else "canonical_edge_ids_v1"
+diff --git a/bmtk/simulator/dpointnet/direct_recorded_adjoint.py b/bmtk/simulator/dpointnet/direct_recorded_adjoint.py
+index a2a4c0cb..6e35b9ba 100644
+--- a/bmtk/simulator/dpointnet/direct_recorded_adjoint.py
++++ b/bmtk/simulator/dpointnet/direct_recorded_adjoint.py
+@@ -24,6 +24,14 @@
+   the records in TensorLists, streams count/trace statistics and runs the
+   full-horizon reverse loop behind a ``tf.custom_gradient``.
+ 
++A :class:`SpikeExchange` attached to a named spike input lets that input carry
++recurrent spikes of neurons simulated elsewhere (another process or device):
++the runner asks the exchange for the input's frame before every step, giving it
++the spikes this cell emitted on the previous step, and in the reverse loop hands
++it the complete credit of each frame, receiving the credit of the cell's own
++previous-step spikes in return. A network split by neurons across runners then
++trains exactly like the unsplit network.
++
+ Structure adapted from Javier's ``v1_model_utils/recorded_adjoint.py`` reverse
+ step (credit: Javier); DPointNet keeps its NEST dynamics, event map, dtype
+ boundaries, independent per-source VJPs and canonical master ownership.
+@@ -51,6 +59,49 @@
+ RECORD_FORMAT = "direct_step_record_v1"
+ 
+ 
++class SpikeExchange:
++    """Transport for a named spike input fed by recurrent spikes of other runners.
++
++    The input keeps its own CSR projection, delays and (optionally trainable)
++    weights; only the source of its frames changes. With ``x(t)`` the input
++    frame projected at step ``t`` and ``z(t)`` this cell's spikes:
++
++    * ``forward(time, spikes)`` runs before step ``time`` with ``spikes =
++      z(time - 1)`` (``z(-1)`` is the newest slot of the initial spike
++      history) and returns ``x(time)``, a ``[batch, width]`` binary frame.
++    * ``reverse(time, credit)`` runs while step ``time`` is reversed, after
++      every step that projected ``x(time)``; ``credit`` is the complete FP32
++      cotangent ``[batch, width]`` of ``x(time)`` (silent sources included).
++      It returns the cotangent ``[batch, neurons]`` of this cell's ``z(time -
++      1)`` contributed by the other runners' use of it; ``time == 0`` returns
++      the credit of the initial spike history.
++    * ``begin()`` runs once before the forward loop and once before the
++      reverse loop; it may return an op/tensor to order against, or ``None``.
++
++    An exchanged input takes no columns in the runner's ``inputs``: the
++    replay holds the remaining named inputs' columns, in cell order, so a
++    partition never materializes a dense frame per remote source.
++
++    Both hooks run exactly ``sequence_length`` times per rollout in time order
++    (forward) and reverse time order (reverse), so collective transports stay
++    matched across runners. Spikes are cast to the compute dtype; frames are
++    stored bit-packed and must be 0/1. The spike-gradient scale of the
++    recurrent population (``recurrent_spike_gradient_scale``) also scales the
++    exchanged credit, as it would scale the same edges' local recurrence.
++    Frames before step 0 come from the input's initial history state (also
++    0/1); their credit is not returned, as for every named input.
++    """
++
++    def begin(self):
++        return None
++
++    def forward(self, time, spikes):
++        raise NotImplementedError
++
++    def reverse(self, time, credit):
++        raise NotImplementedError
++
++
+ def direct_records_supported(cell):
+     """Names of the conditions the cell fails for the direct recorded adjoint."""
+     if type(cell) is not GLIF3Cell:
+@@ -165,7 +216,7 @@ class DirectRecordedStep:
+     returns per-population tuples in that order.
+     """
+ 
+-    def __init__(self, cell, batch, initial_state):
++    def __init__(self, cell, batch, initial_state, exchanged=()):
+         unsupported = direct_records_supported(cell)
+         if unsupported:
+             raise ValueError("Direct recorded adjoint requires: " + ", ".join(unsupported))
+@@ -188,6 +239,7 @@ def __init__(self, cell, batch, initial_state):
+             "connectivity": cell._recurrent_projection_connectivity(),
+             "variable": cell.recurrent_weight_values,
+             "trainable": bool(cell.recurrent_weight_values.trainable),
++            "exchanged": False,
+         }]
+         for index, (name, net) in enumerate(cell.inputs.items()):
+             width = int(net["input_dim"])
+@@ -200,7 +252,11 @@ def __init__(self, cell, batch, initial_state):
+                 "trainable": bool(net["input_weight_values"].trainable),
+                 "connectivity": net["fused_connectivity"],
+                 "variable": net["input_weight_values"],
++                "exchanged": name in exchanged,
+             })
++        unknown = set(exchanged) - set(cell.inputs)
++        if unknown:
++            raise ValueError(f"Exchanged inputs are not named inputs of the cell: {sorted(unknown)}")
+         self.penalty_mode = cell._voltage_penalty_mode
+         self.sweep_options = dict(
+             target_tile_size=cell.combined_current_target_tile_size,
+@@ -366,6 +422,8 @@ def reverse(self, record, previous_asc, carry, spike_cotangent, penalty_cotangen
+         per-population booleans requesting dense source cotangents (silent
+         sources included) and ``accumulators`` the caller-owned per-population
+         FP32 weight-gradient accumulators (``None`` to skip a population).
++        Exchanged populations' source cotangents carry the recurrent
++        spike-gradient scale, as the recurrent population's do.
+ 
+         Returns ``(previous_carry, source_cotangents, accumulators)`` where the
+         previous carry holds the cotangents of the step's inputs
+@@ -421,7 +479,8 @@ def reverse(self, record, previous_asc, carry, spike_cotangent, penalty_cotangen
+             if credit:
+                 source_grad, weight_grad = csr_spike_ops._OPS.dpointnet_csr_spike_grad_csr_master(
+                     source, currents_grad, _metadata(connectivity), population["variable"],
+-                    self.basis, tf.ones((), self.spike_dtype),
++                    self.basis,
++                    self.recurrent_scale if population["exchanged"] else tf.ones((), self.spike_dtype),
+                     use_packed_sm120_backward=False, write_csr_weight_gradient=True,
+                     use_small_batch_backward=False, use_javier_batch32_backward=False,
+                     **attributes,
+@@ -453,7 +512,7 @@ class DirectRecordedAdjointRunner:
+     """
+ 
+     def __init__(self, core_model, cell, sequence_length, chunk_size, count_windows=None,
+-                 differentiate_inputs=False, **kwargs):
++                 differentiate_inputs=False, spike_exchanges=None, **kwargs):
+         unsupported = direct_records_supported(cell)
+         if unsupported:
+             raise ValueError("Direct recorded adjoint requires: " + ", ".join(unsupported))
+@@ -486,6 +545,25 @@ def __init__(self, core_model, cell, sequence_length, chunk_size, count_windows=
+         if not self.count_windows:
+             raise ValueError("Statistics require at least one count window.")
+         self.n_sequence_outputs = 2
++        self.spike_exchanges = dict(spike_exchanges or {})
++        for name, exchange in self.spike_exchanges.items():
++            net = cell.inputs.get(name)
++            if net is None:
++                raise ValueError(f"Spike exchange {name!r} is not a named input of the cell.")
++            if net["input_type"] != "spikes":
++                raise ValueError(f"Spike exchange {name!r} requires a 'spikes' input, not {net['input_type']!r}.")
++            for method in ("begin", "forward", "reverse"):
++                if not callable(getattr(exchange, method, None)):
++                    raise TypeError(f"Spike exchange {name!r} has no callable {method}().")
++        # Replay columns of the named inputs; exchanged inputs take none.
++        self.replay_columns, offset = {}, 0
++        for index, name in enumerate(cell.inputs):
++            if name in self.spike_exchanges:
++                continue
++            width = int(cell.inputs_idx[index + 1]) - int(cell.inputs_idx[index])
++            self.replay_columns[name] = (offset, offset + width)
++            offset += width
++        self.replay_width = offset
+ 
+     # -- input sources --------------------------------------------------------------
+ 
+@@ -521,11 +599,44 @@ def _input_frame(self, step, population, inputs, time, tables, noise_steps, cloc
+                     step.batch, noise_steps + tf.cast(time, noise_steps.dtype), population["net"],
+                 ), step.spike_dtype)
+         else:
+-            start, stop = population["columns"]
++            start, stop = self.replay_columns[population["name"]]
+             frame = tf.cast(inputs[:, time, start:stop], step.spike_dtype)
+         # A tensor time index drops the static width the sweep validates.
+         return tf.ensure_shape(frame, (step.batch, population["width"]))
+ 
++    def _begin_exchanges(self, after=()):
++        """Control inputs ordering every exchange's ``begin()`` after ``after`` and before a loop.
++
++        ``begin`` usually has no data inputs; without ``after`` the reverse
++        loop's call could be scheduled before the forward loop has finished.
++        """
++        started = []
++        with tf.control_dependencies(list(after)):
++            for exchange in self.spike_exchanges.values():
++                value = exchange.begin()
++                if value is not None:
++                    started.append(value)
++        return started
++
++    @staticmethod
++    def _frame_words(population):
++        return 2 * ((population["width"] + 31) // 32)
++
++    def _exchanged_source(self, step, population, frames, time):
++        """Recorded exchanged frames ``x(time), x(time - 1), ...`` as the forward projected them."""
++        history = population["history_steps"]
++        parts = []
++        for k in range(history + 1):
++            words = tf.raw_ops.TensorListGetItem(
++                input_handle=frames, index=time - k + history,
++                element_shape=tf.constant([step.batch, self._frame_words(population)], tf.int32),
++                element_dtype=tf.int32,
++            )
++            parts.append(unpack_step_record(
++                words, population["width"], step.spike_dtype, step.refractory_dtype,
++            )[0])
++        return parts[0] if len(parts) == 1 else tf.concat(parts, axis=1)
++
+     def _reverse_source(self, step, population, inputs, time, tables, noise_steps, initial_state):
+         """``x(time), x(time - 1), ...`` concatenated as the forward projected them."""
+         frames = [self._input_frame(step, population, inputs, time, tables, noise_steps)]
+@@ -614,7 +725,7 @@ def _forward(self, inputs, initial_state, sampled_traces, time_check):
+         cell = self.cell
+         batch, length = int(inputs.shape[0]), self.sequence_length
+         with _rollout_context(cell):
+-            step = DirectRecordedStep(cell, batch, initial_state)
++            step = DirectRecordedStep(cell, batch, initial_state, exchanged=tuple(self.spike_exchanges))
+             neurons = step.neurons
+             tables = self._prepare_noise(step, inputs, initial_state)
+             record_rollout_acceleration(getattr(cell, "acceleration_report", None), {
+@@ -622,6 +733,7 @@ def _forward(self, inputs, initial_state, sampled_traces, time_check):
+                 "use_prepared_cpu_poisson": bool(tables),
+                 "temporal_path": "direct_recorded_forward",
+                 "record_format": RECORD_FORMAT,
++                **({"spike_exchanges": tuple(self.spike_exchanges)} if self.spike_exchanges else {}),
+             })
+             noise_steps = initial_state[6]
+             # Per-step FP32 records as separate allocations land in oversized free
+@@ -657,12 +769,49 @@ def _forward(self, inputs, initial_state, sampled_traces, time_check):
+             )
+             penalties = tf.TensorArray(tf.float32, size=length, element_shape=(batch,))
+             trace_plan = self._trace_plan(sampled_traces, step)
++            # Exchanged frames are recorded bit-packed, indexed by time + history:
++            # the first ``history_steps`` entries hold the initial input history
++            # (oldest first), as the word records hold the initial spike history.
++            exchanged = [population["name"] for population in step.populations if population["exchanged"]]
++            frames = []
++            for population in step.populations[1:]:
++                if not population["exchanged"]:
++                    continue
++                width, history = population["width"], population["history_steps"]
++                no_blocking = tf.zeros([batch, width], step.refractory_dtype)
++                record = tf.raw_ops.EmptyTensorList(
++                    element_shape=tf.constant([batch, self._frame_words(population)], tf.int32),
++                    max_num_elements=length + history, element_dtype=tf.int32,
++                )
++                start, _ = population["history"]
++                for k in reversed(range(history)):
++                    initial_frame = tf.cast(
++                        initial_state[7][:, start + k * width:start + (k + 1) * width], step.spike_dtype,
++                    )
++                    record = tf.raw_ops.TensorListPushBack(
++                        input_handle=record, tensor=pack_step_record(initial_frame, no_blocking),
++                    )
++                frames.append(record)
++            frames = tuple(frames)
+ 
+-            def body(time, clock, state, voltages, words, penalties):
++            def body(time, clock, state, voltages, words, penalties, frames):
+                 sources = [tf.cast(state[0], step.spike_dtype)]
+-                new_input_history = []
++                previous_spikes = sources[0][:, :neurons]
++                new_input_history, new_frames = [], list(frames)
+                 for population in step.populations[1:]:
+-                    source = self._input_frame(step, population, inputs, time, tables, noise_steps, clock)
++                    if population["exchanged"]:
++                        index = exchanged.index(population["name"])
++                        source = tf.ensure_shape(tf.cast(
++                            self.spike_exchanges[population["name"]].forward(time, previous_spikes),
++                            step.spike_dtype,
++                        ), (batch, population["width"]))
++                        new_frames[index] = tf.raw_ops.TensorListPushBack(
++                            input_handle=frames[index], tensor=pack_step_record(
++                                source, tf.zeros([batch, population["width"]], step.refractory_dtype),
++                            ),
++                        )
++                    else:
++                        source = self._input_frame(step, population, inputs, time, tables, noise_steps, clock)
+                     if population["history_steps"]:
+                         start, stop = population["history"]
+                         source = tf.concat(
+@@ -685,30 +834,30 @@ def body(time, clock, state, voltages, words, penalties):
+                     voltages = tf.raw_ops.TensorListPushBack(input_handle=voltages, tensor=pre_reset)
+                 words = tf.raw_ops.TensorListPushBack(input_handle=words, tensor=record)
+                 penalties = penalties.write(time, penalty)
+-                return time + 1, clock + 1, new_state, voltages, words, penalties
++                return time + 1, clock + 1, new_state, voltages, words, penalties, tuple(new_frames)
+ 
+-            def chunk(index, clock, state, voltages, words, penalties):
++            def chunk(index, clock, state, voltages, words, penalties, frames):
+                 tf.raw_ops.ResourceScatterUpdate(
+                     resource=asc_snapshots.handle, indices=(clock // self.chunk_size)[None],
+                     updates=state[3][None],
+                 )
+                 stop = tf.minimum((index + 1) * self.chunk_size, length)
+-                _, clock, state, voltages, words, penalties = tf.while_loop(
++                _, clock, state, voltages, words, penalties, frames = tf.while_loop(
+                     lambda time, *_: time < stop, body,
+-                    (index * self.chunk_size, clock, state, voltages, words, penalties),
++                    (index * self.chunk_size, clock, state, voltages, words, penalties, frames),
+                     parallel_iterations=1,
+                 )
+-                return index + 1, clock, state, voltages, words, penalties
++                return index + 1, clock, state, voltages, words, penalties, frames
+ 
+-            with tf.control_dependencies([time_check]):
++            with tf.control_dependencies([time_check, *self._begin_exchanges()]):
+                 state = tuple(tf.identity(value) for value in initial_state)
+             # Device-resident int64 step clock beside the host loop counter: device
+             # index consumers read it without a per-step host-to-device upload.
+             with step.device_scope():
+                 clock = tf.identity(tf.zeros([], tf.int64))
+-            _, _, state, voltages, words, penalties = tf.while_loop(
++            _, _, state, voltages, words, penalties, frames = tf.while_loop(
+                 lambda index, *_: index < self.n_chunks, chunk,
+-                (tf.constant(0), clock, state, voltages, words, penalties),
++                (tf.constant(0), clock, state, voltages, words, penalties, frames),
+                 parallel_iterations=1,
+             )
+             # Statistics come from the packed records after the loop: a stacked
+@@ -738,7 +887,7 @@ def chunk(index, clock, state, voltages, words, penalties):
+                         trace_outputs += (tf.cast(traces[offset:offset + extent], step.spike_dtype),)
+                         offset += extent
+         penalty_sequence = tf.transpose(penalties.stack())
+-        records = (scratch if buffered else voltages, words, asc_snapshots, tables, noise_steps, buffered)
++        records = (scratch if buffered else voltages, words, asc_snapshots, tables, noise_steps, buffered, frames)
+         return counts, trace_outputs, (penalty_sequence,), tuple(state), records
+ 
+     # -- reverse driver ------------------------------------------------------------------
+@@ -747,9 +896,9 @@ def _backward(self, inputs, initial_state, final_state, records, sampled_traces,
+                   count_gradients, trace_gradients, penalty_gradient, state_gradients, variables):
+         cell = self.cell
+         batch, length = int(inputs.shape[0]), self.sequence_length
+-        voltages, words, asc_snapshots, tables, noise_steps, buffered = records
++        voltages, words, asc_snapshots, tables, noise_steps, buffered, frames = records
+         with _rollout_context(cell):
+-            step = DirectRecordedStep(cell, batch, initial_state)
++            step = DirectRecordedStep(cell, batch, initial_state, exchanged=tuple(self.spike_exchanges))
+             neurons, delay, S, T = step.neurons, step.delay, step.spike_dtype, step.state_dtype
+             record_rollout_acceleration(getattr(cell, "acceleration_report", None), {
+                 "temporal_path": "direct_recorded_vjp",
+@@ -825,8 +974,12 @@ def spikes_at(time):
+                 return step.unpack(words_at(time))[0]
+ 
+             populations = step.populations
+-            source_credit = tuple(population["recurrent"] for population in populations)
++            source_credit = tuple(population["recurrent"] or population["exchanged"] for population in populations)
+             accumulate = tuple(population["trainable"] for population in populations)
++            exchanged = [
++                (index, population) for index, population in enumerate(populations) if population["exchanged"]
++            ]
++            exchanged_names = [population["name"] for _, population in exchanged]
+ 
+             block = self.asc_block
+             blocks_per_chunk = -(-self.chunk_size // block)
+@@ -854,28 +1007,46 @@ def chunk_snapshot(chunk_index):
+                 )
+                 return tf.reshape(row, [batch, 2 * neurons])
+ 
+-            def reverse_step(time, carry, window, accumulators, asc_buffer, block_start):
++            def reverse_step(time, carry, window, accumulators, asc_buffer, block_start, pending):
+                 sources = [window]
+                 for population, keep in zip(populations[1:], accumulate[1:]):
+-                    sources.append(
+-                        self._reverse_source(step, population, inputs, time, tables, noise_steps, initial_state)
+-                        if keep else tf.zeros([batch, 0], S)
+-                    )
++                    if population["exchanged"]:
++                        sources.append(self._exchanged_source(
++                            step, population, frames[exchanged_names.index(population["name"])], time,
++                        ))
++                    else:
++                        sources.append(
++                            self._reverse_source(step, population, inputs, time, tables, noise_steps, initial_state)
++                            if keep else tf.zeros([batch, 0], S)
++                        )
+                 carry, credit, accumulators = step.reverse(
+                     voltage_record(time), asc_buffer.read(time - block_start), carry,
+                     spike_base(time), penalty_gradient[:, time], sources, source_credit,
+                     tuple(acc if keep else None for acc, keep in zip(accumulators, accumulate)),
+                     trace=trace_at(time),
+                 )
+-                carry = carry + (credit[0],)
++                history_credit = credit[0]
++                new_pending = []
++                for (index, population), frame_credit in zip(exchanged, pending):
++                    # Frame x(time) was projected by steps time..time+history; all are
++                    # reversed now, so its credit is complete.
++                    width = population["width"]
++                    frame_credit = frame_credit + tf.cast(credit[index], tf.float32)
++                    received = self.spike_exchanges[population["name"]].reverse(time, frame_credit[:, :width])
++                    received = tf.ensure_shape(tf.cast(received, history_credit.dtype), (batch, neurons))
++                    history_credit = history_credit + tf.pad(received, ((0, 0), (0, step.history_width - neurons)))
++                    new_pending.append(tf.concat(
++                        [frame_credit[:, width:], tf.zeros([batch, width], tf.float32)], axis=1,
++                    ))
++                carry = carry + (history_credit,)
+                 accumulators = tuple(
+                     tf.zeros([0], tf.float32) if acc is None else acc for acc in accumulators
+                 )
+                 # At time 0 the shifted-in frame is never read; clamp it to the oldest record.
+                 window = step.shift_history(window, words_at(tf.maximum(time - 1 - delay, -delay)))
+-                return time - 1, carry, window, accumulators, asc_buffer, block_start
++                return time - 1, carry, window, accumulators, asc_buffer, block_start, tuple(new_pending)
+ 
+-            def reverse_block(block_index, carry, window, accumulators, coarse, chunk_start, chunk_stop):
++            def reverse_block(block_index, carry, window, accumulators, pending, coarse, chunk_start, chunk_stop):
+                 block_start = chunk_start + block_index * block
+                 block_stop = tf.minimum(block_start + block, chunk_stop)
+                 # The last block's value at block_stop - 1 is written by the walk's
+@@ -884,14 +1055,14 @@ def reverse_block(block_index, carry, window, accumulators, coarse, chunk_start,
+                     block_start, block_stop - 1, coarse.read(block_index),
+                     tf.TensorArray(T, size=block, element_shape=(batch, 2 * neurons)), 1,
+                 )
+-                _, carry, window, accumulators, _, _ = tf.while_loop(
++                _, carry, window, accumulators, _, _, pending = tf.while_loop(
+                     lambda time, *_: time >= block_start, reverse_step,
+-                    (block_stop - 1, carry, window, accumulators, fine, block_start),
++                    (block_stop - 1, carry, window, accumulators, fine, block_start, pending),
+                     parallel_iterations=1,
+                 )
+-                return block_index - 1, carry, window, accumulators, coarse, chunk_start, chunk_stop
++                return block_index - 1, carry, window, accumulators, pending, coarse, chunk_start, chunk_stop
+ 
+-            def reverse_chunk(chunk_index, carry, window, accumulators):
++            def reverse_chunk(chunk_index, carry, window, accumulators, pending):
+                 start = chunk_index * self.chunk_size
+                 stop = tf.minimum(start + self.chunk_size, length)
+                 last_block = (stop - start - 1) // block
+@@ -900,24 +1071,25 @@ def reverse_chunk(chunk_index, carry, window, accumulators):
+                     start, start + last_block * block, chunk_snapshot(chunk_index),
+                     tf.TensorArray(T, size=blocks_per_chunk + 1, element_shape=(batch, 2 * neurons)), block,
+                 )
+-                _, carry, window, accumulators, _, _, _ = tf.while_loop(
++                _, carry, window, accumulators, pending, _, _, _ = tf.while_loop(
+                     lambda block_index, *_: block_index >= 0, reverse_block,
+-                    (last_block, carry, window, accumulators, coarse, start, stop),
++                    (last_block, carry, window, accumulators, pending, coarse, start, stop),
+                     parallel_iterations=1,
+                 )
+-                return chunk_index - 1, carry, window, accumulators
++                return chunk_index - 1, carry, window, accumulators, pending
+ 
+             def floating_gradient(gradient, value):
+                 return tf.zeros_like(value) if gradient is None else tf.cast(gradient, value.dtype)
+ 
+-            carry = (
+-                floating_gradient(state_gradients[1], final_state[1]),
+-                floating_gradient(state_gradients[3], final_state[3]),
+-                floating_gradient(state_gradients[4], final_state[4]),
+-                floating_gradient(state_gradients[5], final_state[5]),
+-                floating_gradient(state_gradients[0], final_state[0]),
+-                tf.zeros_like(final_state[0]),
+-            )
++            with tf.control_dependencies(self._begin_exchanges(after=final_state)):
++                carry = tuple(tf.identity(value) for value in (
++                    floating_gradient(state_gradients[1], final_state[1]),
++                    floating_gradient(state_gradients[3], final_state[3]),
++                    floating_gradient(state_gradients[4], final_state[4]),
++                    floating_gradient(state_gradients[5], final_state[5]),
++                    floating_gradient(state_gradients[0], final_state[0]),
++                    tf.zeros_like(final_state[0]),
++                ))
+             # The delay window of the last step as one [batch, neurons * delay] tensor
+             # (newest slot first), as the forward's history state holds it.
+             window = tf.concat(
+@@ -927,9 +1099,26 @@ def floating_gradient(gradient, value):
+                 tf.zeros_like(population["variable"]) if keep else tf.zeros([0], tf.float32)
+                 for population, keep in zip(populations, accumulate)
+             )
+-            _, carry, _, accumulators = tf.while_loop(
++            # Pending FP32 credit of exchanged frames x(time), ..., x(time - history). The
++            # final input-history state holds x(L-1), ..., x(L-history): its cotangent seeds
++            # the first frames (as the recurrent history cotangent seeds the carry), and
++            # x(L-1-history) starts empty.
++            history_gradient = state_gradients[7] if step.has_input_history else None
++            seeds = []
++            for _, population in exchanged:
++                width, history = population["width"], population["history_steps"]
++                with step.device_scope():
++                    seed = tf.zeros([batch, width], tf.float32)
++                    if history and history_gradient is not None and final_state[7].dtype.is_floating:
++                        start, stop = population["history"]
++                        seed = tf.concat([tf.cast(history_gradient[:, start:stop], tf.float32), seed], axis=1)
++                    elif history:
++                        seed = tf.zeros([batch, width * (history + 1)], tf.float32)
++                seeds.append(seed)
++            pending = tuple(seeds)
++            _, carry, _, accumulators, _ = tf.while_loop(
+                 lambda chunk_index, *_: chunk_index >= 0, reverse_chunk,
+-                (tf.constant(self.n_chunks - 1), carry, window, accumulators),
++                (tf.constant(self.n_chunks - 1), carry, window, accumulators, pending),
+                 parallel_iterations=1,
+             )
+         grad_v, grad_asc, grad_rise, grad_psc, grad_history, history_credit = carry
+@@ -969,6 +1158,11 @@ def __call__(self, inputs, initial_state, sampled_traces=()):
+             raise ValueError(
+                 "Direct recorded adjoint requires a static batch and input length equal to sequence_length."
+             )
++        if self.spike_exchanges and inputs.shape[2] != self.replay_width:
++            raise ValueError(
++                f"With spike exchanges the inputs hold only the {self.replay_width} replay columns of "
++                f"the non-exchanged named inputs, got {inputs.shape[2]}."
++            )
+         output_count = len(self.count_windows) + len(sampled_traces) + 1
+         checks = (
+             tf.debugging.assert_equal(tf.shape(inputs)[1], self.sequence_length),
+@@ -976,6 +1170,15 @@ def __call__(self, inputs, initial_state, sampled_traces=()):
+                 tf.reduce_all((initial_state[0] == 0) | (initial_state[0] == 1)), True,
+                 message="Recorded adjoints require binary initial spike history.",
+             ),
++        ) + tuple(
++            tf.debugging.assert_equal(
++                tf.reduce_all((history == 0) | (history == 1)), True,
++                message=f"Spike exchange {name!r} requires a binary initial input history.",
++            )
++            for name, net in self.cell.inputs.items()
++            if name in self.spike_exchanges and int(net["history_stop"]) > int(net["history_start"])
++            # Only inputs with history reach here; a cell without any has no eighth state.
++            for history in [initial_state[7][:, int(net["history_start"]):int(net["history_stop"])]]
+         )
+ 
+         @tf.custom_gradient
+diff --git a/docs/autodocs/source/dpointnet_development.rst b/docs/autodocs/source/dpointnet_development.rst
+index b57e478d..f983ab11 100644
+--- a/docs/autodocs/source/dpointnet_development.rst
++++ b/docs/autodocs/source/dpointnet_development.rst
+@@ -402,6 +402,16 @@ lexicographic permutation, including duplicates.
+ ``lex_sort_order_np`` similarly packs nonnegative integer pairs; signed, floating,
+ empty or overflowing cases retain the original lexsort.
+ 
++Host construction keeps integer indices and types in their own width (int32
++indices are not widened to int64), validates integer inputs without float
++copies, builds sort keys with one allocation, counts and scans edges in chunks
++and marks compact pairs in a dense ``n_post * n_synapse_types`` table when that
++table is small, writing metadata sections directly into the final buffer. On a
++23M-edge recurrent rank this lowered the transient host peak from about 110 to
++39 bytes per edge, with byte-identical metadata;
++``tests/simulator/dpointnet/test_csr_host_build.py`` compares every output with
++the whole-array int64 construction across dtypes, chunk sizes and pair paths.
++
+ Use unsigned integer arithmetic, never float64 keys or approximate ordering.
+ Compare packed-key paths with independent tuple/lexsort references and test
+ overflow, signed, floating and empty cases. These optimizations require no user
+diff --git a/docs/autodocs/source/dpointnet_training.rst b/docs/autodocs/source/dpointnet_training.rst
+index a74d961e..33d9796e 100644
+--- a/docs/autodocs/source/dpointnet_training.rst
++++ b/docs/autodocs/source/dpointnet_training.rst
+@@ -354,6 +354,37 @@ module's storage policy. ``DirectRecordedAdjointRunner`` is that storage policy
+ for one replica. The route needs the rebuilt record/reverse operators and the
+ same GPU conditions as the recorded route; unsupported requests raise.
+ 
++Spike exchanges (neuron-partitioned networks)
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++A network too large for one device can be split by neurons: each runner owns
++some neurons, their incoming edges and the masters of those edges. Edges whose
++source neuron belongs to another runner become a named ``"spikes"`` input of
++the target's cell, keeping their weights, delays and synapse types, and
++``DirectRecordedAdjointRunner(..., spike_exchanges={name: exchange})`` feeds
++that input from a :class:`~bmtk.simulator.dpointnet.direct_recorded_adjoint.SpikeExchange`:
++
++* ``forward(time, spikes)`` runs before every step with this cell's spikes of
++  the previous step (step ``0`` receives the newest initial-history slot) and
++  returns the input's binary frame for the step, i.e. the other runners'
++  previous-step spikes;
++* ``reverse(time, credit)`` runs while every step is reversed with the
++  complete FP32 credit of that step's frame (silent sources included) and
++  returns the credit of this cell's previous-step spikes contributed by the
++  other runners; it is added to the recurrent history credit;
++* ``begin()`` runs once before the forward loop and once, after the forward,
++  before the reverse loop.
++
++Both hooks run once per step, in time order and reverse time order, so a
++collective transport (for example MPI ``Alltoallv``) stays matched across
++runners; the transport itself is the caller's. Exchanged inputs take no
++columns in the runner's ``inputs``, the recurrent spike-gradient scale applies
++to the exchanged credit and exchanged frames are recorded bit-packed. With a
++transport that delivers every owner's spikes and credit, the split network's
++spikes and per-edge master gradients equal the unsplit network's up to FP32
++summation order; ``tests/simulator/dpointnet/test_direct_spike_exchange.py``
++checks this with a loopback exchange.
++
+ This is different from **saved checkpoints**, which store weights and, when
+ explicitly included, optimizer/state variables for later restoration.
+ 
+diff --git a/tests/simulator/dpointnet/test_csr_host_build.py b/tests/simulator/dpointnet/test_csr_host_build.py
+new file mode 100644
+index 00000000..6e290591
+--- /dev/null
++++ b/tests/simulator/dpointnet/test_csr_host_build.py
+@@ -0,0 +1,178 @@
++"""Low-memory host CSR construction equals the straightforward int64 algorithm.
++
++``build_csr_connectivity`` keeps narrow integer inputs narrow, works on edge
++chunks and marks compact (target, type) pairs in a dense table. The oracle
++below is the original whole-array int64 construction (lexicographic edge
++order, ``np.unique`` pairs); every metadata byte, the host edge order and the
++derived flags must match it for any input dtype, chunk size and pair path.
++"""
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import tensorflow as tf
++
++from bmtk.simulator.dpointnet.custom_ops import csr_spike_ops as ops
++
++NAMES = (
++    "dpointnet_csr_spike_forward_csr_master", "dpointnet_csr_weight_grad",
++    "dpointnet_csr_spike_grad_csr_master",
++    "dpointnet_csr_spike_grad_accumulate_csr_master",
++    "dpointnet_combined_sweep_csr_master",
++)
++
++
++@pytest.fixture
++def host_capability(monkeypatch):
++    monkeypatch.setattr(ops, "_OPS", SimpleNamespace(**{name: (lambda *, uint8_types=False: uint8_types)
++                                                        for name in NAMES}))
++
++
++def oracle(indices, types, n_sources, n_targets, n_types, *, pairs, sort_by_target, host_lifecycle,
++           uint8_types, scalar_types, projection_types=None):
++    indices = np.asarray(indices).astype(np.int64)
++    types = np.asarray(types).astype(np.int64)
++    dtype = ops._csr_index_dtype(len(indices), n_sources, n_targets, n_types).as_numpy_dtype
++    pre, post = indices[:, 1], indices[:, 0]
++    order = np.lexsort((types, post, pre)) if sort_by_target else np.argsort(pre, kind="stable")
++    row_splits = np.concatenate(([0], np.cumsum(np.bincount(pre, minlength=n_sources)))).astype(dtype)
++    sorted_pre, sorted_post = pre[order], post[order]
++    repeated = bool(sort_by_target and len(pre) > 1 and np.any(
++        (sorted_pre[1:] == sorted_pre[:-1]) & (sorted_post[1:] == sorted_post[:-1])))
++    post_ids, sorted_types = sorted_post.astype(dtype), types[order].astype(dtype)
++    parts = [post_ids, sorted_types, row_splits] + ([] if host_lifecycle else [order.astype(dtype)])
++    n_pairs = 0
++    if pairs and len(pre):
++        pair_types = sorted_types if projection_types is None else projection_types[sorted_types]
++        keys = post_ids.astype(np.uint64) * np.uint64(n_types) + pair_types.astype(np.uint64)
++        unique, inverse = np.unique(keys, return_inverse=True)
++        parts += [inverse.reshape(-1).astype(dtype), (unique // np.uint64(n_types)).astype(dtype),
++                  (unique % np.uint64(n_types)).astype(dtype)]
++        n_pairs = len(unique)
++    if uint8_types:
++        wide = np.concatenate([parts[0], *parts[2:]])
++        padding = (-len(sorted_types)) % np.dtype(dtype).itemsize
++        metadata = np.concatenate((wide.view(np.uint8), sorted_types.astype(np.uint8),
++                                   np.zeros(padding, np.uint8))).view(dtype)
++    else:
++        metadata = np.concatenate(parts)
++    scalar = None
++    if scalar_types and len(post):
++        scalar = np.zeros(n_targets, np.int64)
++        np.maximum.at(scalar, post, types)
++        if np.any(scalar[post] != types):
++            scalar = None
++    return dict(metadata=metadata, order=order, repeated=repeated, n_pairs=n_pairs, scalar=scalar)
++
++
++def network(edges, n_sources, n_targets, n_types, seed, duplicates):
++    rng = np.random.default_rng(seed)
++    indices = np.column_stack((rng.integers(0, n_targets, edges), rng.integers(0, n_sources, edges)))
++    if duplicates and edges > 3:
++        indices[edges // 2] = indices[edges // 2 - 1]
++    return indices, rng.integers(0, n_types, edges)
++
++
++@pytest.mark.parametrize("index_dtype", [np.int32, np.int64, np.uint32, np.float64])
++@pytest.mark.parametrize("type_dtype", [np.uint8, np.int32, np.int64])
++@pytest.mark.parametrize("chunk", [7, 1 << 24])
++@pytest.mark.parametrize("dense_pairs", [True, False])
++@pytest.mark.parametrize("edges,duplicates", [(0, False), (1, False), (41, True), (1000, False), (1000, True)])
++def test_build_matches_whole_array_int64_oracle(host_capability, monkeypatch, index_dtype, type_dtype, chunk,
++                                                dense_pairs, edges, duplicates):
++    monkeypatch.setattr(ops, "_HOST_CHUNK_EDGES", chunk)
++    monkeypatch.setattr(ops, "_DENSE_PAIR_TABLE_MIN", 1 << 20 if dense_pairs else 0)
++    n_sources, n_targets, n_types = 53, 900, 4
++    indices, types = network(edges, n_sources, n_targets, n_types, edges, duplicates)
++    indices, types = indices.astype(index_dtype), types.astype(type_dtype)
++    for sort_by_target, host_lifecycle, uint8_types, pairs, scalar in (
++        (True, True, True, True, True), (True, False, False, True, False),
++        (False, True, False, False, True), (True, True, False, False, False),
++    ):
++        expected = oracle(indices, types, n_sources, n_targets, n_types, pairs=pairs,
++                          sort_by_target=sort_by_target, host_lifecycle=host_lifecycle,
++                          uint8_types=uint8_types, scalar_types=scalar)
++        conn = ops.build_csr_connectivity(
++            indices, types, n_sources, n_targets, n_types, build_compact_pairs=pairs,
++            sort_by_target=sort_by_target, host_lifecycle=host_lifecycle, uint8_types=uint8_types,
++            build_scalar_target_types=scalar,
++        )
++        try:
++            metadata = tf.raw_ops.ReadVariableOp(
++                resource=conn["metadata_handle"], dtype=tf.as_dtype(conn["index_dtype"])).numpy()
++            assert metadata.dtype == expected["metadata"].dtype
++            np.testing.assert_array_equal(metadata, expected["metadata"])
++            assert conn["has_repeated_targets"] == expected["repeated"]
++            assert conn["n_pairs"] == expected["n_pairs"]
++            if host_lifecycle:
++                np.testing.assert_array_equal(conn["host_edge_order"], expected["order"])
++            if scalar:
++                if expected["scalar"] is None:
++                    assert conn["scalar_target_types"] is None
++                else:
++                    np.testing.assert_array_equal(conn["scalar_target_types"], expected["scalar"])
++        finally:
++            conn.close()
++
++
++def test_projection_representatives_share_pairs(host_capability):
++    indices, types = network(200, 11, 30, 4, 3, True)
++    basis = np.array([[1.0, 0.5], [1.0, 0.5], [0.2, 0.1], [0.2, 0.1]], np.float32)
++    expected = oracle(indices, types, 11, 30, 4, pairs=True, sort_by_target=True, host_lifecycle=False,
++                      uint8_types=False, scalar_types=False, projection_types=np.array([0, 0, 2, 2]))
++    conn = ops.build_csr_connectivity(indices.astype(np.int32), types.astype(np.int32), 11, 30, 4,
++                                      build_compact_pairs=True, sort_by_target=True, projection_basis=basis)
++    try:
++        metadata = tf.raw_ops.ReadVariableOp(resource=conn["metadata_handle"], dtype=tf.uint32).numpy()
++        np.testing.assert_array_equal(metadata, expected["metadata"])
++        assert conn["n_pairs"] == expected["n_pairs"]
++    finally:
++        conn.close()
++
++
++def test_integer_inputs_are_not_widened(monkeypatch):
++    seen = []
++    original = ops._composite_keys
++
++    def record(major, minor, stride):
++        seen.append((major.dtype, minor.dtype))
++        return original(major, minor, stride)
++
++    monkeypatch.setattr(ops, "_composite_keys", record)
++    indices, types = network(100, 13, 17, 4, 5, False)
++    conn = ops.build_csr_connectivity(indices.astype(np.int32), types.astype(np.int32), 13, 17, 4,
++                                      build_compact_pairs=True, sort_by_target=True)
++    conn.close()
++    assert seen and all(np.dtype(major).itemsize <= 4 for major, _ in seen)
++    with pytest.raises(ValueError, match="int64 range"):
++        ops.build_csr_connectivity(np.array([[0, 2**63]], np.uint64), np.array([0]), 2, 2, 1)
++    with pytest.raises(ValueError, match="finite integer"):
++        ops.build_csr_connectivity(np.array([[0, 0.5]]), np.array([0]), 2, 2, 1)
++
++
++@pytest.mark.parametrize("chunk", [1, 2, 3, 4, 5, 1 << 24])
++def test_repeated_targets_detected_across_chunk_boundaries(host_capability, monkeypatch, chunk):
++    monkeypatch.setattr(ops, "_HOST_CHUNK_EDGES", chunk)
++    # CSR order (source 0 first, then targets): targets 0, 1, 2, 3, 3; the repeated
++    # (source, target) pair occupies positions 3 and 4.
++    repeated = np.array([[3, 0], [0, 0], [3, 0], [2, 0], [1, 0], [4, 1]], np.int32)
++    distinct = repeated.copy()
++    distinct[2] = [4, 0]
++    for indices, expected in ((repeated, True), (distinct, False)):
++        conn = ops.build_csr_connectivity(indices, np.zeros(len(indices), np.int32), 2, 5, 1, sort_by_target=True)
++        try:
++            assert conn["has_repeated_targets"] is expected
++        finally:
++            conn.close()
++
++
++def test_input_index_dtype_keeps_small_signed_indices_narrow():
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import _input_index_dtype
++
++    assert _input_index_dtype(np.zeros((3, 2), np.int32), 2**31 - 1) is np.int32
++    assert _input_index_dtype(np.zeros((3, 2), np.uint16), 100) is np.int32
++    assert _input_index_dtype(np.zeros((3, 2), np.int32), 2**31) is np.int64
++    assert _input_index_dtype(np.zeros((3, 2), np.uint32), 100) is np.int64
++    assert _input_index_dtype(np.zeros((3, 2), np.int64), 100) is np.int64
++    assert _input_index_dtype([[0, 1]], 100) is np.int64
+diff --git a/tests/simulator/dpointnet/test_direct_spike_exchange.py b/tests/simulator/dpointnet/test_direct_spike_exchange.py
+new file mode 100644
+index 00000000..ce1669a8
+--- /dev/null
++++ b/tests/simulator/dpointnet/test_direct_spike_exchange.py
+@@ -0,0 +1,281 @@
++"""Spike exchange hooks of the direct recorded adjoint.
++
++A network whose recurrent edges from some neurons are moved into a named
++spike input, fed back by a loopback exchange (the cell's own spikes), must
++reproduce the unsplit network: the same spikes, states, penalties and, per
++canonical edge, the same master gradients. This is the one-process form of a
++neuron-partitioned network whose exchange is a real transport.
++"""
++
++import copy
++
++import numpy as np
++import pytest
++import tensorflow as tf
++
++from bmtk.simulator.dpointnet.cell_models.glif3_cell import GLIF3Cell
++from bmtk.simulator.dpointnet.custom_ops import fused_cuda_available
++from bmtk.simulator.dpointnet.direct_recorded_adjoint import (
++    DirectRecordedAdjointRunner, SpikeExchange, direct_records_supported,
++)
++from test_direct_recorded_adjoint import DIRECT_OPTIONS
++from test_precision_credit import make_cell
++
++NEURONS, DRIVES, MAX_DELAY, LENGTH, CHUNK = 24, 8, 4, 13, 4
++EXCHANGED = "exchanged"
++
++
++@pytest.fixture(autouse=True)
++def restore_policy():
++    previous = tf.keras.mixed_precision.global_policy()
++    yield
++    tf.keras.mixed_precision.set_global_policy(previous)
++
++
++class Loopback(SpikeExchange):
++    """Returns the cell's own previous-step spikes and their credit unchanged."""
++
++    def __init__(self, log=None):
++        self.log = log
++
++    def _record(self, kind, time):
++        if self.log is None:
++            return
++        tf.numpy_function(lambda value: self.log.append((kind, int(value))) or np.int32(0),
++                          [time], tf.int32, stateful=True)
++
++    def begin(self):
++        if self.log is None:
++            return None
++        return tf.numpy_function(lambda: self.log.append(("begin", -1)) or np.int32(0), [], tf.int32, stateful=True)
++
++    def forward(self, time, spikes):
++        self._record("forward", time)
++        return spikes
++
++    def reverse(self, time, credit):
++        self._record("reverse", time)
++        return credit
++
++
++def _spec(batch, scale, one_step=False):
++    network, _, arguments = make_cell(
++        "nest", selective=False, batch_size=batch, hard_reset_gradient_mode="soft_surrogate",
++        return_spec=True, **DIRECT_OPTIONS,
++    )
++    rng = np.random.default_rng(5)
++    for key, value in network["node_params"].items():
++        network["node_params"][key] = np.concatenate([value] * (NEURONS // 2))
++    network["n_nodes"] = NEURONS
++    network["node_type_ids"] = np.tile(network["node_type_ids"], NEURONS // 2)
++    edges = 120
++    targets = rng.integers(0, NEURONS, edges)
++    sources = rng.integers(0, NEURONS, edges)
++    network["synapses"].update(
++        indices=np.stack([targets, sources], axis=1).astype(np.int64),
++        weights=rng.uniform(-250.0, 400.0, edges),
++        delays=rng.integers(1, MAX_DELAY + 1, edges).astype(np.float64),
++        syn_ids=np.zeros(edges, np.int64),
++        dense_shape=(NEURONS, NEURONS),
++    )
++    drive_edges = 40
++    drive = {
++        "n_inputs": DRIVES,
++        "indices": np.stack([rng.integers(0, NEURONS, drive_edges), rng.integers(0, DRIVES, drive_edges)], axis=1),
++        "weights": rng.uniform(800.0, 2000.0, drive_edges),
++        "delays": (np.ones(drive_edges) if one_step else rng.integers(1, 3, drive_edges).astype(np.float64)),
++        "syn_ids": np.zeros(drive_edges, np.int64),
++        "input_type": "spikes",
++        "options": {"trainable": True},
++    }
++    arguments.update(max_delay=float(MAX_DELAY), recurrent_dampening_factor=scale, train_recurrent=True)
++    return network, drive, arguments
++
++
++def _cells(batch, scale, moved_sources, one_step=False):
++    """Unsplit reference and loopback candidate; ``one_step`` gives moved edges and drive delay 1."""
++    network, drive, arguments = _spec(batch, scale, one_step)
++    indices = network["synapses"]["indices"]
++    moved = np.isin(indices[:, 1], moved_sources)
++    if one_step:
++        network["synapses"]["delays"][moved] = 1.0
++    reference = GLIF3Cell(copy.deepcopy(network), {"drive": copy.deepcopy(drive)}, **arguments)
++    local = copy.deepcopy(network)
++    for key in ("indices", "weights", "delays", "syn_ids"):
++        local["synapses"][key] = network["synapses"][key][~moved]
++    exchanged = {
++        "n_inputs": NEURONS,
++        "indices": indices[moved],
++        "weights": network["synapses"]["weights"][moved],
++        "delays": network["synapses"]["delays"][moved],
++        "syn_ids": network["synapses"]["syn_ids"][moved],
++        "input_type": "spikes",
++        "options": {"trainable": True},
++    }
++    candidate = GLIF3Cell(local, {"drive": copy.deepcopy(drive), EXCHANGED: exchanged}, **arguments)
++    return reference, candidate, moved
++
++
++def _initial(cell, batch, history_slots):
++    """Shared nonzero initial state; the exchanged input history holds x(-k) = z(-k-1)."""
++    state = list(cell.zero_state(batch, cell.compute_dtype))
++    state[0] = tf.cast(history_slots, state[0].dtype)
++    rng = np.random.default_rng(11)
++    state[1] = tf.cast(rng.uniform(0.2, 1.0, state[1].shape), state[1].dtype)
++    net = cell.inputs.get(EXCHANGED)
++    if net is not None and int(net["history_stop"]) > int(net["history_start"]):
++        start, stop = int(net["history_start"]), int(net["history_stop"])
++        history = state[7].numpy()
++        slots = (stop - start) // NEURONS
++        for k in range(slots):
++            history[:, start + k * NEURONS:start + (k + 1) * NEURONS] = \
++                history_slots[:, (k + 1) * NEURONS:(k + 2) * NEURONS]
++        state[7] = tf.constant(history)
++    return tuple(state)
++
++
++def _rollout(cell, batch, history_slots, drive, exchanges=None, final_term=None):
++    initial = _initial(cell, batch, history_slots)
++    # The exchanged input takes no replay columns; "drive" is declared first in both cells.
++    inputs = drive
++    runner = DirectRecordedAdjointRunner(
++        None, cell, LENGTH, CHUNK, count_windows=((0, LENGTH), (2, 9)), spike_exchanges=exchanges,
++    )
++    floating = tuple(value for value in initial[:7] if value.dtype.is_floating)
++    variables = tuple(cell.trainable_variables)
++
++    @tf.function
++    def evaluate():
++        with tf.GradientTape() as tape:
++            tape.watch(floating)
++            output = runner(inputs, initial)
++            values = output.counts + output.sequences + tuple(
++                value for value in output.final_state[:7] if value.dtype.is_floating
++            )
++            loss = tf.add_n([
++                tf.reduce_sum(tf.square(tf.cast(value, tf.float32)) * (index + 1) * 1e-3)
++                for index, value in enumerate(values)
++            ])
++            if final_term is not None:
++                loss += final_term(output.final_state)
++        return values, tape.gradient(loss, (*floating, *variables),
++                                     unconnected_gradients=tf.UnconnectedGradients.ZERO)
++
++    values, gradients = evaluate()
++    n_floating = len(floating)
++    return values, gradients[:n_floating], dict(zip([v.name for v in variables], gradients[n_floating:]))
++
++
++def _canonical(cell, gradients, name):
++    if name == "<recurrent>":
++        variable, layout = cell.recurrent_weight_values, cell.recurrent_master_layout
++    else:
++        variable, layout = cell.inputs[name]["input_weight_values"], cell.inputs[name]["master_layout"]
++    return layout.host_to_canonical(gradients[variable.name].numpy())
++
++
++def _history_terms(candidate, batch):
++    """Equal losses on the exchanged frames x(L-k) of the candidate's final input history and
++    on the reference's final recurrent history slots k, which hold the same spikes z(L-1-k)."""
++    net = candidate.inputs[EXCHANGED]
++    start, stop = int(net["history_start"]), int(net["history_stop"])
++    weights = tf.constant(np.random.default_rng(13).standard_normal((batch, stop - start)), tf.float32)
++
++    def candidate_term(final_state):
++        return tf.reduce_sum(weights * tf.cast(final_state[7][:, start:stop], tf.float32))
++
++    def reference_term(final_state):
++        return tf.reduce_sum(weights * tf.cast(final_state[0][:, NEURONS:NEURONS + stop - start], tf.float32))
++
++    return reference_term, candidate_term
++
++
++@pytest.mark.parametrize("history_loss", [False, True])
++@pytest.mark.parametrize("scale", [1.0, 0.5])
++@pytest.mark.parametrize("batch", [2, 3])
++def test_loopback_exchange_reproduces_unsplit_network(batch, scale, history_loss):
++    if not fused_cuda_available():
++        pytest.skip("Authorized GPU and rebuilt CUDA operators required.")
++    reference, candidate, moved = _cells(batch, scale, np.arange(NEURONS // 2, NEURONS))
++    try:
++        assert direct_records_supported(reference) == () and direct_records_supported(candidate) == ()
++        assert moved.any() and (~moved).any()
++        assert int(candidate.inputs[EXCHANGED]["history_stop"]) > int(candidate.inputs[EXCHANGED]["history_start"])
++        rng = np.random.default_rng(3)
++        history = (rng.random((batch, NEURONS * MAX_DELAY)) < 0.3).astype(np.float32)
++        drive = tf.constant((rng.random((batch, LENGTH, DRIVES)) < 0.4).astype(np.float32))
++        reference_term, candidate_term = _history_terms(candidate, batch) if history_loss else (None, None)
++        expected, expected_initial, expected_masters = _rollout(
++            reference, batch, history, drive, final_term=reference_term,
++        )
++        log = []
++        observed, observed_initial, observed_masters = _rollout(
++            candidate, batch, history, drive, {EXCHANGED: Loopback(log)}, final_term=candidate_term,
++        )
++        counts = expected[0].numpy()
++        assert counts.sum() > 0 and (counts < LENGTH).any()
++        for target, value in zip(expected[:2], observed[:2]):
++            np.testing.assert_array_equal(value.numpy(), target.numpy())
++        for target, value in zip(expected[2:], observed[2:]):
++            np.testing.assert_allclose(value.numpy(), target.numpy(), rtol=1e-5, atol=1e-6)
++        # Initial voltage/ASC/PSC credit and the credit of z(-1) (newest history slot).
++        for target, value in zip(expected_initial[1:], observed_initial[1:]):
++            np.testing.assert_allclose(value.numpy(), target.numpy(), rtol=1e-4, atol=1e-6)
++        np.testing.assert_allclose(observed_initial[0].numpy()[:, :NEURONS], expected_initial[0].numpy()[:, :NEURONS],
++                                   rtol=1e-4, atol=1e-6)
++        whole = _canonical(reference, expected_masters, "<recurrent>")
++        assert np.any(whole[moved] != 0)
++        np.testing.assert_allclose(_canonical(candidate, observed_masters, "<recurrent>"), whole[~moved],
++                                   rtol=1e-4, atol=1e-6)
++        np.testing.assert_allclose(_canonical(candidate, observed_masters, EXCHANGED), whole[moved],
++                                   rtol=1e-4, atol=1e-6)
++        np.testing.assert_allclose(_canonical(candidate, observed_masters, "drive"),
++                                   _canonical(reference, expected_masters, "drive"), rtol=1e-4, atol=1e-6)
++        assert log == ([("begin", -1)] + [("forward", t) for t in range(LENGTH)]
++                       + [("begin", -1)] + [("reverse", t) for t in reversed(range(LENGTH))])
++    finally:
++        reference.close_fused_cuda()
++        candidate.close_fused_cuda()
++
++
++def test_spike_exchange_validation():
++    if not fused_cuda_available():
++        pytest.skip("Authorized GPU and rebuilt CUDA operators required.")
++    _, candidate, _ = _cells(2, 1.0, np.arange(NEURONS // 2, NEURONS))
++    try:
++        with pytest.raises(ValueError, match="not a named input"):
++            DirectRecordedAdjointRunner(None, candidate, LENGTH, CHUNK, spike_exchanges={"missing": Loopback()})
++        with pytest.raises(TypeError, match="no callable"):
++            DirectRecordedAdjointRunner(None, candidate, LENGTH, CHUNK, spike_exchanges={EXCHANGED: object()})
++        runner = DirectRecordedAdjointRunner(None, candidate, LENGTH, CHUNK, spike_exchanges={EXCHANGED: Loopback()})
++        assert runner.replay_columns == {"drive": (0, DRIVES)} and runner.replay_width == DRIVES
++        full = tf.zeros((2, LENGTH, int(candidate.inputs_idx[-1])))
++        with pytest.raises(ValueError, match="replay columns"):
++            runner(full, candidate.zero_state(2, candidate.compute_dtype))
++    finally:
++        candidate.close_fused_cuda()
++
++
++def test_loopback_exchange_without_input_history():
++    """One-step exchanged edges and drive: the cell has no input-history state at all."""
++    if not fused_cuda_available():
++        pytest.skip("Authorized GPU and rebuilt CUDA operators required.")
++    batch = 2
++    reference, candidate, moved = _cells(batch, 1.0, np.arange(NEURONS // 2, NEURONS), one_step=True)
++    try:
++        assert len(candidate.zero_state(batch, candidate.compute_dtype)) == 7
++        rng = np.random.default_rng(3)
++        history = (rng.random((batch, NEURONS * MAX_DELAY)) < 0.3).astype(np.float32)
++        drive = tf.constant((rng.random((batch, LENGTH, DRIVES)) < 0.4).astype(np.float32))
++        expected, _, expected_masters = _rollout(reference, batch, history, drive)
++        observed, _, observed_masters = _rollout(candidate, batch, history, drive, {EXCHANGED: Loopback()})
++        np.testing.assert_array_equal(observed[0].numpy(), expected[0].numpy())
++        assert expected[0].numpy().sum() > 0
++        whole = _canonical(reference, expected_masters, "<recurrent>")
++        np.testing.assert_allclose(_canonical(candidate, observed_masters, "<recurrent>"), whole[~moved],
++                                   rtol=1e-4, atol=1e-6)
++        np.testing.assert_allclose(_canonical(candidate, observed_masters, EXCHANGED), whole[moved],
++                                   rtol=1e-4, atol=1e-6)
++    finally:
++        reference.close_fused_cuda()
++        candidate.close_fused_cuda()

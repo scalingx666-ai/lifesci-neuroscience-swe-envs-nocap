@@ -1,0 +1,12 @@
+# Issue
+
+**Title:** Exclude artifacts from sdist and wheel
+
+## Description
+
+Building the wheel from the PyPI sdist will include those files and
+directories otherwise. They are also distributed in the uploaded wheel.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `c7ff5ef07df9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

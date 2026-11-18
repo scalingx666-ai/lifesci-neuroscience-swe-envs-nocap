@@ -1,0 +1,488 @@
+diff --git a/cmake/SourceFiles.cmake b/cmake/SourceFiles.cmake
+index e4f0c9a1..549f3597 100644
+--- a/cmake/SourceFiles.cmake
++++ b/cmake/SourceFiles.cmake
+@@ -29,6 +29,8 @@ set(lslsources
+         src/portable_archive/portable_oarchive.hpp
+         src/resolver_impl.cpp
+         src/resolver_impl.h
++        src/resolve_attempt_tcp.cpp
++        src/resolve_attempt_tcp.h
+         src/resolve_attempt_udp.cpp
+         src/resolve_attempt_udp.h
+         src/sample.cpp
+diff --git a/src/api_config.cpp b/src/api_config.cpp
+index 63c6feeb..f6430afa 100644
+--- a/src/api_config.cpp
++++ b/src/api_config.cpp
+@@ -295,6 +295,7 @@ void api_config::load(INI &pt) {
+ 	// read the [lab] settings
+ 	known_peers_ = parse_set(pt.get("lab.KnownPeers", "{}"));
+ 	session_id_ = pt.get("lab.SessionID", "default");
++	resolve_over_tcp_ = pt.get("lab.ResolveOverTCP", false);
+ 
+ 	// read the [tuning] settings
+ 	use_protocol_version_ = std::min(
+diff --git a/src/api_config.h b/src/api_config.h
+index 06f722a4..f65da12e 100644
+--- a/src/api_config.h
++++ b/src/api_config.h
+@@ -176,6 +176,17 @@ class api_config {
+ 	 */
+ 	const std::vector<std::string> &known_peers() const { return known_peers_; }
+ 
++	/**
++	 * @brief Whether to additionally resolve streams by probing TCP data ports directly.
++	 *
++	 * When enabled, a resolve also connects to every port in the BasePort..BasePort+PortRange
++	 * range on loopback and on each KnownPeer and requests stream info over TCP. Because TCP is a
++	 * symmetric, connection-oriented protocol, this is robust against the stateful-firewall issues
++	 * that can block UDP discovery, but it is VERY slow (one connection attempt per port per host,
++	 * and closed/filtered remote ports cost a full connect timeout each). Disabled by default.
++	 */
++	bool resolve_over_tcp() const { return resolve_over_tcp_; }
++
+ 	// === tuning parameters ===
+ 
+ 	/// The network protocol version to use.
+@@ -285,6 +296,7 @@ class api_config {
+ 	std::string listen_address_;
+ 	std::vector<std::string> known_peers_;
+ 	std::string session_id_;
++	bool resolve_over_tcp_;
+ 	// tuning parameters
+ 	int use_protocol_version_;
+ 	double watchdog_time_threshold_;
+diff --git a/src/resolve_attempt_tcp.cpp b/src/resolve_attempt_tcp.cpp
+new file mode 100644
+index 00000000..33009a87
+--- /dev/null
++++ b/src/resolve_attempt_tcp.cpp
+@@ -0,0 +1,136 @@
++#include "resolve_attempt_tcp.h"
++#include "common.h"
++#include "resolver_impl.h"
++#include "stream_info_impl.h"
++#include <algorithm>
++#include <asio/buffer.hpp>
++#include <asio/connect.hpp>
++#include <asio/read.hpp>
++#include <asio/write.hpp>
++#include <exception>
++#include <loguru.hpp>
++#include <mutex>
++#include <utility>
++
++using namespace lsl;
++using err_t = const asio::error_code &;
++
++/// Maximum number of TCP probes in flight at once (one socket each).
++static const std::size_t MAX_CONCURRENT_PROBES = 16;
++
++resolve_attempt_tcp::resolve_attempt_tcp(asio::io_context &io,
++	const std::vector<tcp::endpoint> &targets, const std::string &query, resolver_impl &resolver,
++	double cancel_after)
++	: io_(io), resolver_(resolver), cancel_after_(cancel_after), cancelled_(false),
++	  targets_(targets), next_target_(0), active_workers_(0), cancel_timer_(io) {
++	// Precompute the query message. Unlike the UDP query there is no return port or query id:
++	// the reply comes back on this very connection and the TCP shortinfo responder replies with
++	// the bare shortinfo message (no query-id prefix).
++	query_msg_ = "LSL:shortinfo\r\n" + query + "\r\n";
++	// register ourselves as a candidate for cancellation
++	register_at(&resolver);
++}
++
++resolve_attempt_tcp::~resolve_attempt_tcp() { unregister_from_all(); }
++
++void resolve_attempt_tcp::begin() {
++	// arm the cancel timer
++	if (cancel_after_ != FOREVER) {
++		cancel_timer_.expires_after(timeout_sec(cancel_after_));
++		cancel_timer_.async_wait([shared_this = shared_from_this(), this](err_t err) {
++			if (!err) do_cancel();
++		});
++	}
++	// launch the worker pool
++	active_workers_ = std::min(MAX_CONCURRENT_PROBES, targets_.size());
++	worker_sockets_.resize(active_workers_);
++	std::size_t workers = active_workers_;
++	for (std::size_t w = 0; w < workers; w++) probe_next(w);
++}
++
++void resolve_attempt_tcp::cancel() {
++	post(io_, [shared_this = shared_from_this()]() { shared_this->do_cancel(); });
++}
++
++void resolve_attempt_tcp::probe_next(std::size_t worker) {
++	if (cancelled_) return;
++	if (next_target_ >= targets_.size()) {
++		// this worker is out of endpoints; once all workers are done, drop the cancel timer so
++		// the attempt can finish (and the resolver can schedule a fresh burst)
++		if (--active_workers_ == 0) cancel_timer_.cancel();
++		return;
++	}
++	const tcp::endpoint ep = targets_[next_target_++];
++	auto sock = std::make_shared<tcp_socket>(io_);
++	worker_sockets_[worker] = sock;
++
++	auto self = shared_from_this();
++	sock->async_connect(ep, [self, this, worker, ep, sock](err_t err) {
++		if (cancelled_) return;
++		if (err) {
++			// closed / filtered / unreachable port: move on to the next target
++			probe_next(worker);
++			return;
++		}
++		// connected: send the shortinfo query
++		asio::async_write(*sock, asio::buffer(query_msg_),
++			[self, this, worker, ep, sock](err_t err, std::size_t /*unused*/) {
++				if (cancelled_) return;
++				if (err) {
++					probe_next(worker);
++					return;
++				}
++				// read the reply until the outlet closes the connection (EOF)
++				auto reply = std::make_shared<std::string>();
++				asio::async_read(*sock, asio::dynamic_buffer(*reply),
++					[self, this, worker, ep, sock, reply](err_t err, std::size_t /*unused*/) {
++						if (cancelled_) return;
++						if (!err || err == asio::error::eof) handle_reply(*reply, ep);
++						probe_next(worker);
++					});
++			});
++	});
++}
++
++void resolve_attempt_tcp::handle_reply(const std::string &reply, const tcp::endpoint &ep) {
++	if (reply.empty()) return; // no match: the responder closed without replying
++	try {
++		stream_info_impl info;
++		info.from_shortinfo_message(reply);
++		// The shortinfo XML carries the ports but not the host address; fill it in from the
++		// endpoint we connected to (mirrors the UDP resolver using the reply's source address).
++		const std::string addr = ep.address().to_string();
++		std::string uid = info.uid();
++		{
++			std::lock_guard<std::mutex> lock(resolver_.results_mut_);
++			auto it = resolver_.results_.find(uid);
++			if (it == resolver_.results_.end())
++				it = resolver_.results_.emplace(uid, std::make_pair(info, lsl_clock())).first;
++			else
++				it->second.second = lsl_clock();
++			auto &stored_info = it->second.first;
++			if (ep.address().is_v4()) {
++				if (stored_info.v4address().empty()) stored_info.v4address(addr);
++			} else {
++				if (stored_info.v6address().empty()) stored_info.v6address(addr);
++			}
++		}
++		// prepone the next cancellation check so a hit cancels the remaining (slow) probes
++		if (resolver_.check_cancellation_criteria()) resolver_.cancel_ongoing_resolve();
++	} catch (std::exception &e) {
++		LOG_F(WARNING, "resolve_attempt_tcp: could not parse a reply from %s: %s",
++			ep.address().to_string().c_str(), e.what());
++	}
++}
++
++void resolve_attempt_tcp::do_cancel() {
++	try {
++		cancelled_ = true;
++		for (auto &sock : worker_sockets_)
++			if (sock && sock->is_open()) sock->close();
++		cancel_timer_.cancel();
++	} catch (std::exception &e) {
++		LOG_F(WARNING, "Unexpected error while trying to cancel a resolve_attempt_tcp: %s",
++			e.what());
++	}
++}
+diff --git a/src/resolve_attempt_tcp.h b/src/resolve_attempt_tcp.h
+new file mode 100644
+index 00000000..69692fcf
+--- /dev/null
++++ b/src/resolve_attempt_tcp.h
+@@ -0,0 +1,89 @@
++#ifndef RESOLVE_ATTEMPT_TCP_H
++#define RESOLVE_ATTEMPT_TCP_H
++
++#include "cancellation.h"
++#include "socket_utils.h"
++#include <asio/io_context.hpp>
++#include <asio/ip/tcp.hpp>
++#include <asio/steady_timer.hpp>
++#include <cstddef>
++#include <memory>
++#include <string>
++#include <vector>
++
++using asio::ip::tcp;
++using err_t = const asio::error_code &;
++
++namespace lsl {
++class resolver_impl;
++
++using steady_timer = asio::basic_waitable_timer<asio::chrono::steady_clock,
++	asio::wait_traits<asio::chrono::steady_clock>, asio::io_context::executor_type>;
++
++/**
++ * An asynchronous resolve attempt that probes a set of TCP endpoints directly.
++ *
++ * For each endpoint it opens a TCP connection, sends an `LSL:shortinfo` query, and parses the
++ * outlet's reply into a stream_info that is stored in the shared resolver results. Unlike the UDP
++ * resolver this requires one connection per endpoint, so probes run through a small pool of
++ * concurrent workers. Used as a firewall-robust (but slow) discovery fallback, gated behind the
++ * `lab.ResolveOverTCP` config option.
++ */
++class resolve_attempt_tcp final : public cancellable_obj,
++								  public std::enable_shared_from_this<resolve_attempt_tcp> {
++public:
++	/**
++	 * Instantiate and set up a new TCP resolve attempt.
++	 *
++	 * @param io The io_context that will run the async operations.
++	 * @param targets The TCP endpoints to probe (host x port-range).
++	 * @param query The query string the outlet must match to reply.
++	 * @param resolver The resolver whose results container is populated.
++	 * @param cancel_after Time after which the attempt is automatically cancelled.
++	 */
++	resolve_attempt_tcp(asio::io_context &io, const std::vector<tcp::endpoint> &targets,
++		const std::string &query, resolver_impl &resolver, double cancel_after = 5.0);
++
++	/// Destructor.
++	~resolve_attempt_tcp() final;
++
++	/// Start probing asynchronously.
++	void begin();
++
++	/// Cancel operations asynchronously and destructively.
++	void cancel() override;
++
++private:
++	/// Probe the next not-yet-taken target endpoint using the given worker's socket slot.
++	void probe_next(std::size_t worker);
++
++	/// Parse a reply received from a given endpoint into the resolver results.
++	void handle_reply(const std::string &reply, const tcp::endpoint &ep);
++
++	/// Cancel the outstanding operations.
++	void do_cancel();
++
++	/// the IO service that executes our actions
++	asio::io_context &io_;
++	/// the resolver associated with this attempt
++	resolver_impl &resolver_;
++	/// the timeout for giving up
++	double cancel_after_;
++	/// whether the operation has been cancelled
++	bool cancelled_;
++	/// the endpoints to probe
++	std::vector<tcp::endpoint> targets_;
++	/// the message we send ("LSL:shortinfo\r\n<query>\r\n")
++	std::string query_msg_;
++	/// index of the next target to hand to a worker
++	std::size_t next_target_;
++	/// number of workers that still have endpoints to probe
++	std::size_t active_workers_;
++	/// per-worker current socket (kept so a cancel can close in-flight connects)
++	std::vector<std::shared_ptr<tcp_socket>> worker_sockets_;
++	/// timer to schedule the cancel action
++	steady_timer cancel_timer_;
++};
++} // namespace lsl
++
++#endif
+diff --git a/src/resolver_impl.cpp b/src/resolver_impl.cpp
+index a70c5b2e..650d81e0 100644
+--- a/src/resolver_impl.cpp
++++ b/src/resolver_impl.cpp
+@@ -1,10 +1,12 @@
+ #include "resolver_impl.h"
+ #include "api_config.h"
++#include "resolve_attempt_tcp.h"
+ #include "resolve_attempt_udp.h"
+ #include "socket_utils.h"
+ #include "stream_info_impl.h"
+ #include <asio/io_context.hpp>
+ #include <asio/ip/basic_resolver.hpp>
++#include <asio/ip/tcp.hpp>
+ #include <asio/ip/udp.hpp>
+ #include <exception>
+ #include <loguru.hpp>
+@@ -53,6 +55,29 @@ resolver_impl::resolver_impl()
+ 	if (cfg_->allow_ipv4()) {
+ 		udp_protocols_.push_back(udp::v4());
+ 	}
++
++	// build the TCP probe targets (loopback + known peers, each x port range) if enabled
++	if (cfg_->resolve_over_tcp()) {
++		uint16_t base = cfg_->base_port();
++		uint16_t range = cfg_->port_range();
++		LOG_F(WARNING,
++			"lab.ResolveOverTCP is enabled: discovery will also TCP-probe ports %u-%u on loopback "
++			"and on every KnownPeer. This is robust behind firewalls but VERY slow, especially "
++			"across the internet.",
++			base, static_cast<unsigned>(base + range - 1));
++		std::vector<std::string> hosts{"127.0.0.1"};
++		if (cfg_->allow_ipv6()) hosts.emplace_back("::1");
++		for (const auto &peer : cfg_->known_peers()) hosts.push_back(peer);
++		tcp::resolver tcp_resolver(*io_);
++		for (const auto &host : hosts) {
++			try {
++				for (const auto &res : tcp_resolver.resolve(host, std::to_string(base))) {
++					for (uint16_t p = base; p < base + range; p++)
++						tcp_endpoints_.emplace_back(res.endpoint().address(), p);
++				}
++			} catch (std::exception &) {}
++		}
++	}
+ }
+ 
+ void check_query(const std::string &query) {
+@@ -186,6 +211,17 @@ void resolver_impl::next_resolve_wave() {
+ 			// delay the next multicast wave
+ 			wave_timer_timeout += cfg_->unicast_min_rtt();
+ 		}
++		// fire a TCP probe burst if enabled and a previous one isn't still in flight
++		if (cfg_->resolve_over_tcp() && !tcp_endpoints_.empty() && tcp_attempt_.expired()) {
++			try {
++				auto attempt = std::make_shared<resolve_attempt_tcp>(
++					*io_, tcp_endpoints_, query_, *this, cfg_->unicast_max_rtt());
++				tcp_attempt_ = attempt;
++				attempt->begin();
++			} catch (std::exception &e) {
++				LOG_F(WARNING, "Could not start a TCP resolve attempt: %s", e.what());
++			}
++		}
+ 		wave_timer_.expires_after(timeout_sec(wave_timer_timeout));
+ 		wave_timer_.async_wait([this](err_t err) {
+ 			if (err != asio::error::operation_aborted) next_resolve_wave();
+diff --git a/src/resolver_impl.h b/src/resolver_impl.h
+index baae2f98..6de03e04 100644
+--- a/src/resolver_impl.h
++++ b/src/resolver_impl.h
+@@ -22,6 +22,7 @@ using err_t = const asio::error_code &;
+ 
+ namespace lsl {
+ class api_config;
++class resolve_attempt_tcp;
+ 
+ using steady_timer = asio::basic_waitable_timer<asio::chrono::steady_clock, asio::wait_traits<asio::chrono::steady_clock>, asio::io_context::executor_type>;
+ 
+@@ -132,6 +133,7 @@ class resolver_impl final : public cancellable_registry {
+ 
+ private:
+ 	friend class resolve_attempt_udp;
++	friend class resolve_attempt_tcp;
+ 
+ 	/// This function starts a new wave of resolves.
+ 	void next_resolve_wave();
+@@ -158,6 +160,8 @@ class resolver_impl final : public cancellable_registry {
+ 	std::vector<udp::endpoint> mcast_endpoints_;
+ 	/// the list of per-host UDP endpoints under consideration
+ 	std::vector<udp::endpoint> ucast_endpoints_;
++	/// the list of per-host TCP endpoints to probe when lab.ResolveOverTCP is enabled
++	std::vector<tcp::endpoint> tcp_endpoints_;
+ 
+ 	// things related to cancellation
+ 	/// if set, no more resolves can be started (destructively cancelled).
+@@ -188,6 +192,8 @@ class resolver_impl final : public cancellable_registry {
+ 	io_context_p io_;
+ 	/// a thread that runs background IO if we are performing a resolve_continuous
+ 	std::shared_ptr<std::thread> background_io_;
++	/// the currently in-flight TCP probe attempt (if any); used to avoid overlapping bursts
++	std::weak_ptr<resolve_attempt_tcp> tcp_attempt_;
+ 	/// the overall timeout for a query
+ 	steady_timer resolve_timeout_expired_;
+ 	/// a timer that fires when a new wave should be scheduled
+diff --git a/src/tcp_server.cpp b/src/tcp_server.cpp
+index c4173b55..3e9a85ca 100644
+--- a/src/tcp_server.cpp
++++ b/src/tcp_server.cpp
+@@ -544,10 +544,11 @@ void client_session::handle_read_query_outcome(err_t err) {
+ 		auto serv = serv_.lock();
+ 		if (!serv) return;
+ 		if (serv->info_->matches_query(query)) {
+-			// matches: reply (otherwise just close the stream)
++			// matches: reply (otherwise just close the stream). Keep the session (and thus the
++			// socket) alive until the shortinfo has been sent; the session is then destroyed,
++			// closing the socket so the client sees EOF and knows the reply is complete.
+ 			async_write(sock_, asio::buffer(serv->shortinfo_msg_),
+-				[serv](err_t /*unused*/, std::size_t /*unused*/) {
+-					/* keep the tcp_server alive until the shortinfo is sent completely*/
++				[shared_this = shared_from_this(), serv](err_t /*unused*/, std::size_t /*unused*/) {
+ 				});
+ 		} else {
+ 			DLOG_F(INFO, "%p got a shortinfo query response for the wrong query", this);
+diff --git a/testing/CMakeLists.txt b/testing/CMakeLists.txt
+index efe25452..190bae97 100644
+--- a/testing/CMakeLists.txt
++++ b/testing/CMakeLists.txt
+@@ -109,6 +109,17 @@ add_executable(lsl_test_runtime_config int/runtime_config.cpp)
+ target_link_libraries(lsl_test_runtime_config PRIVATE lslobj lslboost common catch_main)
+ target_compile_definitions(lsl_test_runtime_config PRIVATE LIBLSL_EXPORTS)
+ 
++# resolve_over_tcp test sets the api_config singleton, so it lives in its own executable.
++add_executable(lsl_test_resolve_over_tcp int/resolve_over_tcp.cpp)
++target_link_libraries(lsl_test_resolve_over_tcp PRIVATE lslobj lslboost common catch_main)
++target_compile_definitions(lsl_test_resolve_over_tcp PRIVATE LIBLSL_EXPORTS)
++# Needs pugixml headers (resolver_impl.h -> stream_info_impl.h includes pugixml)
++if(LSL_PUGIXML_IS_FETCHED)
++    target_include_directories(lsl_test_resolve_over_tcp PRIVATE ${pugixml_SOURCE_DIR}/src)
++else()
++    target_link_libraries(lsl_test_resolve_over_tcp PRIVATE pugixml::pugixml)
++endif()
++
+ # resolve_query_port test sets the api_config singleton, so it lives in its own executable.
+ add_executable(lsl_test_resolve_query_port int/resolve_query_port.cpp)
+ target_link_libraries(lsl_test_resolve_query_port PRIVATE lslobj lslboost common catch_main)
+@@ -135,7 +146,7 @@ if(LSL_BENCHMARKS)
+ 	)
+ endif()
+ 
+-set(LSL_TESTS lsl_test_exported lsl_test_internal lsl_test_runtime_config lsl_test_resolve_query_port)
++set(LSL_TESTS lsl_test_exported lsl_test_internal lsl_test_runtime_config lsl_test_resolve_over_tcp lsl_test_resolve_query_port)
+ foreach(lsltest ${LSL_TESTS})
+ 	add_test(NAME ${lsltest} COMMAND ${lsltest} --wait-for-keypress never)
+ 	if(LSL_INSTALL)
+diff --git a/testing/int/resolve_over_tcp.cpp b/testing/int/resolve_over_tcp.cpp
+new file mode 100644
+index 00000000..9f6bd7f7
+--- /dev/null
++++ b/testing/int/resolve_over_tcp.cpp
+@@ -0,0 +1,37 @@
++#include "api_config.h"
++#include <catch2/catch_test_macros.hpp>
++#include <lsl_cpp.h>
++#include <vector>
++
++// Verifies that lab.ResolveOverTCP discovers a local stream even when UDP discovery is fully
++// blinded (ResolveScope=machine with an empty MachineAddresses leaves no multicast/broadcast
++// targets, and empty KnownPeers leaves no unicast targets). With UDP unable to reach the outlet,
++// a successful resolve can only have come from the TCP probe path.
++//
++// Sets the api_config singleton, so (like runtime_config) it lives in its own executable.
++
++TEST_CASE("ResolveOverTCP finds a local stream when UDP discovery is blind", "[resolver][tcp]") {
++	lsl::api_config::set_api_config_content(
++		"[ports]\n"
++		"IPv6 = disable\n"
++		"PortRange = 4\n"
++		"[multicast]\n"
++		"ResolveScope = machine\n"
++		"MachineAddresses = {}\n" // no multicast/broadcast discovery targets at all
++		"[lab]\n"
++		"SessionID = resolve_over_tcp_test\n"
++		"KnownPeers = {}\n" // no unicast UDP discovery targets either
++		"ResolveOverTCP = 1\n");
++
++	lsl::stream_info info("tcptest", "test", 1, lsl::IRREGULAR_RATE, lsl::cf_float32, "tcpsrc");
++	lsl::stream_outlet outlet(info);
++
++	// UDP discovery has no targets, so a hit here must have come from the loopback TCP probe.
++	std::vector<lsl::stream_info> found = lsl::resolve_stream("name", "tcptest", 1, 5.0);
++
++	REQUIRE(found.size() == 1);
++	CHECK(found[0].name() == "tcptest");
++	CHECK(found[0].source_id() == "tcpsrc");
++	// The resolved info must carry the TCP endpoint that the probe connected to.
++	CHECK(found[0].channel_count() == 1);
++}

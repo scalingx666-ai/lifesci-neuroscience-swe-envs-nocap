@@ -1,0 +1,199 @@
+diff --git a/meegkit/asr.py b/meegkit/asr.py
+index 4568a60c..91b7cc2a 100755
+--- a/meegkit/asr.py
++++ b/meegkit/asr.py
+@@ -256,10 +256,11 @@ def transform(self, X, y=None, **kwargs):
+                 break
+ 
+         # Exponential covariance weights – the most recent covariance has a
+-        # weight of 1, while the oldest one in memory has a weight of 5%
+-        weights = [1, ]
+-        for c in np.cumsum(self._counter[1:]):
+-            weights = [self.sample_weight[-c]] + weights
++        # weight of 1, while the oldest one in memory has a weight of ~5%. A
++        # block's weight is set by the number of MORE-RECENT samples following
++        # it (a suffix sum of per-block sample counts), so that unequal chunk
++        # sizes are weighted by their true recency.
++        weights = _recency_weights(self._counter, self.sample_weight)
+ 
+         # Clean data, using covariances weighted by sample_weight
+         out, self.state_ = asr_process(X, X_filt, self.state_,
+@@ -270,6 +271,23 @@ def transform(self, X, y=None, **kwargs):
+         return out
+ 
+ 
++def _recency_weights(counter, sample_weight):
++    """Exponential recency weights for stored covariance blocks.
++
++    A block's weight is set by the number of MORE-RECENT samples that follow
++    it (the suffix sum of ``counter``), so unequal chunk sizes are weighted by
++    true recency. The most recent block gets ``sample_weight[-1]`` (== 1);
++    older blocks decay toward 5%. ``counter`` is ordered oldest->newest.
++    """
++    weights = []
++    newer = 0
++    for count in reversed(counter):
++        idx = min(newer, len(sample_weight) - 1)
++        weights.insert(0, sample_weight[-(idx + 1)])
++        newer += count
++    return weights
++
++
+ def clean_windows(X, sfreq, max_bad_chans=0.2, zthresholds=[-3.5, 5],
+                   win_len=.5, win_overlap=0.66, min_clean_fraction=0.25,
+                   max_dropout_fraction=0.1, show=False):
+@@ -610,7 +628,8 @@ def asr_process(X, X_filt, state, cov=None, detrend=False, method="riemann",
+             cov = mean_covariance(
+                 cov, metric="riemann", sample_weight=sample_weight)
+         else:
+-            cov = geometric_median(cov.reshape((-1, nc * nc)))
++            cov = geometric_median(cov.reshape((-1, nc * nc)),
++                                   sample_weight=sample_weight)
+             cov = cov.reshape((nc, nc))
+ 
+     maxdims = int(np.floor(0.66 * nc + 0.5))  # constant TODO make param
+diff --git a/meegkit/utils/asr.py b/meegkit/utils/asr.py
+index 263af8e2..0df8d154 100755
+--- a/meegkit/utils/asr.py
++++ b/meegkit/utils/asr.py
+@@ -333,11 +333,11 @@ def yulewalk_filter(X, sfreq, zi=None, ab=None, axis=-1):
+     return out, zf
+ 
+ 
+-def geometric_median(X, tol=1e-5, max_iter=500):
++def geometric_median(X, tol=1e-5, max_iter=500, sample_weight=None):
+     """Geometric median.
+ 
+-    This code is adapted from [2]_ using the Vardi and Zhang algorithm
+-    described in [1]_.
++    This code is adapted from [2]_ using the (optionally weighted) Vardi and
++    Zhang algorithm described in [1]_.
+ 
+     Parameters
+     ----------
+@@ -347,6 +347,10 @@ def geometric_median(X, tol=1e-5, max_iter=500):
+         Tolerance (default=1.e-5)
+     max_iter : int
+         Max number of iterations (default=500):
++    sample_weight : array, shape=(n_observations,) | None
++        Per-observation weights (``eta_i`` in the Vardi-Zhang notation). If
++        None (default), every observation is weighted equally and the
++        iteration reduces exactly to the unweighted geometric median.
+ 
+     Returns
+     -------
+@@ -360,27 +364,33 @@ def geometric_median(X, tol=1e-5, max_iter=500):
+        97(4), 1423-1426. https://doi.org/10.1073/pnas.97.4.1423
+     .. [2] https://stackoverflow.com/questions/30299267/
+     """
+-    y = np.mean(X, 0)  # initial value
++    if sample_weight is None:
++        w = np.ones(len(X))
++    else:
++        w = np.asarray(sample_weight, dtype=float)
++
++    y = np.average(X, axis=0, weights=w)  # initial value
+ 
+     i = 0
+     while i < max_iter:
+         D = cdist(X, [y])
+         nonzeros = (D != 0)[:, 0]
+ 
+-        Dinv = 1. / D[nonzeros]
++        Dinv = w[nonzeros][:, None] / D[nonzeros]
+         Dinvs = np.sum(Dinv)
+         W = Dinv / Dinvs
+         T = np.sum(W * X[nonzeros], 0)
+ 
+-        num_zeros = len(X) - np.sum(nonzeros)
+-        if num_zeros == 0:
++        # weight mass of observations coincident with the current estimate
++        eta = np.sum(w[~nonzeros])
++        if eta == 0:
+             y1 = T
+-        elif num_zeros == len(X):
++        elif not nonzeros.any():
+             return y
+         else:
+             R = (T - y) * Dinvs
+             r = np.linalg.norm(R)
+-            rinv = 0 if r == 0 else num_zeros / r
++            rinv = 0 if r == 0 else eta / r
+             y1 = max(0, 1 - rinv) * T + min(1, rinv) * y
+ 
+         if euclidean(y, y1) < tol:
+diff --git a/tests/test_asr.py b/tests/test_asr.py
+index 8dc280ea..fa78bed2 100644
+--- a/tests/test_asr.py
++++ b/tests/test_asr.py
+@@ -600,6 +600,70 @@ def test_rms_window_offsets_rounds_each_start():
+         offsets[:7], np.array([0, 42, 85, 127, 170, 212, 255]))
+ 
+ 
++def test_geometric_median_weighted():
++    """Weighted geometric median: uniform weights match the unweighted result, heavy weights bias toward the point."""
++    from meegkit.utils.asr import geometric_median
++    X = rng.standard_normal((5, 3))
++
++    # (a) uniform weights == default (unweighted) result
++    gm_u = geometric_median(X)
++    gm_ones = geometric_median(X, sample_weight=np.ones(5))
++    assert np.allclose(gm_u, gm_ones)
++
++    # (b) heavily weighting one point pulls the median toward that point
++    gm_w = geometric_median(X, sample_weight=[1., 1., 1., 1., 100.])
++    assert np.linalg.norm(gm_w - X[4]) < np.linalg.norm(gm_u - X[4])
++    assert not np.allclose(gm_u, gm_w)
++
++
++def test_asr_process_euclid_uses_weights():
++    """euclid asr_process forwards sample_weight to geometric_median."""
++    nc, ns = 4, 50
++    # two clearly distinct covariance blocks
++    B1 = rng.standard_normal((nc, ns))
++    B2 = 3 * rng.standard_normal((nc, ns)) + 1
++    covs = np.stack([B1 @ B1.T / ns, B2 @ B2.T / ns])  # (2, nc, nc)
++
++    X = rng.standard_normal((nc, ns))
++    T = 0.1 * np.eye(nc)
++
++    def run(weights):
++        state = dict(M=np.eye(nc), T=T, R=None)
++        with patch(
++            "meegkit.asr.geometric_median",
++            side_effect=lambda arr, sample_weight=None: np.average(
++                arr, axis=0, weights=sample_weight),
++        ) as gm:
++            out, _ = asr_process(X, X, state, cov=covs, method="euclid",
++                                 sample_weight=weights)
++            forwarded = gm.call_args.kwargs["sample_weight"]
++            np.testing.assert_allclose(forwarded, weights)
++        return out
++
++    out_a = run([1., 1.])
++    out_b = run([0.05, 1.])
++    assert out_a.shape == out_b.shape
++
++
++def test_recency_weights_suffix_sum():
++    """Online recency weights use suffix (not prefix) sums."""
++    from meegkit.asr import _recency_weights
++    sw = np.geomspace(0.05, 1, 201)
++    counter = [5, 10, 60, 100]  # sum 175 < 200, ordered oldest->newest
++
++    # samples strictly newer than each block: [170, 160, 100, 0]
++    new = _recency_weights(counter, sw)
++    expected = [sw[-171], sw[-161], sw[-101], sw[-1]]
++    assert np.allclose(new, expected)
++    assert new[-1] == 1.0  # most-recent block keeps weight 1
++
++    # the old prefix-sum vector differs on interior blocks
++    old = [1.]
++    for c in np.cumsum(counter[1:]):
++        old = [sw[-c]] + old
++    assert not np.allclose(new, old)
++
++
+ if __name__ == "__main__":
+     pytest.main([__file__])
+     # test_yulewalk(250, True)

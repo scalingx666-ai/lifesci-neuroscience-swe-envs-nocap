@@ -1,0 +1,910 @@
+diff --git a/nobrainer/gpu.py b/nobrainer/gpu.py
+new file mode 100644
+index 00000000..e54d4f48
+--- /dev/null
++++ b/nobrainer/gpu.py
+@@ -0,0 +1,267 @@
++"""GPU utilities: device detection, memory profiling, batch size optimization.
++
++Examples
++--------
++Auto-select the best batch size for a model and block shape::
++
++    from nobrainer.gpu import auto_batch_size, gpu_info
++
++    info = gpu_info()
++    print(info)
++    # [{'name': 'Tesla T4', 'memory_gb': 15.1, 'id': 0}, ...]
++
++    batch_size = auto_batch_size(
++        model=my_model,
++        block_shape=(32, 32, 32),
++        n_classes=2,
++        target_memory_fraction=0.85,
++    )
++    print(f"Optimal batch size: {batch_size}")
++
++Scale batch size for multi-GPU::
++
++    from nobrainer.gpu import scale_for_multi_gpu
++
++    effective_batch, per_gpu_batch, n_gpus = scale_for_multi_gpu(
++        base_batch_size=32,
++        block_shape=(32, 32, 32),
++    )
++    # On 4x T4: effective=128, per_gpu=32, n_gpus=4
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++import torch
++import torch.nn as nn
++
++logger = logging.getLogger(__name__)
++
++
++def get_device() -> torch.device:
++    """Select the best available device: CUDA > MPS > CPU."""
++    if torch.cuda.is_available():
++        return torch.device("cuda")
++    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
++        return torch.device("mps")
++    return torch.device("cpu")
++
++
++def gpu_count() -> int:
++    """Return the number of CUDA GPUs available (0 if none)."""
++    if torch.cuda.is_available():
++        return torch.cuda.device_count()
++    return 0
++
++
++def gpu_info() -> list[dict[str, Any]]:
++    """Return a list of dicts with GPU name, memory, and id.
++
++    Returns an empty list if no CUDA GPUs are available.
++    """
++    info = []
++    if not torch.cuda.is_available():
++        return info
++    for i in range(torch.cuda.device_count()):
++        props = torch.cuda.get_device_properties(i)
++        info.append(
++            {
++                "id": i,
++                "name": props.name,
++                "memory_gb": round(props.total_memory / 1e9, 1),
++                "compute_capability": f"{props.major}.{props.minor}",
++            }
++        )
++    return info
++
++
++def _estimate_memory_per_sample(
++    model: nn.Module,
++    block_shape: tuple[int, int, int],
++    n_classes: int = 2,
++    in_channels: int = 1,
++    dtype: torch.dtype = torch.float32,
++) -> float:
++    """Estimate GPU memory (bytes) for one training sample.
++
++    Runs a forward + backward pass with batch_size=1 and measures the
++    peak allocated memory.  The model is moved to GPU temporarily.
++
++    Parameters
++    ----------
++    model : nn.Module
++        Model to profile.
++    block_shape : tuple of int
++        Spatial dimensions of one input patch.
++    n_classes : int
++        Number of output classes.
++    in_channels : int
++        Number of input channels.
++    dtype : torch.dtype
++        Input data type.
++
++    Returns
++    -------
++    float
++        Estimated bytes per sample (forward + backward + optimizer overhead).
++    """
++    if not torch.cuda.is_available():
++        raise RuntimeError("CUDA required for memory estimation")
++
++    device = torch.device("cuda")
++    model = model.to(device)
++    model.train()
++
++    torch.cuda.reset_peak_memory_stats(device)
++    torch.cuda.empty_cache()
++
++    baseline = torch.cuda.memory_allocated(device)
++
++    x = torch.randn(1, in_channels, *block_shape, device=device, dtype=dtype)
++    labels = torch.randint(0, n_classes, (1, *block_shape), device=device)
++
++    out = model(x)
++    loss = nn.CrossEntropyLoss()(out, labels)
++    loss.backward()
++
++    peak = torch.cuda.max_memory_allocated(device) - baseline
++
++    # Clean up
++    model.zero_grad(set_to_none=True)
++    del x, labels, out, loss
++    torch.cuda.empty_cache()
++    model.cpu()
++
++    return float(peak)
++
++
++def auto_batch_size(
++    model: nn.Module,
++    block_shape: tuple[int, int, int],
++    n_classes: int = 2,
++    in_channels: int = 1,
++    target_memory_fraction: float = 0.85,
++    gpu_id: int = 0,
++    min_batch: int = 1,
++    max_batch: int = 256,
++) -> int:
++    """Estimate the largest batch size that fits in GPU memory.
++
++    Profiles one sample, then scales to fill ``target_memory_fraction``
++    of the GPU.
++
++    Parameters
++    ----------
++    model : nn.Module
++        Model to profile (will be temporarily moved to GPU).
++    block_shape : tuple of int
++        Spatial dimensions ``(D, H, W)`` of one input patch.
++    n_classes : int
++        Number of output classes.
++    in_channels : int
++        Number of input channels.
++    target_memory_fraction : float
++        Fraction of total GPU memory to target (default 0.85).
++    gpu_id : int
++        Which GPU to profile.
++    min_batch : int
++        Minimum batch size to return.
++    max_batch : int
++        Maximum batch size to return.
++
++    Returns
++    -------
++    int
++        Recommended batch size for one GPU.
++    """
++    if not torch.cuda.is_available():
++        logger.warning("No CUDA — returning min_batch=%d", min_batch)
++        return min_batch
++
++    total_mem = torch.cuda.get_device_properties(gpu_id).total_memory
++    target_mem = total_mem * target_memory_fraction
++
++    try:
++        mem_per_sample = _estimate_memory_per_sample(
++            model, block_shape, n_classes, in_channels
++        )
++    except RuntimeError as e:
++        logger.warning("Memory estimation failed: %s — returning min_batch", e)
++        return min_batch
++
++    # Account for ~20% overhead (optimizer state, fragmentation)
++    effective_per_sample = mem_per_sample * 1.2
++    batch = int(target_mem / effective_per_sample)
++    batch = max(min_batch, min(batch, max_batch))
++
++    logger.info(
++        "auto_batch_size: %.1f GB total, %.1f MB/sample, "
++        "target %.0f%% → batch_size=%d",
++        total_mem / 1e9,
++        mem_per_sample / 1e6,
++        target_memory_fraction * 100,
++        batch,
++    )
++    return batch
++
++
++def scale_for_multi_gpu(
++    base_batch_size: int,
++    block_shape: tuple[int, int, int] | None = None,
++    model: nn.Module | None = None,
++    n_classes: int = 2,
++    target_memory_fraction: float = 0.85,
++) -> tuple[int, int, int]:
++    """Scale batch size for multi-GPU training.
++
++    If ``model`` is provided, uses :func:`auto_batch_size` to determine
++    the per-GPU batch size based on actual memory profiling.  Otherwise,
++    divides ``base_batch_size`` evenly across available GPUs.
++
++    Parameters
++    ----------
++    base_batch_size : int
++        Desired effective (global) batch size.
++    block_shape : tuple of int, optional
++        Spatial dimensions for memory profiling.
++    model : nn.Module, optional
++        Model for memory profiling.  If None, uses simple division.
++    n_classes : int
++        Number of output classes (for profiling).
++    target_memory_fraction : float
++        Target GPU memory fraction (for profiling).
++
++    Returns
++    -------
++    effective_batch : int
++        Total batch size across all GPUs.
++    per_gpu_batch : int
++        Batch size per GPU.
++    n_gpus : int
++        Number of GPUs to use.
++    """
++    n_gpus = gpu_count()
++    if n_gpus == 0:
++        return base_batch_size, base_batch_size, 0
++
++    if model is not None and block_shape is not None:
++        per_gpu = auto_batch_size(
++            model,
++            block_shape,
++            n_classes=n_classes,
++            target_memory_fraction=target_memory_fraction,
++        )
++    else:
++        per_gpu = max(1, base_batch_size // n_gpus)
++
++    effective = per_gpu * n_gpus
++
++    logger.info(
++        "Multi-GPU scaling: %d GPUs × %d per-GPU = %d effective batch",
++        n_gpus,
++        per_gpu,
++        effective,
++    )
++    return effective, per_gpu, n_gpus
+diff --git a/nobrainer/slurm.py b/nobrainer/slurm.py
+new file mode 100644
+index 00000000..094542f5
+--- /dev/null
++++ b/nobrainer/slurm.py
+@@ -0,0 +1,188 @@
++"""SLURM utilities for preemptible training with checkpoint/resume.
++
++Provides signal handling for SLURM preemption and checkpoint persistence
++so training jobs can be interrupted and resumed automatically via
++``--requeue``.
++
++Usage::
++
++    from nobrainer.slurm import (
++        SlurmPreemptionHandler,
++        save_checkpoint,
++        load_checkpoint,
++    )
++
++    handler = SlurmPreemptionHandler()
++    start_epoch, metrics = load_checkpoint(ckpt_dir, model, optimizer)
++
++    for epoch in range(start_epoch, total_epochs):
++        train_one_epoch(...)
++        save_checkpoint(ckpt_dir, model, optimizer, epoch, metrics)
++        if handler.preempted:
++            break  # job will be requeued by SLURM
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++from pathlib import Path
++import signal
++from typing import Any
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++
++class SlurmPreemptionHandler:
++    """Handle SLURM preemption signals for graceful checkpoint-and-exit.
++
++    SLURM sends a configurable signal (default SIGUSR1 via ``--signal``)
++    before killing a preempted job.  This handler sets a flag so the
++    training loop can checkpoint and exit cleanly.  The ``--requeue``
++    sbatch flag then re-submits the job.
++
++    On non-SLURM systems (no ``SLURM_JOB_ID`` environment variable),
++    the handler is still safe to create but will never fire.
++
++    Parameters
++    ----------
++    sig : signal.Signals
++        Signal to catch (default ``SIGUSR1``).
++    """
++
++    def __init__(self, sig: signal.Signals = signal.SIGUSR1) -> None:
++        self.preempted = False
++        self._sig = sig
++        try:
++            signal.signal(sig, self._handle)
++            logger.info("SLURM preemption handler registered (signal=%s)", sig.name)
++        except (OSError, ValueError):
++            # Signal registration can fail in non-main threads or on Windows
++            logger.debug("Could not register signal handler for %s", sig)
++
++    def _handle(self, signum: int, frame: Any) -> None:
++        logger.warning(
++            "Received preemption signal %d — will checkpoint and exit", signum
++        )
++        self.preempted = True
++
++    @staticmethod
++    def is_slurm_job() -> bool:
++        """Return True if running inside a SLURM job."""
++        return "SLURM_JOB_ID" in os.environ
++
++    @staticmethod
++    def slurm_info() -> dict[str, str]:
++        """Return a dict of useful SLURM environment variables."""
++        keys = [
++            "SLURM_JOB_ID",
++            "SLURM_JOB_NAME",
++            "SLURM_JOB_PARTITION",
++            "SLURM_NODELIST",
++            "SLURM_NTASKS",
++            "SLURM_GPUS_ON_NODE",
++            "SLURM_RESTART_COUNT",
++        ]
++        return {k: os.environ[k] for k in keys if k in os.environ}
++
++
++def save_checkpoint(
++    checkpoint_dir: str | Path,
++    model: torch.nn.Module,
++    optimizer: torch.optim.Optimizer,
++    epoch: int,
++    metrics: dict[str, Any] | None = None,
++) -> Path:
++    """Save a resumable training checkpoint.
++
++    Writes ``checkpoint.pt`` with model weights, optimizer state, epoch,
++    and metrics.  Also writes ``checkpoint_meta.json`` for inspection.
++
++    Parameters
++    ----------
++    checkpoint_dir : str or Path
++        Directory for checkpoint files.
++    model : torch.nn.Module
++        Model to checkpoint.
++    optimizer : torch.optim.Optimizer
++        Optimizer state to persist.
++    epoch : int
++        Completed epoch number (0-indexed).
++    metrics : dict, optional
++        Accumulated training metrics.
++
++    Returns
++    -------
++    Path
++        Path to the written ``checkpoint.pt``.
++    """
++    checkpoint_dir = Path(checkpoint_dir)
++    checkpoint_dir.mkdir(parents=True, exist_ok=True)
++    ckpt_path = checkpoint_dir / "checkpoint.pt"
++
++    torch.save(
++        {
++            "epoch": epoch,
++            "model_state_dict": model.state_dict(),
++            "optimizer_state_dict": optimizer.state_dict(),
++            "metrics": metrics or {},
++        },
++        ckpt_path,
++    )
++
++    meta = {
++        "epoch": epoch,
++        "best_loss": (metrics or {}).get("best_loss"),
++        "train_losses": (metrics or {}).get("train_losses", [])[-3:],
++    }
++    with open(checkpoint_dir / "checkpoint_meta.json", "w") as f:
++        json.dump(meta, f, indent=2, default=str)
++
++    logger.info("Checkpoint saved: epoch %d → %s", epoch, ckpt_path)
++    return ckpt_path
++
++
++def load_checkpoint(
++    checkpoint_dir: str | Path,
++    model: torch.nn.Module,
++    optimizer: torch.optim.Optimizer | None = None,
++) -> tuple[int, dict[str, Any]]:
++    """Load a training checkpoint and return ``(start_epoch, metrics)``.
++
++    Parameters
++    ----------
++    checkpoint_dir : str or Path
++        Directory containing ``checkpoint.pt``.
++    model : torch.nn.Module
++        Model to load weights into.
++    optimizer : torch.optim.Optimizer or None
++        Optimizer to restore.  If None, only model is loaded.
++
++    Returns
++    -------
++    start_epoch : int
++        Next epoch to train (checkpoint epoch + 1).
++    metrics : dict
++        Accumulated metrics from previous training.
++    """
++    ckpt_path = Path(checkpoint_dir) / "checkpoint.pt"
++    if not ckpt_path.exists():
++        logger.info("No checkpoint at %s — starting from scratch", ckpt_path)
++        return 0, {}
++
++    ckpt = torch.load(ckpt_path, weights_only=False)
++    model.load_state_dict(ckpt["model_state_dict"])
++    if optimizer is not None and "optimizer_state_dict" in ckpt:
++        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
++
++    start_epoch = ckpt["epoch"] + 1
++    metrics = ckpt.get("metrics", {})
++    logger.info(
++        "Resumed from checkpoint: epoch %d, best_loss=%.6f",
++        ckpt["epoch"],
++        metrics.get("best_loss", float("inf")),
++    )
++    return start_epoch, metrics
+diff --git a/nobrainer/tests/unit/test_gpu.py b/nobrainer/tests/unit/test_gpu.py
+new file mode 100644
+index 00000000..76b145c4
+--- /dev/null
++++ b/nobrainer/tests/unit/test_gpu.py
+@@ -0,0 +1,50 @@
++"""Unit tests for nobrainer.gpu utilities."""
++
++from __future__ import annotations
++
++import torch
++
++from nobrainer.gpu import get_device, gpu_count, gpu_info, scale_for_multi_gpu
++
++
++class TestGetDevice:
++    def test_returns_torch_device(self):
++        d = get_device()
++        assert isinstance(d, torch.device)
++
++    def test_device_type_known(self):
++        d = get_device()
++        assert d.type in ("cuda", "mps", "cpu")
++
++
++class TestGpuCount:
++    def test_returns_int(self):
++        n = gpu_count()
++        assert isinstance(n, int)
++        assert n >= 0
++
++
++class TestGpuInfo:
++    def test_returns_list(self):
++        info = gpu_info()
++        assert isinstance(info, list)
++        if torch.cuda.is_available():
++            assert len(info) > 0
++            assert "name" in info[0]
++            assert "memory_gb" in info[0]
++
++
++class TestScaleForMultiGpu:
++    def test_no_gpu_returns_base(self):
++        if torch.cuda.is_available():
++            return  # skip on GPU machines
++        eff, per, n = scale_for_multi_gpu(base_batch_size=32)
++        assert eff == 32
++        assert per == 32
++        assert n == 0
++
++    def test_simple_division(self):
++        # Without model, just divides
++        eff, per, n = scale_for_multi_gpu(base_batch_size=32)
++        if n > 0:
++            assert eff == per * n
+diff --git a/nobrainer/tests/unit/test_slurm.py b/nobrainer/tests/unit/test_slurm.py
+new file mode 100644
+index 00000000..3b70c8cd
+--- /dev/null
++++ b/nobrainer/tests/unit/test_slurm.py
+@@ -0,0 +1,53 @@
++"""Unit tests for nobrainer.slurm utilities."""
++
++from __future__ import annotations
++
++import torch
++
++from nobrainer.slurm import SlurmPreemptionHandler, load_checkpoint, save_checkpoint
++
++
++class TestSlurmPreemptionHandler:
++    def test_initial_state(self):
++        h = SlurmPreemptionHandler()
++        assert h.preempted is False
++
++    def test_is_slurm_job(self):
++        # In test environment, should be False
++        assert isinstance(SlurmPreemptionHandler.is_slurm_job(), bool)
++
++
++class TestCheckpoint:
++    def test_save_and_load(self, tmp_path):
++        model = torch.nn.Linear(4, 2)
++        opt = torch.optim.SGD(model.parameters(), lr=0.01)
++
++        metrics = {"train_losses": [1.0, 0.5], "best_loss": 0.5}
++        save_checkpoint(tmp_path, model, opt, epoch=5, metrics=metrics)
++
++        assert (tmp_path / "checkpoint.pt").exists()
++        assert (tmp_path / "checkpoint_meta.json").exists()
++
++        model2 = torch.nn.Linear(4, 2)
++        opt2 = torch.optim.SGD(model2.parameters(), lr=0.01)
++        start, restored = load_checkpoint(tmp_path, model2, opt2)
++
++        assert start == 6  # next epoch
++        assert restored["best_loss"] == 0.5
++        assert len(restored["train_losses"]) == 2
++
++    def test_load_no_checkpoint(self, tmp_path):
++        model = torch.nn.Linear(4, 2)
++        start, metrics = load_checkpoint(tmp_path, model)
++        assert start == 0
++        assert metrics == {}
++
++    def test_model_weights_restored(self, tmp_path):
++        model = torch.nn.Linear(4, 2)
++        model.weight.data.fill_(42.0)
++        opt = torch.optim.SGD(model.parameters(), lr=0.01)
++        save_checkpoint(tmp_path, model, opt, epoch=0)
++
++        model2 = torch.nn.Linear(4, 2)
++        load_checkpoint(tmp_path, model2)
++        assert torch.allclose(model2.weight.data, torch.tensor(42.0))
+diff --git a/nobrainer/training.py b/nobrainer/training.py
+index b2b08271..45d3ac64 100644
+--- a/nobrainer/training.py
++++ b/nobrainer/training.py
+@@ -14,12 +14,14 @@
+ 
+ 
+ def get_device() -> torch.device:
+-    """Select the best available device: CUDA > MPS > CPU."""
+-    if torch.cuda.is_available():
+-        return torch.device("cuda")
+-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+-        return torch.device("mps")
+-    return torch.device("cpu")
++    """Select the best available device: CUDA > MPS > CPU.
++
++    .. note::
++       Also available as :func:`nobrainer.gpu.get_device`.
++    """
++    from nobrainer.gpu import get_device as _get_device
++
++    return _get_device()
+ 
+ 
+ def fit(
+diff --git a/scripts/kwyk_reproduction/03_train_bayesian.py b/scripts/kwyk_reproduction/03_train_bayesian.py
+index 675f5849..c491c9a6 100644
+--- a/scripts/kwyk_reproduction/03_train_bayesian.py
++++ b/scripts/kwyk_reproduction/03_train_bayesian.py
+@@ -36,15 +36,10 @@
+ import numpy as np
+ import torch
+ import torch.nn as nn
+-from utils import (
+-    SlurmPreemptionHandler,
+-    compute_dice,
+-    load_config,
+-    load_training_checkpoint,
+-    save_figure,
+-    save_training_checkpoint,
+-    setup_logging,
+-)
++from utils import compute_dice, load_config, save_figure, setup_logging
++
++from nobrainer.gpu import auto_batch_size, gpu_count
++from nobrainer.slurm import SlurmPreemptionHandler, load_checkpoint, save_checkpoint
+ 
+ log = setup_logging(__name__)
+ 
+@@ -315,9 +310,7 @@ def train_bayesian(
+     model = model.to(device)
+ 
+     # -- Resume from checkpoint if available --------------------------------
+-    start_epoch, prev_metrics = load_training_checkpoint(
+-        checkpoint_dir, model, optimizer
+-    )
++    start_epoch, prev_metrics = load_checkpoint(checkpoint_dir, model, optimizer)
+ 
+     # Restore accumulated metrics from prior runs
+     train_losses: list[float] = prev_metrics.get("train_losses", [])
+@@ -438,7 +431,7 @@ def train_bayesian(
+             "kl_terms": kl_terms,
+             "best_loss": best_loss,
+         }
+-        save_training_checkpoint(checkpoint_dir, model, optimizer, epoch, metrics)
++        save_checkpoint(checkpoint_dir, model, optimizer, epoch, metrics)
+ 
+         elapsed = time.time() - t_epoch
+         log.info(
+@@ -634,27 +627,9 @@ def main() -> None:
+         log.error("No training volumes found in manifest. Exiting.")
+         return
+ 
+-    from nobrainer.processing.dataset import Dataset
+-
+-    ds_train = (
+-        Dataset.from_files(train_pairs, block_shape=block_shape, n_classes=n_classes)
+-        .batch(batch_size)
+-        .binarize(label_mapping)
+-    )
+-    train_loader = ds_train.dataloader
+-
+-    ds_val = None
+-    val_loader = None
+-    if val_pairs:
+-        ds_val = (
+-            Dataset.from_files(val_pairs, block_shape=block_shape, n_classes=n_classes)
+-            .batch(batch_size)
+-            .binarize(label_mapping)
+-        )
+-        val_loader = ds_val.dataloader
+-
+-    # ---- Build KWYK MeshNet (VWN + dropout variant) --------------------------
++    # ---- Build KWYK MeshNet first (needed for auto batch size) ----------------
+     from nobrainer.models import get as get_model
++    from nobrainer.processing.dataset import Dataset
+ 
+     dropout_type = variant_config.get("dropout_type", "bernoulli")
+     model_args = {
+@@ -683,6 +658,47 @@ def main() -> None:
+         sum(p.numel() for p in bayesian_model.parameters()),
+     )
+ 
++    # ---- Auto batch size + multi-GPU scaling --------------------------------
++    n_gpus = gpu_count()
++    if n_gpus > 0:
++        optimal_per_gpu = auto_batch_size(
++            bayesian_model,
++            block_shape,
++            n_classes=n_classes,
++            target_memory_fraction=0.80,
++        )
++        effective_batch = optimal_per_gpu * max(n_gpus, 1)
++        log.info(
++            "GPU batch scaling: %d GPU(s) × %d per-GPU = %d effective "
++            "(config batch_size=%d)",
++            n_gpus,
++            optimal_per_gpu,
++            effective_batch,
++            batch_size,
++        )
++        batch_size = optimal_per_gpu  # per-GPU batch for DataLoader
++    else:
++        log.info("No GPU detected — using config batch_size=%d", batch_size)
++
++    # ---- Build datasets with optimized batch size ----------------------------
++
++    ds_train = (
++        Dataset.from_files(train_pairs, block_shape=block_shape, n_classes=n_classes)
++        .batch(batch_size)
++        .binarize(label_mapping)
++    )
++    train_loader = ds_train.dataloader
++
++    ds_val = None
++    val_loader = None
++    if val_pairs:
++        ds_val = (
++            Dataset.from_files(val_pairs, block_shape=block_shape, n_classes=n_classes)
++            .batch(batch_size)
++            .binarize(label_mapping)
++        )
++        val_loader = ds_val.dataloader
++
+     # ---- Optional warm-start ------------------------------------------------
+     if use_warmstart:
+         warmstart_dir = Path(args.warmstart)
+diff --git a/scripts/kwyk_reproduction/slurm_train.sbatch b/scripts/kwyk_reproduction/slurm_train.sbatch
+index c4a56346..4eb6b9ac 100755
+--- a/scripts/kwyk_reproduction/slurm_train.sbatch
++++ b/scripts/kwyk_reproduction/slurm_train.sbatch
+@@ -12,33 +12,27 @@
+ #
+ # KWYK Brain Extraction Reproduction — SLURM Preemptible Training
+ #
+-# This script trains all 3 kwyk model variants on a preemptible partition.
+-# When the job is preempted, SLURM sends SIGUSR1 120 seconds before
+-# killing the process.  The training scripts checkpoint and exit cleanly,
+-# then --requeue re-submits the job.  On restart, training resumes from
+-# the last checkpoint automatically.
++# Trains all kwyk model variants with automatic checkpoint/resume on
++# preemption and automatic batch size optimization per GPU.
+ #
+ # Usage:
+-#   sbatch slurm_train.sbatch                    # Full pipeline
+-#   sbatch --partition=gpu slurm_train.sbatch     # Non-preemptible
+-#   sbatch --time=4:00:00 slurm_train.sbatch      # Shorter time limit
++#   sbatch slurm_train.sbatch                             # 1 GPU
++#   sbatch --gres=gpu:4 slurm_train.sbatch                # 4 GPUs
++#   sbatch --partition=gpu slurm_train.sbatch              # Non-preemptible
++#   KWYK_EPOCHS=100 sbatch slurm_train.sbatch              # More epochs
+ #
+-# Environment variables (override defaults):
++# Multi-GPU:
++#   Batch size is auto-optimized per GPU via nobrainer.gpu.auto_batch_size.
++#   Request more GPUs with --gres=gpu:N.
++#
++# Environment variables:
+ #   KWYK_DATASETS    — space-separated OpenNeuro IDs (default: ds000114)
+-#   KWYK_EPOCHS      — epochs per model variant (default: 50)
++#   KWYK_EPOCHS      — epochs per variant (default: 50)
+ #   KWYK_WORK_DIR    — working directory (default: $SLURM_SUBMIT_DIR)
+-#   KWYK_VENV        — path to Python venv (default: .venv-kwyk)
+-#
+-# Requirements:
+-#   - Python 3.12+ with uv
+-#   - CUDA-capable GPU
+-#   - Network access for OpenNeuro (first run only)
++#   KWYK_VENV        — path to venv (default: .venv-kwyk)
+ 
+ set -euo pipefail
+ 
+-# ---------------------------------------------------------------------------
+-# Configuration
+-# ---------------------------------------------------------------------------
+ WORK_DIR="${KWYK_WORK_DIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
+ VENV_DIR="${KWYK_VENV:-${WORK_DIR}/.venv-kwyk}"
+ DATASETS="${KWYK_DATASETS:-ds000114}"
+@@ -49,104 +43,56 @@ NOBRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ echo "=== KWYK SLURM Training ==="
+ echo "Job ID:     ${SLURM_JOB_ID:-local}"
+ echo "Node:       $(hostname)"
+-echo "GPU:        $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
+ echo "Partition:  ${SLURM_JOB_PARTITION:-unknown}"
+-echo "Work dir:   ${WORK_DIR}"
+-echo "Datasets:   ${DATASETS}"
+-echo "Epochs:     ${EPOCHS}"
++echo "GPUs:       ${SLURM_GPUS_ON_NODE:-unknown}"
+ echo "Restart:    ${SLURM_RESTART_COUNT:-0}"
+-echo ""
+ 
+ cd "$WORK_DIR"
+ 
+-# ---------------------------------------------------------------------------
+-# Virtual environment setup (only on first run)
+-# ---------------------------------------------------------------------------
++# --- Setup venv (first run only) ---
+ if [ ! -d "$VENV_DIR" ]; then
+-    echo "Creating virtual environment at ${VENV_DIR}..."
+     uv venv --python 3.14 "$VENV_DIR"
+ fi
+-
+ # shellcheck disable=SC1091
+ source "${VENV_DIR}/bin/activate"
+-
+-echo "Installing dependencies..."
+ uv pip install -e "${NOBRAINER_ROOT}[bayesian,versioning,dev]" \
+     monai pyro-ppl datalad matplotlib pyyaml scipy nibabel 2>&1 | tail -3
+ uv tool install git-annex 2>/dev/null || true
+ 
+-# Verify GPU
++# --- Show GPU info ---
+ python -c "
+-import torch
+-assert torch.cuda.is_available(), 'CUDA not available'
+-print(f'GPU: {torch.cuda.get_device_name(0)}')
+-print(f'CUDA: {torch.version.cuda}')
+-print(f'Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
++from nobrainer.gpu import gpu_info, gpu_count
++print('GPUs:', gpu_count())
++for g in gpu_info():
++    print('  GPU {id}: {name} ({memory_gb} GB)'.format(**g))
+ "
+ 
+-# ---------------------------------------------------------------------------
+-# Step 1: Assemble dataset (skipped if manifest exists)
+-# ---------------------------------------------------------------------------
+ cd "$SCRIPT_DIR"
+ 
++# --- Step 1: Data ---
+ if [ ! -f manifest.csv ]; then
+-    echo "=== Step 1: Assembling dataset ==="
+     # shellcheck disable=SC2086
+-    python 01_assemble_dataset.py \
+-        --datasets $DATASETS \
+-        --output-csv manifest.csv \
+-        --output-dir data \
+-        --label-mapping binary
+-else
+-    echo "=== Step 1: manifest.csv exists, skipping data assembly ==="
+-    wc -l manifest.csv
++    python 01_assemble_dataset.py --datasets $DATASETS \
++        --output-csv manifest.csv --output-dir data --label-mapping binary
+ fi
+ 
+-# ---------------------------------------------------------------------------
+-# Step 2: Train deterministic MeshNet (warm-start foundation)
+-# ---------------------------------------------------------------------------
+-echo "=== Step 2: Training deterministic MeshNet ==="
+-python 02_train_meshnet.py \
+-    --manifest manifest.csv \
+-    --config config.yaml \
+-    --output-dir checkpoints/meshnet \
+-    --epochs "$EPOCHS"
++# --- Step 2: Deterministic MeshNet ---
++python 02_train_meshnet.py --manifest manifest.csv --config config.yaml \
++    --output-dir checkpoints/meshnet --epochs "$EPOCHS"
+ 
+-# ---------------------------------------------------------------------------
+-# Step 3: Train all Bayesian variants (with checkpoint/resume)
+-# ---------------------------------------------------------------------------
+-for variant in bwn_multi bvwn_multi_prior bayesian_gaussian; do
+-    echo ""
+-    echo "=== Step 3: Training variant ${variant} ==="
+-    python 03_train_bayesian.py \
+-        --manifest manifest.csv \
+-        --config config.yaml \
+-        --variant "$variant" \
+-        --warmstart checkpoints/meshnet \
+-        --output-dir "checkpoints/${variant}" \
+-        --epochs "$EPOCHS"
++# --- Step 3: All Bayesian variants (auto batch size, checkpoint/resume) ---
++for variant in bwn_multi bvwn_multi_prior; do
++    echo "=== Training $variant ==="
++    python 03_train_bayesian.py --manifest manifest.csv --config config.yaml \
++        --variant "$variant" --warmstart checkpoints/meshnet \
++        --output-dir "checkpoints/$variant" --epochs "$EPOCHS"
+ done
+ 
+-# ---------------------------------------------------------------------------
+-# Step 4: Evaluate all variants
+-# ---------------------------------------------------------------------------
+-echo ""
+-echo "=== Step 4: Evaluating all variants ==="
+-for variant_dir in checkpoints/meshnet checkpoints/bwn_multi checkpoints/bvwn_multi_prior checkpoints/bayesian_gaussian; do
+-    variant_name=$(basename "$variant_dir")
+-    if [ -f "$variant_dir/model.pth" ]; then
+-        echo "  Evaluating ${variant_name}..."
+-        python 04_evaluate.py \
+-            --model "$variant_dir/model.pth" \
+-            --manifest manifest.csv \
+-            --split test \
+-            --n-samples 10 \
+-            --output-dir "results/${variant_name}" || true
+-    fi
++# --- Step 4: Evaluate ---
++for v in checkpoints/meshnet checkpoints/bwn_multi checkpoints/bvwn_multi_prior; do
++    [ -f "$v/model.pth" ] && python 04_evaluate.py --model "$v/model.pth" \
++        --manifest manifest.csv --split test --n-samples 10 \
++        --output-dir "results/$(basename $v)" || true
+ done
+ 
+-echo ""
+-echo "=== Training complete ==="
+-echo "Checkpoints: $(ls checkpoints/*/model.pth 2>/dev/null | wc -l) models"
+-echo "Results:     $(ls results/*/dice_scores.csv 2>/dev/null | wc -l) evaluations"
+-ls -la checkpoints/*/ 2>/dev/null || true
++echo "=== Done: $(ls checkpoints/*/model.pth 2>/dev/null | wc -l) models ==="

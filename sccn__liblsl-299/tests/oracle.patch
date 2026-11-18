@@ -1,0 +1,529 @@
+diff --git a/include/lsl/inlet.h b/include/lsl/inlet.h
+index fd98d680..fba53914 100644
+--- a/include/lsl/inlet.h
++++ b/include/lsl/inlet.h
+@@ -86,6 +86,7 @@ extern LIBLSL_C_API void lsl_open_stream(lsl_inlet in, double timeout, int32_t *
+ * interested in data from a source (temporarily or not) but keeps the outlet alive,
+ * it should call lsl_close_stream() to not waste unnecessary system and network
+ * resources.
++* The stream can subsequently be reopened with lsl_open_stream() or a pull call.
+ */
+ extern LIBLSL_C_API void lsl_close_stream(lsl_inlet in);
+ 
+diff --git a/include/lsl_cpp.h b/include/lsl_cpp.h
+index 381ccd68..36a95365 100644
+--- a/include/lsl_cpp.h
++++ b/include/lsl_cpp.h
+@@ -975,6 +975,7 @@ class stream_inlet {
+ 	 * interested in data from a source (temporarily or not) but keeps the outlet alive,
+ 	 * it should call close_stream() to not waste unnecessary system and network
+ 	 * resources.
++	 * The stream can subsequently be reopened with open_stream() or a pull call.
+ 	 */
+ 	void close_stream() { lsl_close_stream(obj.get()); }
+ 
+diff --git a/src/data_receiver.cpp b/src/data_receiver.cpp
+index 77e55f14..437e1e5c 100644
+--- a/src/data_receiver.cpp
++++ b/src/data_receiver.cpp
+@@ -53,15 +53,20 @@ data_receiver::~data_receiver() {
+ // === external access ===
+ 
+ void data_receiver::open_stream(double timeout) {
++	std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mut_);
+ 	closing_stream_ = false;
+ 	std::unique_lock<std::mutex> lock(connected_mut_);
+-	auto connection_completed = [this]() { return connected_ || conn_.lost(); };
++	const auto generation = close_generation_;
++	auto connection_completed = [this, generation]() {
++		return connected_ || conn_.lost() || close_generation_ != generation;
++	};
+ 	if (!connection_completed()) {
+ 		// start thread if not yet running
+ 		if (check_thread_start_ && !data_thread_.joinable()) {
+ 			data_thread_ = std::thread(&data_receiver::data_thread, this);
+ 			check_thread_start_ = false;
+ 		}
++		lifecycle_lock.unlock();
+ 		// wait until the connection attempt completes (or we time out)
+ 		if (timeout >= FOREVER)
+ 			connected_upd_.wait(lock, connection_completed);
+@@ -69,15 +74,31 @@ void data_receiver::open_stream(double timeout) {
+ 					 lock, std::chrono::duration<double>(timeout), connection_completed))
+ 			throw timeout_error("The open_stream() operation timed out.");
+ 	}
++	if (close_generation_ != generation)
++		throw timeout_error("The open_stream() operation was interrupted by close_stream().");
+ 	if (conn_.lost())
+ 		throw lost_error("The stream read by this inlet has been lost. To recover, you need to "
+ 						 "re-resolve the source and re-create the inlet.");
+ }
+ 
+ void data_receiver::close_stream() {
+-	check_thread_start_ = true;
+-	closing_stream_ = true;
++	std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mut_);
++	{
++		std::lock_guard<std::mutex> lock(connected_mut_);
++		closing_stream_ = true;
++		++close_generation_;
++	}
++	// Wake both open_stream waiters and the reconnect back-off before joining.
++	connected_upd_.notify_all();
+ 	cancel_all_registered();
++	if (data_thread_.joinable()) data_thread_.join();
++	{
++		std::lock_guard<std::mutex> lock(connected_mut_);
++		connected_ = false;
++	}
++	// The producer has stopped, so no in-flight sample can repopulate the queue.
++	sample_queue_.flush();
++	check_thread_start_ = true;
+ }
+ 
+ sample_p lsl::data_receiver::try_get_next_sample(double timeout) {
+@@ -85,9 +106,13 @@ sample_p lsl::data_receiver::try_get_next_sample(double timeout) {
+ 		throw lost_error("The stream read by this outlet has been lost. To recover, you need to "
+ 						 "re-resolve the source and re-create the inlet.");
+ 	// start data thread implicitly if necessary
+-	if (check_thread_start_ && !data_thread_.joinable()) {
+-		data_thread_ = std::thread(&data_receiver::data_thread, this);
+-		check_thread_start_ = false;
++	if (check_thread_start_) {
++		std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mut_);
++		if (check_thread_start_ && !data_thread_.joinable()) {
++			closing_stream_ = false;
++			data_thread_ = std::thread(&data_receiver::data_thread, this);
++			check_thread_start_ = false;
++		}
+ 	}
+ 	// get the sample with timeout
+ 	if (sample_p s = sample_queue_.pop_sample(timeout))
+@@ -148,6 +173,8 @@ void data_receiver::data_thread() {
+ 				cancellable_streambuf buffer;
+ 				buffer.register_at(&conn_);
+ 				buffer.register_at(this);
++				// Close may have cancelled before this buffer was registered.
++				if (closing_stream_) break;
+ 				std::iostream server_stream(&buffer);
+ 				std::unique_ptr<eos::portable_iarchive> inarch;
+ 				// connect to endpoint
+@@ -301,6 +328,7 @@ void data_receiver::data_thread() {
+ 				// recover silently)
+ 				{
+ 					std::lock_guard<std::mutex> lock(connected_mut_);
++					if (closing_stream_) break;
+ 					connected_ = true;
+ 				}
+ 				connected_upd_.notify_all();
+@@ -330,22 +358,28 @@ void data_receiver::data_thread() {
+ 				}
+ 			} catch (err_t) {
+ 				// connection-level error: closed, reset, refused, etc.
+-				conn_.try_recover_from_error();
++				if (closing_stream_) break;
++				conn_.try_recover_from_error(&closing_stream_);
+ 			} catch (lost_error &) {
+ 				// another type of connection error
+-				conn_.try_recover_from_error();
++				if (closing_stream_) break;
++				conn_.try_recover_from_error(&closing_stream_);
+ 			} catch (shutdown_error &) {
+ 				// termination due to connection shutdown
+ 				throw lost_error("The inlet has been disengaged.");
+ 			} catch (std::exception &e) {
+ 				// some perhaps more serious transmission or parsing error (could be indicative of a
+ 				// protocol issue)
++				if (closing_stream_) break;
+ 				if (!conn_.shutdown())
+ 					LOG_F(ERROR, "Stream transmission broke off (%s); re-connecting...", e.what());
+-				conn_.try_recover_from_error();
++				conn_.try_recover_from_error(&closing_stream_);
+ 			}
+-			// wait for a few msec so as to not spam the provider with reconnects
+-			std::this_thread::sleep_for(std::chrono::milliseconds(500));
++			if (closing_stream_) break;
++			// Back off between reconnects, but let close_stream interrupt the wait.
++			std::unique_lock<std::mutex> lock(connected_mut_);
++			connected_upd_.wait_for(lock, std::chrono::milliseconds(500),
++				[this]() { return closing_stream_.load() || conn_.shutdown(); });
+ 		}
+ 	} catch (lost_error &) {
+ 		// the connection was irrecoverably lost: since the pull_sample() function may
+diff --git a/src/data_receiver.h b/src/data_receiver.h
+index 0cda11fe..5ee55b82 100644
+--- a/src/data_receiver.h
++++ b/src/data_receiver.h
+@@ -22,7 +22,7 @@ class inlet_connection; // Forward declaration
+  * The public functions have an optional timeout after which they give up, while the background
+  * thread continues to do its job (so the next public-function call may succeed within the timeout).
+  * The background thread terminates only if the data_receiver is destroyed or the underlying
+- * connection is lost or shut down.
++ * connection is lost or shut down, or close_stream() is called.
+  */
+ class data_receiver final : public cancellable_registry {
+ public:
+@@ -91,12 +91,16 @@ class data_receiver final : public cancellable_registry {
+ 	factory_p sample_factory_;
+ 	/// background read thread
+ 	std::thread data_thread_;
+-	/// whether we need to check whether the thread has been started
+-	bool check_thread_start_;
++	/// serializes thread creation and close/join
++	std::mutex lifecycle_mut_;
++	/// fast-path hint for pull calls; thread creation is rechecked under lifecycle_mut_
++	std::atomic<bool> check_thread_start_;
+ 	/// indicates to the data thread that it a close has been requested
+ 	std::atomic<bool> closing_stream_;
+ 	/// whether the stream has been connected / opened
+ 	bool connected_;
++	/// identifies opens interrupted by close, even if another open follows immediately
++	uint64_t close_generation_{0}; // protected by connected_mut_
+ 	/// queue of samples ready to be picked up (populated by the data thread)
+ 	consumer_queue sample_queue_;
+ 	/// mutex to protect the connected state
+diff --git a/src/inlet_connection.cpp b/src/inlet_connection.cpp
+index 2d1efadd..79b1e02d 100644
+--- a/src/inlet_connection.cpp
++++ b/src/inlet_connection.cpp
+@@ -160,10 +160,20 @@ double inlet_connection::current_srate() {
+ 
+ 
+ // === connection recovery logic ===
+-void inlet_connection::try_recover() {
++void inlet_connection::try_recover(const std::atomic<bool> *cancel) {
+ 	if (recovery_enabled_) {
+ 		try {
+-			std::lock_guard<std::mutex> lock(recovery_mut_);
++			std::unique_lock<std::timed_mutex> lock(recovery_mut_, std::defer_lock);
++			if (cancel) {
++				// Another inlet component may be resolving indefinitely. Closing the data
++				// stream must not wait for that component to recover.
++				// Only recovery uses this timed wait; normal sample reception does not.
++				while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
++					if (cancel->load() || shutdown_) return;
++				}
++				if (cancel->load()) return;
++			} else
++				lock.lock();
+ 			// first create the query string based on the known stream information
+ 			std::ostringstream query;
+ 			{
+@@ -191,7 +201,8 @@ void inlet_connection::try_recover() {
+ 				// issue the resolve (blocks until it is either cancelled or got at least one
+ 				// matching streaminfo and has waited for a certain timeout)
+ 				std::vector<stream_info_impl> infos =
+-					resolver_.resolve_oneshot(query.str(), 1, FOREVER, attempt == 0 ? 1.0 : 5.0);
++					resolver_.resolve_oneshot(query.str(), 1, FOREVER, attempt == 0 ? 1.0 : 5.0, cancel);
++				if (cancel && cancel->load()) return;
+ 				if (!infos.empty()) {
+ 					// got a result
+ 					unique_lock_t lock_recover_host_info(host_info_mut_);
+@@ -290,8 +301,8 @@ void inlet_connection::watchdog_thread() {
+ 	}
+ }
+ 
+-void inlet_connection::try_recover_from_error() {
+-	if (!shutdown_) {
++void inlet_connection::try_recover_from_error(const std::atomic<bool> *cancel) {
++	if (!shutdown_ && !(cancel && cancel->load())) {
+ 		if (!recovery_enabled_) {
+ 			// if the stream is irrecoverable it is now lost,
+ 			// so we need to notify the other inlet components
+@@ -307,7 +318,7 @@ void inlet_connection::try_recover_from_error() {
+ 			throw lost_error("The stream read by this inlet has been lost. To recover, you need to "
+ 							 "re-resolve the source and re-create the inlet.");
+ 		}
+-		try_recover();
++		try_recover(cancel);
+ 	}
+ }
+ 
+diff --git a/src/inlet_connection.h b/src/inlet_connection.h
+index 5e0c8d7a..5135ca7c 100644
+--- a/src/inlet_connection.h
++++ b/src/inlet_connection.h
+@@ -104,9 +104,10 @@ class inlet_connection : public cancellable_registry {
+ 	 *
+ 	 * This either blocks until it succeeds or declares the connection as lost (if recovery is
+ 	 * disabled), and throws a lost error.
++	 * An optional cancellation flag stops waiting without declaring the connection lost.
+ 	 * Only call this when the connection is found to have broken down (e.g., socket error).
+ 	 */
+-	void try_recover_from_error();
++	void try_recover_from_error(const std::atomic<bool> *cancel = nullptr);
+ 
+ 
+ 	// === client status info ===
+@@ -158,7 +159,7 @@ class inlet_connection : public cancellable_registry {
+ 	void watchdog_thread();
+ 
+ 	/// A (potentially speculative) resolve-and-recover operation.
+-	void try_recover();
++	void try_recover(const std::atomic<bool> *cancel = nullptr);
+ 
+ 	/// Sets the endpoints from a stream info considering a previous connection
+ 	bool set_protocols(const stream_info_impl &info, bool prefer_v6);
+@@ -195,7 +196,7 @@ class inlet_connection : public cancellable_registry {
+ 	/// our resolver, in case we need it
+ 	resolver_impl resolver_;
+ 	/// we allow only one recovery operation at a time
+-	std::mutex recovery_mut_;
++	std::timed_mutex recovery_mut_;
+ 
+ 	// client status info for recovery & notification purposes
+ 	/// a group of condition variables that should be notified when the connection is lost
+diff --git a/src/resolver_impl.cpp b/src/resolver_impl.cpp
+index 0d976dc5..e28f893b 100644
+--- a/src/resolver_impl.cpp
++++ b/src/resolver_impl.cpp
+@@ -9,6 +9,7 @@
+ #include <asio/ip/tcp.hpp>
+ #include <asio/ip/udp.hpp>
+ #include <algorithm>
++#include <chrono>
+ #include <exception>
+ #include <loguru.hpp>
+ #include <memory>
+@@ -24,7 +25,7 @@ using namespace lsl;
+ resolver_impl::resolver_impl()
+ 	: cfg_(api_config::get_instance()), cancelled_(false), expired_(false), forget_after_(FOREVER),
+ 	  fast_mode_(true), io_(std::make_shared<asio::io_context>()), resolve_timeout_expired_(*io_),
+-	  wave_timer_(*io_), unicast_timer_(*io_) {
++	  cancel_poll_timer_(*io_), wave_timer_(*io_), unicast_timer_(*io_) {
+ 	// parse the multicast addresses into endpoints and store them
+ 	uint16_t mcast_port = cfg_->multicast_port();
+ 	for (const auto &mcast_addr : cfg_->multicast_addresses()) {
+@@ -134,7 +135,8 @@ resolver_impl *resolver_impl::create_resolver(
+ // === resolve functions ===
+ 
+ std::vector<stream_info_impl> resolver_impl::resolve_oneshot(
+-	const std::string &query, int minimum, double timeout, double minimum_time) {
++	const std::string &query, int minimum, double timeout, double minimum_time,
++	const std::atomic<bool> *cancel) {
+ 	if(status == resolver_status::running_continuous)
+ 		throw std::logic_error("resolve_oneshot called during continuous operation");
+ 
+@@ -158,6 +160,8 @@ std::vector<stream_info_impl> resolver_impl::resolve_oneshot(
+ 		});
+ 	}
+ 
++	if (cancel) poll_cancellation(cancel);
++
+ 	// start the first wave of resolve packets
+ 	next_resolve_wave();
+ 
+@@ -321,6 +325,21 @@ bool resolver_impl::check_cancellation_criteria()
+ 	return false;
+ }
+ 
++void resolver_impl::poll_cancellation(const std::atomic<bool> *cancel) {
++	// An already-ready timer handler can run after its cancellation was posted.
++	if (expired_ || cancelled_) return;
++	if (cancel->load()) {
++		cancel_ongoing_resolve();
++		return;
++	}
++	// Only interruptible recovery queries install this timer; steady-state
++	// reception and ordinary discovery queries incur no polling cost.
++	cancel_poll_timer_.expires_after(std::chrono::milliseconds(10));
++	cancel_poll_timer_.async_wait([this, cancel](err_t err) {
++		if (!err) poll_cancellation(cancel);
++	});
++}
++
+ void resolver_impl::cancel_ongoing_resolve() {
+ 	// make sure that ongoing handler loops terminate
+ 	expired_ = true;
+@@ -329,6 +348,7 @@ void resolver_impl::cancel_ongoing_resolve() {
+ 	post(*io_, [this]() { unicast_timer_.cancel(); });
+ 	// and cancel the timeout, too
+ 	post(*io_, [this]() { resolve_timeout_expired_.cancel(); });
++	post(*io_, [this]() { cancel_poll_timer_.cancel(); });
+ 	// cancel all currently active resolve attempts
+ 	cancel_all_registered();
+ }
+diff --git a/src/resolver_impl.h b/src/resolver_impl.h
+index 6de03e04..cf60dad8 100644
+--- a/src/resolver_impl.h
++++ b/src/resolver_impl.h
+@@ -98,9 +98,12 @@ class resolver_impl final : public cancellable_registry {
+ 	 * produce the desired number of results).
+ 	 * @param minimum_time Search for matching streams for at least this much time (e.g., if
+ 	 * multiple streams may be present).
++	 * @param cancel Optional flag to stop this query without disabling future queries.
++	 * Must remain valid until the call returns.
+ 	 */
+ 	std::vector<stream_info_impl> resolve_oneshot(const std::string &query, int minimum = 0,
+-		double timeout = FOREVER, double minimum_time = 0.0);
++		double timeout = FOREVER, double minimum_time = 0.0,
++		const std::atomic<bool> *cancel = nullptr);
+ 
+ 	/**
+ 	 * Starts a background thread that resolves a query string and periodically updates the list of
+@@ -149,6 +152,7 @@ class resolver_impl final : public cancellable_registry {
+ 
+ 	/// Cancel the currently ongoing resolve, if any.
+ 	void cancel_ongoing_resolve();
++	void poll_cancellation(const std::atomic<bool> *cancel);
+ 
+ 
+ 	// constants (mostly config-deduced)
+@@ -196,6 +200,8 @@ class resolver_impl final : public cancellable_registry {
+ 	std::weak_ptr<resolve_attempt_tcp> tcp_attempt_;
+ 	/// the overall timeout for a query
+ 	steady_timer resolve_timeout_expired_;
++	/// polls an optional per-query cancellation flag
++	steady_timer cancel_poll_timer_;
+ 	/// a timer that fires when a new wave should be scheduled
+ 	steady_timer wave_timer_;
+ 	/// a timer that fires when the unicast wave should be scheduled
+diff --git a/testing/CMakeLists.txt b/testing/CMakeLists.txt
+index 41afc22b..8b797141 100644
+--- a/testing/CMakeLists.txt
++++ b/testing/CMakeLists.txt
+@@ -69,6 +69,7 @@ target_link_libraries(common PUBLIC Catch2::Catch2)
+ add_executable(lsl_test_exported
+ 	ext/DataType.cpp
+ 	ext/discovery.cpp
++	ext/inlet_reopen.cpp
+ 	ext/move.cpp
+ 	ext/streaminfo.cpp
+ 	ext/sync_outlet.cpp
+diff --git a/testing/ext/inlet_reopen.cpp b/testing/ext/inlet_reopen.cpp
+new file mode 100644
+index 00000000..5e6a76cb
+--- /dev/null
++++ b/testing/ext/inlet_reopen.cpp
+@@ -0,0 +1,131 @@
++#include <catch2/catch_all.hpp>
++#include <lsl_cpp.h>
++#include <atomic>
++#include <chrono>
++#include <future>
++#include <thread>
++
++namespace {
++// Repeat the sample so these lifecycle tests do not depend on the separate
++// open_stream()/outlet-readiness race (#176), or stale outlet consumer counts.
++class sample_sender {
++public:
++	sample_sender(lsl::stream_outlet &outlet, float value)
++		: thread_([this, &outlet, value]() {
++			while (!stop_) {
++				outlet.push_sample(&value);
++				std::this_thread::sleep_for(std::chrono::milliseconds(5));
++			}
++		}) {}
++	~sample_sender() {
++		stop_ = true;
++		thread_.join();
++	}
++private:
++	std::atomic<bool> stop_{false};
++	std::thread thread_;
++};
++}
++
++TEST_CASE("An inlet can close and reopen repeatedly", "[inlet][reopen]") {
++	const bool recover = GENERATE(false, true);
++	const bool explicit_open = GENERATE(false, true);
++	CAPTURE(recover, explicit_open);
++	lsl::stream_info info("reopen", "test", 1, 0, lsl::cf_float32, "reopen-source-" + std::to_string(lsl::local_clock()));
++	lsl::stream_outlet outlet(info);
++	auto found = lsl::resolve_stream("source_id", info.source_id(), 1, 2);
++	REQUIRE(found.size() == 1);
++	lsl::stream_inlet inlet(found[0], 360, 0, recover);
++
++	// Closing an inlet before its first open, or closing it twice, is harmless.
++	inlet.close_stream();
++	inlet.close_stream();
++	for (int cycle = 1; cycle <= 3; ++cycle) {
++		if (explicit_open) inlet.open_stream(2);
++		{
++			sample_sender sender(outlet, static_cast<float>(cycle));
++			float received = 0;
++			REQUIRE(inlet.pull_sample(&received, 1, 2) != 0);
++			CHECK(received == static_cast<float>(cycle));
++			// Leave unread data in the queue to check the documented close semantics.
++			const double deadline = lsl::local_clock() + 2;
++			while (!inlet.samples_available() && lsl::local_clock() < deadline)
++				std::this_thread::sleep_for(std::chrono::milliseconds(5));
++			REQUIRE(inlet.samples_available() > 0);
++		}
++		inlet.close_stream();
++		CHECK(inlet.samples_available() == 0);
++		inlet.close_stream();
++	}
++}
++
++TEST_CASE("Closing an inlet interrupts recovery and permits a later open", "[inlet][reopen]") {
++	const bool request_info_first = GENERATE(false, true);
++	CAPTURE(request_info_first);
++	lsl::stream_info info("reopen-missing", "test", 1, 0, lsl::cf_float32,
++		"reopen-missing-source-" + std::to_string(lsl::local_clock()));
++	lsl::stream_inlet inlet(info);
++	// The metadata receiver can own the recovery lock while the data receiver
++	// waits for it. Closing data must leave the metadata receiver operational.
++	if (request_info_first) REQUIRE_THROWS_AS(inlet.info(0.1), lsl::timeout_error);
++	REQUIRE_THROWS_AS(inlet.open_stream(0.1), lsl::timeout_error);
++	const double start = lsl::local_clock();
++	inlet.close_stream();
++	CHECK(lsl::local_clock() - start < 2);
++	CHECK(inlet.samples_available() == 0);
++
++	lsl::stream_outlet outlet(info);
++	inlet.open_stream(5);
++	{
++		sample_sender sender(outlet, 42);
++		float received = 0;
++		REQUIRE(inlet.pull_sample(&received, 1, 2) != 0);
++		CHECK(received == 42);
++	}
++	CHECK(inlet.info(2).source_id() == info.source_id());
++	inlet.close_stream();
++}
++
++TEST_CASE("Closing during connection setup permits reopening", "[inlet][reopen]") {
++	lsl::stream_info info("reopen-setup", "test", 1, 0, lsl::cf_float32, "reopen-setup-source-" + std::to_string(lsl::local_clock()));
++	lsl::stream_outlet outlet(info);
++	auto found = lsl::resolve_stream("source_id", info.source_id(), 1, 2);
++	REQUIRE(found.size() == 1);
++	lsl::stream_inlet inlet(found[0], 360, 0, false);
++	for (int cycle = 0; cycle < 20; ++cycle) {
++		try {
++			inlet.open_stream(0);
++		} catch (const lsl::timeout_error &) {
++			// The receiver may not have registered its cancellable socket yet.
++		}
++		inlet.close_stream();
++	}
++	inlet.open_stream(2);
++	sample_sender sender(outlet, 42);
++	float received = 0;
++	REQUIRE(inlet.pull_sample(&received, 1, 2) != 0);
++	CHECK(received == 42);
++}
++
++TEST_CASE("Closing interrupts a concurrent indefinite open", "[inlet][reopen]") {
++	const bool reopen_immediately = GENERATE(false, true);
++	lsl::stream_info info("close-waiter", "test", 1, 0, lsl::cf_float32,
++		"close-waiter-" + std::to_string(lsl::local_clock()));
++	lsl::stream_inlet inlet(info);
++	auto opening = std::async(std::launch::async, [&]() {
++		try {
++			inlet.open_stream(lsl::FOREVER);
++			return false;
++		} catch (const lsl::timeout_error &) { return true; }
++	});
++	CHECK(opening.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout);
++	inlet.close_stream();
++	if (!reopen_immediately)
++		CHECK(opening.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
++	// Also reopen immediately: an old waiter must still observe its own close.
++	// This makes a missing notification a bounded failure rather than a hung test.
++	lsl::stream_outlet outlet(info);
++	inlet.open_stream(5);
++	CHECK(opening.get());
++	inlet.close_stream();
++}

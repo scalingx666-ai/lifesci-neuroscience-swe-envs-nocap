@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** Improvements to first and second level thresholding
+
+## Description
+
+1) I've added an explicit "template" parameter to both modules to help avoid incorrect mapping (cf. Issue #150). The options are structural, normalised_structural, and SPMT1 template (firstlevel) and averaged_structural or SPMT1 (secondlevel). The default settings are normalised_structural and SPMT1, respectively, which should reproduce the current behavior so (fingers crossed) it shouldn't break any existing pipelines. Firstlevel_threshold even continues to check for a 2-element structural stream and will use the second (presumably normed) structural if present (we've talked about scouring this particular stream weirdness from the code, but I started looking into it and its a much bigger project than just aamod_firstlevel_threshold.) If the module doesn't find the normed structural, it will fall back to using the SPM T1 template, which was the old behavior as well.
+
+2) Both firstlevel and secondlevel threshold now save *all* maps and renders (i.e., including those in which no voxels survive thresholding). We use a custom postprocessing tool at WashU that gathers all the analysis jpgs into an html montage for rapid review, and having random missing images makes the montage confusing. However, I realize saving zero-voxel images can be problematic (because you don't know if they are really zero-voxel images, or the map/render just missed a few). Ergo, I indicate zero voxel images by indicating "no voxels survive threshold" on the image.
+
+3) I've added a "description" parameter. This is text is written to the upper right corner of jpegs created by the module. The text can be anything you like (I find it especially useful in branched analyses). Our design philosophy should be: analysis results should be self-documenting whenever possible. (Items 2 and 3 require a jpeg utility insertInImage.m which I downloaded from a Mathworks site and put in /external.)
+
+4) I now generate SPM stats tables in firstlevel and add them to the report. This code isn't perfect -- it can only handle 'none' and 'FWE' thresholding, but it saves having to go back into SPM to get quantitative stats for these options. This functionality requires two auxiliary utilities: spm_list_display_noUI.m and make_stats_table.m, which I added to /extrafunctions.
+
+5)   I check in firstlevel_threshold if there is a possible problem with the template space. In secondlevel_threshold, I warn the user if they try to use FWE thresholding with a small number of subjects. (This may be an obvious mistake to experienced users, but I recall once getting stuck for a couple of days trying to figure out why my small-n second level analysis was crashing.) I've started adding these kinds of sanity checks to every module I modify -- any checking of module settings I can think of that might help the user not do something stupid (for example, map normed epis onto native structurals). A recurring theme in aa development is making the package more accessible -- especially to new users -- and I believe we should be adding checks everywhere we can.  The code doesn't have to take extreme measures or try to correct the parameters -- just displaying an informative message is sufficient. This is not a new idea -- a handful of extant modules warn the user of of suspicious behavior (e.g., "multiple T1 found") but aa developers should really be much more diligent about this.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `6639fc209d46`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

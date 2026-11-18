@@ -1,0 +1,152 @@
+diff --git a/brainpy/dnn/pooling.py b/brainpy/dnn/pooling.py
+index 83aff5ad..ac25d194 100644
+--- a/brainpy/dnn/pooling.py
++++ b/brainpy/dnn/pooling.py
+@@ -703,6 +703,13 @@ def __init__(
+ def _adaptive_pool1d(x, target_size: int, operation: Callable):
+     """Adaptive pool 1D.
+ 
++    Reduces a 1-D array to ``target_size`` values using PyTorch-style adaptive
++    pooling bins: output ``i`` is ``operation`` applied to the input window
++    ``x[floor(i * size / target_size) : ceil((i + 1) * size / target_size)]``.
++    This works for any ``size`` relative to ``target_size`` — including
++    ``target_size > size`` (upsampling, where windows shrink to a single element
++    and are repeated across outputs).
++
+     Parameters
+     ----------
+     x
+@@ -710,23 +717,33 @@ def _adaptive_pool1d(x, target_size: int, operation: Callable):
+     target_size : int
+         The shape of the output after the pooling operation `(target_size,)`.
+     operation : Callable
+-        The pooling operation to be performed on the input array.
++        The pooling operation to be performed on the input array. It must reduce a
++        1-D array to a scalar (e.g. ``jax.numpy.mean`` or ``jax.numpy.max``).
+ 
+     Returns
+     -------
+         A JAX array of shape `(target_size, )`.
++
++    Notes
++    -----
++    Bin boundaries are static (derived from ``x``'s shape and ``target_size``), so
++    the per-bin comprehension is unrolled once at trace time rather than executed
++    step-by-step at runtime. Every window is non-empty because
++    ``ceil((i + 1) * size / target_size) > floor(i * size / target_size)`` for
++    ``size >= 1``; the previous block-reshape implementation instead divided by
++    ``size // target_size`` and raised ``ZeroDivisionError`` whenever
++    ``target_size > size``.
+     """
++    if target_size <= 0:
++        raise ValueError(f"target_size must be a positive integer, got {target_size}.")
+     x = bm.as_jax(x)
+-    size = jnp.size(x)
+-    num_head_arrays = size % target_size
+-    num_block = size // target_size
+-    if num_head_arrays != 0:
+-        head_end_index = num_head_arrays * (num_block + 1)
+-        heads = jax.vmap(operation)(x[:head_end_index].reshape(num_head_arrays, -1))
+-        tails = jax.vmap(operation)(x[head_end_index:].reshape(-1, num_block))
+-        outs = jnp.concatenate([heads, tails])
+-    else:
+-        outs = jax.vmap(operation)(x.reshape(-1, num_block))
++    size = x.shape[0]
++    # PyTorch adaptive-pooling bins: start = floor(i * size / T),
++    # end = ceil((i + 1) * size / T) computed with integer arithmetic.
++    outs = jnp.stack([
++        operation(x[(i * size) // target_size: -((-((i + 1) * size)) // target_size)])
++        for i in range(target_size)
++    ])
+     return outs
+ 
+ 
+diff --git a/brainpy/dnn/pooling_layers_test.py b/brainpy/dnn/pooling_layers_test.py
+index 85d47805..4548fd3e 100644
+--- a/brainpy/dnn/pooling_layers_test.py
++++ b/brainpy/dnn/pooling_layers_test.py
+@@ -274,5 +274,68 @@ def test_pool_leftmost_negative_channel_axis(self):
+         self.assertEqual(out.shape, (6, 4, 4))
+ 
+ 
++def _adaptive_pool1d_reference(x, target_size, op):
++    """Reference PyTorch-style adaptive pooling of a 1-D array (numpy)."""
++    x = np.asarray(x)
++    size = x.shape[0]
++    out = []
++    for i in range(target_size):
++        start = (i * size) // target_size
++        end = -((-((i + 1) * size)) // target_size)  # ceil((i + 1) * size / target_size)
++        out.append(op(x[start:end]))
++    return np.array(out)
++
++
++class TestAdaptivePool1d(parameterized.TestCase):
++    """Regression coverage for ``_adaptive_pool1d``.
++
++    Guards the fix for the ``ZeroDivisionError: integer modulo by zero`` that arose
++    when ``target_size > size`` (a spatial dimension smaller than its target), which
++    made the old block-reshape implementation build ``reshape(-1, 0)``.
++    """
++
++    @parameterized.product(
++        size_target=((100, 6), (100, 7), (100, 10), (32, 4), (5, 5),
++                     (2, 6), (1, 4), (3, 8)),
++        op=('mean', 'max'),
++    )
++    def test_matches_pytorch_formula(self, size_target, op):
++        from brainpy.dnn.pooling import _adaptive_pool1d
++        size, target = size_target
++        jop, nop = (jnp.mean, np.mean) if op == 'mean' else (jnp.max, np.max)
++        x = np.arange(size, dtype=np.float32) * 0.5 - 3.0
++        got = np.asarray(_adaptive_pool1d(bm.as_jax(x), target, jop))
++        expected = _adaptive_pool1d_reference(x, target, nop)
++        self.assertEqual(got.shape, (target,))
++        np.testing.assert_allclose(got, expected, atol=1e-5)
++
++    def test_upsampling_repeats_elements(self):
++        # target_size (6) > size (2): the previously-crashing case. PyTorch adaptive
++        # max pooling repeats each element across its bins.
++        from brainpy.dnn.pooling import _adaptive_pool1d
++        x = jnp.asarray([10.0, 20.0])
++        out = np.asarray(_adaptive_pool1d(x, 6, jnp.max))
++        np.testing.assert_array_equal(out, [10., 10., 10., 20., 20., 20.])
++
++    def test_rejects_nonpositive_target(self):
++        from brainpy.dnn.pooling import _adaptive_pool1d
++        with self.assertRaises(ValueError):
++            _adaptive_pool1d(jnp.arange(4.0), 0, jnp.mean)
++        with self.assertRaises(ValueError):
++            _adaptive_pool1d(jnp.arange(4.0), -2, jnp.mean)
++
++    @parameterized.product(axis=(-1, 0, 1, 2, 3))
++    def test_adaptivemaxpool3d_spatial_dim_smaller_than_target(self, axis):
++        # A spatial dim of size 2 is pooled to target 6 for every channel_axis that
++        # does not consume it; this raised ZeroDivisionError before the fix.
++        bm.random.seed(123)
++        inp = bm.random.randn(2, 128, 64, 32)
++        net = bp.dnn.AdaptiveMaxPool3d(target_shape=[6, 5, 4], channel_axis=axis)
++        out = net(inp)
++        channel_size = inp.shape[axis]
++        self.assertEqual(sorted(out.shape), sorted([channel_size, 6, 5, 4]))
++        self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
++
++
+ if __name__ == '__main__':
+     absltest.main()
+diff --git a/pyproject.toml b/pyproject.toml
+index 8299335e..37225b61 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -146,7 +146,10 @@ exclude_also = [
+ # curated set lives in exactly one place. Grow ``files`` (and the override
+ # ``module`` list) as more modules are fully typed.
+ [tool.mypy]
+-python_version = "3.11"
++# Target a modern Python for type-checking. numpy's published stubs use PEP 695
++# ``type`` aliases, which mypy rejects as a syntax error unless the analysis target
++# is Python 3.12+; pinning an older version breaks the check against current numpy.
++python_version = "3.14"
+ ignore_missing_imports = true
+ follow_imports = "silent"
+ warn_unused_ignores = true

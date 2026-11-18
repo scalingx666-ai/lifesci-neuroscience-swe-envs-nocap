@@ -1,0 +1,1702 @@
+diff --git a/docs/make_api.py b/docs/make_api.py
+index d6c91eb0cd..c1ba2c3272 100644
+--- a/docs/make_api.py
++++ b/docs/make_api.py
+@@ -24,6 +24,7 @@
+ # Single-file modules to exclude from the API index
+ EXCLUDE_MODULES = {
+     "movement.cli_entrypoint",
++    "movement.napari.edit_timeline_widget",
+     "movement.napari.loader_widgets",
+     "movement.napari.regions_widget",
+     "movement.napari.save_widget",
+diff --git a/movement/napari/edit_timeline_widget.py b/movement/napari/edit_timeline_widget.py
+new file mode 100644
+index 0000000000..f59748d242
+--- /dev/null
++++ b/movement/napari/edit_timeline_widget.py
+@@ -0,0 +1,513 @@
++"""Widget flagging which frames contain edited points.
++
++Adapted from a pattern for docking a ``matplotlib`` canvas in napari and
++syncing it to the current frame via ``viewer.dims.events.current_step``:
++https://gist.github.com/jni/a0ae9793a0ca43868dd7dce7ea21df79
++"""
++
++from typing import TYPE_CHECKING
++
++import numpy as np
++from matplotlib.backends.backend_qtagg import (
++    FigureCanvasQTAgg as FigureCanvas,
++)
++from matplotlib.figure import Figure
++from napari.layers.base import ActionType
++from napari.utils.theme import get_theme
++from napari.viewer import Viewer
++from qtpy.QtCore import QTimer, Signal
++from qtpy.QtWidgets import QCheckBox, QLabel, QVBoxLayout, QWidget
++
++from movement.napari.layer_wiring import (
++    MAX_FRAME_IDX_KEY,
++    POINTS_PROPERTIES_KEY,
++    active_movement_points_layer,
++    is_movement_points_layer,
++)
++
++if TYPE_CHECKING:
++    from napari.layers import Points
++
++# A click never lands exactly on a frame (e.g. 42.3, not 42), so treat
++# any click within this fraction of the visible frame range as a hit.
++CLICK_TOLERANCE_FRACTION = 0.02
++
++MIN_VISIBLE_FRAMES = 5
++ZOOM_IN_FACTOR = 0.8
++ZOOM_OUT_FACTOR = 1.25
++
++# Mouse movements below this many pixels are treated as a click, not
++# the start of a pan drag (avoids a shaky click being read as a pan).
++DRAG_THRESHOLD_PIXELS = 3
++
++
++class EditControlsWidget(QWidget):
++    """Sidebar controls for the edited-frames timeline.
++
++    Placed in :class:`~movement.napari.meta_widget.MovementMetaWidget`'s
++    "Edit tracked data" collapsible section, which toggles and configures
++    the (separately docked) :class:`EditTimelineWidget` timeline.
++    """
++
++    show_individuals_toggled = Signal(bool)
++
++    def __init__(self, parent=None):
++        """Initialise the instructions label and display checkbox."""
++        super().__init__(parent=parent)
++        instructions = QLabel(
++            "Use the points layer controls to move or delete keypoints. "
++            "Frames with edited points are flagged as coloured bars on the "
++            "timeline below. Click a bar to jump to an edited frame."
++        )
++        instructions.setWordWrap(True)
++
++        # Unchecked: one shared line, every bar in the theme's "current"
++        # colour. Checked: one line per individual, bars coloured per
++        # individual.
++        # Disabled by MovementMetaWidget for single-individual datasets.
++        self.show_individuals_checkbox = QCheckBox("Display individuals")
++        self.show_individuals_checkbox.toggled.connect(
++            self.show_individuals_toggled
++        )
++
++        layout = QVBoxLayout()
++        layout.addWidget(instructions)
++        layout.addWidget(self.show_individuals_checkbox)
++        self.setLayout(layout)
++
++
++class EditTimelineWidget(QWidget):
++    """Dock widget flagging frames with edited points.
++
++    Draws a vertical bar for every frame that contains an edited point
++    on the currently active ``movement`` Points layer. By default all
++    bars share one lane and are drawn in a single colour (the napari
++    theme's ``current`` colour). With :meth:`set_show_individuals` on, bars
++    are split into one lane per individual (separated by thin horizontal
++    rules) and coloured per individual to match the ``face_color`` of
++    that individual's points in the Points layer. A playhead
++    line marks the frame currently shown in the viewer. Scroll to zoom
++    in/out on the timeline, and click a bar to jump to that frame.
++    """
++
++    def __init__(self, napari_viewer: Viewer, parent=None):
++        """Initialise the widget and connect it to viewer events."""
++        super().__init__(parent=parent)
++        self.viewer = napari_viewer
++        self.active_layer: Points | None = None
++        self._show_individuals = False
++        self._bars: list = []
++        self._lane_dividers: list = []
++        self._foreground = "#808080"  # overwritten by _apply_theme
++        self._edit_bar_color = "#808080"  # overwritten by _apply_theme
++        self._edited_frames = np.array([])
++        self._removed_points: list = []
++        self._max_frame = 0
++        self._press_pixel_x: float | None = None
++        self._press_xlim: tuple[float, float] | None = None
++        self._press_event = None
++        self._pan_scale = 0.0
++        self._dragged = False
++
++        self.figure = Figure(figsize=(6, 2.5))
++        self.canvas = FigureCanvas(self.figure)
++        self.canvas.setMinimumHeight(200)
++        self.ax = self.figure.subplots()
++        self._style_axes()
++        self.playhead = self.ax.axvline(
++            0, linewidth=2, linestyle="--", zorder=3
++        )  # higher order in matplotlib is drawn on top; colour set below
++        self._apply_theme()
++
++        layout = QVBoxLayout()
++        layout.setContentsMargins(0, 0, 0, 0)
++        layout.addWidget(self.canvas)
++        self.setLayout(layout)
++
++        self.viewer.dims.events.current_step.connect(self._on_step_changed)
++        self.viewer.layers.selection.events.active.connect(
++            self._on_active_layer_changed
++        )
++        self.viewer.layers.events.inserted.connect(self._on_layer_inserted)
++        self.viewer.layers.events.removed.connect(self._on_layer_removed)
++        self.viewer.events.theme.connect(self._apply_theme)
++        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
++        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_motion)
++        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
++        self.canvas.mpl_connect("scroll_event", self._on_scroll)
++
++        for layer in self.viewer.layers:
++            self._track_layer(layer)
++        # Latch onto an existing movement Points layer
++        self._set_active_layer(active_movement_points_layer(self.viewer))
++
++    def _style_axes(self):
++        """Set the static appearance of the timeline axes."""
++        self.ax.set_yticks([])
++        self.ax.set_ylim(0, 1)
++        self.ax.set_xlabel("frame")
++        self.ax.set_title("Edited frames", fontsize="small")
++        self.figure.tight_layout()
++
++    def _apply_theme(self, event=None):
++        """Style the plot to match the current napari theme.
++
++        Connected to ``viewer.events.theme`` so the plot updates live
++        if the user switches between napari's dark and light themes.
++        """
++        theme = get_theme(self.viewer.theme)
++        background = theme.background.as_hex()
++        foreground = theme.text.as_hex()
++        self._foreground = foreground
++        self._edit_bar_color = theme.current.as_hex()
++
++        self.figure.set_facecolor(background)
++        self.ax.set_facecolor(background)
++        self.ax.xaxis.label.set_color(foreground)
++        self.ax.title.set_color(foreground)
++        self.ax.tick_params(axis="both", colors=foreground)
++        for spine in self.ax.spines.values():
++            spine.set_color(foreground)
++        self.playhead.set_color(theme.secondary.as_hex())
++        # Recreate bars and lane dividers so they pick up the new
++        # foreground/edit-bar colours too.
++        self._redraw_bars()
++
++        self.canvas.draw_idle()
++
++    def _track_layer(self, layer):
++        """Connect to a movement Points layer's data-change event."""
++        if is_movement_points_layer(layer):
++            layer.events.data.connect(self._on_layer_data_changed)
++
++    def _on_layer_inserted(self, event):
++        """Track newly added movement Points layers."""
++        self._track_layer(event.value)
++
++    def _on_layer_removed(self, event):
++        """Clear the display if the active layer was removed."""
++        if event.value is self.active_layer:
++            self.active_layer = None
++            self._max_frame = 0
++            self._removed_points = []
++            self._redraw_bars()
++
++    def set_show_individuals(self, checked: bool) -> None:
++        """Switch between one shared lane and one lane per individual.
++
++        Called by the "Display individuals" checkbox that
++        :class:`~movement.napari.meta_widget.MovementMetaWidget` places
++        in its "Edit tracked data" section.
++        """
++        self._show_individuals = checked
++        self._redraw_bars()
++
++    def _set_active_layer(self, layer):
++        """Display edited frames for ``layer``, a movement Points layer.
++
++        A no-op if ``layer`` is None or already the one shown (e.g. after
++        clicking away to the Tracks layer and back).
++        """
++        if layer is None or layer is self.active_layer:
++            return
++        self.active_layer = layer
++        self._max_frame = layer.metadata.get(MAX_FRAME_IDX_KEY, 0)
++        self._removed_points = self._reconstruct_previously_removed_points(
++            layer
++        )
++        self._redraw_bars()
++        self._reset_xlim()
++
++    def _on_active_layer_changed(self, event=None):
++        """Switch to displaying edited frames for the active Points layer.
++
++        Selecting a non-movement-Points layer (e.g. the Tracks layer)
++        leaves the timeline as is, rather than blanking it. A removed
++        active layer is handled separately by ``_on_layer_removed``.
++        """
++        active = self.viewer.layers.selection.active
++        active = getattr(active, "__wrapped__", active)
++        if not is_movement_points_layer(active):
++            return
++        self._set_active_layer(active)
++
++    @staticmethod
++    def _reconstruct_previously_removed_points(layer):
++        """Restore removed-point bars from a previously-saved session.
++
++        A point removed and saved in an earlier session comes back as a
++        NaN row, dropped from the live layer entirely -- so there is no
++        ``REMOVING`` event to capture it from this session. Reconstruct
++        those bars from ``POINTS_PROPERTIES_KEY``, the full properties
++        table (including NaN rows) stashed on the layer at load time.
++        Points edited without being removed need no such reconstruction,
++        since they're still live rows and ``_redraw_bars`` already reads
++        their ``edited`` property directly.
++        """
++        if layer is None:
++            return []
++        full_properties = layer.metadata.get(POINTS_PROPERTIES_KEY)
++        if full_properties is None or "edited" not in full_properties:
++            return []
++        previously_removed = full_properties[
++            full_properties["position_is_nan"] & full_properties["edited"]
++        ]
++        if previously_removed.empty:
++            return []
++        frame_times = np.sort(full_properties["time"].unique())
++        return [
++            (int(np.searchsorted(frame_times, row.time)), row.individual)
++            for row in previously_removed.itertuples()
++        ]
++
++    def _on_layer_data_changed(self, event):
++        """React to point moves and removals on the active layer.
++
++        Connected to ``events.data`` rather than ``events.properties``:
++        napari's ``Points.remove()`` (Delete/Backspace) only fires
++        ``events.features``, never ``events.properties``, so a
++        properties-only listener misses removals entirely.
++
++        For a move (``CHANGED``), ``DataLoader._on_points_data_changed``
++        (loader_widgets.py) is also connected to this same event and
++        sets the ``edited`` property that ``_redraw_bars`` reads. But
++        the two callbacks' relative order isn't guaranteed. Deferring
++        the redraw with ``QTimer.singleShot(0, ...)`` runs it on the
++        next Qt event-loop tick, after every callback for this event
++        has finished, so ``edited`` is always up to date by then.
++
++        For a removal, the row (and its identity) is about to be
++        deleted from the layer entirely, so there will be nothing left
++        to read afterwards. ``REMOVING`` fires first, while the data is
++        still intact, so that's when we snapshot it.
++        """
++        if event.source is not self.active_layer:
++            return
++        if event.action == ActionType.REMOVING:
++            self._capture_removed_points(event)
++            self._redraw_bars()
++        elif event.action == ActionType.CHANGED:
++            QTimer.singleShot(0, self._redraw_bars)
++
++    def _capture_removed_points(self, event):
++        """Snapshot the identity of points about to be removed."""
++        layer = event.source
++        frames = layer.data[:, 0]
++        individuals = layer.properties["individual"]
++        for idx in event.data_indices:
++            self._removed_points.append((frames[idx], individuals[idx]))
++
++    def _on_step_changed(self, event=None):
++        """Move the playhead line to the current frame."""
++        step = self.viewer.dims.current_step
++        if not step:
++            return
++        frame = step[0]
++        self.playhead.set_xdata([frame, frame])
++        self.canvas.draw_idle()
++
++    def _redraw_bars(self):
++        """Redraw the per-individual lanes of edited-frame bars."""
++        for artist in (*self._bars, *self._lane_dividers):
++            artist.remove()
++        self._bars = []
++        self._lane_dividers = []
++        self._edited_frames = np.array([])
++
++        if self.active_layer is None:
++            self.ax.set_yticks([])
++            self.figure.tight_layout()
++            self._on_step_changed()
++            return
++
++        individuals = self.active_layer.properties["individual"]
++        removed_individuals = [ind for _, ind in self._removed_points]
++        # Union with removed individuals so a lane survives even if an
++        # individual's last remaining point has just been removed.
++        unique_individuals = list(
++            dict.fromkeys([*individuals, *removed_individuals])
++        )
++
++        if self._show_individuals:
++            n_lanes = len(unique_individuals)
++            lane_of = {ind: i for i, ind in enumerate(unique_individuals)}
++            self.ax.set_yticks([(i + 0.5) / n_lanes for i in range(n_lanes)])
++            self.ax.set_yticklabels(unique_individuals, fontsize="small")
++            # Thin horizontal rules separating each individual's lane.
++            for i in range(1, n_lanes):
++                self._lane_dividers.append(
++                    self.ax.axhline(
++                        i / n_lanes,
++                        color=self._foreground,
++                        linewidth=0.5,
++                        alpha=0.3,
++                        zorder=1,
++                    )
++                )
++        else:
++            # A single shared lane: one bar per edited frame, regardless
++            # of how many (or which) individuals were edited on it.
++            n_lanes = 1
++            lane_of = dict.fromkeys(unique_individuals, 0)
++            self.ax.set_yticks([])
++        lane_height = 1.0 / n_lanes
++
++        color_of = self._bar_color_lookup()
++
++        # Combine moved (still-live) and removed points into one list of
++        # (frame, individual) pairs to draw as bars.
++        edited = self.active_layer.properties.get("edited")
++        moved_points = []
++        if edited is not None and edited.any():
++            frames = self.active_layer.data[:, 0]
++            moved_points = [
++                (frames[idx], individuals[idx])
++                for idx in np.nonzero(edited)[0]
++            ]
++        all_points = moved_points + self._removed_points
++
++        if all_points:
++            # A frame may have several edited keypoints for the same
++            # individual; only draw one bar per (frame, individual) --
++            # or, with lanes collapsed, one bar per frame regardless of
++            # individual.
++            seen = set()
++            for frame, individual in all_points:
++                key = (frame, individual) if self._show_individuals else frame
++                if key in seen:
++                    continue
++                seen.add(key)
++                lane = lane_of[individual]
++                y0, y1 = lane * lane_height, (lane + 1) * lane_height
++                self._bars.append(
++                    self.ax.vlines(
++                        frame,
++                        y0,
++                        y1,
++                        colors=[color_of(individual)],
++                        linewidth=2,
++                        zorder=2,
++                    )
++                )
++            self._edited_frames = np.unique([p[0] for p in all_points])
++
++        self.figure.tight_layout()
++        self._on_step_changed()
++
++    def _bar_color_lookup(self):
++        """Return an ``individual -> bar colour`` function.
++
++        With lanes collapsed, every bar is the single ``self._edit_bar_color``
++        (the napari theme's ``current`` colour). With individuals displayed,
++        each bar takes its individual's colour read straight from the Points
++        layer's ``face_color``, so bars match the viewer exactly. An
++        individual with no live point left to read a colour from falls back
++        to ``self._edit_bar_color``.
++        """
++        if not self._show_individuals or self.active_layer is None:
++            return lambda individual: self._edit_bar_color
++
++        individuals = self.active_layer.properties.get("individual")
++        if individuals is None:
++            return lambda individual: self._edit_bar_color
++
++        palette: dict = {}
++        for ind, color in zip(
++            individuals, self.active_layer.face_color, strict=False
++        ):
++            palette.setdefault(ind, tuple(color))
++        return lambda individual: palette.get(individual, self._edit_bar_color)
++
++    def _reset_xlim(self):
++        """Reset the visible frame range to the full extent."""
++        self.ax.set_xlim(0, max(self._max_frame, 1))
++        self.canvas.draw_idle()
++
++    def _on_scroll(self, event):
++        """Zoom the timeline in/out around the cursor position."""
++        if event.inaxes != self.ax or event.xdata is None:
++            return
++        xmin, xmax = self.ax.get_xlim()
++        span = xmax - xmin
++        factor = ZOOM_IN_FACTOR if event.button == "up" else ZOOM_OUT_FACTOR
++        full_span = max(self._max_frame, 1)
++        new_span = min(max(span * factor, MIN_VISIBLE_FRAMES), full_span)
++
++        frac = (event.xdata - xmin) / span if span else 0.5
++        new_xmin = event.xdata - frac * new_span
++        new_xmin = max(0, min(new_xmin, full_span - new_span))
++        self.ax.set_xlim(new_xmin, new_xmin + new_span)
++        self.canvas.draw_idle()
++
++    def _on_mouse_press(self, event):
++        """Record the drag start point, in case this becomes a pan."""
++        if event.inaxes != self.ax or event.xdata is None:
++            return
++        self._press_event = event
++        self._press_pixel_x = event.x
++        self._press_xlim = self.ax.get_xlim()
++        # Data units per screen pixel, fixed for the duration of this
++        # drag so panning doesn't compound as the view shifts (see
++        # _on_mouse_motion).
++        axes_width_pixels = self.ax.get_window_extent().width
++        span = self._press_xlim[1] - self._press_xlim[0]
++        self._pan_scale = span / axes_width_pixels if axes_width_pixels else 0
++        self._dragged = False
++
++    def _on_mouse_motion(self, event):
++        """Pan the timeline while the mouse is dragged.
++
++        Uses the fixed pixel-to-data scale captured on press, rather
++        than the live axes transform, so that repeated small moves
++        accumulate into the total drag distance instead of being
++        computed (and partly cancelled out) against an already-shifted
++        view on every step.
++        """
++        if self._press_pixel_x is None or event.x is None:
++            return
++        pixel_dx = event.x - self._press_pixel_x
++        if abs(pixel_dx) > DRAG_THRESHOLD_PIXELS:
++            self._dragged = True
++        if not self._dragged:
++            return
++
++        data_dx = pixel_dx * self._pan_scale
++        xmin0, xmax0 = self._press_xlim
++        span = xmax0 - xmin0
++        full_span = max(self._max_frame, 1)
++        new_xmin = max(0, min(xmin0 - data_dx, full_span - span))
++        self.ax.set_xlim(new_xmin, new_xmin + span)
++        self.canvas.draw_idle()
++
++    def _on_mouse_release(self, event):
++        """Treat the gesture as a click if the mouse never really moved."""
++        if self._press_pixel_x is None:
++            return
++        if not self._dragged:
++            self._handle_click(self._press_event)
++        self._press_pixel_x = None
++        self._press_xlim = None
++        self._press_event = None
++
++    def _handle_click(self, event):
++        """Jump the viewer to the edited frame nearest the click.
++
++        Double-clicking resets the timeline to the full frame range.
++        Clicks too far from any edited-frame bar are ignored.
++        """
++        if event.dblclick:
++            self._reset_xlim()
++            return
++        if self._edited_frames.size == 0:
++            return
++
++        nearest = self._edited_frames[
++            np.argmin(np.abs(self._edited_frames - event.xdata))
++        ]
++        xmin, xmax = self.ax.get_xlim()
++        tolerance = max(1.0, CLICK_TOLERANCE_FRACTION * (xmax - xmin))
++        if abs(nearest - event.xdata) > tolerance:
++            return
++
++        current_step = self.viewer.dims.current_step
++        self.viewer.dims.current_step = (int(nearest),) + current_step[1:]
+diff --git a/movement/napari/layer_wiring.py b/movement/napari/layer_wiring.py
+index fceb7afc5d..c79027192e 100644
+--- a/movement/napari/layer_wiring.py
++++ b/movement/napari/layer_wiring.py
+@@ -45,6 +45,31 @@
+ _WIRED_VIEWERS: WeakSet = WeakSet()
+ 
+ 
++# ---- Layer helpers -------------------------------------
++def is_movement_points_layer(layer) -> bool:
++    """Return ``True`` for a movement-loaded napari Points layer."""
++    layer = getattr(layer, "__wrapped__", layer)
++    return isinstance(layer, Points) and bool(
++        layer.metadata.get(POINTS_LAYER_KEY)
++    )
++
++
++def active_movement_points_layer(viewer):
++    """Return the active movement Points layer, else the last one, else None.
++
++    Prefers napari's active selection, but falls back to scanning the layer
++    list so a Points layer is still found when the active selection is
++    something else or unset.
++    """
++    active = viewer.layers.selection.active
++    if is_movement_points_layer(active):
++        return getattr(active, "__wrapped__", active)
++    for layer in reversed(viewer.layers):
++        if is_movement_points_layer(layer):
++            return getattr(layer, "__wrapped__", layer)
++    return None
++
++
+ # ---- Callbacks with viewer lifetime --------------------
+ def connect_viewer_callbacks(viewer) -> None:
+     """Wire the layer callbacks to a viewer, skipping if already wired.
+@@ -128,7 +153,7 @@ def update_points_layers_editable(viewer, event=None):
+     """
+     is_editable = frame_axis_is_sliced(viewer)
+     for layer in viewer.layers:
+-        if isinstance(layer, Points) and layer.metadata.get(POINTS_LAYER_KEY):
++        if is_movement_points_layer(layer):
+             layer.editable = is_editable
+ 
+ 
+diff --git a/movement/napari/meta_widget.py b/movement/napari/meta_widget.py
+index 8a73323d4d..f2ec074001 100644
+--- a/movement/napari/meta_widget.py
++++ b/movement/napari/meta_widget.py
+@@ -1,8 +1,23 @@
+ """The main napari widget for the ``movement`` package."""
+ 
++from typing import TYPE_CHECKING
++
++from napari.layers.base import ActionType
+ from napari.viewer import Viewer
+ from qt_niu.collapsible_widget import CollapsibleWidgetContainer
++from qtpy.QtCore import QTimer
++
++if TYPE_CHECKING:
++    from qtpy.QtWidgets import QWidget
+ 
++from movement.napari.edit_timeline_widget import (
++    EditControlsWidget,
++    EditTimelineWidget,
++)
++from movement.napari.layer_wiring import (
++    active_movement_points_layer,
++    is_movement_points_layer,
++)
+ from movement.napari.loader_widgets import DataLoader
+ from movement.napari.regions_widget import RegionsWidget
+ from movement.napari.save_widget import DataSaver
+@@ -18,6 +33,9 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
+     def __init__(self, napari_viewer: Viewer, parent=None):
+         """Initialize the meta-widget."""
+         super().__init__()
++        self._viewer = napari_viewer
++        self.edit_timeline_widget: EditTimelineWidget | None = None
++        self._edit_timeline_dock_widget: QWidget | None = None
+ 
+         # Add the data loader widget
+         self.add_widget(
+@@ -26,11 +44,21 @@ def __init__(self, napari_viewer: Viewer, parent=None):
+             widget_title="Load tracked data",
+         )
+ 
+-        # Add the Regions widget
++        # A collapsible "edit controls" widget that can be used
++        # to show/hide and configure the edit timeline docked
++        # to the bottom of the viewer.
++        self.edit_controls = EditControlsWidget(parent=self)
++        self.edit_controls.show_individuals_toggled.connect(
++            self._on_show_individuals_toggled
++        )
+         self.add_widget(
+-            RegionsWidget(napari_viewer, parent=self),
++            self.edit_controls,
+             collapsible=True,
+-            widget_title="Define regions of interest",
++            widget_title="Edit tracked data",
++        )
++        self._edit_timeline_collapsible = self.collapsible_widgets[-1]
++        self._edit_timeline_collapsible.toggled.connect(
++            self._on_edit_timeline_widget_toggled
+         )
+ 
+         # Add the Save widget
+@@ -40,5 +68,111 @@ def __init__(self, napari_viewer: Viewer, parent=None):
+             widget_title="Save tracked data",
+         )
+ 
++        # Add the Regions widget
++        self.add_widget(
++            RegionsWidget(napari_viewer, parent=self),
++            collapsible=True,
++            widget_title="Define regions of interest",
++        )
++
+         loader_collapsible = self.collapsible_widgets[0]
+         loader_collapsible.expand()  # expand the loader widget by default
++
++        napari_viewer.layers.events.inserted.connect(self._on_layer_inserted)
++
++        self.edit_controls.show_individuals_checkbox.setEnabled(False)
++        napari_viewer.layers.selection.events.active.connect(
++            self._show_individuals_enabled
++        )
++
++    def _on_layer_inserted(self, event) -> None:
++        """Keep the edit timeline section collapsed until a point is edited."""
++        layer = event.value
++        if not is_movement_points_layer(layer):
++            return  # ignore any layer that is not a movement Points layer
++        self._show_individuals_enabled()
++        # Open the edit timeline section as soon as a point is edited
++        # on this layer.
++        layer.events.data.connect(self._on_points_edited)
++        self._edit_timeline_collapsible.collapse(False)
++
++    def _on_points_edited(self, event) -> None:
++        """Expand the edit timeline section when a point is dragged or removed.
++
++        Expanding creates the timeline widget on first edit. We defer this
++        until the event loop is next free (via ``QTimer.singleShot``). This
++        allows the layer's ``edited`` property to be fully set before
++        the timeline widget reads it, and thus ensures the first edit
++        is not missed.
++        """
++        if event.action in (ActionType.CHANGED, ActionType.REMOVING) and (
++            not self._edit_timeline_collapsible.isExpanded()
++        ):
++            QTimer.singleShot(0, self._edit_timeline_collapsible.expand)
++
++    def _on_edit_timeline_widget_toggled(self, expanded: bool) -> None:
++        """Show/hide the edited-frames timeline docked at the bottom."""
++        if not expanded:
++            if self._edit_timeline_dock_widget is not None:
++                self._edit_timeline_dock_widget.hide()
++            return
++        self._autoselect_points_layer()
++        if self.edit_timeline_widget is None:
++            self.edit_timeline_widget = EditTimelineWidget(self._viewer)
++            self.edit_timeline_widget.set_show_individuals(
++                self.edit_controls.show_individuals_checkbox.isChecked()
++            )
++            self._edit_timeline_dock_widget = (
++                self._viewer.window.add_dock_widget(
++                    self.edit_timeline_widget,
++                    area="bottom",
++                    name="edited frames",
++                )
++            )
++            # Handle closing the dock via its title-bar "X"
++            self._edit_timeline_dock_widget.destroyed.connect(
++                self._on_edit_timeline_dock_gone
++            )
++        elif self._edit_timeline_dock_widget is not None:
++            self._edit_timeline_dock_widget.show()
++
++    def _on_edit_timeline_dock_gone(self, _=None) -> None:
++        """Reset state after the docked timeline is closed via its X."""
++        self.edit_timeline_widget = None
++        self._edit_timeline_dock_widget = None
++        # Collapse the edit controls, in line with the now-missing dock.
++        self._edit_timeline_collapsible.collapse(False)
++
++    def _autoselect_points_layer(self) -> None:
++        """Make a movement Points layer active for the timeline.
++
++        Leave the active layer alone if it is already a movement Points
++        layer; otherwise select the last one in the layer list.
++        """
++        if is_movement_points_layer(self._viewer.layers.selection.active):
++            return
++        layer = active_movement_points_layer(self._viewer)
++        if layer is not None:
++            self._viewer.layers.selection.active = layer
++
++    def _on_show_individuals_toggled(self, checked: bool) -> None:
++        """Forward the "Display individuals" checkbox to the timeline."""
++        if self.edit_timeline_widget is not None:
++            self.edit_timeline_widget.set_show_individuals(checked)
++
++    def _show_individuals_enabled(self, *_) -> None:
++        """Enable "Display individuals" only for multi-individual data.
++
++        With a single individual the checkbox does nothing useful, so it
++        is disabled (and unchecked, falling back to the single-colour
++        shared lane).
++        """
++        layer = active_movement_points_layer(self._viewer)
++        if layer is None:
++            return
++        individuals = layer.properties.get("individual")
++        multiple = individuals is not None and len(set(individuals)) > 1
++        checkbox = self.edit_controls.show_individuals_checkbox
++        checkbox.setEnabled(multiple)
++        if not multiple and checkbox.isChecked():
++            checkbox.setChecked(False)
+diff --git a/tests/fixtures/napari.py b/tests/fixtures/napari.py
+index 5f964862f2..5a2c8e5047 100644
+--- a/tests/fixtures/napari.py
++++ b/tests/fixtures/napari.py
+@@ -8,7 +8,7 @@
+ 
+ from movement.io import save_poses
+ from movement.napari.layer_wiring import on_points_data_changed
+-from movement.napari.loader_widgets import DataLoader
++from movement.napari.loader_widgets import POINTS_LAYER_KEY, DataLoader
+ 
+ 
+ @pytest.fixture
+@@ -290,3 +290,90 @@ def _loaded_data_loader(filepath, ds, loader=None):
+         return loader
+ 
+     return _loaded_data_loader
++
++
++@pytest.fixture
++def loader_with_edited_point(
++    valid_poses_path_and_ds, loaded_data_loader, move_point
++):
++    """Return a loaded ``DataLoader`` with one point dragged (edited)."""
++    filepath, ds = valid_poses_path_and_ds
++    loader = loaded_data_loader(filepath, ds)
++    move_point(
++        loader,
++        frame=2,
++        keypoint="centroid",
++        individual="id_0",
++        new_y=100,
++        new_x=200,
++    )
++    return loader
++
++
++@pytest.fixture
++def loader_with_two_edited_individuals(
++    valid_poses_path_and_ds, loaded_data_loader, move_point
++):
++    """Return a loaded ``DataLoader`` with three edited points across two
++    individuals: ``id_0`` and ``id_1`` both on frame 2 (a shared frame),
++    and ``id_1`` again on frame 5.
++
++    Enough to exercise both the "one bar per frame" (lanes collapsed)
++    and "one bar per (frame, individual)" (individuals displayed)
++    behaviours of
++    :class:`~movement.napari.edit_timeline_widget.EditTimelineWidget`.
++    """
++    filepath, ds = valid_poses_path_and_ds
++    loader = loaded_data_loader(filepath, ds)
++    for individual, frame in (("id_0", 2), ("id_1", 2), ("id_1", 5)):
++        move_point(
++            loader,
++            frame=frame,
++            keypoint="centroid",
++            individual=individual,
++            new_y=100,
++            new_x=200,
++        )
++    return loader
++
++
++@pytest.fixture
++def click_on_timeline():
++    """Return a factory that simulates a click on an
++    :class:`~movement.napari.edit_timeline_widget.EditTimelineWidget`
++    timeline, at the given x (frame) position. Pass ``dblclick=True`` to
++    simulate a double-click instead (``xdata`` is then unused, matching
++    ``_handle_click``'s own early return for that case).
++    """
++
++    def _click_on_timeline(edit_timeline_widget, xdata=None, dblclick=False):
++        edit_timeline_widget._handle_click(
++            Mock(dblclick=dblclick, xdata=xdata)
++        )
++
++    return _click_on_timeline
++
++
++@pytest.fixture
++def add_movement_points():
++    """Return a factory that adds a movement Points layer to a viewer.
++
++    The layer has one point per entry in ``individuals`` (all at the
++    origin), with the ``edited`` and ``individual`` properties and the
++    metadata flag that mark it as a movement-loaded layer. Any extra
++    keyword arguments are forwarded to ``viewer.add_points``.
++    """
++
++    def _add(viewer, individuals=("id_0",), edited=None, **kwargs):
++        n = len(individuals)
++        return viewer.add_points(
++            np.zeros((n, 2)),
++            properties={
++                "edited": np.array([False] * n if edited is None else edited),
++                "individual": np.array(list(individuals)),
++            },
++            metadata={POINTS_LAYER_KEY: True},
++            **kwargs,
++        )
++
++    return _add
+diff --git a/tests/test_unit/test_napari_plugin/test_edit_timeline_widget.py b/tests/test_unit/test_napari_plugin/test_edit_timeline_widget.py
+new file mode 100644
+index 0000000000..bb565a32e1
+--- /dev/null
++++ b/tests/test_unit/test_napari_plugin/test_edit_timeline_widget.py
+@@ -0,0 +1,551 @@
++"""Test the napari plugin edit timeline widget."""
++
++from unittest.mock import Mock
++
++import numpy as np
++import pandas as pd
++import pytest
++from matplotlib.colors import to_rgba
++from napari.layers.base import ActionType
++from napari.utils.theme import get_theme
++
++from movement.napari.edit_timeline_widget import (
++    DRAG_THRESHOLD_PIXELS,
++    MIN_VISIBLE_FRAMES,
++    EditTimelineWidget,
++)
++from movement.napari.loader_widgets import POINTS_PROPERTIES_KEY
++
++
++def _bar_colors(edit_timeline_widget):
++    """Return the RGBA colour of each drawn bar, as a list of tuples."""
++    return [tuple(bar.get_colors()[0]) for bar in edit_timeline_widget._bars]
++
++
++@pytest.mark.parametrize(
++    "click_offset, expect_jump",
++    [
++        pytest.param(0.0, True, id="exact_bar"),
++        pytest.param(0.9, True, id="within_tolerance_of_bar"),
++        pytest.param(5.0, False, id="outside_tolerance"),
++    ],
++)
++def test_click_on_timeline_jumps_only_within_tolerance(
++    loader_with_edited_point, click_on_timeline, click_offset, expect_jump
++):
++    """Clicking near a flagged bar jumps the viewer there.
++
++    A bar is a single vertical line, so a click is rarely pixel-exact;
++    ``_handle_click`` accepts anything within ``CLICK_TOLERANCE_FRACTION``
++    of the bar as a hit on it, and ignores clicks further away.
++    """
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    edited_frame = 2
++
++    viewer.dims.current_step = (0,) + viewer.dims.current_step[1:]
++    click_on_timeline(edit_timeline_widget, xdata=edited_frame + click_offset)
++
++    expected_frame = edited_frame if expect_jump else 0
++    assert viewer.dims.current_step[0] == expected_frame
++
++
++def test_drag_pans_the_timeline(loader_with_edited_point):
++    """Dragging the mouse across the timeline pans the visible range."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    # Zoom in first: fully zoomed out (the default) there's nowhere to
++    # pan to, since the full frame range is already in view.
++    edit_timeline_widget._on_scroll(
++        Mock(
++            inaxes=edit_timeline_widget.ax,
++            xdata=sum(edit_timeline_widget.ax.get_xlim()) / 2,
++            button="up",
++        )
++    )
++    xmin, xmax = edit_timeline_widget.ax.get_xlim()
++    cursor = (xmin + xmax) / 2
++
++    edit_timeline_widget._on_mouse_press(
++        Mock(inaxes=edit_timeline_widget.ax, xdata=cursor, x=100)
++    )
++    edit_timeline_widget._on_mouse_motion(
++        Mock(x=50)
++    )  # dragged left by 50 pixels
++    edit_timeline_widget._on_mouse_release(Mock())
++
++    assert edit_timeline_widget.ax.get_xlim() != (xmin, xmax)
++
++
++def test_mouse_press_outside_axes_starts_no_drag(loader_with_edited_point):
++    """A press outside the timeline (or with no xdata) is ignored."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++
++    edit_timeline_widget._on_mouse_press(Mock(inaxes=None, xdata=1.0, x=100))
++
++    assert edit_timeline_widget._press_pixel_x is None
++
++
++def test_mouse_motion_without_a_prior_press_is_a_noop(
++    loader_with_edited_point,
++):
++    """Mouse motion before any press on the timeline pans nothing."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    xlim_before = edit_timeline_widget.ax.get_xlim()
++
++    edit_timeline_widget._on_mouse_motion(Mock(x=50))
++
++    assert edit_timeline_widget.ax.get_xlim() == xlim_before
++
++
++def test_small_mouse_movement_is_not_treated_as_a_drag(
++    loader_with_edited_point,
++):
++    """Movement below the drag threshold does not pan the timeline."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    cursor = sum(edit_timeline_widget.ax.get_xlim()) / 2
++    edit_timeline_widget._on_mouse_press(
++        Mock(inaxes=edit_timeline_widget.ax, xdata=cursor, x=100)
++    )
++    xlim_before = edit_timeline_widget.ax.get_xlim()
++
++    edit_timeline_widget._on_mouse_motion(Mock(x=100 + DRAG_THRESHOLD_PIXELS))
++
++    assert edit_timeline_widget.ax.get_xlim() == xlim_before
++    assert edit_timeline_widget._dragged is False
++
++
++def test_mouse_release_without_a_prior_press_is_a_noop(
++    loader_with_edited_point,
++):
++    """Releasing without a preceding press on the timeline does nothing."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++
++    edit_timeline_widget._on_mouse_release(Mock())  # should not raise
++
++
++def test_release_without_drag_jumps_to_the_clicked_frame(
++    loader_with_edited_point,
++):
++    """A press+release with no real movement in between is a click.
++
++    Exercises the real ``_on_mouse_press``/``_on_mouse_release`` flow,
++    unlike the ``click_on_timeline`` fixture, which calls
++    ``_handle_click`` directly and so never touches this "was it a
++    click or a drag?" bookkeeping.
++    """
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    edited_frame = 2
++    viewer.dims.current_step = (0,) + viewer.dims.current_step[1:]
++
++    edit_timeline_widget._on_mouse_press(
++        Mock(
++            inaxes=edit_timeline_widget.ax,
++            xdata=edited_frame,
++            x=100,
++            dblclick=False,
++        )
++    )
++    edit_timeline_widget._on_mouse_release(Mock())
++
++    assert viewer.dims.current_step[0] == edited_frame
++
++
++def test_click_on_timeline_with_no_edited_frames_is_a_noop(
++    loader_with_edited_point, click_on_timeline
++):
++    """Clicking the timeline when nothing is flagged does nothing."""
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    edit_timeline_widget._edited_frames = np.array([])
++    viewer.dims.current_step = (0,) + viewer.dims.current_step[1:]
++
++    click_on_timeline(edit_timeline_widget, xdata=2)
++
++    assert viewer.dims.current_step[0] == 0
++
++
++def test_scroll_up_zooms_in_and_down_zooms_out(loader_with_edited_point):
++    """Scrolling up shrinks the visible frame range; down grows it."""
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    xmin, xmax = edit_timeline_widget.ax.get_xlim()
++    cursor = (xmin + xmax) / 2
++
++    edit_timeline_widget._on_scroll(
++        Mock(inaxes=edit_timeline_widget.ax, xdata=cursor, button="up")
++    )
++    zoomed_in_xmin, zoomed_in_xmax = edit_timeline_widget.ax.get_xlim()
++    zoomed_in_span = zoomed_in_xmax - zoomed_in_xmin
++    assert zoomed_in_span < (xmax - xmin)
++
++    edit_timeline_widget._on_scroll(
++        Mock(inaxes=edit_timeline_widget.ax, xdata=cursor, button="down")
++    )
++    zoomed_out_xmin, zoomed_out_xmax = edit_timeline_widget.ax.get_xlim()
++    zoomed_out_span = zoomed_out_xmax - zoomed_out_xmin
++    assert zoomed_out_span > zoomed_in_span
++
++
++@pytest.mark.parametrize(
++    "button",
++    [
++        pytest.param("up", id="zoom_in_floor"),
++        pytest.param("down", id="zoom_out_ceiling"),
++    ],
++)
++def test_scroll_repeatedly_clamps_at_span_limit(
++    loader_with_edited_point, button
++):
++    """Scrolling repeatedly in one direction clamps at that span's limit.
++
++    Zooms in a few times first, so the "zoom out" case has room to
++    actually grow back towards the ceiling -- the timeline opens
++    already fully zoomed out (``_reset_xlim`` runs on construction),
++    so without this, scrolling down would trivially no-op from the
++    start instead of exercising the ceiling clamp.
++    """
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    cursor = sum(edit_timeline_widget.ax.get_xlim()) / 2
++
++    def scroll(direction):
++        edit_timeline_widget._on_scroll(
++            Mock(
++                inaxes=edit_timeline_widget.ax, xdata=cursor, button=direction
++            )
++        )
++
++    for _ in range(3):
++        scroll("up")
++
++    for _ in range(50):  # far more scrolls than needed to hit the limit
++        scroll(button)
++
++    xmin, xmax = edit_timeline_widget.ax.get_xlim()
++    expected_span = (
++        MIN_VISIBLE_FRAMES
++        if button == "up"
++        else max(edit_timeline_widget._max_frame, 1)
++    )
++    assert xmax - xmin == pytest.approx(expected_span)
++
++
++@pytest.mark.parametrize(
++    "event_kwargs",
++    [
++        pytest.param({"inaxes": None, "xdata": 5}, id="outside_axes"),
++        pytest.param({"xdata": None}, id="no_xdata"),
++    ],
++)
++def test_scroll_outside_axes_or_without_xdata_is_a_noop(
++    loader_with_edited_point, event_kwargs
++):
++    """A scroll event outside the timeline, or with no xdata, is ignored."""
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    event_kwargs.setdefault("inaxes", edit_timeline_widget.ax)
++    before = edit_timeline_widget.ax.get_xlim()
++
++    edit_timeline_widget._on_scroll(Mock(button="up", **event_kwargs))
++
++    assert edit_timeline_widget.ax.get_xlim() == before
++
++
++def test_double_click_resets_zoomed_view(
++    loader_with_edited_point, click_on_timeline
++):
++    """Double-clicking the timeline resets it to the full frame range."""
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    full_xlim = edit_timeline_widget.ax.get_xlim()
++    cursor = sum(full_xlim) / 2
++
++    edit_timeline_widget._on_scroll(
++        Mock(inaxes=edit_timeline_widget.ax, xdata=cursor, button="up")
++    )
++    assert (
++        edit_timeline_widget.ax.get_xlim() != full_xlim
++    )  # sanity: actually zoomed
++
++    click_on_timeline(edit_timeline_widget, dblclick=True)
++
++    assert edit_timeline_widget.ax.get_xlim() == full_xlim
++
++
++def test_selecting_non_points_layer_keeps_timeline(loader_with_edited_point):
++    """Selecting an unrelated layer must not blank the timeline.
++
++    Selecting e.g. an image layer previously reset ``active_layer`` to
++    ``None`` and collapsed the frame axis to 0-1; the timeline should
++    instead keep showing the last movement Points layer.
++    """
++    viewer = loader_with_edited_point.viewer
++    edit_timeline_widget = EditTimelineWidget(viewer)
++    points_layer = edit_timeline_widget.active_layer
++    full_xlim = edit_timeline_widget.ax.get_xlim()
++
++    other_layer = viewer.add_image(np.zeros((4, 4)))
++    viewer.layers.selection.active = other_layer
++
++    assert edit_timeline_widget.active_layer is points_layer
++    assert edit_timeline_widget.ax.get_xlim() == full_xlim
++
++
++def test_reselecting_the_active_layer_is_a_noop(
++    loader_with_edited_point, mocker
++):
++    """Re-selecting the layer already shown redraws nothing."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    redraw = mocker.spy(edit_timeline_widget, "_redraw_bars")
++
++    # same active layer as before
++    edit_timeline_widget._on_active_layer_changed()
++
++    redraw.assert_not_called()
++
++
++def test_reconstruct_previously_removed_points_without_a_layer():
++    """No layer means nothing to reconstruct."""
++    assert (
++        EditTimelineWidget._reconstruct_previously_removed_points(None) == []
++    )
++
++
++@pytest.mark.parametrize(
++    "times, removed_idx",
++    [
++        pytest.param([0, 1, 2], 1, id="integer_times_fps1"),
++        pytest.param([0.0, 0.5, 1.0], 1, id="subsecond_times_fps2"),
++        pytest.param([0.0, 0.1, 0.2, 0.3], 2, id="subsecond_times_fps10"),
++        pytest.param([0.0, 0.5, 1.0], 2, id="removed_at_last_frame"),
++    ],
++)
++def test_reconstruct_removed_point_maps_time_to_frame_index(
++    times, removed_idx
++):
++    """A saved removal reconstructs at its frame index, not its time.
++
++    The timeline is indexed by integer frame, but a row's ``time`` is in
++    seconds when ``fps`` is set. A point removed and saved from a dataset
++    with ``fps != 1`` must map back to its ordinal frame position.
++    """
++    n = len(times)
++    is_removed = [i == removed_idx for i in range(n)]
++    properties = pd.DataFrame(
++        {
++            "time": times,
++            "individual": ["id_0"] * n,
++            "position_is_nan": is_removed,
++            "edited": is_removed,
++        }
++    )
++    layer = Mock(metadata={POINTS_PROPERTIES_KEY: properties})
++
++    result = EditTimelineWidget._reconstruct_previously_removed_points(layer)
++
++    assert result == [(removed_idx, "id_0")]
++
++
++def test_reconstruct_previously_removed_points_without_any_removed_ones():
++    """Edited points that were never removed leave nothing to reconstruct."""
++    properties = pd.DataFrame(
++        {
++            "time": [0, 1],
++            "individual": ["id_0", "id_0"],
++            "position_is_nan": [False, False],
++            "edited": [True, False],
++        }
++    )
++    layer = Mock(metadata={POINTS_PROPERTIES_KEY: properties})
++
++    assert (
++        EditTimelineWidget._reconstruct_previously_removed_points(layer) == []
++    )
++
++
++def test_layer_data_changed_ignores_other_layers(
++    loader_with_edited_point, mocker
++):
++    """Data changes on a layer other than the active one are ignored."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    redraw = mocker.spy(edit_timeline_widget, "_redraw_bars")
++
++    edit_timeline_widget._on_layer_data_changed(Mock(source=object()))
++
++    redraw.assert_not_called()
++
++
++def test_moving_a_point_defers_a_redraw(loader_with_edited_point, mocker):
++    """A live drag on the active layer redraws the bars once Qt catches up.
++
++    The redraw is deferred via ``QTimer.singleShot`` so that
++    ``DataLoader``'s own handler (which sets the ``edited`` property
++    this widget reads) runs first; run the callback synchronously here
++    so the test does not need to pump the Qt event loop.
++    """
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    mocker.patch(
++        "movement.napari.edit_timeline_widget.QTimer.singleShot",
++        side_effect=lambda _ms, cb: cb(),
++    )
++    redraw = mocker.spy(edit_timeline_widget, "_redraw_bars")
++
++    edit_timeline_widget._on_layer_data_changed(
++        Mock(
++            source=edit_timeline_widget.active_layer, action=ActionType.CHANGED
++        )
++    )
++
++    redraw.assert_called_once()
++
++
++def test_removing_a_point_captures_it_and_redraws(loader_with_edited_point):
++    """Removing a point on the active layer snapshots it, then redraws.
++
++    The row is about to be deleted from the layer entirely, so its
++    identity is captured while the data is still intact (``REMOVING``
++    fires before the removal actually happens).
++    """
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    assert edit_timeline_widget._removed_points == []
++
++    edit_timeline_widget._on_layer_data_changed(
++        Mock(
++            source=edit_timeline_widget.active_layer,
++            action=ActionType.REMOVING,
++            data_indices=(0,),
++        )
++    )
++
++    assert len(edit_timeline_widget._removed_points) == 1
++
++
++def test_step_changed_leaves_playhead_alone_without_a_current_step(
++    loader_with_edited_point,
++):
++    """No current step (e.g. dims not yet set up) leaves the playhead put."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    xdata_before = list(edit_timeline_widget.playhead.get_xdata())
++    edit_timeline_widget.viewer = Mock(dims=Mock(current_step=()))
++
++    edit_timeline_widget._on_step_changed()
++
++    assert list(edit_timeline_widget.playhead.get_xdata()) == xdata_before
++
++
++def test_playhead_and_bars_follow_the_napari_theme(loader_with_edited_point):
++    """The playhead and edit-bar colours are taken from the napari theme.
++
++    The playhead is the theme's ``secondary`` colour and collapsed bars
++    the theme's ``current`` colour; switching the viewer theme re-styles
++    both live (``_apply_theme`` recreates the bars).
++    """
++    viewer = loader_with_edited_point.viewer
++    viewer.theme = "dark"
++    edit_timeline_widget = EditTimelineWidget(viewer)
++
++    dark = get_theme("dark")
++    assert to_rgba(edit_timeline_widget.playhead.get_color()) == to_rgba(
++        dark.secondary.as_hex()
++    )
++    assert edit_timeline_widget._edit_bar_color == dark.current.as_hex()
++    assert _bar_colors(edit_timeline_widget) == [
++        to_rgba(dark.current.as_hex())
++    ]
++
++    viewer.theme = "light"
++    light = get_theme("light")
++    assert to_rgba(edit_timeline_widget.playhead.get_color()) == to_rgba(
++        light.secondary.as_hex()
++    )
++    assert edit_timeline_widget._edit_bar_color == light.current.as_hex()
++    assert _bar_colors(edit_timeline_widget) == [
++        to_rgba(light.current.as_hex())
++    ]
++
++
++def test_lanes_collapse_by_frame_or_split_by_individual(
++    loader_with_two_edited_individuals,
++):
++    """Lane structure follows the "Display individuals" toggle.
++
++    Collapsed (the default): one bar per edited *frame* (individuals
++    sharing a frame merge into one bar), no y-ticks and no lane
++    dividers. Displaying individuals: one bar per (frame, individual),
++    one y-tick per individual, and a divider between each lane pair.
++    Toggling back collapses everything again.
++    """
++    edit_timeline_widget = EditTimelineWidget(
++        loader_with_two_edited_individuals.viewer
++    )
++    n_individuals = len(
++        set(edit_timeline_widget.active_layer.properties["individual"])
++    )
++
++    # Edits are on frames {2, 5}; frame 2 is shared by both individuals.
++    assert len(edit_timeline_widget._bars) == 2
++    assert list(edit_timeline_widget.ax.get_yticks()) == []
++    assert edit_timeline_widget._lane_dividers == []
++
++    edit_timeline_widget.set_show_individuals(True)
++
++    # (2, id_0), (2, id_1) and (5, id_1) -> three separate bars.
++    assert len(edit_timeline_widget._bars) == 3
++    assert len(edit_timeline_widget.ax.get_yticks()) == n_individuals
++    assert len(edit_timeline_widget._lane_dividers) == n_individuals - 1
++
++    edit_timeline_widget.set_show_individuals(False)
++
++    assert len(edit_timeline_widget._bars) == 2
++    assert edit_timeline_widget._lane_dividers == []
++
++
++def test_bar_colours_follow_display_mode_not_edited_data(
++    loader_with_two_edited_individuals,
++):
++    """Bar colours depend on the display mode, not on what was edited.
++
++    Collapsed: every bar is the napari theme's edit-bar colour,
++    whatever mix of individuals or keypoints was edited. Displaying
++    individuals: each bar takes its individual's face colour, read
++    straight from the Points layer. Toggling the option off restores
++    the single colour.
++    """
++    edit_timeline_widget = EditTimelineWidget(
++        loader_with_two_edited_individuals.viewer
++    )
++    single = to_rgba(edit_timeline_widget._edit_bar_color)
++
++    assert _bar_colors(edit_timeline_widget) == [single, single]
++
++    edit_timeline_widget.set_show_individuals(True)
++    layer = edit_timeline_widget.active_layer
++    # Paint each individual a known, distinctive colour; then redraw.
++    # Bars must come back as these exact colours
++    known = {"id_0": (1.0, 0.0, 0.0, 1.0), "id_1": (0.0, 0.0, 1.0, 1.0)}
++    layer.face_color = np.array(
++        [known[ind] for ind in layer.properties["individual"]]
++    )
++    edit_timeline_widget._redraw_bars()
++
++    # id_0 edited on frame 2; id_1 on frames 2 and 5, so  red once, blue twice.
++    assert sorted(_bar_colors(edit_timeline_widget)) == pytest.approx(
++        sorted([known["id_0"], known["id_1"], known["id_1"]])
++    )
++
++    edit_timeline_widget.set_show_individuals(False)
++    assert _bar_colors(edit_timeline_widget) == [single, single]
++
++
++def test_bar_color_lookup_falls_back_without_individual_property(
++    loader_with_edited_point,
++):
++    """Falls back to the shared edit colour if there's no individual data."""
++    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
++    edit_timeline_widget._show_individuals = True
++    edit_timeline_widget.active_layer = Mock(properties={})
++
++    color_of = edit_timeline_widget._bar_color_lookup()
++
++    assert color_of("id_0") == edit_timeline_widget._edit_bar_color
+diff --git a/tests/test_unit/test_napari_plugin/test_meta_widget.py b/tests/test_unit/test_napari_plugin/test_meta_widget.py
+index c226af9442..40d95143a9 100644
+--- a/tests/test_unit/test_napari_plugin/test_meta_widget.py
++++ b/tests/test_unit/test_napari_plugin/test_meta_widget.py
+@@ -1,5 +1,9 @@
+ """Test the napari plugin meta widget."""
+ 
++import numpy as np
++import pytest
++from napari.layers.base import ActionType
++
+ from movement.napari.meta_widget import MovementMetaWidget
+ 
+ 
+@@ -8,16 +12,273 @@ def test_meta_widget_instantiation(make_napari_viewer_proxy):
+     viewer = make_napari_viewer_proxy()
+     meta_widget = MovementMetaWidget(viewer)
+ 
+-    assert len(meta_widget.collapsible_widgets) == 3
++    # number of collapsible widgets
++    assert len(meta_widget.collapsible_widgets) == 4
++    assert meta_widget.edit_timeline_widget is None
+ 
+     first_widget = meta_widget.collapsible_widgets[0]
+     assert first_widget._text == "Load tracked data"
+     assert first_widget.isExpanded()
+ 
+     second_widget = meta_widget.collapsible_widgets[1]
+-    assert second_widget._text == "Define regions of interest"
++    assert second_widget._text == "Edit tracked data"
+     assert not second_widget.isExpanded()
+ 
+     third_widget = meta_widget.collapsible_widgets[2]
+     assert third_widget._text == "Save tracked data"
+     assert not third_widget.isExpanded()
++
++    fourth_widget = meta_widget.collapsible_widgets[3]
++    assert fourth_widget._text == "Define regions of interest"
++    assert not fourth_widget.isExpanded()
++
++
++def test_edit_timeline_widget_collapsable_roundtrip(
++    make_napari_viewer_proxy,
++):
++    """Expand, collapse, then re-expand the "Edit tracked data" section."""
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    edit_timeline_collapsible = meta_widget.collapsible_widgets[1]
++
++    edit_timeline_collapsible.expand(animate=False)
++    assert meta_widget.edit_timeline_widget is not None
++    assert not meta_widget._edit_timeline_dock_widget.isHidden()
++
++    edit_timeline_collapsible.collapse(animate=False)
++    assert (
++        meta_widget.edit_timeline_widget is not None
++    )  # not torn down, just hidden
++    assert meta_widget._edit_timeline_dock_widget.isHidden()
++
++    edit_timeline_collapsible.expand(animate=False)
++    assert not meta_widget._edit_timeline_dock_widget.isHidden()
++
++
++def test_closing_edit_timeline_dock_via_its_x_resets_state(
++    make_napari_viewer_proxy,
++):
++    """Closing the docked timeline via its title-bar "X" resets state.
++
++    ``_on_edit_timeline_dock_gone`` is connected to the dock widget's
++    ``destroyed`` signal (see ``MovementMetaWidget.__init__``), which
++    fires when napari tears the dock down after the user closes it that
++    way -- unlike collapsing the "Edit tracked data" section, which
++    only hides it (see ``test_edit_timeline_widget_collapsable_roundtrip``).
++    """
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    edit_timeline_collapsible = meta_widget.collapsible_widgets[1]
++    edit_timeline_collapsible.expand(animate=False)
++    assert meta_widget.edit_timeline_widget is not None
++
++    meta_widget._on_edit_timeline_dock_gone()
++
++    assert meta_widget.edit_timeline_widget is None
++    assert meta_widget._edit_timeline_dock_widget is None
++    assert not edit_timeline_collapsible.isExpanded()
++
++
++def test_show_individuals_checkbox_edit_timeline_widget(
++    make_napari_viewer_proxy,
++):
++    """The sidebar checkbox controls the docked timeline's lane display."""
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    edit_timeline_collapsible = meta_widget.collapsible_widgets[1]
++    edit_timeline_collapsible.expand(animate=False)
++
++    meta_widget.edit_controls.show_individuals_checkbox.setChecked(True)
++    assert meta_widget.edit_timeline_widget._show_individuals is True
++
++    meta_widget.edit_controls.show_individuals_checkbox.setChecked(False)
++    assert meta_widget.edit_timeline_widget._show_individuals is False
++
++
++@pytest.mark.parametrize(
++    "individuals, expect_enabled",
++    [
++        pytest.param(["id_0"], False, id="single_individual"),
++        pytest.param(["id_0", "id_1"], True, id="multiple_individuals"),
++    ],
++)
++def test_show_individuals_checkbox_enabled_only_for_multiple(
++    make_napari_viewer_proxy, add_movement_points, individuals, expect_enabled
++):
++    """Disable "Display individuals" for single-individual datasets."""
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    checkbox = meta_widget.edit_controls.show_individuals_checkbox
++
++    assert not checkbox.isEnabled()  # nothing loaded yet
++
++    layer = add_movement_points(viewer, individuals)
++    viewer.layers.selection.active = layer
++
++    assert checkbox.isEnabled() is expect_enabled
++
++
++def test_show_individuals_enabled_noop_without_a_movement_layer(
++    make_napari_viewer_proxy, add_movement_points
++):
++    """Selecting a non-movement layer leaves the checkbox state untouched.
++
++    ``_show_individuals_enabled`` fires on every active-layer change,
++    but with no movement Points layer left to check for individuals it
++    has nothing to enable/disable for and must return early -- without
++    that guard it would crash reading ``.properties`` off ``None``.
++    """
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    checkbox = meta_widget.edit_controls.show_individuals_checkbox
++
++    multi = add_movement_points(viewer, ["id_0", "id_1"])
++    viewer.layers.selection.active = multi
++    assert checkbox.isEnabled()  # sanity: enabled for multi-individual data
++
++    viewer.layers.remove(multi)
++    other = viewer.add_points(np.zeros((1, 2)))  # not a movement layer
++    viewer.layers.selection.active = other
++
++    assert checkbox.isEnabled()  # unchanged: no movement layer to check
++
++
++def test_show_individuals_unchecked_when_switching_to_single(
++    make_napari_viewer_proxy, add_movement_points
++):
++    """Switching to a single-individual layer clears an active check."""
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    checkbox = meta_widget.edit_controls.show_individuals_checkbox
++
++    multi = add_movement_points(viewer, ["id_0", "id_1"])
++    viewer.layers.selection.active = multi
++    checkbox.setChecked(True)
++
++    single = add_movement_points(viewer)
++    viewer.layers.selection.active = single
++
++    assert not checkbox.isEnabled()
++    assert not checkbox.isChecked()
++
++
++def test_expanding_edit_section_autoselects_points_layer(
++    make_napari_viewer_proxy, add_movement_points
++):
++    """Expanding the section makes a movement Points layer active."""
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    edit_timeline_collapsible = meta_widget.collapsible_widgets[1]
++
++    points_layer = add_movement_points(viewer)
++    # An unrelated layer stealing the active selection.
++    other_layer = viewer.add_points(np.zeros((1, 2)))
++    viewer.layers.selection.active = other_layer
++
++    edit_timeline_collapsible.expand(animate=False)
++
++    assert viewer.layers.selection.active.name == points_layer.name
++    assert (
++        meta_widget.edit_timeline_widget.active_layer.name == points_layer.name
++    )
++
++
++def test_expanding_edit_section_keeps_movement_layer_active(
++    make_napari_viewer_proxy, add_movement_points
++):
++    """A movement Points layer already active is left selected."""
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    edit_timeline_collapsible = meta_widget.collapsible_widgets[1]
++
++    add_movement_points(viewer)
++    second_layer = add_movement_points(viewer)
++    viewer.layers.selection.active = second_layer
++
++    edit_timeline_collapsible.expand(animate=False)
++
++    assert viewer.layers.selection.active.name == second_layer.name
++
++
++@pytest.mark.parametrize(
++    "edited, pre_expanded",
++    [
++        pytest.param(False, True, id="no_edits_forces_collapse"),
++        pytest.param(True, True, id="prior_edits_still_collapse"),
++    ],
++)
++def test_edit_section_stays_collapsed_on_load(
++    make_napari_viewer_proxy, add_movement_points, edited, pre_expanded
++):
++    """Loading a layer always collapses the edit timeline section.
++
++    Prior edits in the dataset no longer auto-open the section; it
++    only opens once a point is edited in this session. A manual open
++    is overridden on load.
++    """
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    edit_timeline_collapsible = meta_widget.collapsible_widgets[1]
++    if pre_expanded:
++        edit_timeline_collapsible.expand(
++            animate=False
++        )  # simulate a manual open
++    else:
++        assert (
++            not edit_timeline_collapsible.isExpanded()
++        )  # collapsed by default
++
++    add_movement_points(viewer, edited=[edited])
++
++    assert not edit_timeline_collapsible.isExpanded()
++
++
++@pytest.mark.parametrize(
++    "action, expect_expanded",
++    [
++        pytest.param(ActionType.CHANGED, True, id="drag_expands"),
++        pytest.param(ActionType.REMOVING, True, id="remove_expands"),
++        pytest.param(ActionType.ADDED, False, id="add_does_not_expand"),
++    ],
++)
++def test_editing_points_expands_edit_section(
++    make_napari_viewer_proxy,
++    add_movement_points,
++    mocker,
++    action,
++    expect_expanded,
++):
++    """Editing a point opens the section, but only while it is collapsed.
++
++    Dragging or removing a point expands the "Edit tracked data" section;
++    a repeat edit must not re-expand an already-open one (which would
++    replay the open animation on every edit).
++    """
++    # ``_on_points_edited`` defers the expand via ``QTimer.singleShot``;
++    # run the callback synchronously so the test does not pump the loop.
++    mocker.patch(
++        "movement.napari.meta_widget.QTimer.singleShot",
++        side_effect=lambda _ms, cb: cb(),
++    )
++    viewer = make_napari_viewer_proxy()
++    meta_widget = MovementMetaWidget(viewer)
++    edit_timeline_collapsible = meta_widget.collapsible_widgets[1]
++    # Spy on this collapsible's expand specifically
++    expand = mocker.spy(edit_timeline_collapsible, "expand")
++
++    layer = add_movement_points(viewer)
++    assert not edit_timeline_collapsible.isExpanded()
++
++    def edit():
++        layer.events.data(
++            value=layer.data,
++            action=action,
++            data_indices=(0,),
++            vertex_indices=((),),
++        )
++
++    edit()
++    assert edit_timeline_collapsible.isExpanded() is expect_expanded
++
++    edit()  # A repeat edit should not re-expand the collapsible
++    assert expand.call_count == (1 if expect_expanded else 0)

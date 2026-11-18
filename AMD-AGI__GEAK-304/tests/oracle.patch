@@ -1,0 +1,542 @@
+diff --git a/e2e_workflow/e2e_workflow.js b/e2e_workflow/e2e_workflow.js
+index dcfe43912..3e58c0bb6 100644
+--- a/e2e_workflow/e2e_workflow.js
++++ b/e2e_workflow/e2e_workflow.js
+@@ -104,6 +104,12 @@ const HEAD_AUTHOR_MAX = parseInt(A.head_author_max != null ? A.head_author_max :
+ // hits a harness fault / no-win / extraction failure, the orchestrator LOUDLY flags it (and still tries
+ // the author route when a plan exists) instead of dropping the biggest lever on the floor. Default 30%.
+ const HEAD_PROTECT_PCT = parseFloat(A.head_protect_pct != null ? A.head_protect_pct : 30);
++// FAST-MODE ONLY head priority (opt-in, default ''=OFF): a regex matched against each head candidate's
++// op_kind/short_name/name; matching heads are pulled to the FRONT of the head queue BEFORE the budget
++// slice, so e.g. head_priority="gemm" guarantees the dense/scaled-GEMM head is selected AND
++// integrated/stacked FIRST. Applied ONLY when FAST_MODE is on (see the heads[] construction below);
++// default '' leaves every mode (default/fast/deep) byte-identical.
++const HEAD_PRIORITY = String(A.head_priority != null ? A.head_priority : '').trim();
+ // ---- DEEP MODE (opt-in, default OFF) ----------------------------------------------------------------
+ // A long, thorough HeadKernel mode that pursues SOTA per head op via CROSS-BACKEND CO-OPTIMIZATION:
+ // N backends optimize the SAME head op in parallel (one exclusive GPU lane each), continuously
+@@ -730,7 +736,18 @@ const history = ST.history || { insights: [], ledger: [], milestones: [], bottle
+ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+   phase('HeadKernel');
+   log(`Head-kernel track: ${headQueue.length} candidate op(s), head_budget=${HEAD_BUDGET}, threshold=${HEAD_THRESHOLD_PCT}%.`);
+-  const heads = headQueue.slice(0, HEAD_BUDGET).map((c, i) => ({
++  // FAST-MODE head priority: pull HEAD_PRIORITY-matching ops to the front BEFORE the budget slice, so the
++  // prioritized op (e.g. "gemm") is guaranteed selected and gated/stacked FIRST. Gated on FAST_MODE ->
++  // default/deep are byte-identical. Array.sort is stable: non-matches keep their Amdahl order, and among
++  // matches the original order is preserved (only the matched group is promoted ahead of the rest).
++  let _hq = headQueue;
++  if (FAST_MODE && HEAD_PRIORITY) {
++    const _re = new RegExp(HEAD_PRIORITY, 'i');
++    const _isPri = (c) => _re.test(`${c.op_kind || ''} ${c.short_name || ''} ${c.name || ''}`);
++    _hq = headQueue.slice().sort((a, b) => (_isPri(b) ? 1 : 0) - (_isPri(a) ? 1 : 0));
++    log(`[fast-mode] head_priority='${HEAD_PRIORITY}': ${_hq.filter(_isPri).length}/${_hq.length} head(s) match; integrate order=[${_hq.slice(0, HEAD_BUDGET).map((c) => c.short_name || c.op_kind || 'op').join(', ')}].`);
++  }
++  const heads = _hq.slice(0, HEAD_BUDGET).map((c, i) => ({
+     ...c, idx: i, gpu_id: GPU_LIST[i % GPU_LIST.length],
+     short_name: c.short_name || `${c.op_kind || 'op'}${i}`,
+   }));
+diff --git a/e2e_workflow/knowledge/gemm_attention_backends.md b/e2e_workflow/knowledge/gemm_attention_backends.md
+index 647ab55ff..cccff9ba1 100644
+--- a/e2e_workflow/knowledge/gemm_attention_backends.md
++++ b/e2e_workflow/knowledge/gemm_attention_backends.md
+@@ -158,7 +158,7 @@ e2e parity**; if it fails on a non-quant change, flag it for an accuracy eval (s
+ |---|---|---|---|---|---|
+ | dense GEMM | prefill (large M) | aiter(DB, races hipBLASLt/asm/**flydsl**) → hipBLASLt → CK → flydsl | aiter per-shape DB tune | **flydsl** author → Triton author (epilogue fuse / split-K) | fp8 |
+ | dense GEMM | decode (M=batch) | aiter(DB, +flydsl split-K) → hipBLASLt → flydsl | aiter per-shape DB tune | **flydsl**/Triton split-K author | fp8 |
+-| dense GEMM (fp8 a8w8) | prefill/decode | aiter blockscale (CK/asm/**flydsl**) → flydsl_preshuffle_gemm_a8 | aiter DB tune (libtype=flydsl) | **flydsl** author (`flydsl_preshuffle_gemm_a8` baseline) | — (already fp8) |
++| dense GEMM (fp8 a8w8 blockscale, sglang) | prefill/decode | **CK skill `gemm_tuning/fp8_gemm_tuning_sglang_aiter.md` (MANDATED this eval)** — capture (M,N,K) → aiter CK tuner → fp8_utils Triton→CK switch + `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE` | CK tuner (`gemm_a8w8_blockscale_tune.py --libtype both --mp <all GPUs>`) | — (Triton-overlay / flydsl / aiter-bf16 levers FORBIDDEN here; they bypass the skill) | — (already fp8) |
+ | paged attention | prefill | CK → triton → aiter | instance / FA autotune | triton FA rewrite | kv fp8 |
+ | paged attention | decode | aiter → triton → CK | page-size / FA autotune | triton FA rewrite | kv fp8 |
+ 
+diff --git a/e2e_workflow/knowledge/gemm_tuning/fp8_gemm_tuning_sglang_aiter.md b/e2e_workflow/knowledge/gemm_tuning/fp8_gemm_tuning_sglang_aiter.md
+new file mode 100644
+index 000000000..a7d33bb96
+--- /dev/null
++++ b/e2e_workflow/knowledge/gemm_tuning/fp8_gemm_tuning_sglang_aiter.md
+@@ -0,0 +1,338 @@
++---
++name: fp8-gemm-tuning-sglang-aiter
++description: Use when trying to optimize end-to-end SGLang performance with gemm tuning for FP8 models on AMD HIP/ROCm by replacing the default Triton GEMM backend with a tuned Composable Kernel (CK) path through aiter; this skill is the verified playbook for that entire process, using FP8 block-wise GEMM (gemm_a8w8_blockscale) as the primary worked example—GEMM shape/dispatch logging in SGLang, CK composable-kernel tuning, and AITER_CONFIG_GEMM_A8W8_BLOCKSCALE CSV integration. FP8 blockscale and bpreshuffle should also apply by switch the place for dumping gemm and the ck tool used for tuning. 
++---
++
++# FP8 block-wise GEMM tuning (SGLang + aiter)
++
++## Overview
++
++This workflow tunes **FP8 block-scaled GEMM** used on **HIP/AMD** when SGLang runs with **aiter** (`SGLANG_USE_AITER=1`). Stock SGLang **≥ 0.5.6** often routes block FP8 through **Triton** (`aiter.ops.triton.gemm_a8w8_blockscale`) when aiter is enabled. To use **CK** (`aiter.gemm_a8w8_blockscale`) with a tuned kernel table, you pin aiter, capture **(M, N, K)** from a representative server run by **implementing GEMM shape dump and dispatch logging in §5–§6** (trace the path in §4 first), run **aiter’s CK tuner**, point **`AITER_CONFIG_GEMM_A8W8_BLOCKSCALE`** at the produced CSV, and switch imports in **`fp8_utils.py`** so the CK symbol is used. Then rerun the same serving/benchmark pipeline and compare logs to baseline.
++
++**Assumptions:** ROCm/HIP GPU, Python env where SGLang and aiter are importable from the workload script, and write access to the **SGLang** sources you run when adding §5 hooks.
++
++Similar steps could potentially apply to ck bpreshuffle gemm, etc. 
++
++---
++
++## 1. Resolve SGLang and aiter paths; verify versions
++
++- From the workload script (for example a launch wrapper), read **`PYTHONPATH`**, **`VIRTUAL_ENV`**, explicit **`python -m sglang`**, or `which python3` to find which **SGLang** and **aiter** trees are used.
++- **SGLang:** require **≥ 0.5.6** (block FP8 + aiter integration expectations in this workflow). Check with `pip show sglang` or `python -c "import sglang; print(getattr(sglang, '__version__', 'unknown'))"`.
++- **aiter:** require a checkout **at or after** commit `303a583c89fe392a39cad7e45d616cc43bde3278`. If the current commit is not a descendant to this commit, you must update the repo either wise issues like systemetic crash could happen. If this commit does not exsit, run git pull command to update the commit info. **THIS IS IMPORTANT**
++
++---
++
++## 2. Pin aiter to the required commit (if the required commit is not an ancestor of current HEAD, or it is not found in local)
++
++Run inside the **aiter** repository root:
++
++```bash
++git pull
++git checkout 303a583c89fe392a39cad7e45d616cc43bde3278
++git submodule sync && git submodule update --init --recursive
++# Clean JIT build artifacts before rebuild
++rm -rf aiter/jit/*.so
++rm -rf aiter/jit/build/*
++python setup.py develop
++```
++
++Confirm: `git rev-parse HEAD` prints `303a583c89fe392a39cad7e45d616cc43bde3278` (or a descendant if you intentionally stay on newer HEAD after verifying compatibility).
++
++---
++
++## 3. Baseline end-to-end performance
++
++- Run the **same** pipeline you will use after tuning: start **`launch_server`** (or equivalent), then **bench_serving** / your benchmark; capture **server log** and **benchmark output** (latency, throughput, tokens/s, etc.).
++- Store logs under a timestamped directory for **before/after** comparison.
++
++---
++
++## 4. Understand which GEMM path SGLang uses (read code; do not assume)
++
++- On HIP with `SGLANG_USE_AITER=1`, inspect sglang library **`python/sglang/srt/layers/quantization/fp8_utils.py`** inside the `_use_aiter` block: imports decide whether **`gemm_a8w8_blockscale`** comes from **`aiter`** (CK) or **`aiter.ops.triton.gemm_a8w8_blockscale`** (Triton).
++- **Typical SGLang ≥ 0.5.6:** Triton blockscale import is active; CK import is commented. **Different SGLang revisions may differ**—always read the file you actually run.
++
++---
++
++## 5. GEMM shape finding and dumping support (SGLang edits)
++
++CK tuning needs a faithful list of **(M, N, K)** (and related metadata such as dtype) from runs of **your** workload. In the **SGLang** tree that actually runs **`launch_server`**, add support for two env-driven toggles:
++
++- **`SGLANG_DUMP_AITER_FP8_GEMM_SHAPES`:** when enabled, the server log must contain parseable GEMM shape information for downstream steps—commonly lines tagged **`[GEMM_shape_dump]`** with a **`csv_row: M,N,K,...`** suffix (or an equivalent format you document for §7–§8).
++- **`SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH`:** when enabled, emit a concise log that identifies which **`w8a8_block_fp8_linear`** implementation the process is using, so you can cross-check against **§4** (CK vs Triton vs other).
++
++**Implementation approach recommandation:** use **§4** to locate the real block-FP8 / aiter execution path in the checkout, add the smallest set of hooks that fire for the tensors that define **M, N, K**, and keep logging volume sane (for example rank 0 only, or rate-limited if hot).
++
++**Reference implementation** (from a working HIP + aiter layout; **adapt** paths, imports, and callsites to the SGLang version you run—the snippets illustrate behavior, not the only valid layout):
++
++```python
++# fp8_utils.py — add near other FP8 helpers (needs: prod, get_bool_env_var, logger)
++def log_aiter_fp8_gemm_shape_dump(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    block_size: Optional[List[int]] = None,
++    layer_prefix: str = "",
++) -> None:
++    if not get_bool_env_var("SGLANG_DUMP_AITER_FP8_GEMM_SHAPES"):
++        return
++    try:
++        from sglang.srt.distributed import get_tensor_model_parallel_rank
++        if get_tensor_model_parallel_rank() != 0:
++            return
++    except Exception:
++        pass
++    if x.dim() < 2:
++        M, K = int(x.numel()), 1
++    else:
++        M = int(prod(x.shape[:-1]))
++        K = int(x.shape[-1])
++    N = int(weight.shape[0])
++    K_w = int(weight.shape[1])
++    block_msg = f" block_size={block_size}" if block_size is not None else ""
++    prefix_msg = f" layer.prefix={layer_prefix!r}" if layer_prefix else ""
++    csv_row = f"{M},{N},{K_w},{weight.dtype}"
++    logger.warning(
++        "[GEMM_shape_dump] aiter FP8 block GEMM path%s%s | x.shape=%s weight.shape=%s | "
++        "M=%d N=%d K=%d (aiter gemm_a8w8_blockscale / bpreshuffle tune CSV) | csv_row: %s",
++        prefix_msg, block_msg, tuple(x.shape), tuple(weight.shape), M, N, K_w, csv_row,
++    )
++```
++
++```python
++# fp8.py — import the helper from fp8_utils, then before aiter_w8a8_block_fp8_linear(...):
++if self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear:
++    log_aiter_fp8_gemm_shape_dump(
++        x=x[0],  # or x when not a tuple
++        weight=layer.weight,
++        block_size=self.quant_config.weight_block_size,
++        layer_prefix=getattr(layer, "prefix", ""),
++    )
++```
++
++```python
++# fp8.py — Fp8LinearMethod.__init__, after self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
++if self.block_quant and get_bool_env_var("SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH"):
++    _fn = self.w8a8_block_fp8_linear
++    print_warning_once(
++        "[Fp8LinearMethod] block_quant w8a8_block_fp8_linear="
++        f"{getattr(_fn, '__qualname__', repr(_fn))} ({getattr(_fn, '__module__', '?')})"
++    )
++```
++
++If your tree differs, reproduce the **same contract** (env-gated shape lines + env-gated dispatch identity) rather than copying file names blindly.
++
++---
++
++## 6. Enable the new env toggles; collect server log
++
++Now that we have made gemm logging possible, add the following flags used to start SGLang:
++
++```bash
++export SGLANG_DUMP_AITER_FP8_GEMM_SHAPES=1
++export SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH=1
++```
++
++Run your workload again (same scenario you will tune). **Validate** that **`server.log`** (or your log path) reflects **`SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH`** (whatever identity string your §5 hook emits) and contains **`[GEMM_shape_dump]`** with **`csv_row:`** for the hot path. If either is missing, return to §§4–5 before continuing.
++
++---
++
++## 7. Parse GEMM shapes from the server log for tuning
++
++**Goal:** Turn the noisy **§6** server log into a **small, deduplicated** artifact that lists every **GEMM problem** you need to tune—at minimum **(M, N, K)**, plus **whatever else** you chose to log in **§5** if the tuner or kernels need it (activation/weight layout hints, **dtype**, block-scale geometry, **bias** presence, layer name, and so on).
++
++**Responsibilities**
++
++- **Parse** lines emitted under **`SGLANG_DUMP_AITER_FP8_GEMM_SHAPES`** (whatever format **§5** uses—often a stable tag plus a **`csv_row:`**-style payload, but the contract is yours as long as **§8** can read it).
++- **Normalize** fields into a consistent representation for the next step (strip tqdm/progress junk on the same physical line if needed).
++- **Deduplicate** so each distinct tuning key appears once; pick a key that matches how you will build the **untuned** input for **`gemm_a8w8_blockscale_tune.py`** in **§8** (for many flows that is unique **(M, N, K)**; include more columns in the key if you logged extra dimensions that affect kernel choice).
++- **Write** the result to a file you own (for example a cleaned log or CSV path) and treat it as the handoff into **§8**—adjust **§8**’s CSV builder if you used a minimal format instead of full log lines.
++
++If the artifact is empty or obviously incomplete, fix **§5–§6** before running the tuner.
++
++---
++
++## 8. CK tuning with aiter’s blockscale GEMM tuner
++
++Work in the **aiter** checkout from §1–§2. The Composable Kernel entry point for this workflow typically lives under:
++
++**`$AITER_ROOT/csrc/ck_gemm_a8w8_blockscale/`**
++
++There you should find **`gemm_a8w8_blockscale_tune.py`** (names may vary slightly by aiter revision). **Do not rely on workspace-specific wrapper scripts**; treat the aiter tree as the source of truth.
++
++**What should do**
++
++1. **Read the tuner and its CLI**  
++   Open **`gemm_a8w8_blockscale_tune.py`** and any helpers it imports (for example **`GemmCommonTuner`** / **`mp_tuner`** under **`aiter/utility/`**). Run **`python3 gemm_a8w8_blockscale_tune.py --help`** in that directory after setting **`PYTHONPATH`** so **`import aiter`** resolves (typically **`export PYTHONPATH="$AITER_ROOT:${PYTHONPATH}"`**). Note **input** / **output** file flags, **`--libtype`** (e.g. **`ck`**, **`cktile`**, **`both`**), **`--mp`** (worker count for **`mp_tuner`**—set this to use **all** GPUs you intend to parallelize across, not one, unless you are debugging), and whether **split-K** search (e.g. a **`-k`** flag) is optional and expensive.
++
++2. **Build the untuned shape CSV from §7**  
++   The tuner’s **`-i`** input is usually an **untuned** CSV of unique **(M, N, K)** rows (often with an **`M,N,K`** header—confirm with **`--help`** and any aiter docs). Convert the **§7** artifact into that CSV: extract the triples (and drop columns you do not need) in whatever way matches the format **§5** chose and the tuner expects.
++
++3. **Run tuning on a GPU host**  
++   **`cd`** into **`csrc/ck_gemm_a8w8_blockscale`**, ensure ROCm/PyTorch **sees every GPU** you want the tuner to use (for example leave **`HIP_VISIBLE_DEVICES`** / **`CUDA_VISIBLE_DEVICES`** unset, or set them to the full set you intend). Invoke the tuner with your untuned CSV as **`-i`** and your desired tuned CSV path as **`-o`**. **Parallelize across all of those devices:** set **`--mp`** to the **full visible device count** (or the explicit parallelism the tuner’s **`--help`** documents), not a single GPU by default—the **§3–§6** workload may have run at **TP&nbsp;< host GPU count**; tuning should still exploit **every** available accelerator to shorten wall time on large shape lists. A typical invocation shape (flags are illustrative—**confirm against `--help`**):
++
++   ```bash
++   export AITER_ROOT=/path/to/aiter
++   export PYTHONPATH="${AITER_ROOT}:${PYTHONPATH:-}"
++   cd "${AITER_ROOT}/csrc/ck_gemm_a8w8_blockscale"
++   # ROCm: PyTorch still exposes devices via torch.cuda.device_count(); use all visible GPUs for --mp.
++   NGPU="$(python3 -c 'import torch; print(torch.cuda.device_count() or 1)')"
++   python3 gemm_a8w8_blockscale_tune.py -i /path/to/untuned_mnk.csv -o /path/to/a8w8_blockscale_tuned_gemm.csv --libtype both --mp "${NGPU}"
++   ```
++
++---
++
++## 9. Switch SGLang to CK `gemm_a8w8_blockscale` (not Triton)
++
++In **`fp8_utils.py`**, inside `if _use_aiter:`:
++
++- **Use CK:** import `gemm_a8w8_blockscale` from **`aiter`** together with `gemm_a8w8_bpreshuffle`, `get_hip_quant`.
++- **Stop using Triton blockscale:** comment out `from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale`.
++
++Target pattern:
++
++```python
++from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
++# from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
++```
++
++(Revert or guard behind a local branch if you need to compare Triton vs CK quickly.)
++
++### 9.1 CRITICAL — the activation-scale LAYOUT is per-kernel; match it to CK (do not assume)
++
++This is the single most dangerous, silent failure in this whole flow. The per-token activation scale
++has a **memory layout that each aiter kernel fixes**, and you MUST feed CK the layout *it* expects:
++
++- `aiter.ops.triton.gemm_a8w8_blockscale` (Triton) → **non-transposed** scale.
++- `aiter.gemm_a8w8_blockscale` (plain CK, the kernel this skill switches to) → **non-transposed** scale.
++- `gemm_a8w8_blockscale_bpreshuffle` (the stock non-Triton kernel) → **transposed** scale.
++
++Stock sglang `fp8_utils` computes `transpose_scale = not use_triton`, i.e. it produces the **transposed**
++layout for the non-Triton path — correct for *bpreshuffle*, **WRONG for plain CK**. If you switch the
++kernel to CK but leave that logic, every **multi-token (M≥2)** GEMM gets scrambled per-token scales →
++**~19% error → garbage output / accuracy collapse**, while the tuner's `errRatio` stays 0 and an **M=1
++smoke test looks perfectly fine** (transposing a 1-row scale is a no-op). This is exactly how a
++"fast but wrong" config ships undetected.
++
++**Do not hard-code the layout — DETECT it.** The correct value is aiter-version / kernel / GPU-arch
++coupled, so verify it empirically every run with a tiny check: run the CK kernel in BOTH scale layouts
++and compare each against the **Triton** kernel (the production-correct reference) at **M≥2**, on
++identical inputs. Run this in a scratch script on one GPU (no server, seconds). The reference must be a
++**single, layout-independent** result — derive it from Triton (or from an fp32 dequant of the
++*non-transposed* quantization); do NOT re-derive the reference from each layout's own scale tensor, or
++the wrong layout will falsely "match" itself.
++
++```python
++# scratch check — pick the activation-scale layout the CK kernel actually wants. M MUST be >=2.
++import torch, aiter
++from aiter import get_hip_quant
++from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale as triton_gemm
++ck = aiter.gemm_a8w8_blockscale
++qa = get_hip_quant(aiter.QuantType.per_1x128); FP8 = aiter.dtypes.fp8; FP8_MAX = 240.0  # e4m3fnuz
++relerr = lambda a, b: ((a.float()-b.float()).norm()/(b.float().norm()+1e-9)).item()
++M, (N, K) = 16, (5120, 5120)                      # use a LIVE (N,K) from §7; repeat per family
++w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / K**0.5
++wf = w.float().reshape(N//128,128,K//128,128); s = wf.abs().amax((1,3),keepdim=True).clamp(min=1e-8)/FP8_MAX
++wq = (wf/s).clamp(-FP8_MAX,FP8_MAX).to(FP8).reshape(N,K); ws = s.reshape(N//128,K//128).contiguous()
++x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) / K**0.5
++xq, xs = qa(x, quant_dtype=FP8, transpose_scale=False)
++ref = triton_gemm(xq, wq, xs, ws, dtype=torch.bfloat16)            # ONE fixed, trusted reference
++for flag in (False, True):
++    xqi, xsi = qa(x, quant_dtype=FP8, transpose_scale=flag)
++    print(f"transpose_scale={flag}:", relerr(ck(xqi, wq, xsi, ws, dtype=torch.bfloat16), ref))
++```
++
++Decision:
++- Pick the `transpose_scale` whose rel-err is ~0 (≈1e-3). Set the CK path in `fp8_utils` to that value
++  (and make the `input_scale is not None` branch consistent — e.g. do NOT transpose for CK if the winner
++  is `transpose_scale=False`).
++- If **both** layouts give large error for these shapes, CK is numerically broken here → **do not deploy
++  CK; keep the Triton baseline** (a faster-but-wrong server is a regression).
++
++For the aiter build this skill was validated against, the winner is **`transpose_scale=False`**
++(non-transposed). Treat that as the expected-but-unverified default — the check above is the source of
++truth, because at **M=1 both layouts look identical** (transposing a 1-row scale is a no-op), so this
++must be checked at M≥2.
++
++---
++
++## 10. Point aiter at the tuned CSV; rerun and compare
++
++```bash
++export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=/path/to/ck_gemm_json_out/a8w8_blockscale_tuned_gemm.csv
++```
++
++Restart SGLang with the **same** model, TP, concurrency, and benchmark flags as the baseline. Compare **e2e latency / throughput** and server logs to the baseline from §3. You should see improved performance when the hot shapes are covered by the CSV and the CK path is active.
++
++Example env block (from a working script): `GEMM_tuning_test4/run_sglang_test_fff.sh` (shape/dispatch exports assume the §5 patches are in the SGLang tree that script runs; tune `AITER_CONFIG_...` separately). NOTE: that reference script launches **stock Triton** (no CK env/overlay) — it is a *baseline* launch, not the CK candidate. Do not use a stock launch to "validate" the CK candidate (see §10.1).
++
++### 10.1 MANDATORY correctness check — output parity on the ENGAGED CK server, at M≥2
++
++Throughput and the tuner's `errRatio` are **NOT** correctness signals — a numerically-broken CK path
++runs at full speed and `errRatio` stays 0. Before reporting any speedup, confirm the CK swap is
++numerically sound with an **output-parity check on the exact CK-engaged server**:
++
++1. **Same-server, same-config.** Launch ONE server with the CK switch + `AITER_CONFIG_...` engaged, and
++   measure against *that* server. Never validate on a separately-launched **stock** server — it silently
++   runs Triton and "passes" while the real CK candidate is broken. Confirm the CK path is actually live
++   in `server.log` (CK module loaded / "is tuned on") during the check.
++2. **Greedy (temp=0) output parity vs the Triton baseline**, on prompts long enough to drive
++   **multi-token decode (M≥2)** — short / M=1 prompts can look fine while M≥2 is garbage. Outputs must
++   match the baseline (or be coherent). This is the skill's own go/no-go: if they diverge, the CK
++   integration is wrong (almost always the §9.1 scale layout) — fix the layout (or fall back to Triton)
++   and re-check. Do not report a speedup that fails this.
++
++Note: **task-level accuracy gating (e.g. gsm8k) is decided and run by the outer GEAK workflow** (its
++accuracy-gate option), not prescribed here. This skill only guarantees the GEMM swap is numerically
++correct (the parity check above); if the workflow enables a task-accuracy gate, it must likewise run on
++the engaged CK server, not a stock stand-in.
++
++---
++
++## Checklist (verified)
++
++| Step | Action |
++|------|--------|
++| 1 | Locate SGLang + aiter; verify SGLang ≥ 0.5.6; verify aiter ≥ commit `303a583c...` |
++| 2 | If needed: `git checkout` + submodules + clean JIT + `python setup.py develop` in aiter |
++| 3 | Save baseline benchmark + `server.log` |
++| 4 | Read `fp8_utils.py` / `fp8.py`; trace block FP8 → aiter path (§4) |
++| 5 | Implement §5: env-gated **`SGLANG_DUMP_AITER_FP8_GEMM_SHAPES`** (shape lines for §7) and **`SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH`** (which `w8a8_block_fp8_linear`); run from patched tree |
++| 6 | Export `SGLANG_DUMP_AITER_FP8_GEMM_SHAPES=1` and `SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH=1`; confirm dispatch logging and `[GEMM_shape_dump]` / `csv_row` in server log (§6) |
++| 7 | Parse §6 log → deduped shape artifact per §7; hand off to §8’s untuned CSV builder |
++| 8 | In aiter `csrc/ck_gemm_a8w8_blockscale`: read `gemm_a8w8_blockscale_tune.py` + `--help`; build untuned **M,N,K** CSV from §7; run tuner → tuned CSV for §10 |
++| 9 | Edit `fp8_utils.py` imports: CK `gemm_a8w8_blockscale` on, Triton blockscale off |
++| 9.1 | **Detect the activation-scale layout** (§9.1 scratch check: CK vs Triton at M≥2, both layouts); set the CK path's `transpose_scale` to the winner (expected `False`/non-transposed); if both fail, keep Triton |
++| 10 | `export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=...`; rerun; compare to baseline |
++| 10.1 | **Correctness check on the ENGAGED CK server, M≥2:** greedy output parity vs Triton baseline (never throughput/`errRatio` alone). Task-accuracy gating (gsm8k) is the outer GEAK workflow's decision, not this skill's |
++
++---
++
++## Pitfalls
++
++- **Wrong Python / wrong tree:** §5 edits must live in the same SGLang tree / interpreter that runs **`launch_server`**.
++- **Env toggles and tree alignment:** **`SGLANG_DUMP_AITER_FP8_GEMM_SHAPES`** and **`SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH`** take effect only in the checkout where you added the §5 hooks; keep **`PYTHONPATH`** / editable installs aligned with **`launch_server`**.
++- **Scale-layout mismatch (SILENT, CATASTROPHIC — see §9.1):** each aiter blockscale kernel fixes its
++  own per-token activation-scale memory layout. Triton and plain CK `gemm_a8w8_blockscale` want
++  **non-transposed**; `bpreshuffle` wants **transposed**. Stock sglang's `transpose_scale = not use_triton`
++  produces the *transposed* (bpreshuffle) layout on the non-Triton path — **wrong for CK**. Feeding CK a
++  transposed scale gives **~19% error on every M≥2 GEMM → garbage / accuracy collapse**, yet `errRatio`
++  stays 0 and **M=1 smoke tests pass** (transposing a 1-row scale is a no-op). Symptom: throughput up,
++  outputs degenerate (repeated tokens, gibberish) once batch/decode has ≥2 tokens. Always run the §9.1
++  probe (M≥2) to pick the layout, and gate accuracy on the engaged server (§10.1). This convention is
++  aiter-version/arch-coupled — verify, never assume. (This is the bug that produced a "fast but wrong"
++  +77%/+124% result that passed throughput+`errRatio` but failed real generation.)
++- **Validate the candidate, not a stand-in (see §10.1):** run the parity check (and any outer
++  task-accuracy gate) on the SAME server that has the CK path engaged. A separately-launched stock server
++  silently measures Triton and "passes" while the real CK candidate is broken — this is how a broken run
++  can report a healthy accuracy number.
++- **Shape coverage:** Missing **(M, N, K)** in the CSV falls back to the CK **default** kernel for those
++  shapes (look for `not found tuned config ... use default` in the log). With the correct scale layout the
++  default is still numerically OK (just untuned/slower); coverage is a *performance* concern, not the
++  cause of gibberish — gibberish is the scale-layout bug above. Capture the live cuda-graph **decode
++  buckets** (not just a few representative M) so engaged decode shapes are tuned. Use §5 **dispatch**
++  logging to confirm which **`w8a8_block_fp8_linear`** implementation is active.
++- **Tuner CLI drift:** Always use **`python3 gemm_a8w8_blockscale_tune.py --help`** on the checked-out aiter revision; flag names and defaults can change.
++- **Skip baseline ck run:** Do not try to run ck backend fp8 benchmark without tuned csv, as it may stuck. The final goal is to correctly compare tuned ck execution with baseline (by default triton probably).
++- **Version / checkout before “clever” code fixes:** Most confusing runtime errors in this flow (including aiter JIT failures such as `NameError: name 'aiter_tensor_t' is not defined`) trace back to **§1–§2 not being satisfied**—wrong **aiter** `HEAD`, stale **submodules**, or **stale JIT** (`aiter/jit/*.so`, `aiter/jit/build/*`) from another revision. **Do not** patch around that in application code (for example adding `aiter_tensor_t` shims in `aiter/jit/core.py` or SGLang). **First** realign the tree: run the full **§2** sequence (`git checkout` the required commit, `git submodule sync` / `git submodule update --init --recursive`, remove JIT artifacts as in §2, `python setup.py develop`), confirm **`git rev-parse HEAD`**, then re-run. Only treat the failure as a genuine bug to debug in source if it **still** reproduces on that pinned, clean-JIT checkout.
++- **Fair speedup comparison:** Measure speedup against the **original** end-to-end workflow—the **default** block-FP8 path your stack actually uses **before** this skill’s CK switch (often **Triton** `gemm_a8w8_blockscale` when SGLang + aiter route that way; confirm with **`SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH`** / §4)—captured in the **§3** baseline with the **same** model, TP, concurrency, and benchmark flags. The **after** run is the **§9–§10** configuration: CK **`gemm_a8w8_blockscale`**, **`AITER_CONFIG_GEMM_A8W8_BLOCKSCALE`** set to the **§8** tuned CSV, and an otherwise identical pipeline. Do not attribute gains to this skill when the two runs differ in workload shape, scheduler flags, or visible GPUs unless that is explicitly part of the experiment.
+\ No newline at end of file
+diff --git a/e2e_workflow/knowledge/learned/INDEX.md b/e2e_workflow/knowledge/learned/INDEX.md
+index 60934ec9a..196b9f2b3 100644
+--- a/e2e_workflow/knowledge/learned/INDEX.md
++++ b/e2e_workflow/knowledge/learned/INDEX.md
+@@ -8,7 +8,7 @@ Confidence (a hint strength, not authority): ★ noise/unverified · ★★ sing
+ ## dense GEMM
+ - [gfx950 · vLLM MXFP8 E8M0 decode-bound] dense-linear split-K/fused decode-tile Triton rewrite ★★★ **+21.8% e2e (verified, gsm8k-clean); decode-driven (converts only at high conc); grouped-MoE GEMM resists (~1.1× ceiling)** — (mxfp8-linear-decode-rewrite-gfx950.md)
+ - [gfx942 · sglang bf16] aiter per-shape DB tune ★★★ **+2.23% e2e (verified)** — (aiter-bf16-tuned-gemm-gfx942.md)
+-- [gfx942 · sglang fp8 a8w8 blockscale] per-(N,K) M-bucketed Triton config-JSON overlay ★★★ ~1.10× prefill — (fp8-a8w8-blockscale-overlay-gfx942.md)
++- [gfx942 · sglang fp8 a8w8 blockscale] **MANDATED LEVER = the CK skill** `gemm_tuning/fp8_gemm_tuning_sglang_aiter.md` (capture live (M,N,K) → aiter CK tuner → fp8_utils Triton→CK switch overlay + `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE`); baseline = the UNTUNED Triton default, so CK-tuned is the real win. The old per-(N,K) Triton config-JSON overlay is **DEPRECATED for this op (do NOT use it — it keeps the slow Triton seam live and bypasses the skill)** — (fp8-a8w8-blockscale-overlay-gfx942.md)
+ - [gfx950 · vLLM MXFP8 E8M0] dense `tl.dot_scaled` STATIC tiles (decode BK256/prefill BM128) ★★★ part of +12.1% e2e — (mxfp8-microscale-gemm-gfx950.md)
+ 
+ ## MoE grouped GEMM
+diff --git a/e2e_workflow/knowledge/learned/fp8-a8w8-blockscale-overlay-gfx942.md b/e2e_workflow/knowledge/learned/fp8-a8w8-blockscale-overlay-gfx942.md
+index fb38e496b..f2663edd0 100644
+--- a/e2e_workflow/knowledge/learned/fp8-a8w8-blockscale-overlay-gfx942.md
++++ b/e2e_workflow/knowledge/learned/fp8-a8w8-blockscale-overlay-gfx942.md
+@@ -2,11 +2,65 @@
+ key: fp8_a8w8_blockscale dense GEMM · gfx942 · sglang Triton live path
+ type: lever
+ confidence: ★★★
+-effect: iso ~1.06–1.10× prefill (up/gate head); e2e ceiling ~+4–5% on a 57%-GPU head
+-confirms: 11
+-last_seen: 2026-06-15
++effect: iso ~1.06–1.16× prefill (Triton-overlay, DEPRECATED); CK-tuned KERNEL ~1.78× vs untuned Triton on the M=13645 head (kernel-level)
++confirms: 16
++last_seen: 2026-06-25
++status: DEPRECATED-FOR-THIS-EVAL
+ ---
+-# fp8 a8w8 blockscale GEMM → per-(N,K) M-bucketed Triton config-JSON overlay
++> ✅ **16th confirm (2026-06-25, Qwen3-14B-FP8 TP=2, gfx942/MI300X cu_num=304, e2e_qwen3_14b_fp8_..._3515_8954).**
++> Re-ran the CK skill end to end on the exact 16 live (M,N,K) (4 NK families × {1,16,2048,13645}), `--libtype
++> both --mp 2`: ALL 16 winners `libtype=ck`, errRatio 0.0. Dominant head M=13645,N=5120,K=8704 CK
++> kernelId=0 = 1.469 ms (matches the 1.456 ms / ~1.78× kernel prior). Engagement reconfirmed
++> ("is tuned on cu_num = 304"); faithful block-scale dequant correctness rel_err 0.0017 (tol 0.06). Op_bench
++> bake-off reconfirmed bpreshuffle drop-in is WRONG (rel_err 42.4). Shipped the M-ROUTED overlay (M≤256→CK,
++> else Triton) per the banner below. NOTE: one stale JIT baton lock from a prematurely-killed tuner run
++> stalled the build for ~25 min with 0 compiler procs — clearing `aiter/jit/build/lock_module_*` +
++> `build/module_*_tune` and restarting (per skill §2/pitfall) fixed it; watch for this.
++> 🔑 **REGIME SPLIT is the deployable refinement (2026-06-25, Qwen3-14B-FP8 TP=2, gfx942, conc=16).**
++> Re-ran the CK skill end to end (tuned 16 live (M,N,K) = 4 NK families × {1,16,2048,13645}, `--libtype both
++> --mp 2`, all winners `libtype=ck` errRatio 0.0, engagement confirmed via "is tuned on cu_num=304"). The
++> PRODUCTION custom-op `aiter.gemm_a8w8_blockscale` (what fp8_utils calls post-switch), measured eager with
++> CUDA events on this box, is **regime-split, not uniformly faster**:
++>   · decode/skinny-M (M≤256): CK ~**3.4–4.0× FASTER** than the untuned Triton block-scale default
++>     (Triton is ~0.11–0.14 ms flat for any small M; CK ~0.03 ms). Crossover at M≈256↔512.
++>   · prefill/large-M (M≥512): CK ~**0.5–0.66× (1.5–2× SLOWER)** than Triton on EVERY family (down/gate_up/
++>     qkv/o), measured both device-only (CUDA events) and wall, plain & transposed x_scale layouts identical.
++>     This contradicts the tuner's own ~1.46–1.49 ms "kernel" `us` column — the production
++>     `gemm_a8w8_blockscale_ck` lookup path runs ~4.85 ms eager on M=13645,N=5120,K=8704. Trust the
++>     production-op A/B, not the tuner CSV `us`, for the prefill verdict.
++> ✅ **Deployable winner = M-ROUTED overlay (NOT a wholesale Triton→CK import swap).** A bare import swap
++> routes prefill to CK too → regresses the GPU-time-heavy prefill. Instead the fp8_utils overlay rebinds
++> `triton_gemm_a8w8_blockscale` to a dispatcher: `M≤256 → CK (tuned), else → stock Triton`
++> (env `SGLANG_CK_BLOCKSCALE_M_MAX`, default 256). Verified correct (err~0.003, tol 0.06): decode hits CK
++> 0.0355 ms while prefill passes through to Triton at parity. Captures the e2e-critical decode/TPOT win
++> (steady-state M≈conc=16) with ZERO prefill regression. `winner_kind=env` (apply_env
++> `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=<tuned.csv>`) + `code_patch=<fp8_utils M-routed CK overlay>` +
++> `tuning_artifact=<tuned.csv>`. Still gate at e2e (HIP-graph capture must keep the small-M CK path live).
++---
++> ✅ **CK-skill result (this eval, Qwen3-14B-FP8 TP=2, gfx942/MI300X):** ran the MANDATED CK playbook end
++> to end. Tuned all 20 live (M,N,K) (4 NK families × {1,16,2048,13645,16385}) with `gemm_a8w8_blockscale_tune.py
++> --libtype both --mp 2`; ALL winners are `libtype=ck`, errRatio 0.0. Dominant head (M=13645,N=8704,K=5120)
++> CK kernelId=0 = **1.456 ms vs untuned Triton 2.60 ms = 1.78× at the kernel level** (tuner & raw `gemm_a8w8_blockscale_tune`
++> agree exactly). Engagement verified: `AITER_LOG_TUNED_CONFIG=1` prints "is tuned on cu_num=304".
++> ⚠️ **CONDITIONED caution for the Integrator e2e gate:** the *production* custom-op `aiter.gemm_a8w8_blockscale`
++> (what fp8_utils calls after the Triton→CK switch) measured **4.85 ms eager** on the same shape — ~3.4 ms
++> per-call Python/dispatch wrapper overhead ON TOP of the 1.46 ms kernel (steady-state over 500 iters, NOT a
++> one-time cost). So in EAGER it is ~1.9× SLOWER than Triton despite the faster kernel. This overhead is the
++> kind HIP-graph / torch.compile capture amortizes (the live serving path captures decode & wraps prefill),
++> which is exactly why the e2e gate — not an isolated eager bench — is the judge. The win is REAL at the
++> kernel; verify the wrapper overhead is absorbed under graph capture at e2e before crediting it.
++---
++> ⛔ **DEPRECATED for the current eval.** The Triton config-JSON overlay below keeps the slow Triton
++> blockscale seam live and **bypasses the user's CK skill**. For an sglang fp8 a8w8 blockscale head the
++> MANDATED lever is the CK playbook `gemm_tuning/fp8_gemm_tuning_sglang_aiter.md`
++> (capture live (M,N,K) → aiter CK tuner `csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py` →
++> fp8_utils Triton→CK switch overlay + `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=<tuned.csv>`). The correct
++> baseline for the speedup is the **UNTUNED Triton default** the stack runs by default — NOT a CK-default
++> heuristic. The "CK env yields ~1.00×" caution below was measured CK-default-vs-CK-tuned on a vLLM CK
++> live path; it does NOT describe CK-tuned-vs-Triton-untuned on this sglang rig. Do not let this card
++> steer the bake-off to the Triton overlay / flydsl / aiter-bf16 levers — follow the CK skill.
++
++# fp8 a8w8 blockscale GEMM → per-(N,K) M-bucketed Triton config-JSON overlay  (DEPRECATED — see banner)
+ - lever: the live seam is `aiter.ops.triton.gemm_a8w8_blockscale`. Stock has NO per-(N,K) config for
+   the model's large shapes → it uses a generic tile = headroom. Win = drop a tuned
+   `gfx942-GEMM-A8W8_BLOCKSCALE-N=<N>-K=<K>.json` into `aiter/ops/triton/configs/gemm/`
+@@ -25,4 +79,17 @@ last_seen: 2026-06-15
+   xdl-cshuffle; the lever there is env `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=<csv>`, but it yields ~1.00×
+   (CK default heuristic already picks the optimal `256x128x128 intrawave_v3`). ALWAYS check which live
+   path (CK vs Triton) is engaged BEFORE choosing the lever.
+-- source: exp/e2e_*Qwen3.5-27B-FP8*/ runs 06-08 … 06-15 (11 consistent re-confirms)
++- caution: the aiter `gemm_a8w8_blockscale_bpreshuffle` path benches ~1.5× faster than the plain
++  Triton blockscale kernel BUT is WRONG as a naive drop-in (op_bench Qwen3-14B-FP8: rel_err 43.6 vs the
++  blockscale baseline's 0.0075) — it needs weights preshuffled first. It is the large-M prefill lever,
++  not a free swap; only use via the preshuffle seam (`aiter:gemm_a8w8_blockscale_bpreshuffle` + a once
++  `shuffle_weight`), never by rebinding the live blockscale call to it directly.
++- source: exp/e2e_*Qwen3.5-27B-FP8*/ runs 06-08 … 06-15 (11 re-confirms); + exp/e2e_qwen3_14b_fp8_20260624
++  (13th: Qwen3-14B-FP8 TP=2, 4 per-GPU families. In-process config= A/B, fixed synth fp8 operands, min-of-50.
++  Prefill M={13645,16385}: up/gate N=17408,K=5120 BM256/BN128/GM4/nw8 = 1.16×; qkv N=3584,K=5120 same = 1.15×;
++  down N=5120,K=8704 BM256/BN128/GM1/nw8 = 1.09×; o N=5120,K=2560 BM256/BN128/GM4/nw8 = 1.09×; prefill geomean 1.11×.
++  All correct (fp8 tol 0.06). BM128_BN256 LOST on every family here (default-class), reconfirming "widen BM not BN"
++  for these K=5120-ish shapes. Decode kept generic via M_LEQ_1024 key. Overlay engagement re-verified live via
++  get_gemm_config (BM 128→256 on prefill). aiter bpreshuffle benched 4.63 vs 6.48 ms (1.4×) but rel_err 41.8 = NOT a drop-in.)
++  (12th: re-confirmed live seam + "not found tuned config, will use default config" headroom on up/gate
++  N=17408,K=5120; aiter bf16 DB tune is the WRONG lever here — fp8 path is the Triton seam, not aiter.tuned_gemm)
+diff --git a/e2e_workflow/roles/op_benchmarker.md b/e2e_workflow/roles/op_benchmarker.md
+index 8838de967..c73bd7ac0 100644
+--- a/e2e_workflow/roles/op_benchmarker.md
++++ b/e2e_workflow/roles/op_benchmarker.md
+@@ -52,6 +52,36 @@ well (Tier C), not just tuned — that is the lever the old design skipped.
+     `SKILL_DIR/knowledge/gemm_tuning/aiter_gemm_tuning.md`. **Do NOT use PyTorch TunableOp / `HIPBLASLT_TUNING_FILE`** —
+     on sglang/aiter they hook the PyTorch dispatch the live path bypasses (zero engagement). For attn,
+     Tier-B is the `--attention-backend` swap (a server flag the Config Tuner owns).
++  - **For an fp8 block-scale GEMM (`gemm_a8w8_blockscale` — the live op on an fp8 / a8w8_blockscale model;
++    sglang+aiter routes it through the TRITON blockscale kernel by default, which runs the UNTUNED default
++    config), the dense bf16 recipe above does NOT apply.**
++    🔒 **MANDATED LEVER (this eval) — the CK skill is the ONLY accepted route for this op.** Follow
++    `SKILL_DIR/knowledge/gemm_tuning/fp8_gemm_tuning_sglang_aiter.md` — the verified **CK** playbook —
++    in full, end to end:
++    capture the live `(M,N,K)` via its `SGLANG_DUMP_AITER_FP8_GEMM_SHAPES` / `SGLANG_LOG_FP8_BLOCK_GEMM_DISPATCH`
++    hooks, tune with aiter's CK tuner (`csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py
++    --libtype both --mp <ALL GPUs>`, never pin to 1), switch `fp8_utils.py` to the CK `gemm_a8w8_blockscale`
++    import **as a reversible OVERLAY (never a site-packages edit)**, and deploy
++    `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=<tuned.csv>`. Return the head candidate as `winner_kind=env` with
++    `apply_env=AITER_CONFIG_GEMM_A8W8_BLOCKSCALE=<csv>` PLUS `code_patch=<fp8_utils CK-switch overlay diff>`
++    and `tuning_artifact=<tuned.csv>`; the Integrator overlays it and gates on e2e. (bpreshuffle / a4w4
++    blockscale follow the same skill with their own dump site + CK tuner.)
++    ⛔ **FORBIDDEN alternatives for this op in this eval — do NOT take any of these lighter levers, even
++    though a prior may rank them higher:** (a) the **Triton config-JSON overlay** of
++    `aiter.ops.triton.gemm_a8w8_blockscale` (dropping `gfx942-GEMM-A8W8_BLOCKSCALE-N=*-K=*.json` /
++    `AITER_TRITON_CONFIGS_PATH`); (b) the **flydsl** env-DB tune or flydsl author route; (c) the **aiter
++    bf16 DB tune** (`AITER_TUNE_GEMM`/`AITER_CONFIG_GEMM_BF16`) — that is the wrong path for fp8 blockscale.
++    These keep the slow Triton seam live and BYPASS the user's CK skill. A head result for this op that is
++    not the CK env+overlay above is a **defection**: return `gate=no_win` with `reason="non-CK lever
++    forbidden this eval"` rather than shipping a Triton-overlay/flydsl candidate. The CK path is the
++    measured win here because the baseline is the **untuned Triton default**, not a CK-default heuristic.
++    ⚠️ **Any `knowledge/learned/` card that ranks the Triton config-JSON overlay (or flydsl/aiter-bf16) as
++    the fp8-blockscale win is OBSOLETE for this eval — ignore it and follow the CK skill.**
++  - **Skill discovery — do this for EVERY GEMM head BEFORE deciding the lever:** `ls
++    SKILL_DIR/knowledge/gemm_tuning/` and read the frontmatter `description:` of each `*.md`; **FOLLOW any
++    skill whose description matches this op's quant format / backend** (e.g. fp8 block-scale → the file
++    above). A skill dropped into that directory is an authoritative, verified playbook — never skip it
++    because it is not hardcoded by name in this role.
+   - Write any driver script you need into `$EVAL_DIR` (NOT the shared `scripts/`). Discover tool paths
+     (e.g. gradlib) generically, never hardcode. The env winner is `winner_kind=env`.
+ - **Tier C — code (author or rewrite)** (editable languages: triton/**flydsl**/hip/ck): the **workflows route**.

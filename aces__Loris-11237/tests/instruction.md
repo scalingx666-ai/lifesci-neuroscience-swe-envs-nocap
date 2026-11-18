@@ -1,0 +1,74 @@
+# Issue
+
+**Title:** Bump dompurify from 3.4.13 to 3.4.16
+
+## Description
+
+Bumps [dompurify](https://github.com/cure53/DOMPurify) from 3.4.13 to 3.4.16.
+<details>
+<summary>Release notes</summary>
+<p><em>Sourced from <a href="https://github.com/cure53/DOMPurify/releases">dompurify's releases</a>.</em></p>
+<blockquote>
+<h2>DOMPurify 3.4.16</h2>
+<ul>
+<li>Fixed a problem with <code>IN_PLACE</code> node removal when working with hooks, thanks <a href="https://github.com/manus-pi"><code>@​manus-pi</code></a></li>
+<li>Fixed a problem with <code>IN_PLACE</code> sanitization and raw-text roots, thanks <a href="https://github.com/h-t-m"><code>@​h-t-m</code></a></li>
+<li>Fixed a problem with ESM default exports landing in CommonJS declarations, thanks <a href="https://github.com/ssi02014"><code>@​ssi02014</code></a></li>
+<li>Migrated from <code>rollup</code> to <code>rolldown</code> because performance, thanks <a href="https://github.com/ssi02014"><code>@​ssi02014</code></a></li>
+<li>Bumped several dependencies where possible</li>
+</ul>
+<h2>DOMPurify 3.4.15</h2>
+<ul>
+<li>Added better clobbering hardening when XML content is involved, thanks <a href="https://github.com/gnyselcuk"><code>@​gnyselcuk</code></a></li>
+<li>Added several smaller hardening and edge-case improvements, thanks <a href="https://github.com/leechristensen"><code>@​leechristensen</code></a></li>
+<li>Bumped several dependencies where possible</li>
+</ul>
+<h2>DOMPurify 3.4.14</h2>
+<ul>
+<li>Fixed an issue with possible bypasses when risky tags are allow-listed, thanks <a href="https://github.com/AlirezaRouhbakhsh"><code>@​AlirezaRouhbakhsh</code></a></li>
+<li>Fixed a couple of edge cases with mixed document contexts, thanks <a href="https://github.com/fishjojo1"><code>@​fishjojo1</code></a></li>
+<li>Added the SVG <code>pointer-events</code> and <code>vector-effect</code> presentation attributes to the allow-list, thanks <a href="https://github.com/Jaybhade"><code>@​Jaybhade</code></a></li>
+<li>Conducted another refactoring run, removed dead branches and duplicated logic, flattened attribute validation</li>
+<li>Updated the documentation in several spots, README, wiki, etc., thanks <a href="https://github.com/Akokonunes"><code>@​Akokonunes</code></a></li>
+<li>Updated several development dependencies and CI workflow actions</li>
+</ul>
+</blockquote>
+</details>
+<details>
+<summary>Commits</summary>
+<ul>
+<li><a href=""><code>b9b9d80</code></a> release: 3.4.16 (<a href="">#1636</a>)</li>
+<li><a href=""><code>1d7460c</code></a> release: 3.4.15 (<a href="">#1609</a>)</li>
+<li><a href=""><code>4e6fe24</code></a> release: 3.4.14 (<a href="">#1587</a>)</li>
+<li>See full diff in <a href="https://github.com/cure53/DOMPurify/compare/3.4.13...3.4.16">compare view</a></li>
+</ul>
+</details>
+<br />
+
+[![Dependabot compatibility score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=dompurify&package-manager=npm_and_yarn&previous-version=3.4.13&new-version=3.4.16)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)
+
+Dependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+---
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it
+- `@dependabot show <dependency name> ignore conditions` will show all of the ignore conditions of the specified dependency
+- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)
+You can disable automated security fix PRs for this repo from the [Security Alerts page](https://github.com/aces/Loris/network/alerts).
+
+</details>
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `bad3ac76b2f5`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

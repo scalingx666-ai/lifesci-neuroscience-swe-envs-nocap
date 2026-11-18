@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** conform to function signature and usage pattern a few lines above
+
+## Description
+
+simple self-explanatory fix
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `25794139690c`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

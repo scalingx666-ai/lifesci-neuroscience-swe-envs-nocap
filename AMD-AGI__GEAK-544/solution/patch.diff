@@ -1,0 +1,178 @@
+diff --git a/e2e_workflow/e2e_workflow.js b/e2e_workflow/e2e_workflow.js
+index cd14f9264..c5e45d8d1 100644
+--- a/e2e_workflow/e2e_workflow.js
++++ b/e2e_workflow/e2e_workflow.js
+@@ -2007,6 +2007,9 @@ const AGENT_TIMEOUT_RETRY = String(A.agent_timeout_retry != null ? A.agent_timeo
+ // serving leg (director's baseline, tuner's launch+bench cycles, the head e2e A/B), and each
+ // one otherwise rediscovers at ~1h that a tool-managed background shell gets group-reaped
+ // mid-measurement — an hour of budget and a booted server lost per role that learns it.
++// The wait rule never starts a command with `sleep`: with background tasks on, Claude Code 2.1.310+
++// refuses a leading `sleep` of 25s or more and offers Monitor, whose notification a role agent never
++// sees — its turn ending is its return. run_e2e.py also turns background tasks off for the same reason.
+ const PROCESS_SAFETY = `## PROCESS SAFETY (a violation can kill the caller's orchestrator, failing the whole task)
+ This container's PID 1 is the CALLER's orchestrator process, not yours, and it is NOT restartable.
+ NEVER run global or pattern-matched process cleanup: no \`pkill -f\` / \`pgrep -f ... | xargs kill\` /
+@@ -2027,12 +2030,17 @@ Your foreground bound is BASH_MAX_TIMEOUT_MS, and your tool's OWN background mod
+ tool manages for you is reaped on the manager's schedule, and the reap is a GROUP kill that takes the
+ server down with the client — you get a truncated log, an unloaded GPU, and no summary, from a leg that
+ was measuring perfectly. Do NOT run a bench through your tool's background/\`run_in_background\` mode.
+-Launch it so it is orphaned to init, OUTSIDE the manager's reach, then poll its log:
++Launch it so it is orphaned to init, OUTSIDE the manager's reach, then wait on its log:
+     cd "\$EVAL_DIR" && setsid nohup bash run_bench.sh > run_bench.out 2>&1 < /dev/null &
+     # returns immediately; the leg's parent becomes PID 1 and no tool-call bound applies
+-Then poll in SEPARATE short calls (\`sleep 300; tail -5 run_bench.out\`) until the summary lands. Before
+-you conclude a leg died, check whether it is still alive (\`ps -o pid,stat,etime -p <pid>\`) and whether
+-the GPUs still hold weights — a reaped wrapper with a live leg underneath looks identical to a crash.
++Then wait in SEPARATE foreground calls, each a bounded loop that checks BEFORE it sleeps and ends inside
++the timeout you give that Bash call (the tool caps it at BASH_MAX_TIMEOUT_MS, 10 min by default):
++    timeout 540 bash -c 'until [ -s <leg_dir>/bench_summary.json ]; do sleep 30; done'; tail -5 run_bench.out
++Never START a command with a \`sleep\` (Claude Code refuses one of 25s or more), and never wait by ending
++your turn: your turn ending IS your return, so a Monitor, background-watcher or \`run_in_background\`
++notification lands after you are gone. Keep waiting until the summary lands or the leg is provably dead.
++Before you conclude a leg died, check whether it is still alive (\`ps -o pid,stat,etime -p <pid>\`) and
++whether the GPUs still hold weights — a reaped wrapper with a live leg underneath looks identical to a crash.
+ 
+ ## ONCE THE FINAL PHASE STARTS, IT OWNS THE GPUS
+ When \$EVAL_DIR/.final_phase_fence exists the search is over: the workflow stopped every leg, tuner and
+diff --git a/interface/run_e2e.py b/interface/run_e2e.py
+index afb8f7593..e80128db0 100644
+--- a/interface/run_e2e.py
++++ b/interface/run_e2e.py
+@@ -271,6 +271,26 @@ def _note_session_id(msg: object) -> None:
+         _LAST_SDK_SESSION["session_id"] = sid.strip()
+ 
+ 
++BACKGROUND_TASKS_ENV = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
++
++
++def _foreground_wait_env() -> dict[str, str]:
++    """Turn Claude Code background tasks off unless the operator chose a value.
++
++    Role agents wait out hour-long serving legs in foreground Bash calls. With
++    background tasks on, Claude Code 2.1.310+ refuses a call that starts with
++    ``sleep N`` (N >= 25) and steers the agent to Monitor/``run_in_background``,
++    whose notification arrives after a workflow agent's turn has ended, and a
++    turn ending is that agent's return.
++
++    Returns:
++        ``{BACKGROUND_TASKS_ENV: "1"}``, or ``{}`` when it is already set.
++    """
++    if BACKGROUND_TASKS_ENV in os.environ:
++        return {}
++    return {BACKGROUND_TASKS_ENV: "1"}
++
++
+ def _sdk_child_env() -> dict[str, str]:
+     """Build the environment overlay for the Claude Code child process.
+ 
+@@ -296,6 +316,7 @@ def _sdk_child_env() -> dict[str, str]:
+     run_mark = os.environ.get(RUN_MARK_ENV, "")
+     if run_mark:
+         env[RUN_MARK_ENV] = run_mark
++    env.update(_foreground_wait_env())
+     return env
+ 
+ 
+@@ -2538,8 +2559,8 @@ def _invoke_via_runtime(
+     # the wrapper a margin so a graceful finalize is never killed prematurely.
+     wrap_timeout = (timeout_s + 900) if timeout_s else None
+     proc = subprocess.run(
+-        cmd, cwd=str(E2E_DIR), env=dict(os.environ), capture_output=True,
+-        text=True, timeout=wrap_timeout,
++        cmd, cwd=str(E2E_DIR), env=dict(os.environ, **_foreground_wait_env()),
++        capture_output=True, text=True, timeout=wrap_timeout,
+     )
+     if proc.returncode != 0:
+         raise RuntimeError(
+diff --git a/interface/test_run_e2e_dispatch.py b/interface/test_run_e2e_dispatch.py
+index 199c7285c..6b66beca6 100644
+--- a/interface/test_run_e2e_dispatch.py
++++ b/interface/test_run_e2e_dispatch.py
+@@ -49,6 +49,7 @@
+ import io
+ import json
+ import os
++import re
+ import shutil
+ import signal
+ import sys
+@@ -559,6 +560,19 @@ def test_build_prompt_leads_with_process_safety(self):
+         for banned in ("pkill -f", "killall", "kill -- -PGID"):
+             self.assertIn(banned, prompt)
+ 
++    def test_role_agent_wait_rule_never_starts_a_command_with_a_long_sleep(self):
++        """With background tasks on, Claude Code 2.1.310+ refuses a Bash call that
++        starts with `sleep N` (N >= 25). A role agent that copies such an example is
++        refused, arms a Monitor, and returns before its leg has finished."""
++        src = rx.E2E_SCRIPT.read_text(encoding="utf-8")
++        start = src.index("const PROCESS_SAFETY = `")
++        safety = src[start:src.index("\n`;", start)]
++        examples = re.findall(r"\\`(.*?)\\`", safety) + re.findall(r"^ {4}(\S.*)$", safety, re.MULTILINE)
++        long_leading = [cmd for cmd in examples
++                        if (m := re.match(r"sleep\s+(\d+)", cmd.strip())) and int(m.group(1)) >= 25]
++        self.assertEqual(long_leading, [])
++        self.assertRegex(safety, re.compile(r"^ {4}timeout \d+ bash -c 'until ", re.MULTILINE))
++
+ 
+ class TestProtectedPgids(_RunE2ECase):
+     """`_publish_protected_pgids` is the caller-side half of the #397 fix: the
+@@ -2022,6 +2036,7 @@ def test_options_carry_effort_sandbox_env_and_pinned_cli(self):
+         pipeline (rather than the agent 'backgrounding' it) under root."""
+         self.patch_rx("CLAUDE_EFFORT", "high")
+         self.patch_rx("CLAUDE_BIN", "/opt/claude-2.1.181/claude")
++        os.environ.pop(rx.BACKGROUND_TASKS_ENV, None)
+         _anyio, sdk = self._install([ResultMessage(result="done")])
+         real_geteuid = os.geteuid
+         os.geteuid = lambda: 0
+@@ -2036,7 +2051,7 @@ def test_options_carry_effort_sandbox_env_and_pinned_cli(self):
+         self.assertEqual(kwargs["settings"], rx.WORKFLOW_SETTINGS)
+         self.assertEqual(kwargs["cwd"], str(rx.E2E_DIR))
+         self.assertEqual(kwargs["extra_args"], {"effort": "high"})
+-        self.assertEqual(kwargs["env"], {"IS_SANDBOX": "1"})
++        self.assertEqual(kwargs["env"], {"IS_SANDBOX": "1", rx.BACKGROUND_TASKS_ENV: "1"})
+         self.assertEqual(kwargs["cli_path"], "/opt/claude-2.1.181/claude")
+ 
+     def test_public_build_effort_is_not_forwarded(self):
+diff --git a/interface/test_run_e2e_runtime_dispatch.py b/interface/test_run_e2e_runtime_dispatch.py
+index 817998d02..f955bd108 100644
+--- a/interface/test_run_e2e_runtime_dispatch.py
++++ b/interface/test_run_e2e_runtime_dispatch.py
+@@ -158,6 +158,19 @@ def test_the_command_carries_the_selection_the_files_and_a_timeout_margin(monkey
+     assert captured["kw"]["timeout"] == 3600 + 900
+ 
+ 
++def test_the_runtime_child_turns_background_tasks_off_unless_the_operator_set_them(monkeypatch, tmp_path):
++    """The runtime's claude profile runs `claude -p` per agent with this env."""
++    captured = {"proc": _Proc(stdout='{"eval_dir": "/e"}')}
++    rx = _runtime_mod(monkeypatch, captured)
++    monkeypatch.delenv(rx.BACKGROUND_TASKS_ENV, raising=False)
++    rx._invoke_via_runtime({}, 60, str(tmp_path))
++    assert captured["kw"]["env"][rx.BACKGROUND_TASKS_ENV] == "1"
++
++    monkeypatch.setenv(rx.BACKGROUND_TASKS_ENV, "0")
++    rx._invoke_via_runtime({}, 60, str(tmp_path))
++    assert captured["kw"]["env"][rx.BACKGROUND_TASKS_ENV] == "0"
++
++
+ def test_without_an_eval_dir_no_result_file_is_requested(monkeypatch):
+     captured = {"proc": _Proc(stdout='{"eval_dir": "/e"}')}
+     rx = _runtime_mod(monkeypatch, captured)
+diff --git a/interface/test_run_e2e_trace_mirror.py b/interface/test_run_e2e_trace_mirror.py
+index e9e4422e2..dba77cda3 100644
+--- a/interface/test_run_e2e_trace_mirror.py
++++ b/interface/test_run_e2e_trace_mirror.py
+@@ -525,6 +525,14 @@ def test_sdk_child_env_sandboxes_only_under_root(monkeypatch):
+     assert "IS_SANDBOX" not in rx._sdk_child_env()
+ 
+ 
++def test_sdk_child_env_turns_background_tasks_off_unless_the_operator_set_them(monkeypatch):
++    """An operator's own value, "0" included, is inherited untouched."""
++    monkeypatch.delenv(rx.BACKGROUND_TASKS_ENV, raising=False)
++    assert rx._sdk_child_env()[rx.BACKGROUND_TASKS_ENV] == "1"
++    monkeypatch.setenv(rx.BACKGROUND_TASKS_ENV, "0")
++    assert rx.BACKGROUND_TASKS_ENV not in rx._sdk_child_env()
++
++
+ def test_mirror_trace_without_an_eval_dir_is_a_no_op():
+     assert rx._mirror_trace("")["status"] == "no_eval_dir"
+ 

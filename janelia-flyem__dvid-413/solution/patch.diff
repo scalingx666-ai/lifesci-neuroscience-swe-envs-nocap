@@ -1,0 +1,335 @@
+diff --git a/datastore/datainstance.go b/datastore/datainstance.go
+index f68a6376..38cb0c63 100644
+--- a/datastore/datainstance.go
++++ b/datastore/datainstance.go
+@@ -108,9 +108,9 @@ func (vctx *VersionedCtx) VersionedKeyValue(values []*storage.KeyValue) (*storag
+ 	return kv, err
+ }
+ 
+-// GetBestKeyVersion returns the key that most closely matches this context's version.
++// GetBestKeyForVersion returns the key that most closely matches this context's version.
+ // If no suitable key or a tombstone is encountered closed to the version, nil is returned.
+-func (vctx *VersionedCtx) GetBestKeyVersion(keys []storage.Key) (storage.Key, error) {
++func (vctx *VersionedCtx) GetBestKeyForVersion(keys []storage.Key) (storage.Key, error) {
+ 	if len(keys) == 0 {
+ 		return nil, nil
+ 	}
+@@ -135,6 +135,29 @@ func (vctx *VersionedCtx) GetBestKeyVersion(keys []storage.Key) (storage.Key, er
+ 	return kv.K, err
+ }
+ 
++// GetBestVersion returns the VersionID of the key that most closely matches this context's version.
++// If no suitable key or a tombstone is encountered closed to the version, VersionID 0 is returned.
++func (vctx *VersionedCtx) GetBestVersion(keys []storage.Key) (dvid.VersionID, error) {
++	if len(keys) == 0 {
++		return 0, nil
++	}
++	// Set up a map[VersionID]Key
++	versionMap := make(kvVersions, len(keys))
++	for _, k := range keys {
++		vid, err := vctx.VersionFromKey(k)
++		if err != nil {
++			return 0, err
++		}
++		kv := storage.KeyValue{K: k}
++		versionMap[vid] = kvvNode{kv: &kv}
++	}
++
++	// Get the correct key-value for this version among all ancestors, some of which might have
++	// a value.
++	_, versionID, err := versionMap.FindMatch(vctx.VersionID())
++	return versionID, err
++}
++
+ // VersionUUID returns the UUID associated with this versioned context.
+ func (vctx *VersionedCtx) VersionUUID() dvid.UUID {
+ 	uuid, _ := UUIDFromVersion(vctx.VersionID())
+@@ -1053,6 +1076,24 @@ func (d *Data) MutDelete(mutID uint64) {
+ 	d.opWG_mu.Unlock()
+ }
+ 
++// GetKeyVersionGetter returns a KeyVersionGetter assigned to this data instance.
++// If the store is nil or not available, an error is returned.
++func GetKeyVersionGetter(d dvid.Data) (db storage.KeyVersionGetter, err error) {
++	store, err := d.KVStore()
++	if err != nil {
++		return nil, err
++	}
++	if store == nil {
++		return nil, ErrInvalidStore
++	}
++	var ok bool
++	db, ok = store.(storage.KeyVersionGetter)
++	if !ok {
++		return nil, fmt.Errorf("Store assigned to data %q (%s) is not a KeyVersionGetter", d.DataName(), store)
++	}
++	return
++}
++
+ // GetKeyValueDB returns a kv data store assigned to this data instance.
+ // If the store is nil or not available, an error is returned.
+ func GetKeyValueDB(d dvid.Data) (db storage.KeyValueDB, err error) {
+diff --git a/datatype/labelmap/handlers.go b/datatype/labelmap/handlers.go
+index 4c5d709a..45e189d1 100644
+--- a/datatype/labelmap/handlers.go
++++ b/datatype/labelmap/handlers.go
+@@ -322,6 +322,56 @@ func (d *Data) handleProximity(ctx *datastore.VersionedCtx, w http.ResponseWrite
+ 	timedLog.Infof("HTTP %s proximity for labels %d, %d (%s)", r.Method, label1, label2, r.URL)
+ }
+ 
++func (d *Data) handleIndexVersion(ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request, parts []string) {
++	// GET  <api URL>/node/<UUID>/<data name>/index-version/<label>
++	timedLog := dvid.NewTimeLog()
++
++	queryStrings := r.URL.Query()
++	if throttle := queryStrings.Get("throttle"); throttle == "on" || throttle == "true" {
++		if server.ThrottledHTTP(w) {
++			return
++		}
++		defer server.ThrottledOpDone()
++	}
++
++	label, err := strconv.ParseUint(parts[4], 10, 64)
++	if err != nil {
++		server.BadRequest(w, r, err)
++		return
++	}
++	if label == 0 {
++		server.BadRequest(w, r, "there is no index for protected label 0")
++		return
++	}
++
++	switch strings.ToLower(r.Method) {
++	case "get":
++		versionID, err := getLabelIndexVersion(ctx, label)
++		if err != nil {
++			server.BadRequest(w, r, err)
++			return
++		}
++		// Translate from VersionID to UUID.
++		uuid, err := datastore.UUIDFromVersion(versionID)
++		if err != nil {
++			server.BadRequest(w, r, fmt.Errorf("could not convert version ID %d to UUID: %v", versionID, err))
++			return
++		}
++		// Write the UUID as a string to response.
++		w.Header().Set("Content-type", "text/plain")
++		if _, err := w.Write([]byte(uuid)); err != nil {
++			server.BadRequest(w, r, fmt.Errorf("error writing UUID %s to response: %v", uuid, err))
++			return
++		}
++
++	default:
++		server.BadRequest(w, r, "only GET action allowed for /index-version endpoint")
++		return
++	}
++
++	timedLog.Infof("HTTP %s index-version for label %d (%s)", r.Method, label, r.URL)
++}
++
+ func (d *Data) handleIndex(ctx *datastore.VersionedCtx, w http.ResponseWriter, r *http.Request, parts []string) {
+ 	// GET  <api URL>/node/<UUID>/<data name>/index/<label>
+ 	// POST <api URL>/node/<UUID>/<data name>/index/<label>
+diff --git a/datatype/labelmap/labelidx.go b/datatype/labelmap/labelidx.go
+index c5fc00b0..66889c1a 100644
+--- a/datatype/labelmap/labelidx.go
++++ b/datatype/labelmap/labelidx.go
+@@ -97,6 +97,13 @@ func (d *Data) Initialize() {
+ 	}
+ }
+ 
++// Mutation cache, currently supported only for labelmap's label indices,
++// stores every label index just before modification. This allows you to
++// reach back to its state just before any given mutation id.
++//
++// See scripts/distro-files/config-full.toml for an example of how to set cache path.
++// If [mutcache] section is not specified, no mutation cache is created.
++
+ func (d *Data) getMutcache(v dvid.VersionID, mutID uint64, label uint64) (*labels.Index, error) {
+ 	if mutcache == nil {
+ 		return nil, nil
+@@ -175,6 +182,14 @@ func (d *Data) labelIndexExists(v dvid.VersionID, label uint64) (bool, error) {
+ 	return store.Exists(ctx, NewLabelIndexTKey(label))
+ }
+ 
++func getLabelIndexVersion(ctx *datastore.VersionedCtx, label uint64) (dvid.VersionID, error) {
++	store, err := datastore.GetKeyVersionGetter(ctx.Data())
++	if err != nil {
++		return 0, err
++	}
++	return store.GetVersion(ctx, NewLabelIndexTKey(label))
++}
++
+ // returns nil if no Meta is found.
+ // should only call getCachedLabelIndex external to this file.
+ func getLabelIndex(ctx *datastore.VersionedCtx, label uint64) (*labels.Index, error) {
+diff --git a/datatype/labelmap/labelidx_test.go b/datatype/labelmap/labelidx_test.go
+index c5256eb6..1271de74 100644
+--- a/datatype/labelmap/labelidx_test.go
++++ b/datatype/labelmap/labelidx_test.go
+@@ -301,12 +301,17 @@ func TestIngest(t *testing.T) {
+ 	idx3 = body3.getIndex(t)
+ 
+ 	ingestIndex(t, child2, idx1)
++	checkIndexVersion(t, 2, child1, child2)
+ 	ingestIndex(t, child2, idx2)
++	checkIndexVersion(t, 2, child2, child2)
+ 	ingestIndex(t, child2, idx3)
++
++	checkIndexVersion(t, 7, child1, child2)
+ 	blankIdx.Label = 7
+ 	ingestIndex(t, child2, blankIdx)
+ 	blankIdx.Label = 8
+ 	ingestIndex(t, child2, blankIdx)
++	checkIndexVersion(t, 7, child2, child2)
+ 
+ 	// Test result
+ 	checkSparsevolAPIs(t, child2)
+diff --git a/datatype/labelmap/labelmap.go b/datatype/labelmap/labelmap.go
+index 8054ba72..83fdcfdf 100644
+--- a/datatype/labelmap/labelmap.go
++++ b/datatype/labelmap/labelmap.go
+@@ -1453,6 +1453,16 @@ GET <api URL>/node/<UUID>/<data name>/proximity/<label 1 (target)>,<label 2a>,<l
+ 	are artificially split along block boundaries but won't be true for agglomerated
+ 	labels.
+ 	
++
++GET  <api URL>/node/<UUID>/<data name>/index-version/<label>
++
++	Returns the UUID of the the most recently stored label index for the given label.
++	Returns a status code 404 (Not Found) if label does not exist.
++
++	For example, if the label index for label 1234 was last stored in UUID d26e15,
++	the response would be the full UUID string "d26e15af06784aedbfcac1ff82684b51".
++
++
+ GET  <api URL>/node/<UUID>/<data name>/index/<label>?mutid=<uint64>
+ POST <api URL>/node/<UUID>/<data name>/index/<label>
+ 
+@@ -2974,6 +2984,9 @@ func (d *Data) ServeHTTP(uuid dvid.UUID, ctx *datastore.VersionedCtx, w http.Res
+ 	case "proximity":
+ 		d.handleProximity(ctx, w, r, parts)
+ 
++	case "index-version":
++		d.handleIndexVersion(ctx, w, r, parts)
++
+ 	case "index":
+ 		d.handleIndex(ctx, w, r, parts)
+ 
+diff --git a/datatype/labelmap/mutate_test.go b/datatype/labelmap/mutate_test.go
+index ca95bbf9..e09e9af7 100644
+--- a/datatype/labelmap/mutate_test.go
++++ b/datatype/labelmap/mutate_test.go
+@@ -86,6 +86,15 @@ func checkSparsevolAPIs(t *testing.T, uuid dvid.UUID) {
+ 	}
+ }
+ 
++func checkIndexVersion(t *testing.T, label uint64, expectedUUID, curUUID dvid.UUID) {
++	reqStr := fmt.Sprintf("%snode/%s/labels/index-version/%d", server.WebAPIPath, curUUID, label)
++	encoding := server.TestHTTP(t, "GET", reqStr, nil)
++	// test if encoding is same as uuid1 or else through t.Fatalf
++	if dvid.UUID(encoding) != expectedUUID {
++		t.Fatalf("Expected index version encoding to be %s, got %s\n", expectedUUID, encoding)
++	}
++}
++
+ func ingestIndex(t *testing.T, uuid dvid.UUID, idx *labels.Index) {
+ 	serialization, err := pb.Marshal(idx)
+ 	if err != nil {
+diff --git a/storage/badger/badger.go b/storage/badger/badger.go
+index 8b55b512..a858bd96 100644
+--- a/storage/badger/badger.go
++++ b/storage/badger/badger.go
+@@ -348,6 +348,38 @@ func (db *BadgerDB) GetKeyUsage(ranges []storage.KeyRange) (hitsPerInstance []st
+ 	return
+ }
+ 
++// ---- KeyVersionsGetter interface ------
++
++// GetVersion returns the VersionID of the key for the given context.
++// If an error occurs, the key does not exist, or the key is a tombstone, VersionID 0 is returned.
++func (db *BadgerDB) GetVersion(ctx storage.Context, tk storage.TKey) (dvid.VersionID, error) {
++	if db == nil {
++		return 0, fmt.Errorf("Can't call GetVersions() on nil BadgerDB")
++	}
++	if db.options == nil {
++		return 0, fmt.Errorf("Can't call GetVersions() on db with nil options: %v", db)
++	}
++	if ctx == nil {
++		return 0, fmt.Errorf("Received nil context in GetVersions()")
++	}
++	if !ctx.Versioned() {
++		return 0, fmt.Errorf("GetVersions() called on non-versioned context: %v", ctx)
++	}
++	vctx, ok := ctx.(storage.VersionedCtx)
++	if !ok {
++		return 0, fmt.Errorf("Bad GetVersions(): context is versioned but doesn't fulfill interface: %v", ctx)
++	}
++	keys, err := db.getKeyVersions(vctx, tk)
++	if err != nil {
++		return 0, err
++	}
++	versionID, err := vctx.GetBestVersion(keys)
++	if err != nil {
++		return 0, err
++	}
++	return versionID, err
++}
++
+ // ---- KeyValueGetter interface ------
+ 
+ // Get returns a value given a key.
+@@ -370,7 +402,7 @@ func (db *BadgerDB) Get(ctx storage.Context, tk storage.TKey) ([]byte, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		key, err := vctx.GetBestKeyVersion(keys)
++		key, err := vctx.GetBestKeyForVersion(keys)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -430,7 +462,7 @@ func (db *BadgerDB) Exists(ctx storage.Context, tk storage.TKey) (exists bool, e
+ 		if err != nil {
+ 			return false, err
+ 		}
+-		key, err := vctx.GetBestKeyVersion(keys)
++		key, err := vctx.GetBestKeyForVersion(keys)
+ 		if err != nil {
+ 			return false, err
+ 		}
+diff --git a/storage/context.go b/storage/context.go
+index 4de583cf..2d1ba6f4 100644
+--- a/storage/context.go
++++ b/storage/context.go
+@@ -100,9 +100,13 @@ type VersionedCtx interface {
+ 	// Returns upper bound key for versions.
+ 	MaxVersionKey(TKey) (Key, error)
+ 
+-	// GetBestKeyVersion returns the key that most closely matches this context's version.
++	// GetBestKeyForVersion returns the key that most closely matches this context's version.
+ 	// If no suitable key or a tombstone is encountered closed to the version, nil is returned.
+-	GetBestKeyVersion([]Key) (Key, error)
++	GetBestKeyForVersion([]Key) (Key, error)
++
++	// GetBestVersion returns the version of the stored key that most closely matches this context's version.
++	// If no suitable key or a tombstone is encountered closed to the version, a version 0 is returned.
++	GetBestVersion([]Key) (dvid.VersionID, error)
+ 
+ 	// VersionedKeyValue returns the key-value pair corresponding to this key's version
+ 	// given a list of key-value pairs across many versions.  If no suitable key-value
+diff --git a/storage/keyvalue.go b/storage/keyvalue.go
+index 2ebefdc5..dd91fda3 100644
+--- a/storage/keyvalue.go
++++ b/storage/keyvalue.go
+@@ -243,6 +243,11 @@ type KeyValueGetter interface {
+ 	Exists(ctx Context, k TKey) (bool, error)
+ }
+ 
++type KeyVersionGetter interface {
++	// GetVersions returns the VersionID of the key for the given context.
++	GetVersion(ctx Context, k TKey) (dvid.VersionID, error)
++}
++
+ type OrderedKeyValueGetter interface {
+ 	KeyValueGetter
+ 

@@ -1,0 +1,250 @@
+diff --git a/frontend/javascripts/test/sagas/operation_context_saga.spec.ts b/frontend/javascripts/test/sagas/operation_context_saga.spec.ts
+index 4ce11b997fe..007899e5b1e 100644
+--- a/frontend/javascripts/test/sagas/operation_context_saga.spec.ts
++++ b/frontend/javascripts/test/sagas/operation_context_saga.spec.ts
+@@ -1,3 +1,4 @@
++import ErrorHandling from "libs/error_handling";
+ import { noop } from "lodash-es";
+ import { applyMiddleware, createStore } from "redux";
+ import createSagaMiddleware from "redux-saga";
+@@ -10,9 +11,10 @@ import {
+   borrowedContext,
+   createOperationContext,
+   getOrCreateOperationContext,
++  watchForLongRunningOperations,
+ } from "viewer/model/sagas/operation_context_saga";
+ import { combinedReducer, type OperationContextState, type WebknossosState } from "viewer/store";
+-import { beforeEach, describe, expect, it } from "vitest";
++import { beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ // Minimal store for operation context tests — only handles the four operation context
+ // action types. Predicates in these tests don't access other WK state slices.
+@@ -349,4 +351,103 @@ describe("operation_context_saga", () => {
+     await sagaMiddleware.run(op).toPromise();
+     expect(log).toEqual(["id: FLOODFILL", "ran"]);
+   });
++
++  describe("watchForLongRunningOperations", () => {
++    const THRESHOLD_MS = 30;
++
++    beforeEach(() => {
++      vi.mocked(ErrorHandling.notify).mockClear();
++    });
++
++    it("reports an operation that runs longer than the threshold (once)", async () => {
++      const { sagaMiddleware } = makeTestStore();
++      sagaMiddleware.run(watchForLongRunningOperations, THRESHOLD_MS);
++
++      function* op() {
++        const ctx = yield* createOperationContext({
++          id: "PROOFREADING",
++          description: "Proofreading in progress",
++        });
++        yield* ctx.execute(function* () {
++          yield delay(3 * THRESHOLD_MS);
++        });
++      }
++
++      await sagaMiddleware.run(op).toPromise();
++
++      expect(ErrorHandling.notify).toHaveBeenCalledTimes(1);
++      const [error, params, severity] = vi.mocked(ErrorHandling.notify).mock.calls[0];
++      expect((error as Error).message).toBe(
++        `Operation "PROOFREADING" has been running for more than ${THRESHOLD_MS / 1000} seconds.`,
++      );
++      expect(params).toMatchObject({
++        operationId: "PROOFREADING",
++        description: "Proofreading in progress",
++        activeOperations: [{ id: "PROOFREADING", description: "Proofreading in progress" }],
++      });
++      expect(severity).toBe("warning");
++    });
++
++    it("reports an operation that blocks the thread longer than the threshold", async () => {
++      const { sagaMiddleware } = makeTestStore();
++      sagaMiddleware.run(watchForLongRunningOperations, THRESHOLD_MS);
++
++      // Simulate a blocked thread: the clock advances while the operation runs, but the
++      // timeout of the watchdog cannot fire before the operation is unregistered.
++      let now = 1_000_000;
++      const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
++
++      function* op() {
++        const ctx = yield* createOperationContext({ id: "PROOFREADING" });
++        yield* ctx.execute(function* () {
++          now += 2 * THRESHOLD_MS;
++          yield* call(noop);
++        });
++      }
++
++      try {
++        await sagaMiddleware.run(op).toPromise();
++      } finally {
++        dateNowSpy.mockRestore();
++      }
++
++      expect(ErrorHandling.notify).toHaveBeenCalledTimes(1);
++    });
++
++    it("does not report operations that finish in time", async () => {
++      const { sagaMiddleware } = makeTestStore();
++      sagaMiddleware.run(watchForLongRunningOperations, THRESHOLD_MS);
++
++      function* op() {
++        const ctx = yield* createOperationContext({ id: "FLOODFILL" });
++        yield* ctx.execute(function* () {
++          yield delay(5);
++        });
++      }
++
++      await sagaMiddleware.run(op).toPromise();
++      // Wait longer than the threshold to ensure that no (late) report is made.
++      await new Promise((resolve) => setTimeout(resolve, 2 * THRESHOLD_MS));
++
++      expect(ErrorHandling.notify).not.toHaveBeenCalled();
++    });
++
++    it("tracks each registration of an operation separately", async () => {
++      const { sagaMiddleware } = makeTestStore();
++      sagaMiddleware.run(watchForLongRunningOperations, THRESHOLD_MS);
++
++      function* op(durationMs: number) {
++        const ctx = yield* createOperationContext({ id: "FLOODFILL" });
++        yield* ctx.execute(function* () {
++          yield delay(durationMs);
++        });
++      }
++
++      // The first run finishes in time, the second one is too slow.
++      await sagaMiddleware.run(op, 5).toPromise();
++      await sagaMiddleware.run(op, 3 * THRESHOLD_MS).toPromise();
++
++      expect(ErrorHandling.notify).toHaveBeenCalledTimes(1);
++    });
++  });
+ });
+diff --git a/frontend/javascripts/viewer/model/sagas/operation_context_saga.ts b/frontend/javascripts/viewer/model/sagas/operation_context_saga.ts
+index c61508cca1f..5cfd7fb75a5 100644
+--- a/frontend/javascripts/viewer/model/sagas/operation_context_saga.ts
++++ b/frontend/javascripts/viewer/model/sagas/operation_context_saga.ts
+@@ -1,7 +1,12 @@
++import ErrorHandling from "libs/error_handling";
+ import Mutex from "libs/mutex";
+-import { call, put, take } from "redux-saga/effects";
+-import { takeEvery } from "typed-redux-saga";
+-import type { OperationId } from "viewer/model/actions/operation_context_actions";
++import { type ActionPattern, call, put } from "redux-saga/effects";
++import { delay, race, takeEvery } from "typed-redux-saga";
++import type { Action } from "viewer/model/actions/actions";
++import type {
++  OperationId,
++  RegisterOperationAction,
++} from "viewer/model/actions/operation_context_actions";
+ import {
+   registerChildOperationAction,
+   registerOperationAction,
+@@ -9,7 +14,7 @@ import {
+   unregisterOperationAction,
+ } from "viewer/model/actions/operation_context_actions";
+ import type { WebknossosState } from "viewer/store";
+-import { type Saga, select } from "./effect_generators";
++import { type Saga, select, take } from "./effect_generators";
+ 
+ /*
+  * This module introduces the concept of Operation Contexts that can be used
+@@ -165,7 +170,7 @@ export function* createOperationContext(
+   }
+ 
+   if (behavior === "wait") {
+-    yield take("UNREGISTER_OPERATION");
++    yield* take("UNREGISTER_OPERATION");
+     // Re-check after waking: another waiter may have grabbed the lock first.
+     // Cast is safe: we only reach "wait" when behaviorWhenDisallowed is "wait" or undefined.
+     return yield call(createOperationContext, options as NonNullableOptions);
+@@ -228,6 +233,62 @@ export function* getOrCreateOperationContext(
+   return yield* createOperationContext(options as NonNullableOptions);
+ }
+ 
++// ─── Watchdog ─────────────────────────────────────────────────────────────────
++
++// While an operation is registered, the user interface is blocked. An operation that
++// never finishes (e.g., because it waits for something that never happens) makes the
++// viewports unusable without any hint about the reason. The watchdog reports such operations.
++export const LONG_RUNNING_OPERATION_THRESHOLD_MS = 20 * 1000;
++
++function* reportIfOperationRunsTooLong(
++  action: RegisterOperationAction,
++  thresholdMs: number,
++): Saga<void> {
++  const { id, description } = action;
++  const isThisOperationUnregistered = ((a: Action) =>
++    a.type === "UNREGISTER_OPERATION" && a.id === id) as ActionPattern<Action>;
++  const startTime = Date.now();
++
++  const { unregistered } = yield* race({
++    unregistered: take(isThisOperationUnregistered),
++    timeout: delay(thresholdMs),
++  });
++  // If the browser thread was blocked for longer than the threshold, the timeout
++  // cannot fire in time and the unregistration can win the race even though the
++  // operation took too long. Therefore, check the elapsed time explicitly.
++  const hasExceededThreshold = Date.now() - startTime >= thresholdMs;
++  if (unregistered != null && !hasExceededThreshold) {
++    return;
++  }
++
++  const { activeOperations, childOperations } = yield* select((state) => state.operationContext);
++  const message = `Operation "${id}" has been running for more than ${thresholdMs / 1000} seconds.`;
++  console.warn(
++    `${message} The user interface might be blocked. Active operations:`,
++    activeOperations,
++    "Child operations:",
++    childOperations,
++  );
++  ErrorHandling.notify(
++    new Error(message),
++    { operationId: id, description, activeOperations, childOperations },
++    "warning",
++  );
++
++  if (unregistered == null) {
++    yield* take(isThisOperationUnregistered);
++  }
++  console.warn(`Operation "${id}" finished after ${(Date.now() - startTime) / 1000} seconds.`);
++}
++
++export function* watchForLongRunningOperations(
++  thresholdMs: number = LONG_RUNNING_OPERATION_THRESHOLD_MS,
++): Saga<void> {
++  yield* takeEvery("REGISTER_OPERATION", function* (action: RegisterOperationAction) {
++    yield* reportIfOperationRunsTooLong(action, thresholdMs);
++  });
++}
++
+ // ─── Test utilities ───────────────────────────────────────────────────────────
+ 
+ // Resets module-level state. Only intended for use in tests.
+diff --git a/frontend/javascripts/viewer/model/sagas/root_saga.ts b/frontend/javascripts/viewer/model/sagas/root_saga.ts
+index 460a5ef4bbc..526415a2955 100644
+--- a/frontend/javascripts/viewer/model/sagas/root_saga.ts
++++ b/frontend/javascripts/viewer/model/sagas/root_saga.ts
+@@ -27,7 +27,10 @@ import adHocMeshSaga from "./meshes/ad_hoc_mesh_saga";
+ import commonMeshSaga, { handleAdditionalCoordinateUpdate } from "./meshes/common_mesh_saga";
+ import precomputedMeshSaga from "./meshes/precomputed_mesh_saga";
+ import mipSaga from "./mip_saga";
+-import { resetOperationContextOnWkReady } from "./operation_context_saga";
++import {
++  resetOperationContextOnWkReady,
++  watchForLongRunningOperations,
++} from "./operation_context_saga";
+ import { toggleErrorHighlighting } from "./saving/save_queue_draining_saga";
+ import splitBoundaryMeshSaga from "./split_boundary_mesh_saga";
+ import { warnIfEmailIsUnverified } from "./user_saga";
+@@ -96,6 +99,7 @@ function* restartableSaga(): Saga<void> {
+       call(idReservationSaga),
+       call(mipSaga),
+       call(resetOperationContextOnWkReady),
++      call(watchForLongRunningOperations),
+     ]);
+   } catch (err: any) {
+     rootSagaCrashed = true;

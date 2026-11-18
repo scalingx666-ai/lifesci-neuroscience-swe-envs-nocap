@@ -1,0 +1,288 @@
+diff --git a/README.md b/README.md
+index 97c0750e..8d788f2e 100644
+--- a/README.md
++++ b/README.md
+@@ -1095,11 +1095,25 @@ for stream in all_streams:
+ ## Record & Replay
+ 
+ ```bash
+-pieeg-server record session.csv                    # standalone, Ctrl-C to stop
+-pieeg-server record session.csv --duration 300     # 5 minutes
+-pieeg-server --record session.csv                  # record while streaming
++pieeg-server record session.csv                          # standalone, Ctrl-C to stop
++pieeg-server record session.csv --duration 300           # 5 minutes
++pieeg-server record session.csv --native --sample-rate 2000   # high-rate native capture
++pieeg-server --record session.csv                        # record while streaming
+ ```
+ 
++### `record` options
++
++| Flag | Default | Description |
++|------|---------|-------------|
++| `--duration SEC` | — | Stop after N seconds (default: until Ctrl-C) |
++| `--native` | — | Use the native `pieeg-core` acquisition loop — recommended for high sample rates (e.g. 2000 SPS × 16 ch) where the pure-Python read loop drops samples. Requires `pieeg-core` built with the `hardware` feature (aarch64 Pi wheel). |
++| `--sample-rate SPS` | device native | ADC output data rate for `--native`: `250`, `500`, `1000`, `2000`, or `4000`. |
++| `--device DEVICE` | `pieeg16` | `pieeg8`, `pieeg16`, `ironbci8`, or `ironbci32` |
++| `--gpio-chip PATH` | `/dev/gpiochip4` | GPIO chip device |
++| `--mock` | — | Synthetic EEG (no hardware needed) |
++
++> **Native capture:** `--native` hands the SPI/GPIO/ADC lifecycle to a dedicated Rust read thread (GIL released) that feeds a lock-free queue. Dropped samples are always counted and logged — never silent. Build the wheel with `maturin build --release --features hardware` on the Pi first.
++
+ | Feature | Details |
+ |---------|---------|
+ | Format | CSV: `timestamp, ch1, ch2, ..., chN` |
+diff --git a/pieeg_server/__main__.py b/pieeg_server/__main__.py
+index 5494a3e0..b339c7e6 100644
+--- a/pieeg_server/__main__.py
++++ b/pieeg_server/__main__.py
+@@ -149,6 +149,17 @@ def _add_serial_args(parser):
+         "--gpio-chip", default="/dev/gpiochip4",
+         help="GPIO chip device path (default: '/dev/gpiochip4' for Pi 5)",
+     )
++    rec.add_argument(
++        "--native", action="store_true",
++        help="Use the native pieeg-core acquisition loop (recommended for high "
++             "sample rates like 2000 SPS; requires pieeg-core built with the "
++             "'hardware' feature)",
++    )
++    rec.add_argument(
++        "--sample-rate", type=int, default=None, metavar="SPS",
++        help="ADC output data rate in SPS for native acquisition "
++             "(250/500/1000/2000/4000; default: device native rate)",
++    )
+     rec.add_argument("--profile", **profile_kwargs)
+     _add_ble_args(rec)
+     _add_serial_args(rec)
+@@ -408,8 +419,12 @@ def _print_startup_panel(console, args, device_label, num_ch, local_ip, hostname
+     console.print()
+ 
+ 
+-def _make_hardware(args, logger):
+-    """Create and open the hardware backend (real, BLE, or mock)."""
++def _make_hardware(args, logger, open_device: bool = True):
++    """Create the hardware backend (real, BLE, or mock).
++
++    When ``open_device`` is False the device is created but not opened — used
++    by native acquisition, which owns the SPI buses and GPIO lines itself.
++    """
+     device = getattr(args, "device", "pieeg16")
+     num_ch = _num_channels_from_device(device)
+     if args.mock:
+@@ -456,6 +471,9 @@ def _make_hardware(args, logger):
+             num_channels=num_ch,
+             profile=profile_name,
+         )
++    if not open_device:
++        # Native acquisition owns the SPI/GPIO devices; don't open here.
++        return hw
+     hw.open()
+     if not args.mock and not _is_ble_device(device) and not _is_serial_device(device):
+         logger.info("Hardware initialized - ADCs configured, LEDs should be ON")
+@@ -553,13 +571,19 @@ def main():
+         _setup_rich_logging(verbose=args.verbose)
+         logger = logging.getLogger("pieeg")
+ 
+-        hw = _make_hardware(args, logger)
++        # Native acquisition requires real hardware and owns the SPI/GPIO
++        # devices itself, so we create the hardware object without opening it.
++        native = bool(getattr(args, "native", False)) and not args.mock
++        hw = _make_hardware(args, logger, open_device=not native)
+         loop = asyncio.new_event_loop()
+         asyncio.set_event_loop(loop)
+         _device = getattr(args, "device", "pieeg16")
+         acq = AcquisitionLoop(hw, loop, mock=args.mock,
+                               ble=_is_ble_device(_device),
+-                              serial=_is_serial_device(_device))
++                              serial=_is_serial_device(_device),
++                              native=native,
++                              sample_rate=getattr(args, "sample_rate", None),
++                              gpio_chip=args.gpio_chip)
+         acq.start()
+         recorder = Recorder(acq, output=args.output, duration=args.duration,
+                             num_channels=acq.num_channels)
+@@ -575,6 +599,11 @@ def _rec_shutdown(*_):
+         signal.signal(signal.SIGTERM, _rec_shutdown)
+         loop.run_until_complete(recorder.run())
+         acq.stop()
++        if native and acq.native_dropped:
++            logger.warning(
++                "Native acquisition dropped %d frames during recording "
++                "(consumer back-pressure)", acq.native_dropped,
++            )
+         hw.close()
+         return
+ 
+diff --git a/pieeg_server/_native.py b/pieeg_server/_native.py
+index dd51b274..f285ebf9 100644
+--- a/pieeg_server/_native.py
++++ b/pieeg_server/_native.py
+@@ -28,12 +28,16 @@
+     HampelFilter: Any = _pc.HampelFilter
+     MultichannelFilter: Any = _pc.MultichannelFilter
+     decode_channels: Any = _pc.decode_channels
++    # Only present when pieeg-core is built with the `hardware` feature
++    # (e.g. the Raspberry Pi wheel). Absent on off-Pi builds.
++    NativeAcquisition: Any = getattr(_pc, "NativeAcquisition", None)
+ except ImportError:
+     HAS_NATIVE = False
+     NATIVE_VERSION = None
+     HampelFilter = None
+     MultichannelFilter = None
+     decode_channels = None
++    NativeAcquisition = None
+ 
+ 
+ def engine_info() -> dict:
+@@ -51,5 +55,6 @@ def engine_info() -> dict:
+     "HampelFilter",
+     "MultichannelFilter",
+     "decode_channels",
++    "NativeAcquisition",
+     "engine_info",
+ ]
+diff --git a/pieeg_server/acquisition.py b/pieeg_server/acquisition.py
+index 73162050..46f599ea 100644
+--- a/pieeg_server/acquisition.py
++++ b/pieeg_server/acquisition.py
+@@ -24,12 +24,21 @@ class AcquisitionLoop:
+     """Runs the SPI read loop in a background thread, feeds async queues."""
+ 
+     def __init__(self, hardware, loop: asyncio.AbstractEventLoop,
+-                 mock: bool = False, ble: bool = False, serial: bool = False):
++                 mock: bool = False, ble: bool = False, serial: bool = False,
++                 native: bool = False, sample_rate: int | None = None,
++                 gpio_chip: str = "/dev/gpiochip4"):
+         self._hw = hardware
+         self._loop = loop
+         self._mock = mock
+         self._ble = ble
+         self._serial = serial
++        self._native = native
++        # Native path owns the ADC config, so it needs the target rate up front.
++        self._native_sample_rate = int(
++            sample_rate or getattr(hardware, "sample_rate", SAMPLE_RATE)
++        )
++        self._native_gpiochip = gpio_chip
++        self._native_acq = None
+         self._subscribers: list[asyncio.Queue] = []
+         self._stop_event = threading.Event()
+         self._thread: threading.Thread | None = None
+@@ -75,6 +84,12 @@ def queue(self) -> asyncio.Queue:
+     def sample_count(self) -> int:
+         return self._sample_count
+ 
++    @property
++    def native_dropped(self) -> int:
++        """Frames dropped by the native ring (0 if not in native mode)."""
++        acq = self._native_acq
++        return int(acq.dropped) if acq is not None else 0
++
+     def start(self):
+         self._stop_event.clear()
+         self._thread = threading.Thread(
+@@ -101,7 +116,9 @@ def restart_with_config(self, reg_map: dict[int, int]):
+         self.start()
+ 
+     def _run(self):
+-        if self._mock:
++        if self._native:
++            self._run_native()
++        elif self._mock:
+             self._run_mock()
+         elif self._ble:
+             self._run_ble()
+@@ -110,6 +127,78 @@ def _run(self):
+         else:
+             self._run_hardware()
+ 
++    def _run_native(self):
++        """Drain the native pieeg-core acquisition loop.
++
++        The native ``NativeAcquisition`` owns the SPI buses, GPIO lines and ADC
++        configuration, and reads DRDY on a dedicated OS thread with the GIL
++        released. This method simply drains its lock-free queue in batches and
++        forwards frames downstream in the same shape as ``_run_hardware``.
++
++        Used for high sample rates (e.g. 2 kSPS × 16 ch) where the pure-Python
++        read loop cannot keep up. Requires ``pieeg-core`` built with the
++        ``hardware`` feature; otherwise raises so the caller can fall back.
++        """
++        import logging
++
++        from . import _native
++
++        log = logging.getLogger("pieeg.acquisition")
++
++        NativeAcquisition = getattr(_native, "NativeAcquisition", None)
++        if NativeAcquisition is None:
++            raise RuntimeError(
++                "Native acquisition requires pieeg-core built with the "
++                "'hardware' feature (aarch64 Raspberry Pi wheel). "
++                "Rebuild with: maturin build --release --features hardware"
++            )
++
++        acq = NativeAcquisition(
++            num_channels=self._hw.num_channels,
++            sample_rate=self._native_sample_rate,
++            gpiochip=self._native_gpiochip,
++        )
++        acq.start()
++        self._native_acq = acq
++        log.info(
++            "Native acquisition started (%d ch @ %d SPS)",
++            self._hw.num_channels, self._native_sample_rate,
++        )
++
++        # Poll interval when the queue is empty: a fraction of the sample period
++        # keeps latency low without busy-spinning.
++        idle_sleep = min(0.002, 1.0 / max(1, self._native_sample_rate))
++        last_dropped = 0
++        try:
++            while not self._stop_event.is_set():
++                batch = acq.read_batch(256)
++                if not batch:
++                    time.sleep(idle_sleep)
++                    continue
++
++                # Build all frame dicts up front and hand them to the event
++                # loop in a single cross-thread hop. One call_soon_threadsafe
++                # per sample would reintroduce exactly the per-sample overhead
++                # the native reader exists to remove.
++                frames = [
++                    {"t": round(t, 6), "n": seq, "channels": channels}
++                    for seq, t, channels in batch
++                ]
++                self._sample_count = batch[-1][0]
++                self._loop.call_soon_threadsafe(self._enqueue_batch, frames)
++
++                dropped = acq.dropped
++                if dropped != last_dropped:
++                    log.warning(
++                        "Native acquisition dropped %d frames (ring overflow) — "
++                        "consumer not draining fast enough", dropped,
++                    )
++                    last_dropped = dropped
++        finally:
++            acq.stop()
++            log.info("Native acquisition stopped (%d frames dropped total)",
++                     acq.dropped)
++
+     def _run_mock(self):
+         """Generate synthetic data for testing without hardware.
+ 
+@@ -196,6 +285,15 @@ def _enqueue(self, frame: dict):
+                 except asyncio.QueueFull:
+                     pass
+ 
++    def _enqueue_batch(self, frames: list[dict]):
++        """Enqueue a whole batch of frames from a single event-loop callback.
++
++        Used by native acquisition so the read thread schedules one
++        ``call_soon_threadsafe`` per ``read_batch`` rather than one per sample.
++        """
++        for frame in frames:
++            self._enqueue(frame)
++
+     def _run_ble(self):
+         """BLE acquisition: connect, then poll the notification buffer at 250 Hz.
+ 

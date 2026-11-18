@@ -1,0 +1,358 @@
+diff --git a/packages/backend-core/src/app.ts b/packages/backend-core/src/app.ts
+index 3c17b6a3..0306a038 100644
+--- a/packages/backend-core/src/app.ts
++++ b/packages/backend-core/src/app.ts
+@@ -378,11 +378,12 @@ export function createApp(options: CreateAppOptions): Hono {
+   // Missing / non-boolean → runtime treats as enabled (default-on). PUT is a
+   // MERGE (partial patch); unknown keys and non-boolean values are ignored.
+   //
+-  // ⚠️ IMPORTANT: The runtime lazy-reads this file ONCE per process. A change
+-  // via this endpoint therefore only takes effect on newly-created sessions
+-  // (whose first ensureAgent triggers the read). To apply the change to
+-  // already-running sessions, restart the backend. This is documented in the
+-  // frontend panel via a persistent notice.
++  // Liveness: the runtime reads this file on every `ensureAgent`, so a PUT
++  // here takes effect on the next new session (or the next expert spawn in
++  // an existing session) immediately. Already-running agents keep the tool
++  // list they were given at agent-creation time — Pi caches it inside the
++  // provider session — so applying the change to a currently-active agent
++  // still requires a backend restart. The frontend panel spells this out.
+   api.get("/tool-toggles", async (c) => {
+     return c.json(await readToolToggles(dataDir));
+   });
+diff --git a/packages/runtime/src/__tests__/tool-toggles-hot.test.ts b/packages/runtime/src/__tests__/tool-toggles-hot.test.ts
+new file mode 100644
+index 00000000..fb3cf166
+--- /dev/null
++++ b/packages/runtime/src/__tests__/tool-toggles-hot.test.ts
+@@ -0,0 +1,177 @@
++/**
++ * Regression: `tool_toggles.json` is read on every `ensureAgent`, so a flip
++ * via `PUT /api/tool-toggles` takes effect on the next new session (or the
++ * next expert spawn) WITHOUT a runtime restart.
++ *
++ * Old behavior: `SessionManager` cached the toggles for the process lifetime
++ * — the first `ensureAgent` seeded the cache with whatever the disk had
++ * at that instant, and all subsequent sessions saw the same stale value.
++ * A user who opened Settings AFTER the first session had already started
++ * saw their toggle change ignored forever.
++ *
++ * New behavior tested here: toggle disk file, create a new session, expect
++ * the new session's principal to receive an agentFactory call whose
++ * `allowedToolNames` reflects the current disk state — not whatever was
++ * on disk at first-manager-use.
++ */
++import { describe, it, expect, beforeEach, afterEach } from "vitest";
++import { mkdtemp, mkdir, rm, writeFile, unlink } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { SessionManager } from "../session-manager.js";
++import { MockAgentSession } from "../mock-agent.js";
++import type { AgentSessionFactory } from "../types.js";
++
++// Persist writes are fire-and-forget; on afterEach an ENOTEMPTY can race the
++// still-in-flight bus/mailbox flush. Give the writes a beat to settle, then
++// retry rm a few times before giving up.
++async function rmRetry(path: string): Promise<void> {
++  for (let i = 0; i < 5; i++) {
++    try {
++      await rm(path, { recursive: true, force: true });
++      return;
++    } catch {
++      await new Promise((r) => setTimeout(r, 50));
++    }
++  }
++  await rm(path, { recursive: true, force: true });
++}
++
++/** Flush every persisted write and stop background tasks. */
++async function finish(m: SessionManager): Promise<void> {
++  m.shutdown();
++  await m.emergencySaveAll();
++}
++
++/**
++ * A spying factory that records every `allowedToolNames` list it saw, then
++ * defers to the real MockAgentSession so the rest of the SessionManager
++ * pipeline (session_state, mailbox, etc.) behaves normally.
++ */
++function makeSpyingFactory(): {
++  factory: AgentSessionFactory;
++  callsFor: (agentName: string) => string[][];
++} {
++  const calls: Array<{ agentName: string; allowedToolNames: string[] }> = [];
++  const factory: AgentSessionFactory = async (params) => {
++    calls.push({
++      agentName: params.agentName,
++      allowedToolNames: [...params.allowedToolNames],
++    });
++    return new MockAgentSession({
++      sessionId: params.sessionId,
++      agentName: params.agentName,
++      systemTools: params.systemTools,
++    });
++  };
++  return {
++    factory,
++    callsFor: (agentName) =>
++      calls.filter((c) => c.agentName === agentName).map((c) => c.allowedToolNames),
++  };
++}
++
++async function writeToggles(dataRoot: string, patch: Record<string, boolean>): Promise<void> {
++  const dir = join(dataRoot, "bp_template");
++  await mkdir(dir, { recursive: true });
++  await writeFile(join(dir, "tool_toggles.json"), JSON.stringify(patch), "utf8");
++}
++
++describe("tool_toggles hot-read on ensureAgent", () => {
++  let dataRoot: string;
++
++  beforeEach(async () => {
++    dataRoot = await mkdtemp(join(tmpdir(), "bp-toggles-hot-"));
++  });
++  afterEach(async () => {
++    await rmRetry(dataRoot);
++  });
++
++  it("picks up a mid-run flip on the NEXT createSession (no restart)", async () => {
++    // First session: tool_toggles.json does not exist → skill_search enabled
++    // (default-on). The manager reads disk on this ensureAgent and gets null.
++    const spy = makeSpyingFactory();
++    const m = new SessionManager({ dataRoot, agentFactory: spy.factory });
++
++    const s1 = await m.createSession();
++    // Trigger principal creation (createSession returns before ensureAgent
++    // fires; sendMessage forces it).
++    await m.sendMessage(s1.id, "hi");
++
++    const firstPrincipal = spy.callsFor("principal")[0];
++    expect(firstPrincipal).toBeDefined();
++    expect(firstPrincipal).toContain("skill_search");
++
++    // The user flips the toggle in Settings after session 1 has already run.
++    // Under the old (cached) behavior, this write would be silently ignored
++    // for the lifetime of the process.
++    await writeToggles(dataRoot, {
++      skill_search: false,
++      get_domain_knowledge_local: false,
++      search_papers_local: false,
++    });
++
++    // New session — must observe the flip.
++    const s2 = await m.createSession();
++    await m.sendMessage(s2.id, "hi");
++
++    const secondPrincipal = spy.callsFor("principal")[1];
++    expect(secondPrincipal).toBeDefined();
++    expect(secondPrincipal).not.toContain("skill_search");
++    expect(secondPrincipal).not.toContain("get_domain_knowledge_local");
++    expect(secondPrincipal).not.toContain("search_papers_local");
++
++    // Comms / orchestration primitives stay put — the toggles must not
++    // affect always-on tools.
++    expect(secondPrincipal).toContain("send_message");
++    expect(secondPrincipal).toContain("create_agent");
++
++    await finish(m);
++  });
++
++  it("picks up removal of the toggle file (back to default-on)", async () => {
++    // Seed with everything OFF, then delete the file mid-run and confirm
++    // that "no file → default-on" is re-evaluated on the next session.
++    await writeToggles(dataRoot, {
++      skill_search: false,
++      get_domain_knowledge_local: false,
++      search_papers_local: false,
++    });
++
++    const spy = makeSpyingFactory();
++    const m = new SessionManager({ dataRoot, agentFactory: spy.factory });
++
++    const s1 = await m.createSession();
++    await m.sendMessage(s1.id, "hi");
++    expect(spy.callsFor("principal")[0]).not.toContain("skill_search");
++
++    await unlink(join(dataRoot, "bp_template", "tool_toggles.json"));
++
++    const s2 = await m.createSession();
++    await m.sendMessage(s2.id, "hi");
++    expect(spy.callsFor("principal")[1]).toContain("skill_search");
++
++    await finish(m);
++  });
++
++  it("explicit constructor injection still bypasses disk (test override wins)", async () => {
++    // If a test wires `opts.toolToggles`, the manager must NEVER read disk —
++    // even if a stale tool_toggles.json exists alongside. This keeps tests
++    // hermetic when the tmp dataRoot happens to contain a fixture.
++    await writeToggles(dataRoot, { skill_search: true });
++
++    const spy = makeSpyingFactory();
++    const m = new SessionManager({
++      dataRoot,
++      agentFactory: spy.factory,
++      toolToggles: { skill_search: false }, // injection wins
++    });
++
++    const s = await m.createSession();
++    await m.sendMessage(s.id, "hi");
++
++    expect(spy.callsFor("principal")[0]).not.toContain("skill_search");
++
++    await finish(m);
++  });
++});
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index 38e8eb40..399398e9 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -291,11 +291,11 @@ export interface SessionManagerOptions {
+   /**
+    * Per-tool on/off overrides for the three user-controllable Pi-native
+    * SystemTools (`skill_search`, `get_domain_knowledge_local`,
+-   * `search_papers_local`). When omitted, the runtime lazy-reads
+-   * `<dataRoot>/bp_template/tool_toggles.json` on the first `ensureAgent`
+-   * and caches the result for the process lifetime. Tests inject this to
+-   * bypass the disk read. Passing `{}` explicitly disables the disk load
+-   * and treats every tool as enabled (default-on).
++   * `search_papers_local`). When omitted, the runtime reads
++   * `<dataRoot>/bp_template/tool_toggles.json` on every `ensureAgent`, so a
++   * UI flip takes effect on the next new session / expert spawn. Tests
++   * inject this to bypass disk entirely for the lifetime of the manager;
++   * passing `{}` explicitly pins "all enabled" without touching disk.
+    */
+   toolToggles?: ToolToggles | null;
+   /**
+@@ -412,14 +412,17 @@ export class SessionManager {
+   // `workspaces/<sid>/`. Default `local`; env `BP_USER_ID`.
+   private readonly persistentUserId: string;
+ 
+-  // Per-tool on/off overrides. Populated by `ensureToolToggles()` on the
+-  // first agent creation and cached for the process lifetime; a restart is
+-  // required for a change to affect already-running sessions (an explicit
+-  // design choice to avoid mid-session tool-list mutation — see plan doc).
+-  // Sentinel: `undefined` = not yet loaded from disk; `null` = loaded and
+-  // no file found / unparseable (equivalent to "all enabled"); an object =
+-  // the parsed shape.
+-  private toolToggles: ToolToggles | null | undefined = undefined;
++  // Per-tool on/off overrides — TEST INJECTION SEED ONLY.
++  //
++  // The runtime path reads `bp_template/tool_toggles.json` on every
++  // `ensureAgent` (see `ensureToolToggles`), so a UI flip takes effect on the
++  // next new session / expert spawn without a restart. This field is only set
++  // when a test passes `opts.toolToggles` to the constructor to bypass disk.
++  //
++  // Sentinel: `undefined` = no injection, read from disk each time;
++  //           `null` = injected "no signal → all enabled" (no disk read);
++  //           object = injected explicit toggles (no disk read).
++  private injectedToolToggles: ToolToggles | null | undefined = undefined;
+ 
+   // #261: cross-user read-only shared root, addressed by the `/shared` prefix.
+   // An absolute dir OUTSIDE dataRoot, shared across ALL users. `undefined` =
+@@ -455,12 +458,12 @@ export class SessionManager {
+     this.sharedDir = resolveSharedDir(opts.sharedDir);
+ 
+     // Test-only injection path: if callers pass `toolToggles`, use it verbatim
+-    // and skip the disk read altogether. `undefined` (the field is absent from
+-    // opts) leaves the sentinel at `undefined` so `ensureToolToggles` triggers
+-    // the lazy load on first use. Passing `null` explicitly seeds the cache
+-    // with "no signal → all enabled" without touching disk.
++    // and skip disk reads for the lifetime of this manager. `undefined` (the
++    // field is absent from opts) leaves the sentinel at `undefined` so
++    // `ensureToolToggles` reads disk each time. Passing `null` explicitly
++    // pins "no signal → all enabled" without touching disk.
+     if (opts.toolToggles !== undefined) {
+-      this.toolToggles = opts.toolToggles;
++      this.injectedToolToggles = opts.toolToggles;
+     }
+ 
+     const limitBytes = opts.memLimitBytes ?? parseMemLimitMb(process.env);
+@@ -503,23 +506,32 @@ export class SessionManager {
+   }
+ 
+   /**
+-   * Load per-tool on/off overrides once per process. Called from `ensureAgent`;
+-   * result cached until restart. A change to `tool_toggles.json` therefore
+-   * requires a runtime restart to affect already-running sessions (see plan
+-   * doc: this is deliberate — hot tool-list mutation into an active
+-   * agent/provider connection is fragile). Newly-created sessions after the
+-   * change pick up the new value on their first `ensureAgent`.
++   * Load per-tool on/off overrides. Called from `ensureAgent`; reads disk
++   * each time so a UI flip via `PUT /api/tool-toggles` takes effect on the
++   * next new session / expert spawn without a runtime restart.
++   *
++   * The file is tiny (three booleans, ~100 bytes) and `ensureAgent` isn't
++   * hot — it fires on session create + expert spawn, not per turn — so the
++   * extra fs.readFile is negligible next to the Pi SDK setup that follows.
++   *
++   * Test injection: if the constructor received an explicit `opts.toolToggles`,
++   * that value is returned verbatim on every call and disk is never read.
++   *
++   * Already-running agents keep the tool list they were given at
++   * `agentFactory` time (Pi caches it inside the provider session), so a
++   * mid-run flip is still restart-to-apply for the RUNNING session — but a
++   * NEW session created after the flip picks up the change immediately.
+    */
+   private async ensureToolToggles(): Promise<ToolToggles | null> {
+-    if (this.toolToggles !== undefined) return this.toolToggles;
++    if (this.injectedToolToggles !== undefined) return this.injectedToolToggles;
+     try {
+-      this.toolToggles = await loadToolToggles(this.dataRoot);
++      return await loadToolToggles(this.dataRoot);
+     } catch {
+-      // A read failure is not fatal — fall back to "all enabled" and remember
+-      // that we tried, so we don't retry on every `ensureAgent`.
+-      this.toolToggles = null;
++      // A read failure is not fatal — fall back to "all enabled" for this
++      // one call. We retry on the next `ensureAgent` (the fs error may be
++      // transient — dir permission changed, disk hiccup, etc.).
++      return null;
+     }
+-    return this.toolToggles;
+   }
+ 
+   /**
+diff --git a/packages/web/src/components/settings/BuiltinToolsSection.tsx b/packages/web/src/components/settings/BuiltinToolsSection.tsx
+index 693a2b5b..20e77d44 100644
+--- a/packages/web/src/components/settings/BuiltinToolsSection.tsx
++++ b/packages/web/src/components/settings/BuiltinToolsSection.tsx
+@@ -9,10 +9,12 @@
+  * these are Pi-native tools, not MCP transports.
+  *
+  * Persistence model: each toggle flip immediately PUTs {name: bool} to
+- * /api/tool-toggles (partial-merge write). The runtime lazy-reads the file
+- * once per process, so a change here only affects newly-created sessions.
+- * A running-backend restart applies the change to all sessions. This is
+- * spelled out in the panel via `settings.builtinTools.restartHint`.
++ * /api/tool-toggles (partial-merge write). The runtime reads the file on
++ * every agent creation, so a change here takes effect on the next new
++ * session (or the next expert spawn) without a restart. Already-running
++ * agents keep the tool list they were given at creation time — restart the
++ * backend to force the change onto them. Spelled out via
++ * `settings.builtinTools.restartHint`.
+  */
+ import { useEffect, useState } from "react";
+ import { Loader2 } from "lucide-react";
+diff --git a/packages/web/src/i18n/messages/settings.ts b/packages/web/src/i18n/messages/settings.ts
+index f958f1e4..cdcbad36 100644
+--- a/packages/web/src/i18n/messages/settings.ts
++++ b/packages/web/src/i18n/messages/settings.ts
+@@ -19,7 +19,7 @@ export default defineMessages(
+     // Pi-native SystemTools whose exposure to agents is user-controllable.
+     "settings.builtinTools.title": "内置工具",
+     "settings.builtinTools.desc": "控制这三个内置工具是否对 agent 可见。关闭后 agent 的工具列表不再包含该工具，也无法调用。",
+-    "settings.builtinTools.restartHint": "改动会立即写入磁盘，但只在「重启后端」或「新建会话」时生效于所有会话。要让当前所有会话立即使用新设置，请重启后端。",
++    "settings.builtinTools.restartHint": "改动会立即生效于「新建会话」和新拉起的 expert。已经在跑的 agent 会保留创建时的工具列表，要让所有正在运行的会话立即生效，请重启后端。",
+     "settings.builtinTools.loadFailed": "加载工具开关失败",
+     "settings.builtinTools.saveFailed": "保存失败：{message}",
+     "settings.builtinTools.tool.skill_search.title": "路由技能库检索",
+@@ -256,7 +256,7 @@ export default defineMessages(
+     "settings.tab.preferences": "Preferences",
+     "settings.builtinTools.title": "Built-in tools",
+     "settings.builtinTools.desc": "Control whether each built-in tool is exposed to agents. When off, the tool disappears from the agent's tool list and can't be called.",
+-    "settings.builtinTools.restartHint": "Changes are written to disk immediately, but they only take effect for running sessions after a backend restart. New sessions pick up the new setting on their first turn.",
++    "settings.builtinTools.restartHint": "Changes take effect immediately for new sessions and newly-spawned experts. Already-running agents keep the tool list they were given at creation time — restart the backend to apply the change to them too.",
+     "settings.builtinTools.loadFailed": "Failed to load tool toggles",
+     "settings.builtinTools.saveFailed": "Save failed: {message}",
+     "settings.builtinTools.tool.skill_search.title": "Router skill search",

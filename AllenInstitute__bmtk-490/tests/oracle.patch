@@ -1,0 +1,1313 @@
+diff --git a/.gitignore b/.gitignore
+index 594a99bc..cbeeed62 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -56,3 +56,5 @@ examples/dpointnet_v1/Synchronization_data/
+ examples/dpointnet_*/*callbacks*
+ **/_lgn_grating_ops.so
+ **/_lgn_grating_ops.archs
++**/_lgn_movie_ops.so
++**/_lgn_movie_ops.archs
+diff --git a/bmtk/simulator/dpointnet/custom_ops/build.sh b/bmtk/simulator/dpointnet/custom_ops/build.sh
+index d9b48339..d65d64d7 100755
+--- a/bmtk/simulator/dpointnet/custom_ops/build.sh
++++ b/bmtk/simulator/dpointnet/custom_ops/build.sh
+@@ -9,6 +9,7 @@ build_dir="${DPOINTNET_CUSTOM_OP_BUILD_DIR:-$custom_ops_dir/build}"
+ output="${DPOINTNET_CUSTOM_OP_OUTPUT:-$custom_ops_dir/_csr_spike_ops.so}"
+ glif_output="${DPOINTNET_GLIF_OP_OUTPUT:-$custom_ops_dir/_glif_state_ops.so}"
+ lgn_output="${DPOINTNET_LGN_OP_OUTPUT:-$custom_ops_dir/_lgn_grating_ops.so}"
++movie_output="${DPOINTNET_MOVIE_OP_OUTPUT:-$custom_ops_dir/_lgn_movie_ops.so}"
+ 
+ if [[ -n "${NVCC:-}" ]]; then
+   nvcc="$NVCC"
+@@ -120,6 +121,29 @@ mkdir -p "$build_dir"
+   -Wl,-rpath,"$prefix/lib" \
+   -o "$lgn_output"
+ 
++"$cxx" -std=c++17 -fPIC -O3 -DNDEBUG \
++  -I"$prefix/include" \
++  "${tf_compile_flags[@]}" \
++  -c "$custom_ops_dir/lgn_movie_ops.cc" \
++  -o "$build_dir/lgn_movie_ops.o"
++
++"$nvcc" -ccbin "$cxx" -std=c++17 -x cu -Xcompiler=-fPIC -O3 -DNDEBUG \
++  --expt-relaxed-constexpr \
++  -DGOOGLE_CUDA=1 \
++  -I"$prefix/include" \
++  "${tf_compile_flags[@]}" \
++  "${gencode_flags[@]}" \
++  -c "$custom_ops_dir/lgn_movie_ops.cu.cc" \
++  -o "$build_dir/lgn_movie_ops.cu.o"
++
++"$cxx" -shared \
++  "$build_dir/lgn_movie_ops.o" \
++  "$build_dir/lgn_movie_ops.cu.o" \
++  "${tf_link_flags[@]}" \
++  -L"$prefix/lib" -lcudart \
++  -Wl,-rpath,"$prefix/lib" \
++  -o "$movie_output"
++
+ arch_file="${output%.so}.archs"
+ {
+   printf 'sm=%s\n' "${cuda_archs[*]}"
+@@ -128,7 +152,9 @@ arch_file="${output%.so}.archs"
+ 
+ cp "$arch_file" "${glif_output%.so}.archs"
+ cp "$arch_file" "${lgn_output%.so}.archs"
++cp "$arch_file" "${movie_output%.so}.archs"
+ 
+ echo "$output"
+ echo "$glif_output"
+ echo "$lgn_output"
++echo "$movie_output"
+diff --git a/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.cc b/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.cc
+new file mode 100644
+index 00000000..c0dd0c18
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.cc
+@@ -0,0 +1,98 @@
++// Adapted from Javier Galvan's v1_model_utils/cuda_lgn/lgn_movie_ops.cc (commit d8fb466b; credit: Javier).
++// DPointNet renames the operators with the Dpointnet prefix and keeps the math unchanged.
++#include "tensorflow/core/framework/op.h"
++#include "tensorflow/core/framework/shape_inference.h"
++
++using namespace tensorflow;
++
++// The LGN response to an arbitrary movie, [batch, time, rows, cols], the same
++// pipeline as lgn.LGN.spatial_response + firing_rates_from_spatial in float32:
++//
++// 1. Spatial: per frame and spatial-size bin, the separable Gaussian filter
++//    (vertical then horizontal taps, zero padding, TF 'SAME' alignment), then
++//    every subunit's bilinear sample. A sample is a weighted sum of four
++//    filtered pixels (`sample_corners`, flat row * cols + col); its weights fold
++//    in the corner weights, the edge normalization (bmtk_compat) and the
++//    unit's amplitude, as everything up to the rectification is linear.
++//    `bin_offsets` [bins + 1] delimits each bin's samples, and
++//    `sample_columns` maps a sample to its subunit column: the unit index for
++//    dominant subunits, units + slot for composite non-dominant ones.
++// 2. Temporal: per subunit column, the causal convolution with its kernel
++//    ([lags / 4, columns, 4]: lag m, in block m / 4 at m % 4, multiplies the
++//    frame m steps back; lags a multiple of 16 ending with at least 32 zeros),
++//    zero history before the first frame. Lags outside a 32-column tile's `lag_ranges` [first, last]
++//    are exactly zero and skipped.
++// 3. rate = max(dominant + spont, 0) + [composite] max(non-dominant + spont', 0),
++//    in Hz; `output` = "probabilities" gives p = 1 - exp(-rate dt), dt = 1 ms,
++//    to about half an ulp.
++//
++// Everything accumulates in float32; the movie may be float16 or float32. The
++// constants are those of `rows` x `cols` frames, which the movie must match.
++#define LGN_MOVIE_INPUTS                                                     \
++  Input("movie: T")                                                          \
++      .Input("taps: float")                                                  \
++      .Input("half_widths: int64")                                           \
++      .Input("bin_offsets: int64")                                           \
++      .Input("samples: int64")                                               \
++      .Input("sample_weights: float")                                        \
++      .Input("kernels: float")                                               \
++      .Input("lag_ranges: int64")                                            \
++      .Input("spontaneous: float")                                           \
++      .Input("composite_slot: int64")                                        \
++      .Input("composite_kernels: float")                                     \
++      .Input("composite_lag_ranges: int64")                                  \
++      .Input("composite_spontaneous: float")
++
++namespace {
++Status MovieShape(shape_inference::InferenceContext* c, int movie, int units) {
++  shape_inference::ShapeHandle shape;
++  TF_RETURN_IF_ERROR(c->WithRank(c->input(movie), 4, &shape));
++  c->set_output(0, c->MakeShape({c->Dim(shape, 0), c->Dim(shape, 1),
++                                 c->Dim(c->input(units), 0)}));
++  return absl::OkStatus();
++}
++}  // namespace
++
++// Rates (Hz) or spike probabilities, float32 [batch, time, units].
++REGISTER_OP("DpointnetLgnMovieResponse")
++    .Attr("T: {half, float}")
++    .Attr("rows: int")
++    .Attr("cols: int")
++    .Attr("output: {'rates', 'probabilities'} = 'rates'")
++    .LGN_MOVIE_INPUTS
++    .Output("response: float")
++    .SetShapeFn([](shape_inference::InferenceContext* c) {
++      return MovieShape(c, 0, 8);
++    });
++
++// Spikes uniforms < p for the samples [offset, offset + chunk) of the movie
++// batch, the uniforms given as at most 16 equal [time, units] (one sample each)
++// or [samples, time, units] tensors, written into `spikes_in` in place (or into
++// a new [batch, time, units] tensor when `spikes_in` is empty): the same
++// chunked sampling as LgnGratingSpikes. The probability never leaves registers.
++// With `batch` > 0 the movie holds only the chunk's samples, [chunk, time,
++// rows, cols], and the spikes are [batch, time, units], so a caller can build
++// one chunk of movie at a time; with 0 the movie is the whole batch.
++REGISTER_OP("DpointnetLgnMovieSpikes")
++    .Attr("T: {half, float}")
++    .Attr("rows: int")
++    .Attr("cols: int")
++    .Attr("U: {half, float}")
++    .Attr("offset: int >= 0")
++    .Attr("entries: int >= 1")
++    .Attr("batch: int >= 0 = 0")
++    .Input("spikes_in: bool")
++    .LGN_MOVIE_INPUTS
++    .Input("uniforms: entries * U")
++    .Output("spikes: bool")
++    .SetShapeFn([](shape_inference::InferenceContext* c) {
++      TF_RETURN_IF_ERROR(MovieShape(c, 1, 9));
++      int batch;
++      TF_RETURN_IF_ERROR(c->GetAttr("batch", &batch));
++      if (batch > 0) {
++        shape_inference::ShapeHandle shape;
++        TF_RETURN_IF_ERROR(c->ReplaceDim(c->output(0), 0, c->MakeDim(batch), &shape));
++        c->set_output(0, shape);
++      }
++      return absl::OkStatus();
++    });
+diff --git a/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.cu.cc b/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.cu.cc
+new file mode 100644
+index 00000000..70377ae5
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.cu.cc
+@@ -0,0 +1,564 @@
++// Adapted from Javier Galvan's v1_model_utils/cuda_lgn/lgn_movie_ops.cu.cc (commit d8fb466b; credit: Javier).
++// DPointNet renames the operators with the Dpointnet prefix and keeps the math unchanged.
++#if GOOGLE_CUDA
++#define EIGEN_USE_GPU
++#include <cstdlib>
++#include <cuda_fp16.h>
++
++#include <algorithm>
++#include <limits>
++#include <string>
++#include <utility>
++
++#include "tensorflow/core/framework/op_kernel.h"
++#include "tensorflow/core/util/gpu_kernel_helper.h"
++#include "lgn_common.cuh"
++
++using namespace tensorflow;
++using GPUDevice = Eigen::GpuDevice;
++
++namespace {
++
++using lgn::Output;
++using lgn::SpikeProbability;
++using lgn::Uniforms;
++
++// Spatial pass: one block per frame.
++constexpr int kSpatialThreads = 1024;
++constexpr int kRows = 10;     // vertical outputs per item (one column)
++constexpr int kCols = 11;     // horizontal outputs per item; odd, so lanes hit distinct banks
++constexpr int kItems = 1;     // horizontal items per thread
++constexpr int kMaxHalf = 13;  // filters up to 27 taps
++constexpr int kPad = kMaxHalf;  // zero halo of the shared frame and filtered buffers
++
++// Temporal pass: a lane per subunit column, kSteps timesteps x kSamples samples per thread.
++constexpr int kTile = 32;
++constexpr int kTimeWarps = 4;
++constexpr int kSteps = 16;
++constexpr int kSamples = 1;
++constexpr int kLagPadding = 32;  // zero lags the kernels carry after their last nonzero one
++static_assert(2 * kSteps - 1 <= kLagPadding && kSteps % 4 == 0,
++              "lag blocks prefetch the next block's weights in whole float4s");
++
++// The per-chunk spatial responses stay below this many bytes.
++constexpr int64_t kChunkBytes = int64_t{256} << 20;
++
++// A packed sample: bits 0-29 the flat index of its top-left corner (y0, x0),
++// bit 30 x1 = x0 + 1, bit 31 y1 = y0 + 1, bits 32-62 its subunit column.
++constexpr int64_t kIndexMask = (int64_t{1} << 30) - 1;
++
++__device__ float LoadUniform(const float* u) { return __ldcs(u); }
++__device__ float LoadUniform(const Eigen::half* u) {
++  return __half2float(__ldcs(reinterpret_cast<const __half*>(u)));
++}
++
++// The separable passes of one bin, its half-width H a template parameter so
++// the 2H + 1 taps sit in registers and every loaded pixel feeds up to 2H + 1
++// independent accumulators. Vertical: each item is kRows rows of one column,
++// frame -> filtered. Horizontal: each item is kCols columns of one row,
++// filtered -> filtered in place (staged in registers across a barrier). Both
++// buffers carry zero halos, so neither pass checks bounds: frame
++// [rows + 2 kPad][cols] and filtered [rows][cols + 2 kPad], both pointing at
++// their first interior element.
++template <int H>
++__device__ void Vertical(const float* frame, float* filtered, int rows, int cols,
++                         const float* taps) {
++  float tap[2 * H + 1];
++#pragma unroll
++  for (int j = 0; j <= 2 * H; ++j) tap[j] = taps[j - H];
++  const int groups = (rows + kRows - 1) / kRows, pitch = cols + 2 * kPad;
++  for (int item = threadIdx.x; item < groups * cols; item += blockDim.x) {
++    const int group = item / cols, x = item - group * cols, y0 = group * kRows;
++    float acc[kRows] = {};
++#pragma unroll
++    for (int k = 0; k < kRows + 2 * H; ++k) {
++      const float value = frame[(y0 - H + k) * cols + x];
++#pragma unroll
++      for (int r = 0; r < kRows; ++r)
++        if (k - r >= 0 && k - r <= 2 * H) acc[r] = fmaf(tap[k - r], value, acc[r]);
++    }
++#pragma unroll
++    for (int r = 0; r < kRows; ++r)
++      if (y0 + r < rows) filtered[(y0 + r) * pitch + x] = acc[r];
++  }
++}
++
++template <int H>
++__device__ void Horizontal(float* filtered, int rows, int cols, const float* taps) {
++  float tap[2 * H + 1];
++#pragma unroll
++  for (int j = 0; j <= 2 * H; ++j) tap[j] = taps[j - H];
++  const int groups = (cols + kCols - 1) / kCols, pitch = cols + 2 * kPad;
++  float acc[kItems][kCols] = {};
++#pragma unroll
++  for (int n = 0; n < kItems; ++n) {
++    const int item = threadIdx.x + n * blockDim.x;
++    if (item >= rows * groups) break;
++    const int y = item / groups, x0 = (item - y * groups) * kCols;
++    const float* row = filtered + y * pitch;
++#pragma unroll
++    for (int k = 0; k < kCols + 2 * H; ++k) {
++      const float value = row[x0 - H + k];
++#pragma unroll
++      for (int r = 0; r < kCols; ++r)
++        if (k - r >= 0 && k - r <= 2 * H) acc[n][r] = fmaf(tap[k - r], value, acc[n][r]);
++    }
++  }
++  __syncthreads();
++#pragma unroll
++  for (int n = 0; n < kItems; ++n) {
++    const int item = threadIdx.x + n * blockDim.x;
++    if (item >= rows * groups) break;
++    const int y = item / groups, x0 = (item - y * groups) * kCols;
++#pragma unroll
++    for (int r = 0; r < kCols; ++r)
++      if (x0 + r < cols) filtered[y * pitch + x0 + r] = acc[n][r];
++  }
++}
++
++template <int H>
++__device__ void Separable(const float* frame, float* filtered, int rows, int cols,
++                          const float* vertical, const float* horizontal, int half) {
++  if constexpr (H < kMaxHalf) {
++    if (half != H)
++      return Separable<H + 1>(frame, filtered, rows, cols, vertical, horizontal, half);
++  }
++  Vertical<H>(frame, filtered, rows, cols, vertical);
++  __syncthreads();
++  Horizontal<H>(filtered, rows, cols, horizontal);
++}
++
++// Shared-memory floats of SpatialKernel for frames of `rows` x `cols` processed
++// in bands of `band` rows (`band == rows`: the whole frame at once).
++// The frame buffer holds a whole number of Vertical's kRows-row groups (plus the
++// halo): the pass reads every row of a group's kRows + 2H window unguarded, so
++// the rows past a partial last group must exist (zero) in shared memory.
++__host__ __device__ inline int FrameRows(int brows) {
++  return (brows + kRows - 1) / kRows * kRows + 2 * kPad;
++}
++
++__host__ __device__ inline int SpatialSharedFloats(int rows, int cols, int band, int bins,
++                                                   int width) {
++  const int brows = min(band + 1, rows), pitch = cols + 2 * kPad;
++  return kPad + brows * pitch + FrameRows(brows) * cols + 2 * bins * width;
++}
++
++// One block per frame (sample g, time t), staged in shared memory as float32,
++// in bands of `band` rows (the whole frame when it fits the device's shared
++// memory): for each band and spatial-size bin, the separable Gaussian filter of
++// the band plus its kPad-row halo (zero padding, 'SAME' alignment) into shared
++// memory, then each of the bin's samples whose first corner row lies in the
++// band as the weighted sum of its four filtered corners, written to
++// spatial[g, t / 4, column, t % 4] (see TemporalKernel). A band computes
++// band + 1 filtered rows so a sample's second corner row (y0 + 1) is present.
++template <typename T>
++__global__ void __launch_bounds__(kSpatialThreads)
++SpatialKernel(const T* __restrict__ movie, int64_t first_frame, int steps, int columns,
++              int rows, int cols, int band, int bins, int width,
++              const float* __restrict__ taps, const int64_t* __restrict__ half_widths,
++              const int64_t* __restrict__ bin_offsets, const int64_t* __restrict__ samples,
++              const float4* __restrict__ weights, float* __restrict__ spatial,
++              int64_t sample_stride) {
++  extern __shared__ float shared[];
++  const int pixels = rows * cols, pitch = cols + 2 * kPad;
++  const int brows_max = min(band + 1, rows);
++  float* filtered = shared + kPad;                                     // [brows][pitch]
++  float* frame = shared + brows_max * pitch + kPad * cols;             // [FrameRows(brows)][cols]
++  float* tap = shared + brows_max * pitch + FrameRows(brows_max) * cols;  // [2, bins, width]
++  const int region = brows_max * pitch + FrameRows(brows_max) * cols;
++  const T* source = movie + (first_frame + blockIdx.x) * pixels;
++  for (int i = threadIdx.x; i < 2 * bins * width; i += blockDim.x) tap[i] = taps[i];
++  const int g = blockIdx.x / steps, t = blockIdx.x - g * steps;
++  float* out = spatial + g * sample_stride + (t >> 2) * 4 * int64_t{columns} + (t & 3);
++  const int center = width / 2;
++  for (int y0 = 0; y0 < rows; y0 += band) {
++    const int brows = min(band + 1, rows - y0);  // filtered rows of this band
++    const int ylast = min(y0 + band, rows);      // samples with first corner row in [y0, ylast)
++    __syncthreads();
++    for (int i = threadIdx.x; i < region; i += blockDim.x) shared[i] = 0.f;
++    __syncthreads();
++    for (int i = threadIdx.x; i < (brows + 2 * kPad) * cols; i += blockDim.x) {
++      const int r = i / cols - kPad, x = i - (r + kPad) * cols, y = y0 + r;
++      if (y >= 0 && y < rows) frame[r * cols + x] = static_cast<float>(source[y * cols + x]);
++    }
++    __syncthreads();
++    for (int bin = 0; bin < bins; ++bin) {
++      Separable<0>(frame, filtered, brows, cols, tap + bin * width + center,
++                      tap + (bins + bin) * width + center, static_cast<int>(half_widths[bin]));
++      __syncthreads();
++      for (int64_t e = bin_offsets[bin] + threadIdx.x; e < bin_offsets[bin + 1]; e += blockDim.x) {
++        const int64_t sample = samples[e];
++        const int flat = static_cast<int>(sample & kIndexMask);
++        const int y = flat / cols;
++        if (y < y0 || y >= ylast) continue;
++        const int base = (y - y0) * pitch + (flat - y * cols);
++        const int dx = static_cast<int>(sample >> 30) & 1, dy = static_cast<int>(sample >> 31) & 1;
++        const float4 w = weights[e];
++        // (y0, x0), (y1, x0), (y0, x1), (y1, x1)
++        float value = w.x * filtered[base];
++        value = fmaf(w.y, filtered[base + dy * pitch], value);
++        value = fmaf(w.z, filtered[base + dx], value);
++        value = fmaf(w.w, filtered[base + dy * pitch + dx], value);
++        out[(sample >> 32) * 4] = value;
++      }
++      __syncthreads();
++    }
++  }
++}
++
++// v[r] = element r of a time-blocked array whose 4-element blocks are `stride` apart.
++__device__ __forceinline__ void Load(const float* p, int64_t stride, float (&v)[kSteps]) {
++#pragma unroll
++  for (int r = 0; r < kSteps; r += 4) {
++    const float4 q = __ldg(reinterpret_cast<const float4*>(p + r / 4 * stride));
++    v[r] = q.x, v[r + 1] = q.y, v[r + 2] = q.z, v[r + 3] = q.w;
++  }
++}
++
++// Loads s[t, t + kSteps) of every sample, zero before the first frame (t and
++// the lags are multiples of kSteps, so such a block lies wholly before or after it).
++__device__ __forceinline__ void LoadFrames(const float* const (&base)[kSamples], int t,
++                                           int64_t stride, float (&v)[kSamples][kSteps]) {
++#pragma unroll
++  for (int i = 0; i < kSamples; ++i) {
++    if (t >= 0) {
++      Load(base[i] + t / 4 * stride, stride, v[i]);
++    } else {
++#pragma unroll
++      for (int r = 0; r < kSteps; ++r) v[i][r] = 0.f;
++    }
++  }
++}
++
++// kSteps lags [m0, m0 + kSteps) of the causal temporal convolution for one
++// thread: kSteps consecutive outputs t0 + r of kSamples samples, with
++// high = s[t0 - m0 + r], low = s[t0 - m0 - kSteps + r] and k the lags' weights,
++// so lag m0 + q of output r reads s[t0 + r - m0 - q] = high[r - q] or
++// low[kSteps + r - q] at static indices. It first issues the next block's loads
++// (`next` = s[t0 - m0 - 2 kSteps + r], `next_k`), so their latency hides behind
++// this block's FMAs; the caller rotates the roles of the windows. The block is
++// summed on its own before it joins the total, which keeps float32 rounding to
++// that of about kSteps + lags / kSteps terms.
++__device__ __forceinline__ void LagBlock(
++    int m0, int t0, const float* kernel, int64_t weights, const float* const (&base)[kSamples],
++    int64_t frames,
++    const float (&high)[kSamples][kSteps], const float (&low)[kSamples][kSteps],
++    float (&next)[kSamples][kSteps], const float (&k)[kSteps], float (&next_k)[kSteps],
++    float (&total)[kSamples][kSteps]) {
++  Load(kernel + (m0 + kSteps) / 4 * weights, weights, next_k);
++  LoadFrames(base, t0 - m0 - 2 * kSteps, frames, next);
++#pragma unroll
++  for (int i = 0; i < kSamples; ++i) {
++    float block[kSteps] = {};
++#pragma unroll
++    for (int q = 0; q < kSteps; ++q)
++#pragma unroll
++      for (int r = 0; r < kSteps; ++r)
++        block[r] = fmaf(k[q], r >= q ? high[i][r - q] : low[i][kSteps + r - q], block[r]);
++#pragma unroll
++    for (int r = 0; r < kSteps; ++r) total[i][r] += block[r];
++  }
++}
++
++// The causal temporal convolution of kTile subunit columns (one per lane):
++//   out[t] = sum over lags m in the tile's range of K[m] s[t - m], s = 0 before 0.
++// Both are time-blocked, [time / 4, columns, 4], so a lane reads 4 consecutive
++// steps with one float4 and a warp's 32 columns are 512 contiguous bytes:
++// s = spatial[sample][t / 4][column][t % 4] (span >= steps frames, a multiple
++// of kSteps; frames past `steps` only reach outputs past them), and
++// K = kernels[m / 4][column][m % 4] (lags a multiple of kSteps, ending with
++// kLagPadding zeros, so a lag block's prefetch never reads past them).
++// `spatial` and `kernels` point at the pass's first column; `width` is the
++// columns of a time block of `spatial` (units + composites). `kComposite` is the non-dominant pass,
++// which writes its rectified rates [samples, time, composites]; the dominant
++// pass adds them and writes the output for the samples
++// [first_sample, first_sample + samples).
++template <Output kOutput, bool kComposite, typename U>
++__global__ void __launch_bounds__(kTile * kTimeWarps)
++TemporalKernel(int steps, int width, int columns, int64_t sample_stride, int samples,
++               const float* __restrict__ spatial, const float* __restrict__ kernels,
++               const int64_t* __restrict__ lag_ranges,
++               const float* __restrict__ spontaneous, const int64_t* __restrict__ slot,
++               float* __restrict__ composite_rates, int composites,
++               Uniforms<U> uniforms, int uniform_offset, void* __restrict__ output,
++               int64_t first_sample) {
++  const int column = blockIdx.y * kTile + threadIdx.x;
++  const int t0 = (blockIdx.x * kTimeWarps + threadIdx.y) * kSteps;
++  const int b0 = blockIdx.z * kSamples;
++  if (column >= columns || t0 >= steps) return;
++  const int first = static_cast<int>(lag_ranges[2 * blockIdx.y]) / kSteps * kSteps;
++  const int last = min(static_cast<int>(lag_ranges[2 * blockIdx.y + 1]), t0 + kSteps - 1);
++  const float* base[kSamples];  // samples past the chunk reread its last one
++#pragma unroll
++  for (int i = 0; i < kSamples; ++i)
++    base[i] = spatial + min(b0 + i, samples - 1) * sample_stride + 4 * column;
++  const float* kernel = kernels + 4 * column;
++  const int64_t frames = 4 * int64_t{width}, weights = 4 * int64_t{columns};
++  // Windows w0, w1, w2 and weights k0, k1 rotate through the roles of LagBlock.
++  float total[kSamples][kSteps] = {}, w0[kSamples][kSteps], w1[kSamples][kSteps],
++      w2[kSamples][kSteps], k0[kSteps], k1[kSteps];
++  LoadFrames(base, t0 - first, frames, w0);
++  LoadFrames(base, t0 - first - kSteps, frames, w1);
++  Load(kernel + first / 4 * weights, weights, k0);
++  for (int m0 = first; m0 <= last;) {
++    LagBlock(m0, t0, kernel, weights, base, frames, w0, w1, w2, k0, k1, total);
++    if ((m0 += kSteps) > last) break;
++    LagBlock(m0, t0, kernel, weights, base, frames, w1, w2, w0, k1, k0, total);
++    if ((m0 += kSteps) > last) break;
++    LagBlock(m0, t0, kernel, weights, base, frames, w2, w0, w1, k0, k1, total);
++    if ((m0 += kSteps) > last) break;
++    LagBlock(m0, t0, kernel, weights, base, frames, w0, w1, w2, k1, k0, total);
++    if ((m0 += kSteps) > last) break;
++    LagBlock(m0, t0, kernel, weights, base, frames, w1, w2, w0, k0, k1, total);
++    if ((m0 += kSteps) > last) break;
++    LagBlock(m0, t0, kernel, weights, base, frames, w2, w0, w1, k1, k0, total);
++    if ((m0 += kSteps) > last) break;
++  }
++  const float spont = spontaneous[column];
++  const int composite = kComposite ? -1 : static_cast<int>(slot[column]);
++#pragma unroll
++  for (int i = 0; i < kSamples; ++i) {
++    if (b0 + i >= samples) break;
++    const int64_t sample = b0 + i;
++#pragma unroll
++    for (int r = 0; r < kSteps; ++r) {
++      const int t = t0 + r;
++      if (t >= steps) break;
++      float rate = fmaxf(total[i][r] + spont, 0.f);
++      if constexpr (kComposite) {
++        composite_rates[(sample * steps + t) * composites + column] = rate;
++        continue;
++      }
++      if (composite >= 0) rate += composite_rates[(sample * steps + t) * composites + composite];
++      const int64_t out = ((first_sample + sample) * steps + t) * columns + column;
++      if constexpr (kOutput == Output::kRates) {
++        __stcs(static_cast<float*>(output) + out, rate);
++      } else if constexpr (kOutput == Output::kProbabilities) {
++        __stcs(static_cast<float*>(output) + out, SpikeProbability(rate));
++      } else {
++        const U* uniform = uniforms.Sample(static_cast<int>(first_sample + sample) - uniform_offset,
++                                           static_cast<int64_t>(steps) * columns);
++        static_cast<bool*>(output)[out] =
++            LoadUniform(uniform + static_cast<int64_t>(t) * columns + column) <
++            SpikeProbability(rate);
++      }
++    }
++  }
++}
++
++// The op inputs from `first` on (after spikes_in for the spike op).
++enum Input {
++  kMovie, kTaps, kHalfWidths, kBinOffsets, kSampleIndex, kSampleWeights, kKernels,
++  kLagRanges, kSpontaneous, kSlot, kCompositeKernels, kCompositeLagRanges,
++  kCompositeSpontaneous,
++};
++
++const Tensor& In(OpKernelContext* c, int first, int index) { return c->input(first + index); }
++
++Status Validate(OpKernelContext* c, int first, int rows, int cols) {
++  const Tensor& movie = In(c, first, kMovie);
++  if (movie.dims() != 4 || movie.dim_size(2) != rows || movie.dim_size(3) != cols)
++    return errors::InvalidArgument("movie must be [batch, time, ", rows, ", ", cols, "]");
++  if (movie.dim_size(2) * ((movie.dim_size(3) + kCols - 1) / kCols) > kSpatialThreads * kItems)
++    return errors::InvalidArgument("frames above ", kSpatialThreads * kItems, " rows x ",
++                                   kCols, "-column groups");
++  const Tensor& taps = In(c, first, kTaps);
++  if (taps.dims() != 3 || taps.dim_size(0) != 2 || taps.dim_size(2) % 2 == 0 ||
++      taps.dim_size(2) > 2 * kMaxHalf + 1)
++    return errors::InvalidArgument("taps must be [2, bins, odd width <= ", 2 * kMaxHalf + 1, "]");
++  const int64_t bins = taps.dim_size(1);
++  if (In(c, first, kHalfWidths).NumElements() != bins ||
++      In(c, first, kBinOffsets).NumElements() != bins + 1)
++    return errors::InvalidArgument("half_widths must be [bins], bin_offsets [bins + 1]");
++  if (In(c, first, kSampleWeights).NumElements() != 4 * In(c, first, kSampleIndex).NumElements())
++    return errors::InvalidArgument("sample_weights must be [samples, 4]");
++  const int64_t units = In(c, first, kSpontaneous).NumElements();
++  const int64_t composites = In(c, first, kCompositeSpontaneous).NumElements();
++  for (auto [index, columns] : {std::pair{kKernels, units}, {kCompositeKernels, composites}}) {
++    const Tensor& kernels = In(c, first, index);
++    if (kernels.dims() != 3 || kernels.dim_size(1) != columns || kernels.dim_size(2) != 4 ||
++        kernels.dim_size(0) % (kSteps / 4) != 0 || kernels.dim_size(0) * 4 < kLagPadding)
++      return errors::InvalidArgument("kernels must be [lags / 4, columns, 4], lags a multiple of ",
++                                     kSteps, " ending with ", kLagPadding, " zeros");
++  }
++  if (In(c, first, kSlot).NumElements() != units)
++    return errors::InvalidArgument("composite_slot must be [units]");
++  if (In(c, first, kLagRanges).NumElements() != 2 * ((units + kTile - 1) / kTile) ||
++      In(c, first, kCompositeLagRanges).NumElements() != 2 * ((composites + kTile - 1) / kTile))
++    return errors::InvalidArgument("lag ranges must be [ceil(columns / 32), 2]");
++  const int64_t span = (movie.dim_size(1) + kSteps - 1) / kSteps * kSteps;
++  if (units + composites >= (int64_t{1} << 31) || movie.dim_size(0) >= (int64_t{1} << 31) ||
++      span * (units + composites) >= (int64_t{1} << 31) ||
++      In(c, first, kKernels).NumElements() >= (int64_t{1} << 31))
++    return errors::InvalidArgument("LGN movie response too large");
++  return OkStatus();
++}
++
++// The samples [begin, end) of the batch, chunk by chunk: spatial responses
++// [chunk, span / 4, units + composites, 4], then the non-dominant and the dominant
++// temporal passes; `output` is the full [batch, time, units] tensor. The movie's
++// first sample is sample `movie_first` of the batch.
++template <typename T, typename U, Output kOutput>
++Status Launch(OpKernelContext* c, int first, int begin, int end, Uniforms<U> uniforms,
++              int uniform_offset, void* output, int movie_first = 0) {
++  const Tensor& movie = In(c, first, kMovie);
++  const int steps = movie.dim_size(1), rows = movie.dim_size(2), cols = movie.dim_size(3);
++  const int units = In(c, first, kSpontaneous).NumElements();
++  const int composites = In(c, first, kCompositeSpontaneous).NumElements();
++  if (end <= begin || steps == 0 || units == 0) return OkStatus();
++  const int span = (steps + kSteps - 1) / kSteps * kSteps;
++  const int width = units + composites;
++  const int64_t sample_stride = int64_t{span} * width;
++  const int64_t sample_bytes = 4 * (sample_stride + int64_t{steps} * composites);
++  const int chunk =
++      static_cast<int>(std::clamp<int64_t>(kChunkBytes / sample_bytes, 1, end - begin));
++  Tensor spatial, composite_rates;
++  TF_RETURN_IF_ERROR(c->allocate_temp(DT_FLOAT, TensorShape({chunk * sample_stride}), &spatial));
++  TF_RETURN_IF_ERROR(c->allocate_temp(
++      DT_FLOAT, TensorShape({int64_t{chunk} * steps * composites}), &composite_rates));
++  const Tensor& taps = In(c, first, kTaps);
++  const int bins = static_cast<int>(taps.dim_size(1)), tap_width = static_cast<int>(taps.dim_size(2));
++  // The whole frame when the device's opt-in shared memory holds it (sm_86+ for
++  // 80 x 120), else the largest band of rows that fits (V100: 2 bands, Pascal: 3).
++  int device = 0, optin = 48 * 1024;
++  if (cudaGetDevice(&device) == cudaSuccess)
++    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
++  int band = rows;
++  // Test hook: DPOINTNET_LGN_MOVIE_MAX_BAND caps the band to exercise the banded
++  // path on devices whose shared memory holds the whole frame.
++  if (const char* cap = std::getenv("DPOINTNET_LGN_MOVIE_MAX_BAND"))
++    band = std::max(1, std::min(band, std::atoi(cap)));
++  while (band > 0 &&
++         SpatialSharedFloats(rows, cols, band, bins, tap_width) * sizeof(float) > optin)
++    --band;
++  if (band < 1)
++    return errors::InvalidArgument("frames of ", rows, " x ", cols,
++                                   " exceed shared memory even one row at a time");
++  const int shared = SpatialSharedFloats(rows, cols, band, bins, tap_width) * sizeof(float);
++  if (cudaFuncSetAttribute(SpatialKernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                           shared) != cudaSuccess)
++    return errors::InvalidArgument("frames of ", rows, " x ", cols, " exceed shared memory");
++  auto stream = c->eigen_device<GPUDevice>().stream();
++  float* spatial_data = spatial.flat<float>().data();
++  float* composite_data = composite_rates.flat<float>().data();
++  const dim3 threads(kTile, kTimeWarps);
++  const int time_blocks = (steps + kSteps * kTimeWarps - 1) / (kSteps * kTimeWarps);
++  for (int b0 = begin; b0 < end; b0 += chunk) {
++    const int samples = std::min(chunk, end - b0);
++    TF_RETURN_IF_ERROR(GpuLaunchKernel(
++        SpatialKernel<T>, samples * steps, kSpatialThreads, shared, stream,
++        reinterpret_cast<const T*>(movie.flat<T>().data()), int64_t{b0 - movie_first} * steps,
++        steps, width,
++        rows, cols, band, bins, tap_width,
++        taps.flat<float>().data(), In(c, first, kHalfWidths).flat<int64_t>().data(),
++        In(c, first, kBinOffsets).flat<int64_t>().data(),
++        In(c, first, kSampleIndex).flat<int64_t>().data(),
++        reinterpret_cast<const float4*>(In(c, first, kSampleWeights).flat<float>().data()),
++        spatial_data, sample_stride));
++    const int sample_blocks = (samples + kSamples - 1) / kSamples;
++    if (composites > 0) {
++      const Tensor& kernels = In(c, first, kCompositeKernels);
++      auto composite_pass = TemporalKernel<kOutput, true, U>;
++      TF_RETURN_IF_ERROR(GpuLaunchKernel(
++          composite_pass, dim3(time_blocks, (composites + kTile - 1) / kTile, sample_blocks),
++          threads, 0, stream, steps, width, composites, sample_stride, samples,
++          spatial_data + 4 * int64_t{units}, kernels.flat<float>().data(),
++          In(c, first, kCompositeLagRanges).flat<int64_t>().data(),
++          In(c, first, kCompositeSpontaneous).flat<float>().data(), nullptr, composite_data,
++          composites, uniforms, uniform_offset, nullptr, int64_t{0}));
++    }
++    const Tensor& kernels = In(c, first, kKernels);
++    auto dominant_pass = TemporalKernel<kOutput, false, U>;
++    TF_RETURN_IF_ERROR(GpuLaunchKernel(
++        dominant_pass, dim3(time_blocks, (units + kTile - 1) / kTile, sample_blocks), threads,
++        0, stream, steps, width, units, sample_stride, samples, spatial_data,
++        kernels.flat<float>().data(), In(c, first, kLagRanges).flat<int64_t>().data(),
++        In(c, first, kSpontaneous).flat<float>().data(),
++        In(c, first, kSlot).flat<int64_t>().data(), composite_data, composites, uniforms,
++        uniform_offset, output, int64_t{b0}));
++  }
++  return OkStatus();
++}
++
++// [batch, time, units]; batch > 0 overrides the movie's own batch.
++TensorShape OutputShape(OpKernelContext* c, int first, int64_t batch = 0) {
++  const Tensor& movie = In(c, first, kMovie);
++  return TensorShape({batch > 0 ? batch : movie.dim_size(0), movie.dim_size(1),
++                      In(c, first, kSpontaneous).NumElements()});
++}
++
++// The frame size the constants were built for.
++class MovieOp : public OpKernel {
++ public:
++  explicit MovieOp(OpKernelConstruction* c) : OpKernel(c) {
++    OP_REQUIRES_OK(c, c->GetAttr("rows", &rows_));
++    OP_REQUIRES_OK(c, c->GetAttr("cols", &cols_));
++  }
++ protected:
++  int rows_, cols_;
++};
++
++template <typename T>
++class ResponseOp : public MovieOp {
++ public:
++  explicit ResponseOp(OpKernelConstruction* c) : MovieOp(c) {
++    std::string output;
++    OP_REQUIRES_OK(c, c->GetAttr("output", &output));
++    rates_ = output == "rates";
++  }
++  void Compute(OpKernelContext* c) override {
++    OP_REQUIRES_OK(c, Validate(c, 0, rows_, cols_));
++    Tensor* output;
++    OP_REQUIRES_OK(c, c->allocate_output(0, OutputShape(c, 0), &output));
++    const int batch = output->dim_size(0);
++    float* data = output->flat<float>().data();
++    OP_REQUIRES_OK(c, rates_
++        ? Launch<T, float, Output::kRates>(c, 0, 0, batch, Uniforms<float>{}, 0, data)
++        : Launch<T, float, Output::kProbabilities>(c, 0, 0, batch, Uniforms<float>{}, 0, data));
++  }
++ private:
++  bool rates_;
++};
++
++template <typename T, typename U>
++class SpikesOp : public MovieOp {
++ public:
++  explicit SpikesOp(OpKernelConstruction* c) : MovieOp(c) {
++    OP_REQUIRES_OK(c, c->GetAttr("offset", &offset_));
++    OP_REQUIRES_OK(c, c->GetAttr("batch", &batch_));
++  }
++  void Compute(OpKernelContext* c) override {
++    OP_REQUIRES_OK(c, Validate(c, 1, rows_, cols_));
++    Uniforms<U> uniforms;
++    int count;
++    Tensor* spikes;
++    OP_REQUIRES_OK(c, lgn::PrepareSpikes(c, 0, OutputShape(c, 1, batch_), offset_, &uniforms,
++                                         &count, &spikes));
++    // A chunk movie holds exactly the chunk's samples.
++    OP_REQUIRES(c, batch_ == 0 || In(c, 1, kMovie).dim_size(0) == count,
++                errors::InvalidArgument("with batch > 0 the movie must hold the chunk's ", count,
++                                        " samples"));
++    OP_REQUIRES_OK(c, (Launch<T, U, Output::kSpikes>(c, 1, offset_, offset_ + count, uniforms,
++                                                     offset_, spikes->flat<bool>().data(),
++                                                     batch_ > 0 ? offset_ : 0)));
++  }
++ private:
++  int offset_, batch_;
++};
++
++}  // namespace
++
++#define REG(T)                                                                     \
++  REGISTER_KERNEL_BUILDER(                                                         \
++      Name("DpointnetLgnMovieResponse").Device(DEVICE_GPU).TypeConstraint<T>("T"), ResponseOp<T>);
++REG(float); REG(Eigen::half);
++#undef REG
++#define REG(T, U)                                                                  \
++  REGISTER_KERNEL_BUILDER(Name("DpointnetLgnMovieSpikes")                                   \
++                              .Device(DEVICE_GPU)                                  \
++                              .TypeConstraint<T>("T")                              \
++                              .TypeConstraint<U>("U"),                             \
++                          SpikesOp<T, U>);
++REG(float, float); REG(float, Eigen::half); REG(Eigen::half, float); REG(Eigen::half, Eigen::half);
++#undef REG
++#endif
+diff --git a/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.py b/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.py
+new file mode 100644
+index 00000000..762c76b6
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/custom_ops/lgn_movie_ops.py
+@@ -0,0 +1,272 @@
++"""Native LGN response to arbitrary movies: spatial filter, temporal filter, rates.
++
++Adapted from Javier Galvan's ``v1_model_utils/cuda_lgn/movie.py`` (commit
++d8fb466b; credit: Javier). See ``lgn_movie_ops.cc`` for the math: the same
++pipeline as ``lgn_tf.lgn.LGN.spatial_response`` + ``firing_rates_from_spatial``
++in float32. The constants are derived here once, in float64 from the float32
++LGN constants, and stored as float32: the separable filter taps, each subunit's
++four bilinear corners with corner weight, edge normalization and amplitude
++folded in, and the temporal kernels by lag in blocks of four
++(``[lags / 4, columns, 4]``) with the range of nonzero lags of every 32-column
++tile. The operators use only plain float loads and are built for every target
++of the fat binary.
++"""
++
++from pathlib import Path
++import warnings
++
++import numpy as np
++import tensorflow as tf
++
++from .csr_spike_ops import _gpu_compatibility_error, _read_built_architectures
++from .lgn_grating_ops import (
++    MAX_CHUNK, REQUIRED_CONSTANTS, _bilinear, _numpy, _same_correlation_normalizer,
++    _separable_taps, supports_lgn,
++)
++
++_LIBRARY_PATH = Path(__file__).with_name("_lgn_movie_ops.so")
++_ARCHITECTURE_PATH = Path(__file__).with_name("_lgn_movie_ops.archs")
++_SM_ARCHITECTURES, _PTX_ARCHITECTURE = _read_built_architectures(_ARCHITECTURE_PATH)
++_OPS = None
++_LOAD_ERROR = None
++TILE = 32  # subunit columns per lag range (one warp of the temporal kernel)
++LAG_PADDING = 32  # trailing zero lags, so the op's lag blocks never check bounds
++# Limits of the spatial kernel (lgn_movie_ops.cu.cc): one block of SPATIAL_THREADS
++# threads filters a frame, each thread HORIZONTAL_COLUMNS columns of one row, and
++# the separable taps sit in registers up to MAX_TAPS wide.
++SPATIAL_THREADS = 1024
++HORIZONTAL_COLUMNS = 11
++MAX_TAPS = 27
++
++__all__ = [
++    "MovieLGNKernel", "native_movie_lgn_available", "lgn_movie_op_status", "supports_lgn",
++    "movie_support_error", "REQUIRED_CONSTANTS",
++]
++
++
++def _load():
++    global _OPS, _LOAD_ERROR
++    if _OPS is None and _LOAD_ERROR is None:
++        if not _LIBRARY_PATH.exists():
++            _LOAD_ERROR = f"Native LGN movie library does not exist at {_LIBRARY_PATH}."
++            return None
++        try:
++            _OPS = tf.load_op_library(str(_LIBRARY_PATH))
++        except (tf.errors.NotFoundError, OSError) as exc:
++            _LOAD_ERROR = f"Native LGN movie library failed to load: {exc}"
++    return _OPS
++
++
++def lgn_movie_op_status():
++    """Human-readable load status of the native movie library."""
++    _load()
++    if _OPS is not None:
++        return f"loaded from {_LIBRARY_PATH}"
++    return _LOAD_ERROR or "not loaded"
++
++
++def native_movie_lgn_available():
++    """Whether the native movie operators can run: a GPU is visible, the fat
++    binary targets it and the library loads."""
++    if not tf.config.list_physical_devices("GPU"):
++        return False
++    if _load() is None:
++        return False
++    error = _gpu_compatibility_error(_SM_ARCHITECTURES, _PTX_ARCHITECTURE, _ARCHITECTURE_PATH)
++    if error:
++        warnings.warn(str(error))
++        return False
++    return True
++
++
++def movie_support_error(lgn, rows, cols):
++    """Why the native movie operators cannot serve ``lgn`` for ``rows`` x ``cols``
++    frames, or None when they can: the LGN must expose the required constants,
++    a frame must fit one block's horizontal work items and the spatial filters
++    must be odd, rank-one Gaussians of at most MAX_TAPS taps."""
++    if not supports_lgn(lgn):
++        return "the LGN lacks the constants the native movie operators need"
++    if rows * -(-cols // HORIZONTAL_COLUMNS) > SPATIAL_THREADS:
++        return (f"frames of {rows} x {cols} exceed the native spatial pass "
++                f"({SPATIAL_THREADS} rows x {HORIZONTAL_COLUMNS}-column groups)")
++    try:
++        filters = [_numpy(kernel).reshape(_numpy(kernel).shape[:2]) for kernel in lgn.gaussian_filters]
++        _separable_taps(filters)
++    except ValueError as exc:
++        return str(exc)
++    if max(max(kernel.shape) for kernel in filters) > MAX_TAPS:
++        return f"spatial filters wider than {MAX_TAPS} taps exceed the native spatial pass"
++    return None
++
++
++def _lag_major(kernels):
++    """[columns, lags]: lag m weighs the frame m steps back (lag 0 the current frame),
++    zero-padded to a multiple of LAG_PADDING lags with at least LAG_PADDING zeros."""
++    lagged = np.asarray(kernels, np.float32)[::-1]
++    lags = (lagged.shape[0] // LAG_PADDING + 2) * LAG_PADDING
++    return np.ascontiguousarray(np.pad(lagged, ((0, lags - lagged.shape[0]), (0, 0))).T)
++
++
++def _time_blocked(kernels):
++    """[lags / 4, columns, 4] of [columns, lags]: a warp's float4 loads are contiguous."""
++    columns, lags = kernels.shape
++    return np.ascontiguousarray(kernels.reshape(columns, lags // 4, 4).transpose(1, 0, 2))
++
++
++def _lag_ranges(kernels):
++    """[tiles, 2] first and last nonzero lag of each TILE-column tile of [columns, lags]
++    kernels ([LAG_PADDING, 0], empty, when all are zero)."""
++    columns, lags = kernels.shape
++    tiles = -(-columns // TILE)
++    nonzero = np.zeros((tiles * TILE, lags), bool)
++    nonzero[:columns] = kernels != 0
++    nonzero = nonzero.reshape(tiles, TILE, lags).any(axis=1)
++    first, last = nonzero.argmax(axis=1), lags - 1 - nonzero[:, ::-1].argmax(axis=1)
++    return np.where(nonzero.any(axis=1)[:, None], np.stack((first, last), axis=1), [LAG_PADDING, 0])
++
++
++class MovieLGNKernel:
++    """The native movie operators and their constants for one built ``lgn_tf.lgn.LGN``
++    and edge-normalization choice.
++
++    ``chunk`` samples are sampled per spike op call (1-16): 1 keeps one sample's
++    movie and uniforms alive at a time. Constants are ``tf.constant`` on the
++    current device; under a distribution strategy construct one kernel per replica.
++    """
++
++    def __init__(self, lgn, *, rows, cols, bmtk_compat=True, chunk=1):
++        if not 1 <= chunk <= MAX_CHUNK:
++            raise ValueError(f"chunk must be in [1, {MAX_CHUNK}], got {chunk}")
++        ops = _load()
++        if ops is None:
++            raise RuntimeError(lgn_movie_op_status())
++        if not tf.config.list_physical_devices("GPU"):
++            raise RuntimeError("Native LGN movie operators require a visible GPU.")
++        error = _gpu_compatibility_error(_SM_ARCHITECTURES, _PTX_ARCHITECTURE, _ARCHITECTURE_PATH)
++        if error:
++            raise RuntimeError(str(error))
++        error = movie_support_error(lgn, rows, cols)
++        if error:
++            raise ValueError(f"Native LGN movie operators cannot serve this LGN: {error}")
++        f64 = lambda value: _numpy(value).astype(np.float32).astype(np.float64)  # noqa: E731
++        filters = [f64(kernel).reshape(f64(kernel).shape[:2]) for kernel in lgn.gaussian_filters]
++        vertical, horizontal = _separable_taps(filters)
++        composite = _numpy(lgn.is_composite).astype(np.float32) > 0.5
++        units = composite.size
++        composite_ids = np.flatnonzero(composite)
++        slot = np.full(units, -1, np.int64)
++        slot[composite_ids] = np.arange(composite_ids.size)
++        amplitude, non_dom_amplitude = f64(lgn.amplitude), f64(lgn.non_dom_amplitude)
++        x, y = f64(lgn.x), f64(lgn.y)
++        non_dom_x, non_dom_y = f64(lgn.non_dominant_x), f64(lgn.non_dominant_y)
++        samples, weights, offsets = [], [], [0]
++        for kernel, indices in zip(filters, lgn.spatial_range_indices):
++            reciprocal = (
++                1.0 / _same_correlation_normalizer(rows, cols, kernel) if bmtk_compat
++                else np.ones((rows, cols))
++            )
++            indices = np.asarray(indices, np.int64)
++            selected = indices[composite[indices]]
++            for column, px, py, scale in (
++                    (indices, x[indices], y[indices], amplitude[indices]),
++                    (units + slot[selected], non_dom_x[selected], non_dom_y[selected],
++                     non_dom_amplitude[selected])):
++                corners, weight = _bilinear(px, py, reciprocal, scale)
++                x0, x1, y0, y1 = corners.T
++                samples.append((y0 * cols + x0) | (x1 - x0) << 30 | (y1 - y0) << 31 | column << 32)
++                weights.append(weight)
++            offsets.append(offsets[-1] + indices.size + selected.size)
++        if offsets[-1] != units + composite_ids.size:
++            raise ValueError("Every LGN unit needs exactly one spatial filter bin")
++        kernels = _lag_major(_numpy(lgn.dom_temporal_kernels))
++        composite_kernels = _lag_major(_numpy(lgn.non_dom_temporal_kernels)[:, composite_ids])
++        spontaneous = _numpy(lgn.spontaneous_firing_rates).astype(np.float32)
++        self.units, self.chunk = units, chunk
++        self._ops = ops
++        self._attrs = dict(rows=rows, cols=cols)
++        self._constants = [tf.constant(value, dtype) for value, dtype in (
++            (np.stack((vertical, horizontal)), tf.float32),
++            ([(f.shape[0] - 1) // 2 for f in filters], tf.int64),
++            (offsets, tf.int64),
++            (np.concatenate(samples), tf.int64),
++            (np.concatenate(weights), tf.float32),
++            (_time_blocked(kernels), tf.float32), (_lag_ranges(kernels), tf.int64),
++            (spontaneous, tf.float32), (slot, tf.int64),
++            (_time_blocked(composite_kernels), tf.float32),
++            (_lag_ranges(composite_kernels), tf.int64),
++            (spontaneous[composite_ids], tf.float32))]
++
++    @staticmethod
++    def _movie(movie):
++        """The movie [batch, time, rows, cols] in float16 or float32 (others become float32)."""
++        movie = tf.convert_to_tensor(movie)
++        return movie if movie.dtype in (tf.float16, tf.float32) else tf.cast(movie, tf.float32)
++
++    def response(self, movie, output="rates"):
++        """Float32 rates in Hz (``output="rates"``) or 1 ms spike probabilities
++        (``"probabilities"``), [batch, time, units], of a movie [batch, time, rows, cols]."""
++        return self._ops.dpointnet_lgn_movie_response(
++            self._movie(movie), *self._constants, output=output, **self._attrs)
++
++    def spikes(self, movie, spike_seeds, dtype=tf.float32, batch=None):
++        """Spikes [batch, time, units]: stateless uniforms of each sample's seed
++        [batch, 2] in ``dtype`` (use float32) below the probabilities, ``chunk``
++        samples at a time. ``movie`` is the batch's movie [batch, time, rows,
++        cols] or a function ``movie(begin, end)`` returning the movie of samples
++        [begin, end) of ``batch`` samples, built only once the previous chunk is
++        sampled so at most one chunk of movie is alive."""
++        if callable(movie):
++            if batch is None:
++                raise ValueError("a movie function needs the batch size")
++            chunk_movie = lambda begin, end: self._movie(movie(begin, end))  # noqa: E731
++            steps = None
++        else:
++            movie = self._movie(movie)
++            batch, steps = movie.shape[0], movie.shape[1]
++            chunk_movie = None
++
++        def uniform(seed, steps):
++            return tf.random.stateless_uniform((steps, self.units), seed=seed, dtype=dtype)
++
++        def sample(spikes, movie, uniforms, offset, whole_batch=0):
++            return self._ops.dpointnet_lgn_movie_spikes(
++                spikes, movie, *self._constants, uniforms, offset=offset, batch=whole_batch,
++                **self._attrs)
++
++        if chunk_movie is not None:
++            spikes = tf.zeros((0,), tf.bool)
++            for begin in range(0, batch, self.chunk):
++                end = min(begin + self.chunk, batch)
++                with tf.control_dependencies([spikes] if begin else []):
++                    part = chunk_movie(begin, end)
++                    uniforms = [uniform(spike_seeds[b], part.shape[1]) for b in range(begin, end)]
++                spikes = sample(spikes, part, uniforms, begin, batch)
++                # Eagerly, drop this chunk's movie and uniforms before the next
++                # chunk is built so only one chunk is alive at a time.
++                del part, uniforms
++            return spikes
++        if batch is None or steps is None:
++            # Symbolic shape: one sample at a time so memory stays bounded.
++            def one(sample):
++                frames, seed = sample
++                return sample_one(frames, seed)
++
++            def sample_one(frames, seed):
++                return self._ops.dpointnet_lgn_movie_spikes(
++                    tf.zeros((0,), tf.bool), frames[None], *self._constants,
++                    [uniform(seed, tf.shape(frames)[0])], offset=0, batch=0, **self._attrs)[0]
++
++            return tf.map_fn(
++                one, (movie, spike_seeds),
++                fn_output_signature=tf.TensorSpec((None, self.units), tf.bool), parallel_iterations=1,
++            )
++        shape = (steps, self.units)
++        if batch == 0:
++            return tf.zeros((0,) + shape, tf.bool)
++        spikes = tf.zeros((0,), tf.bool)
++        for begin in range(0, batch, self.chunk):
++            with tf.control_dependencies([spikes] if begin else []):
++                uniforms = [uniform(spike_seeds[b], steps) for b in range(begin, min(begin + self.chunk, batch))]
++            spikes = sample(spikes, movie, uniforms, begin)
++            del uniforms
++        return spikes
+diff --git a/bmtk/simulator/dpointnet/input_modules/lgn_generator.py b/bmtk/simulator/dpointnet/input_modules/lgn_generator.py
+index e3f54cef..f6e35935 100644
+--- a/bmtk/simulator/dpointnet/input_modules/lgn_generator.py
++++ b/bmtk/simulator/dpointnet/input_modules/lgn_generator.py
+@@ -460,6 +460,10 @@ def firing_rates(self, orientation, phase):
+         videos = movies_concat(
+             movie[..., None], self.pre_delay, self.post_delay, self.dtype
+         )
++        # The LGN's own movie route (native movie operators when available) or
++        # the TensorFlow spatial/temporal pair.
++        if hasattr(self.lgn, "firing_rates"):
++            return self.lgn.firing_rates(videos, self.bmtk_compat)
+         return self.lgn.firing_rates_from_spatial(
+             *self.lgn.spatial_response(videos, self.bmtk_compat)
+         )
+@@ -913,9 +917,12 @@ def compute_grey_screen_probabilities(
+         raise ValueError('lgn_network is required when grey-screen probabilities are not already cached.')
+ 
+     gray_screen = tf.ones((seq_len, row_size, col_size, 1), dtype=dtype)*contrast
+-    spatial = lgn_network.spatial_response(gray_screen, bmtk_compat)
++    if hasattr(lgn_network, "firing_rates"):
++        firing_rates = lgn_network.firing_rates(gray_screen, bmtk_compat)
++    else:
++        spatial = lgn_network.spatial_response(gray_screen, bmtk_compat)
++        firing_rates = lgn_network.firing_rates_from_spatial(*spatial)
++        del spatial
+     del gray_screen
+-    firing_rates = lgn_network.firing_rates_from_spatial(*spatial)
+-    del spatial
+     probabilities = 1 - tf.exp(-firing_rates / 1000.0)
+     return tf.convert_to_tensor(probabilities, dtype=dtype)
+diff --git a/bmtk/simulator/dpointnet/lgn_tf/lgn.py b/bmtk/simulator/dpointnet/lgn_tf/lgn.py
+index 675016eb..7f3e63c5 100644
+--- a/bmtk/simulator/dpointnet/lgn_tf/lgn.py
++++ b/bmtk/simulator/dpointnet/lgn_tf/lgn.py
+@@ -246,7 +246,21 @@ def __init__(
+         spon_frs_path=None,
+         temp_krns_path=None,
+         spatial_krns_path=None,
++        movie_backend="auto",
+     ):
++        """``movie_backend`` selects how :meth:`firing_rates` evaluates a movie:
++        ``"auto"`` (default) uses the native movie operators
++        (``custom_ops.lgn_movie_ops``) when a GPU and the built library are
++        available, else the TensorFlow spatial/temporal path; ``"native"``
++        requires the operators; ``"tensorflow"`` forces the TensorFlow path.
++        ``spatial_response``/``firing_rates_from_spatial`` always use TensorFlow.
++        """
++        if movie_backend not in ("auto", "native", "tensorflow"):
++            raise ValueError(
++                f'movie_backend must be "auto", "native" or "tensorflow", got {movie_backend!r}'
++            )
++        self._movie_backend_request = movie_backend
++        self.row_size, self.col_size = row_size, col_size
+         # Load table of LGN nodes
+         # node_types_df = pd.read_csv(node_types_file, sep=' ')
+         # if 'population' in node_types_df:
+@@ -625,6 +639,65 @@ def __init__(
+             np.argsort(grouped_composite_ids).astype(np.int32)
+         )
+ 
++    def _movie_kernel(self, bmtk_compat):
++        """The native movie kernel for this edge-normalization choice, or None."""
++        request = getattr(self, "_movie_backend_request", "auto")
++        if request == "tensorflow" or not hasattr(self, "row_size"):
++            return None
++        cache = getattr(self, "_movie_kernels", None)
++        if cache is None:
++            cache = self._movie_kernels = {}
++        if bmtk_compat not in cache:
++            from ..custom_ops import lgn_movie_ops
++
++            kernel = None
++            if request == "native" or lgn_movie_ops.native_movie_lgn_available():
++                error = lgn_movie_ops.movie_support_error(self, self.row_size, self.col_size)
++                if error and request == "native":
++                    raise ValueError(f"movie_backend='native' cannot serve this LGN: {error}")
++                if error is None:
++                    # Built eagerly even from inside a tf.function so the cached
++                    # constants can be captured by any later graph or eager call.
++                    with tf.init_scope():
++                        kernel = lgn_movie_ops.MovieLGNKernel(
++                            self, rows=self.row_size, cols=self.col_size,
++                            bmtk_compat=bool(bmtk_compat),
++                        )
++            cache[bmtk_compat] = kernel
++        return cache[bmtk_compat]
++
++    @property
++    def movie_backend(self):
++        """The resolved backend of :meth:`firing_rates` under ``bmtk_compat=True``."""
++        return "native" if self._movie_kernel(True) is not None else "tensorflow"
++
++    def firing_rates(self, movie, bmtk_compat=True):
++        """Firing rates in Hz, [time, units] for a [time, rows, cols, 1] movie or
++        [batch, time, units] for a [batch, time, rows, cols(, 1)] batch of movies.
++
++        Uses the native movie operators when selected (see ``movie_backend``),
++        otherwise ``spatial_response`` followed by ``firing_rates_from_spatial``;
++        the two agree to float32 rounding.
++        """
++        movie = tf.convert_to_tensor(movie)
++        batched = movie.shape.rank == 5 or (movie.shape.rank == 4 and movie.shape[-1] != 1)
++        kernel = self._movie_kernel(bmtk_compat)
++        if kernel is not None:
++            frames = movie[..., 0] if movie.shape.rank == (5 if batched else 4) else movie
++            if not batched:
++                frames = frames[None]
++            rates = tf.cast(kernel.response(frames, output="rates"), self.dtype)
++            return rates if batched else rates[0]
++        if not batched:
++            return self.firing_rates_from_spatial(*self.spatial_response(movie, bmtk_compat))
++        if movie.shape.rank == 4:
++            movie = movie[..., None]
++        return tf.map_fn(
++            lambda sample: self.firing_rates_from_spatial(*self.spatial_response(sample, bmtk_compat)),
++            movie, fn_output_signature=tf.TensorSpec((None, self.n_nodes), self.dtype),
++            parallel_iterations=1,
++        )
++
+     @tf.function
+     def spatial_response(self, movie, bmtk_compat=True):
+         """Return dominant responses and compact composite-cell responses."""
+diff --git a/docs/autodocs/source/dpointnet_lgn_pipeline.rst b/docs/autodocs/source/dpointnet_lgn_pipeline.rst
+index 5e8dbb2e..30436abd 100644
+--- a/docs/autodocs/source/dpointnet_lgn_pipeline.rst
++++ b/docs/autodocs/source/dpointnet_lgn_pipeline.rst
+@@ -86,6 +86,32 @@ The operators contain no architecture-specific instructions and are part of
+ the fat binary (SM 6.1 upward). Structure adapted from Javier Galvan's
+ ``v1_model_utils/cuda_lgn`` (credit: Javier).
+ 
++Native movie operators
++~~~~~~~~~~~~~~~~~~~~~~
++
++Arbitrary movies (natural movies, flashes, gray screens, or gratings outside
++the sinusoidal factorization) go through ``LGN.firing_rates(movie)``, which
++evaluates the same spatial-filter -> bilinear-sample -> temporal-filter ->
++rectification pipeline with the native movie operators
++(``custom_ops/_lgn_movie_ops.so``, ``DpointnetLgnMovieResponse`` /
++``DpointnetLgnMovieSpikes``) when a GPU and the built library are available,
++and otherwise with ``spatial_response`` + ``firing_rates_from_spatial``. The
++two agree to float32 rounding. ``LGN(..., movie_backend="auto"|"native"|
++"tensorflow")`` selects the route; ``LGN.movie_backend`` reports it. ``auto``
++keeps TensorFlow for configurations outside the operators' limits (frames above
++1024 rows x 11-column groups, for example 120 x 120, or spatial filters wider
++than 27 taps; ``lgn_movie_ops.movie_support_error`` names the reason, which an
++explicit ``"native"`` request raises). The
++movie may be ``[time, rows, cols, 1]`` or a batch ``[batch, time, rows,
++cols(, 1)]`` in float16 or float32. ``custom_ops.lgn_movie_ops.MovieLGNKernel``
++also samples seeded spikes in chunks (``chunk`` 1-16 samples at a time, or a
++``movie(begin, end)`` callable so only one chunk of movie is alive). Gray-screen
++probabilities and the TensorFlow fallback of the grating generator use this
++route automatically. The spatial pass stages a frame in shared memory and, on
++devices whose opt-in shared memory holds no whole frame (V100, Pascal for 80 x
++120), filters it in bands of rows; the result is bitwise the same either way
++(``DPOINTNET_LGN_MOVIE_MAX_BAND`` caps the band for tests).
++
+ .. _dpointnet_lgn_pipeline--seeded-sampling:
+ 
+ Seeds and batches
+diff --git a/tests/simulator/dpointnet/test_lgn_grating_native.py b/tests/simulator/dpointnet/test_lgn_grating_native.py
+index ae0d4654..3f9b715b 100644
+--- a/tests/simulator/dpointnet/test_lgn_grating_native.py
++++ b/tests/simulator/dpointnet/test_lgn_grating_native.py
+@@ -172,3 +172,134 @@ def test_host_generator_accepts_device_backend_options(small_lgn):
+     spikes, meta = next(iter(dataset))
+     assert spikes.shape == (40, small_lgn.n_nodes) and spikes.dtype == tf.bool
+     assert float(meta["orientation"][0]) == 90.0
++
++
++# ---------------------------------------------------------------------------
++# Native movie operators (arbitrary movies through LGN.firing_rates)
++# ---------------------------------------------------------------------------
++
++def _movie_available():
++    from bmtk.simulator.dpointnet.custom_ops import lgn_movie_ops
++    return lgn_movie_ops.native_movie_lgn_available()
++
++
++def _movies(seq_len=60):
++    from bmtk.simulator.dpointnet.input_modules.lgn_generator import make_drifting_grating_stimulus, movies_concat
++    rng = np.random.default_rng(9)
++    grating = movies_concat(make_drifting_grating_stimulus(
++        row_size=80, col_size=120, moving_flag=True, image_duration=seq_len - 15, cpd=0.04, temporal_f=2,
++        theta=tf.constant(33.0), phase=tf.constant(120.0), contrast=0.8, dtype=tf.float32)[..., None], 10, 5)
++    noise = tf.constant(rng.uniform(-1, 1, (seq_len, 80, 120, 1)).astype(np.float32))
++    gray = tf.zeros((seq_len, 80, 120, 1), tf.float32)
++    return {"grating": grating, "noise": noise, "gray": gray}
++
++
++def test_movie_backend_selection_and_errors(small_lgn):
++    assert small_lgn.movie_backend == ("native" if _movie_available() else "tensorflow")
++    with pytest.raises(ValueError, match="movie_backend"):
++        type(small_lgn)(network=None, row_size=80, col_size=120, movie_backend="cuda")
++    if not _movie_available():
++        return
++    from bmtk.simulator.dpointnet.custom_ops import lgn_movie_ops
++    with pytest.raises(ValueError, match="chunk"):
++        lgn_movie_ops.MovieLGNKernel(small_lgn, rows=80, cols=120, chunk=17)
++
++
++def _with_frame(lgn, rows, cols, request="auto"):
++    import copy
++    other = copy.copy(lgn)
++    other.row_size, other.col_size = rows, cols
++    other._movie_backend_request = request
++    other._movie_kernels = {}
++    return other
++
++
++def test_unsupported_frames_keep_tensorflow_under_auto(small_lgn):
++    from bmtk.simulator.dpointnet.custom_ops import lgn_movie_ops
++    assert lgn_movie_ops.movie_support_error(small_lgn, 80, 120) is None
++    assert "120 x 120" in lgn_movie_ops.movie_support_error(small_lgn, 120, 120)
++    assert "constants" in lgn_movie_ops.movie_support_error(object(), 80, 120)
++    assert _with_frame(small_lgn, 120, 120).movie_backend == "tensorflow"
++    if _movie_available():
++        with pytest.raises(ValueError, match="cannot serve"):
++            _with_frame(small_lgn, 120, 120, "native").movie_backend
++        with pytest.raises(ValueError, match="cannot serve"):
++            lgn_movie_ops.MovieLGNKernel(small_lgn, rows=120, cols=120)
++
++
++def test_movie_kernel_built_inside_tf_function_serves_later_calls(small_lgn):
++    if not _movie_available():
++        pytest.skip("Native LGN movie operators and a compatible GPU are required.")
++    lgn = _with_frame(small_lgn, 80, 120)
++    movies = _movies(32)
++    traced = tf.function(lambda movie: lgn.firing_rates(movie))
++    expected = {name: small_lgn.firing_rates(movie).numpy() for name, movie in movies.items()}
++    np.testing.assert_array_equal(traced(movies["noise"]).numpy(), expected["noise"])
++    assert lgn.movie_backend == "native"
++    np.testing.assert_array_equal(lgn.firing_rates(movies["grating"]).numpy(), expected["grating"])
++    np.testing.assert_array_equal(
++        traced(tf.stack([movies["gray"], movies["noise"]])).numpy()[1], expected["noise"])
++
++
++@pytest.mark.parametrize("name", ["grating", "noise", "gray"])
++@pytest.mark.parametrize("bmtk_compat", [True, False])
++def test_native_movie_rates_match_tensorflow_path(small_lgn, name, bmtk_compat):
++    if not _movie_available():
++        pytest.skip("Native LGN movie operators and a compatible GPU are required.")
++    movie = _movies()[name]
++    expected = small_lgn.firing_rates_from_spatial(*small_lgn.spatial_response(movie, bmtk_compat)).numpy()
++    actual = small_lgn.firing_rates(movie, bmtk_compat).numpy()
++    assert actual.shape == expected.shape == (60, small_lgn.n_nodes)
++    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=5e-3)
++    # Batched input (rank 5 and rank 4 without the channel axis) gives the same rows.
++    batched = small_lgn.firing_rates(tf.stack([movie, movie]), bmtk_compat).numpy()
++    np.testing.assert_array_equal(batched[0], actual)
++    np.testing.assert_array_equal(small_lgn.firing_rates(tf.stack([movie[..., 0]]), bmtk_compat).numpy()[0], actual)
++
++
++def test_native_movie_spikes_are_seeded_bounded_and_match_probabilities(small_lgn):
++    if not _movie_available():
++        pytest.skip("Native LGN movie operators and a compatible GPU are required.")
++    from bmtk.simulator.dpointnet.custom_ops import lgn_movie_ops
++    movies = _movies()
++    batch = tf.stack([movies["grating"][..., 0], movies["noise"][..., 0], movies["gray"][..., 0]])
++    seeds = tf.constant([[1, 2], [3, 4], [5, 6]], tf.int32)
++    kernel = lgn_movie_ops.MovieLGNKernel(small_lgn, rows=80, cols=120, chunk=2)
++    probabilities = kernel.response(batch, output="probabilities").numpy()
++    rates = kernel.response(batch).numpy()
++    np.testing.assert_allclose(probabilities, 1 - np.exp(-rates.astype(np.float64) / 1000.0), rtol=1e-4, atol=2e-7)
++    spikes = kernel.spikes(batch, seeds).numpy()
++    assert spikes.shape == (3, 60, small_lgn.n_nodes) and spikes.dtype == np.bool_
++    uniforms = np.stack([
++        tf.random.stateless_uniform((60, small_lgn.n_nodes), seed=seeds[i], dtype=tf.float32).numpy()
++        for i in range(3)])
++    assert np.mean(spikes != (uniforms < probabilities)) < 1e-4
++    np.testing.assert_array_equal(kernel.spikes(batch, seeds).numpy(), spikes)
++    # Chunk-of-one and movie-function forms give the same samples.
++    single = lgn_movie_ops.MovieLGNKernel(small_lgn, rows=80, cols=120, chunk=1)
++    np.testing.assert_array_equal(single.spikes(batch, seeds).numpy(), spikes)
++    np.testing.assert_array_equal(single.spikes(lambda b, e: batch[b:e], seeds, batch=3).numpy(), spikes)
++    symbolic = tf.function(kernel.spikes, input_signature=(
++        tf.TensorSpec((None, None, 80, 120), tf.float32), tf.TensorSpec((None, 2), tf.int32)))
++    np.testing.assert_array_equal(symbolic(batch, seeds).numpy(), spikes)
++
++
++@pytest.mark.parametrize("band", [40, 13, 7, 1])
++def test_native_movie_bands_match_whole_frame(small_lgn, monkeypatch, band):
++    # Devices whose shared memory holds no whole 80 x 120 frame (V100, Pascal)
++    # filter the frame in bands of rows; the band cap forces that path here.
++    if not _movie_available():
++        pytest.skip("Native LGN movie operators and a compatible GPU are required.")
++    movie = tf.stack([_movies(32)["noise"][..., 0], _movies(32)["grating"][..., 0]])
++    monkeypatch.delenv("DPOINTNET_LGN_MOVIE_MAX_BAND", raising=False)
++    whole = small_lgn.firing_rates(movie).numpy()
++    monkeypatch.setenv("DPOINTNET_LGN_MOVIE_MAX_BAND", str(band))
++    np.testing.assert_array_equal(small_lgn.firing_rates(movie).numpy(), whole)
++
++
++def test_gray_screen_probabilities_use_movie_route(small_lgn):
++    from bmtk.simulator.dpointnet.input_modules.lgn_generator import compute_grey_screen_probabilities
++    actual = compute_grey_screen_probabilities(small_lgn, 80, 120, 30, contrast=0.0).numpy()
++    expected = (1 - tf.exp(-small_lgn.firing_rates_from_spatial(
++        *small_lgn.spatial_response(tf.zeros((30, 80, 120, 1)), True)) / 1000.0)).numpy()
++    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-6)

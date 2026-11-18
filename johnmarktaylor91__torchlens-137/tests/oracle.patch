@@ -1,0 +1,243 @@
+diff --git a/tests/test_decoration.py b/tests/test_decoration.py
+index 619679bd94..e56cfdac5b 100644
+--- a/tests/test_decoration.py
++++ b/tests/test_decoration.py
+@@ -317,6 +317,99 @@ def test_wrap_restores_logging_after_unwrap(self):
+         assert relu_layers
+ 
+ 
++# =========================================================================
++# 1b. Sequence Slot Fix (sq_item pollution from __getitem__ wrapping)
++# =========================================================================
++
++
++class TestSequenceSlotFix:
++    """Wrapping Tensor.__getitem__ pollutes CPython's sq_item C slot, making
++    PySequence_Check(tensor) return True.  This breaks torch.tensor() on lists
++    of 0-d tensors.  These tests verify the fix holds across all lifecycle paths.
++    """
++
++    @pytest.fixture(autouse=True)
++    def _ensure_wrapped(self):
++        """Start wrapped, ensure wrapped on exit."""
++        wrap_torch()
++        yield
++        wrap_torch()
++
++    @staticmethod
++    def _check_tensor_from_0d(msg: str = "") -> None:
++        """Assert torch.tensor([0-d, 0-d]) works without TypeError."""
++        D = torch.randn(3, 3)
++        result = torch.tensor([D[0, 0], D[1, 1]])
++        assert result.shape == (2,), f"wrong shape {msg}"
++        assert torch.allclose(result, torch.stack([D[0, 0], D[1, 1]])), msg
++
++    @pytest.mark.smoke
++    def test_tensor_from_0d_while_wrapped(self):
++        """torch.tensor([0-d, 0-d]) must work while decoration is active."""
++        self._check_tensor_from_0d("while wrapped")
++
++    @pytest.mark.smoke
++    def test_tensor_from_0d_after_unwrap(self):
++        """torch.tensor([0-d, 0-d]) must work after unwrap_torch()."""
++        unwrap_torch()
++        self._check_tensor_from_0d("after unwrap")
++
++    def test_tensor_from_0d_after_wrap_unwrap_cycle(self):
++        """torch.tensor([0-d, 0-d]) survives multiple wrap/unwrap cycles."""
++        for i in range(3):
++            unwrap_torch()
++            self._check_tensor_from_0d(f"unwrap cycle {i}")
++            wrap_torch()
++            self._check_tensor_from_0d(f"wrap cycle {i}")
++
++    def test_tensor_from_0d_wrapped_context_manager(self):
++        """torch.tensor([0-d, 0-d]) works inside and after wrapped()."""
++        unwrap_torch()
++        with wrapped():
++            self._check_tensor_from_0d("inside wrapped()")
++        self._check_tensor_from_0d("after wrapped() exit")
++
++    def test_tensor_from_0d_after_forward_pass(self):
++        """torch.tensor([0-d, 0-d]) works after a real forward pass."""
++        model = SimpleModel()
++        log_forward_pass(model, torch.randn(5))
++        self._check_tensor_from_0d("after forward pass")
++
++    def test_tensor_from_0d_after_unwrap_when_done(self):
++        """torch.tensor([0-d, 0-d]) works after log_forward_pass(unwrap_when_done=True)."""
++        model = SimpleModel()
++        log_forward_pass(model, torch.randn(5), unwrap_when_done=True)
++        self._check_tensor_from_0d("after unwrap_when_done")
++
++    def test_tensor_from_0d_nested_list(self):
++        """torch.tensor with nested lists of 0-d tensors also works."""
++        D = torch.randn(2, 2)
++        result = torch.tensor([[D[0, 0], D[0, 1]], [D[1, 0], D[1, 1]]])
++        assert result.shape == (2, 2)
++        assert torch.allclose(result, D)
++
++    def test_tensor_indexing_still_works(self):
++        """Clearing sq_item must not break normal tensor indexing."""
++        x = torch.randn(3, 4, 5)
++        assert x[0].shape == (4, 5)
++        assert x[0, 1].shape == (5,)
++        assert x[0, 1, 2].shape == ()
++        assert x[:, 1:3].shape == (3, 2, 5)
++        assert x[torch.tensor([0, 2])].shape == (2, 4, 5)
++
++    def test_sequence_check_false_for_tensors(self):
++        """PySequence_Check must return False for tensors after decoration."""
++        import ctypes
++
++        if sys.implementation.name != "cpython":
++            pytest.skip("ctypes slot check only works on CPython")
++        check = ctypes.pythonapi.PySequence_Check
++        check.argtypes = [ctypes.py_object]
++        check.restype = ctypes.c_int
++        t = torch.tensor(0.5)
++        assert check(t) == 0, "PySequence_Check(tensor) should be False"
++
++
+ # =========================================================================
+ # 2. Torch Functions Normal When Toggle Off
+ # =========================================================================
+diff --git a/torchlens/decoration/torch_funcs.py b/torchlens/decoration/torch_funcs.py
+index 6274498b4a..b805839c8b 100644
+--- a/torchlens/decoration/torch_funcs.py
++++ b/torchlens/decoration/torch_funcs.py
+@@ -35,6 +35,7 @@
+    automatically. We detect active ``DeviceContext`` and inject the kwarg ourselves.
+ """
+ 
++import ctypes
+ import inspect
+ import sys
+ import time
+@@ -61,6 +62,94 @@
+     from ..data_classes.model_log import ModelLog
+ 
+ 
++# ---------------------------------------------------------------------------
++# CPython slot fixup for Tensor sequence protocol
++# ---------------------------------------------------------------------------
++#
++# When __getitem__ is replaced on a C extension type (like torch.Tensor) with
++# a Python function, CPython sets the sq_item slot in tp_as_sequence.  This
++# makes PySequence_Check(tensor) return True, which causes torch.tensor() to
++# try iterating 0-d tensor elements as sequences -- calling len() which raises
++# TypeError.  The sq_item slot is NEVER cleared by restoring the original
++# wrapper_descriptor or by delattr, because CPython's update_one_slot only
++# restores the exact slot the wrapper_descriptor wraps (mp_subscript), not
++# the collateral sq_item slot.
++#
++# We fix this by nulling sq_item directly via ctypes after any decoration or
++# undecoration cycle.  This is safe because tensor indexing uses mp_subscript
++# (mapping protocol), not sq_item (sequence protocol).
++
++
++class _PySequenceMethods(ctypes.Structure):
++    """Minimal ctypes mirror of CPython's PySequenceMethods struct."""
++
++    _fields_ = [
++        ("sq_length", ctypes.c_void_p),
++        ("sq_concat", ctypes.c_void_p),
++        ("sq_repeat", ctypes.c_void_p),
++        ("sq_item", ctypes.c_void_p),
++        ("was_sq_slice", ctypes.c_void_p),
++        ("sq_ass_item", ctypes.c_void_p),
++        ("was_sq_ass_slice", ctypes.c_void_p),
++        ("sq_contains", ctypes.c_void_p),
++        ("sq_inplace_concat", ctypes.c_void_p),
++        ("sq_inplace_repeat", ctypes.c_void_p),
++    ]
++
++
++class _PyTypeObject(ctypes.Structure):
++    """Partial ctypes mirror of CPython's PyTypeObject up to tp_as_sequence.
++
++    Layout is stable across CPython 3.8+ (tp_vectorcall_offset replaced
++    tp_print in 3.8; all earlier fields are pointer-sized regardless).
++    """
++
++    _fields_ = [
++        ("ob_refcnt", ctypes.c_ssize_t),
++        ("ob_type", ctypes.c_void_p),
++        ("ob_size", ctypes.c_ssize_t),
++        ("tp_name", ctypes.c_char_p),
++        ("tp_basicsize", ctypes.c_ssize_t),
++        ("tp_itemsize", ctypes.c_ssize_t),
++        ("tp_dealloc", ctypes.c_void_p),
++        ("tp_vectorcall_offset", ctypes.c_ssize_t),
++        ("tp_getattr", ctypes.c_void_p),
++        ("tp_setattr", ctypes.c_void_p),
++        ("tp_as_async", ctypes.c_void_p),
++        ("tp_repr", ctypes.c_void_p),
++        ("tp_as_number", ctypes.c_void_p),
++        ("tp_as_sequence", ctypes.POINTER(_PySequenceMethods)),
++        ("tp_as_mapping", ctypes.c_void_p),
++    ]
++
++
++def _fix_tensor_sequence_slot() -> None:
++    """Clear the stale sq_item C slot on torch.Tensor after dunder changes.
++
++    Wrapping ``__getitem__`` on a C extension type pollutes the ``sq_item``
++    slot in ``tp_as_sequence``, making ``PySequence_Check(tensor)`` return
++    ``True``.  This breaks ``torch.tensor([0-d_tensor, ...])`` because the
++    C code then calls ``len()`` on each element.  Clearing ``sq_item`` to
++    NULL restores the clean-state behavior where tensors are NOT treated as
++    sequences.  Tensor indexing is unaffected because it goes through
++    ``mp_subscript`` (mapping protocol).
++
++    Safe to call multiple times.  Fails silently on non-CPython or if the
++    struct layout doesn't match (verified via ``tp_name``).
++    """
++    if sys.implementation.name != "cpython":
++        return
++    try:
++        type_obj = _PyTypeObject.from_address(id(torch.Tensor))
++        # Verify struct layout by checking tp_name
++        if type_obj.tp_name != b"Tensor":
++            return
++        if type_obj.tp_as_sequence:
++            type_obj.tp_as_sequence.contents.sq_item = None
++    except Exception:
++        pass  # Best-effort; non-CPython or unexpected layout
++
++
+ def _is_inside_functorch_transform() -> bool:
+     """Return True if inside a vmap/grad/etc. functorch transform."""
+     try:
+@@ -591,6 +680,11 @@ def decorate_all_once():
+     _state._decorated_identity = torch_func_decorator(identity, "identity")
+     _state._is_decorated = True
+ 
++    # Wrapping __getitem__ on torch.Tensor pollutes the C-level sq_item slot,
++    # making PySequence_Check(tensor) return True.  Clear it so torch.tensor()
++    # doesn't try to iterate 0-d tensor elements as sequences.
++    _fix_tensor_sequence_slot()
++
+ 
+ def _replace_detached_references(mapping: Dict[int, Callable]) -> None:
+     """Crawl ``sys.modules`` and replace callable references using ``mapping``.
+@@ -682,6 +776,9 @@ def unwrap_torch() -> None:
+     _replace_detached_references(_state._decorated_to_orig)
+     _state._is_decorated = False
+ 
++    # Restoring Tensor.__getitem__ doesn't clear the stale sq_item slot.
++    _fix_tensor_sequence_slot()
++
+ 
+ def wrap_torch() -> None:
+     """Install (or re-install) torchlens wrappers on all torch functions.
+@@ -729,6 +826,9 @@ def wrap_torch() -> None:
+     _state._is_decorated = True
+     patch_detached_references()
+ 
++    # Re-wrapping __getitem__ pollutes sq_item again; clear it.
++    _fix_tensor_sequence_slot()
++
+ 
+ @contextmanager
+ def wrapped():

@@ -1,0 +1,13 @@
+# Issue
+
+**Title:** Fix off by one error in test
+
+## Description
+
+Test failure was related to 
+
+Masked by xfail during the merging of
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `132e8173c6e9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

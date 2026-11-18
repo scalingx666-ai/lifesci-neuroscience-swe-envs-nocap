@@ -1,0 +1,143 @@
+diff --git a/packages/runtime/src/__tests__/interrupt.test.ts b/packages/runtime/src/__tests__/interrupt.test.ts
+index b2f01fd5..cd4fe21a 100644
+--- a/packages/runtime/src/__tests__/interrupt.test.ts
++++ b/packages/runtime/src/__tests__/interrupt.test.ts
+@@ -161,7 +161,11 @@ describe("whole-session interrupt (#90 / #327)", () => {
+         typeof (e as { message?: string }).message === "string" &&
+         String((e as { message?: string }).message).includes("中断"),
+     );
+-    expect(sysAcks.length).toBeGreaterThanOrEqual(1);
++    expect(sysAcks.length).toBe(1);
++    // #330 — stable id for history + SSE hydrate dedupe.
++    const ackId = (sysAcks[0] as { id?: string }).id;
++    expect(typeof ackId).toBe("string");
++    expect(ackId).toMatch(new RegExp(`^interrupt:${s.id}:`));
+ 
+     // Run state settled so the UI can clear Stop immediately.
+     const state = m.getSessionState(s.id);
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index a57417d9..7ea2294b 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -1533,6 +1533,9 @@ export class SessionManager {
+       d.reject(new Error("interrupted"));
+       entry.pendingInputs.delete(id);
+     }
++    // Capture run identity before aborts clear agent state so the interrupt
++    // acknowledgement can carry a stable id for client hydrate dedupe (#330).
++    const interruptEventId = `interrupt:${sessionId}:${entry.activeRunId ?? randomUUID()}`;
+     // Abort every target and WAIT for each in-flight run to fully settle (#101)
+     // — RUN_FINISHED emitted, status settled, provider stream fenced.
+     await Promise.all(targets.map((a) => a!.abort()));
+@@ -1543,10 +1546,12 @@ export class SessionManager {
+       // the user just stopped.
+       await entry.mailbox.clearAll();
+       // Deterministic UI/runtime acknowledgement — no model/provider run (#327).
++      // Stable `id` so history rehydrate + SSE ring replay coalesce to one bubble (#330).
+       entry.bus.emit(
+         ev.systemMessage(sessionId, "info", "⏹️ 用户已中断当前任务，信箱已清空，正在等候进一步指示。", {
+           agent: "principal",
+           recoverable: true,
++          id: interruptEventId,
+         }),
+       );
+       this.touch(entry);
+diff --git a/packages/web/src/__tests__/messageStreamIdempotency.test.ts b/packages/web/src/__tests__/messageStreamIdempotency.test.ts
+index c6792cae..cf9d5b75 100644
+--- a/packages/web/src/__tests__/messageStreamIdempotency.test.ts
++++ b/packages/web/src/__tests__/messageStreamIdempotency.test.ts
+@@ -224,3 +224,64 @@ describe("message stream idempotency (#314)", () => {
+     expect(reasonTwice[0]!.reasoning).toBe("think hard");
+   });
+ });
++
++describe("interrupt system_message hydrate idempotency (#330)", () => {
++  const interruptMsg = "⏹️ 用户已中断当前任务，信箱已清空，正在等候进一步指示。";
++  const stableId = "interrupt:sess-1:run_abc";
++
++  function interruptEvent(id: string, ts = "2026-07-15T12:05:00.000Z"): WebSocketEvent {
++    return {
++      type: "system_message",
++      id,
++      message: interruptMsg,
++      level: "info",
++      agent: "principal",
++      recoverable: true,
++      _ts: ts,
++    } as WebSocketEvent;
++  }
++
++  it("keeps a single bubble when history and SSE replay the same interrupt id", () => {
++    // Live path folds once; reload path folds history then SSE ring buffer of the
++    // same persisted event — must not stack two interruption status cards.
++    const history = [
++      ...textTriad("asst_partial", ["partial "], { end: false }),
++      {
++        type: "TEXT_MESSAGE_END",
++        messageId: "asst_partial",
++        agentName: "principal",
++        _ts: "2026-07-15T12:04:59.000Z",
++      } as WebSocketEvent,
++      interruptEvent(stableId),
++    ];
++    const once = fold(history);
++    const interruptRows = once.filter((m) => m.kind === "system_message" && m.content.includes("中断"));
++    expect(interruptRows).toHaveLength(1);
++    expect(interruptRows[0]!.id).toBe(stableId);
++
++    // Same stream again (history + SSE replay).
++    const twice = fold([...history, ...history]);
++    const interruptTwice = twice.filter(
++      (m) => m.kind === "system_message" && m.content.includes("中断"),
++    );
++    expect(interruptTwice).toHaveLength(1);
++    expect(interruptTwice[0]!.id).toBe(stableId);
++    // Partial assistant content preserved once.
++    expect(twice.filter((m) => m.id === "asst_partial")).toHaveLength(1);
++    expect(twice.find((m) => m.id === "asst_partial")!.content).toBe("partial ");
++  });
++
++  it("without a stable id, identical interrupt payloads still append (legacy)", () => {
++    // Documents why runtime must emit id — random client ids would double.
++    const bare = {
++      type: "system_message",
++      message: interruptMsg,
++      level: "info",
++      agent: "principal",
++    } as WebSocketEvent;
++    const once = fold([bare]);
++    const twice = fold([bare, bare]);
++    expect(once.filter((m) => m.kind === "system_message")).toHaveLength(1);
++    expect(twice.filter((m) => m.kind === "system_message").length).toBeGreaterThan(1);
++  });
++});
+diff --git a/packages/web/src/contexts/SessionContext.tsx b/packages/web/src/contexts/SessionContext.tsx
+index ac99e45c..ac76d245 100644
+--- a/packages/web/src/contexts/SessionContext.tsx
++++ b/packages/web/src/contexts/SessionContext.tsx
+@@ -704,18 +704,15 @@ export function SessionProvider({ children }: { children: ReactNode }) {
+           setError(tg("ctx.session.interruptFailed"));
+           return;
+         }
+-        // Confirmed stopped: insert the status line. Agent state (incl. the PI
+-        // interrupt-acknowledgement run the runtime now fires) flows in via SSE.
++        // #330 — do NOT insert a client-only stop row. The runtime emits one
++        // canonical system_message with a stable id (interrupt:session:runId)
++        // that persists to events.jsonl and dedupes across history + SSE replay.
++        // A local UUID status bubble would vanish on reload and conflict with it.
++        // Fence any still-streaming assistant partial so content freezes at the
++        // interrupt boundary; the acknowledgement arrives via SSE.
+         setMessagesBySession((current) => {
+           const msgs = current[sid] ?? [];
+-          const stoppedMsg: ChatMessage = {
+-            id: generateUUID(),
+-            role: "system",
+-            content: tg("chat.stoppedByUser"),
+-            createdAt: new Date().toISOString(),
+-            kind: "status",
+-          };
+-          return { ...current, [sid]: [...finalizeAssistant(msgs), stoppedMsg] };
++          return { ...current, [sid]: finalizeAssistant(msgs) };
+         });
+       } catch (err) {
+         setError(err instanceof Error ? err.message : tg("ctx.session.interruptFailed"));

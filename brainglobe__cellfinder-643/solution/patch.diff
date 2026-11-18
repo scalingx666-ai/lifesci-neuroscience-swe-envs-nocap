@@ -1,0 +1,916 @@
+diff --git a/cellfinder/core/classify/classify.py b/cellfinder/core/classify/classify.py
+index 828b4839..951ecbc5 100644
+--- a/cellfinder/core/classify/classify.py
++++ b/cellfinder/core/classify/classify.py
+@@ -17,10 +17,119 @@
+ )
+ from cellfinder.core.classify.tools import get_model, model_input_channels
+ from cellfinder.core.tools.image_processing import dataset_mean_std
+-from cellfinder.core.tools.tools import deprecate_positional_args
++from cellfinder.core.tools.tools import (
++    deprecate_positional_args,
++    validate_dimensions,
++)
+ from cellfinder.core.train.train_yaml import depth_type, models
+ 
+ 
++def _validate_3d_arrays(
++    signal_array: types.array,
++    background_array: Optional[types.array],
++) -> None:
++    """
++    Raise `IOError` unless the signal and background arrays are both 3D.
++    """
++    if signal_array.ndim != 3:
++        raise IOError("Signal data must be 3D")
++    if background_array is not None and background_array.ndim != 3:
++        raise IOError("Background data must be 3D")
++
++
++def _promote_2d_arrays(
++    signal_array: types.array,
++    background_array: Optional[types.array],
++    voxel_sizes: Tuple[float, ...],
++    network_voxel_sizes: Tuple[float, ...],
++) -> Tuple[
++    types.array,
++    Optional[types.array],
++    Tuple[float, ...],
++    Tuple[float, ...],
++]:
++    """
++    Promote 2D inputs to the depth-1 3D form the cube generator expects.
++
++    Accepts 2D or already-3D signal/background arrays, adding a singleton z
++    axis to the 2D ones, and pads 2-element voxel sizes with a z entry.
++
++    Returns the promoted signal array, background array, voxel sizes and
++    network voxel sizes.
++    """
++    if signal_array.ndim not in (2, 3):
++        raise IOError("2D classification needs 2D or 3D signal data")
++    if background_array is not None and background_array.ndim not in (2, 3):
++        raise IOError("2D classification needs 2D or 3D background data")
++
++    if signal_array.ndim == 2:
++        signal_array = signal_array[np.newaxis, ...]
++    if background_array is not None and background_array.ndim == 2:
++        background_array = background_array[np.newaxis, ...]
++    if len(voxel_sizes) == 2:
++        voxel_sizes = (1.0, *voxel_sizes)
++    if len(network_voxel_sizes) == 2:
++        network_voxel_sizes = (1.0, *network_voxel_sizes)
++    # the depth-1 cube must not be rescaled in z, so match the z voxel
++    # size to the data and pull a single plane
++    network_voxel_sizes = (voxel_sizes[0], *network_voxel_sizes[1:])
++
++    return signal_array, background_array, voxel_sizes, network_voxel_sizes
++
++
++def _squeeze_depth1_batch(data, z_axis: int):
++    """
++    Drop the singleton z axis from a depth-1 batch, giving 2D network input.
++    """
++    if data.shape[z_axis] != 1:
++        raise ValueError(
++            "2D classification expects a depth-1 cube, but got "
++            f"depth {data.shape[z_axis]}"
++        )
++    return data.squeeze(z_axis)
++
++
++def _run_inference(
++    model,
++    data_loader: DataLoader,
++    dataset: CuboidArrayDataset,
++    workers: int,
++    squeeze_z_axis: Optional[int],
++    callback: Optional[Callable[[int], None]],
++) -> np.ndarray:
++    """
++    Run the model over every batch, returning the concatenated outputs.
++
++    If `squeeze_z_axis` is not None, each batch has that axis dropped to give
++    2D network input.
++    """
++    if workers:
++        dataset.start_dataset_thread(workers)
++    try:
++        outputs = []
++        for step, data in tqdm.tqdm(
++            enumerate(data_loader),
++            total=len(data_loader.sampler),
++            desc="Classifying",
++            unit="batches",
++            smoothing=1 / (25 * max(1, workers)),
++            mininterval=0.5,
++        ):
++            if squeeze_z_axis is not None:
++                data = _squeeze_depth1_batch(data, squeeze_z_axis)
++            output = model(data)
++            # in original keras, it seemed to held on to the output until the
++            # end (possibly on GPU). This causes resources issues for very
++            # heavy loads. So instead immediately move it to cpu/numpy
++            outputs.append(output.cpu().numpy())
++            if callback is not None:
++                callback(step)
++    finally:
++        dataset.stop_dataset_thread()
++
++    return np.concatenate(outputs, axis=0)
++
++
+ @deprecate_positional_args
+ def main(
+     *,
+@@ -39,6 +148,7 @@ def main(
+     network_depth: depth_type,
+     max_workers: int = 3,
+     pin_memory: bool = False,
++    dimensions: int = 3,
+     callback: Optional[Callable[[int], None]] = None,
+     normalize_channels: bool = False,
+     normalization_n_sampling_planes: int = 50,
+@@ -93,6 +203,10 @@ def main(
+         stay in the CPU RAM while the GPU uses it. I.e. there's enough RAM.
+         Otherwise, if there's a risk of the RAM being paged, it shouldn't be
+         used. Defaults to False.
++    dimensions: int
++        Whether to classify using a 3D network (a z-stack cube, the default)
++        or a 2D network (a single plane). When 2, 2D signal/background arrays
++        are accepted and a depth-1 cube is squeezed to a 2D (y, x, c) image.
+     callback : Callable[int], optional
+         A callback function that is called during classification. Called with
+         the batch number once that batch has been classified.
+@@ -106,10 +220,20 @@ def main(
+         dataset of 200 planes means every fourth plane will be used. Defaults
+         to 50.
+     """
+-    if signal_array.ndim != 3:
+-        raise IOError("Signal data must be 3D")
+-    if background_array is not None and background_array.ndim != 3:
+-        raise IOError("Background data must be 3D")
++    validate_dimensions(dimensions)
++
++    if dimensions == 2:
++        (
++            signal_array,
++            background_array,
++            voxel_sizes,
++            network_voxel_sizes,
++        ) = _promote_2d_arrays(
++            signal_array, background_array, voxel_sizes, network_voxel_sizes
++        )
++        cube_depth = 1
++
++    _validate_3d_arrays(signal_array, background_array)
+ 
+     # Too many workers doesn't increase speed, and uses huge amounts of RAM
+     workers = get_num_processes(min_free_cpu_cores=n_free_cpus)
+@@ -169,12 +293,17 @@ def main(
+         model_weights = trained_model
+         trained_model = None
+ 
++    model_shape = None
++    if dimensions == 2:
++        model_shape = (cube_height, cube_width, dataset.num_channels)
+     model = get_model(
+         existing_model=trained_model,
+         model_weights=model_weights,
+         network_depth=models[network_depth],
+         inference=True,
+         num_channels=dataset.num_channels,
++        dimensions=dimensions,
++        shape=model_shape,
+     )
+ 
+     model_channels = model_input_channels(model)
+@@ -188,29 +317,20 @@ def main(
+         )
+ 
+     logger.info("Running inference")
+-    if workers:
+-        dataset.start_dataset_thread(workers)
+-    try:
+-        outputs = []
+-        for step, data in tqdm.tqdm(
+-            enumerate(data_loader),
+-            total=len(sampler),
+-            desc="Classifying",
+-            unit="batches",
+-            smoothing=1 / (25 * max(1, workers)),
+-            mininterval=0.5,
+-        ):
+-            output = model(data)
+-            # in original keras, it seemed to held on to the output until the
+-            # end (possibly on GPU). This causes resources issues for very
+-            # heavy loads. So instead immediately move it to cpu/numpy
+-            outputs.append(output.cpu().numpy())
+-            if callback is not None:
+-                callback(step)
+-    finally:
+-        dataset.stop_dataset_thread()
++    outputs = _run_inference(
++        model=model,
++        data_loader=data_loader,
++        dataset=dataset,
++        workers=workers,
++        squeeze_z_axis=(
++            dataset.output_axis_order.index("z") + 1
++            if dimensions == 2
++            else None
++        ),
++        callback=callback,
++    )
+ 
+-    predictions = np.argmax(np.concatenate(outputs, axis=0), axis=1)
++    predictions = np.argmax(outputs, axis=1)
+     points_list = []
+ 
+     # only go through the "extractable" points
+diff --git a/cellfinder/core/classify/resnet.py b/cellfinder/core/classify/resnet.py
+index 07f6253c..4834fc0c 100644
+--- a/cellfinder/core/classify/resnet.py
++++ b/cellfinder/core/classify/resnet.py
+@@ -4,17 +4,14 @@
+     KerasTensor as Tensor,
+ )
+ from keras import Model
++from keras import layers as keras_layers
+ from keras.initializers import Initializer
+ from keras.layers import (
+     Activation,
+     Add,
+     BatchNormalization,
+-    Conv3D,
+     Dense,
+-    GlobalAveragePooling3D,
+     Input,
+-    MaxPooling3D,
+-    ZeroPadding3D,
+ )
+ from keras.optimizers import Adam, Optimizer
+ 
+@@ -40,25 +37,50 @@
+     "101-layer": True,
+     "152-layer": True,
+ }
++
++# Per-dimensionality keras layer classes. The network is otherwise identical;
++# only the spatial rank of the convolutions/pooling changes, so we resolve the
++# rank-specific layer (e.g. Conv2D vs Conv3D) by name from keras.layers.
++_layer_kinds = ("Conv", "MaxPooling", "GlobalAveragePooling", "ZeroPadding")
++
++dimension_layers: Dict[int, Dict[str, type]] = {
++    dimensions: {
++        kind: getattr(keras_layers, f"{kind}{dimensions}D")
++        for kind in _layer_kinds
++    }
++    for dimensions in (2, 3)
++}
+ #####################################################################
+ 
+ 
+ def build_model(
+-    shape: Tuple[int, int, int, int] = (50, 50, 20, 2),
++    shape: Tuple[int, ...] = (50, 50, 20, 2),
+     network_depth: layer_type = "18-layer",
+     optimizer: Optional[Optimizer] = None,
+     learning_rate: float = 0.0005,  # higher rates don't always converge
+     loss: str = "categorical_crossentropy",
+     metrics: List[str] = ["accuracy"],
+     number_classes: int = 2,
+-    axis: int = 3,
++    axis: Optional[int] = None,
+     starting_features: int = 64,
+     classification_activation: str = "softmax",
+ ) -> Model:
++    dimensions = len(shape) - 1
++    if dimensions not in dimension_layers:
++        raise ValueError(
++            f"Unsupported spatial dimensionality {dimensions}; "
++            f"expected one of {sorted(dimension_layers)}"
++        )
++    if axis is None:
++        axis = dimensions
++
++    layers = dimension_layers[dimensions]
+     blocks, bottleneck = get_resnet_blocks_and_bottleneck(network_depth)
+ 
+     inputs = Input(shape)
+-    x = non_residual_block(inputs, starting_features, axis=axis)
++    x = non_residual_block(
++        inputs, starting_features, axis=axis, dimensions=dimensions
++    )
+ 
+     features = starting_features
+     for resnet_unit_id, iterations in enumerate(blocks):
+@@ -69,11 +91,12 @@ def build_model(
+                 block_id,
+                 bottleneck=bottleneck,
+                 axis=axis,
++                dimensions=dimensions,
+             )(x)
+ 
+         features *= 2
+ 
+-    x = GlobalAveragePooling3D(name="final_average_pool")(x)
++    x = layers["GlobalAveragePooling"](name="final_average_pool")(x)
+     x = Dense(
+         number_classes,
+         activation=classification_activation,
+@@ -108,23 +131,28 @@ def get_resnet_blocks_and_bottleneck(
+ def non_residual_block(
+     inputs: Tensor,
+     starting_features: int,
+-    conv_kernel: Tuple[int, int, int] = (7, 7, 3),
+-    strides: Tuple[int, int, int] = (2, 2, 2),
++    conv_kernel: Tuple[int, ...] = (7, 7, 3),
++    strides: Tuple[int, ...] = (2, 2, 2),
+     padding: int = 3,
+-    max_pool_size: Tuple[int, int, int] = (3, 3, 2),
++    max_pool_size: Tuple[int, ...] = (3, 3, 2),
+     activation: str = "relu",
+     use_bias: bool = False,
+     bn_epsilon: float = 1e-5,
+     pooling_padding: str = "valid",
+     axis: int = 3,
++    dimensions: int = 3,
+ ) -> Tensor:
+     """
+     Non-residual unit from He et al. (2015). Corresponds to "conv1" and the
+     max pool.
+     """
++    layers = dimension_layers[dimensions]
++    conv_kernel = conv_kernel[:dimensions]
++    strides = strides[:dimensions]
++    max_pool_size = max_pool_size[:dimensions]
+ 
+-    x = ZeroPadding3D(padding=padding, name="conv1_padding")(inputs)
+-    x = Conv3D(
++    x = layers["ZeroPadding"](padding=padding, name="conv1_padding")(inputs)
++    x = layers["Conv"](
+         starting_features,
+         conv_kernel,
+         strides=strides,
+@@ -134,7 +162,7 @@ def non_residual_block(
+     x = BatchNormalization(axis=axis, epsilon=bn_epsilon, name="conv1_bn")(x)
+     x = Activation(activation, name="conv1_activation")(x)
+ 
+-    x = MaxPooling3D(
++    x = layers["MaxPooling"](
+         max_pool_size,
+         strides=strides,
+         padding=pooling_padding,
+@@ -148,14 +176,15 @@ def residual_block(
+     output_features: Tensor,
+     resnet_unit_id: int,
+     block_id: int,
+-    conv_kernel: Tuple[int, int, int] = (3, 3, 3),
+-    bottleneck_conv_kernel: Tuple[int, int, int] = (1, 1, 1),
++    conv_kernel: Tuple[int, ...] = (3, 3, 3),
++    bottleneck_conv_kernel: Tuple[int, ...] = (1, 1, 1),
+     bottleneck: int = False,
+     activation: str = "relu",
+     use_bias: bool = False,
+     kernel_initializer: str = "he_normal",
+     bn_epsilon: float = 1e-5,
+     axis: int = 3,
++    dimensions: int = 3,
+ ) -> Callable[[Tensor], Tensor]:
+     """
+     Residual unit from He et al. (2015)
+@@ -177,13 +206,16 @@ def residual_block(
+     :param axis:
+     :return:
+     """
++    layers = dimension_layers[dimensions]
++    conv_kernel = conv_kernel[:dimensions]
++    bottleneck_conv_kernel = bottleneck_conv_kernel[:dimensions]
+ 
+     stride = get_stride(resnet_unit_id, block_id)
+     resnet_unit_label = resnet_unit_id + 2
+ 
+     def f(x: Tensor) -> Tensor:
+         if bottleneck:
+-            y = Conv3D(
++            y = layers["Conv"](
+                 output_features,
+                 bottleneck_conv_kernel,
+                 strides=stride,
+@@ -192,12 +224,12 @@ def f(x: Tensor) -> Tensor:
+                 kernel_initializer=kernel_initializer,
+             )(x)
+         else:
+-            y = ZeroPadding3D(
++            y = layers["ZeroPadding"](
+                 padding=1,
+                 name=f"resunit{resnet_unit_label}_block{block_id}_pad_a",
+             )(x)
+ 
+-            y = Conv3D(
++            y = layers["Conv"](
+                 output_features,
+                 conv_kernel,
+                 strides=stride,
+@@ -217,11 +249,11 @@ def f(x: Tensor) -> Tensor:
+             name=f"resunit{resnet_unit_label}_block{block_id}_activation_a",
+         )(y)
+ 
+-        y = ZeroPadding3D(
++        y = layers["ZeroPadding"](
+             padding=1, name=f"resunit{resnet_unit_label}_block{block_id}_pad_b"
+         )(y)
+ 
+-        y = Conv3D(
++        y = layers["Conv"](
+             output_features,
+             conv_kernel,
+             use_bias=use_bias,
+@@ -242,7 +274,7 @@ def f(x: Tensor) -> Tensor:
+                 f"{block_id}_activation_b",
+             )(y)
+ 
+-            y = Conv3D(
++            y = layers["Conv"](
+                 output_features * 4,
+                 bottleneck_conv_kernel,
+                 use_bias=use_bias,
+@@ -263,6 +295,7 @@ def f(x: Tensor) -> Tensor:
+                 output_features * 4,
+                 stride,
+                 axis=axis,
++                dimensions=dimensions,
+             )
+         else:
+             identity_shortcut = get_shortcut(
+@@ -272,6 +305,7 @@ def f(x: Tensor) -> Tensor:
+                 output_features,
+                 stride,
+                 axis=axis,
++                dimensions=dimensions,
+             )
+ 
+         y = Add(name=f"resunit{resnet_unit_label}_block{block_id}_add")(
+@@ -298,6 +332,7 @@ def get_shortcut(
+     kernel_initializer: Union[str, Initializer] = "he_normal",
+     bn_epsilon: float = 1e-5,
+     axis: int = 3,
++    dimensions: int = 3,
+ ) -> Tensor:
+     """
+     Create shortcut. For none-bottleneck residual units, this is just the
+@@ -316,11 +351,12 @@ def get_shortcut(
+     :param axis:
+     :return: Shortcut tensor, to add to the output of the residual unit
+     """
++    layers = dimension_layers[dimensions]
+ 
+     if block_id == 0:
+-        shortcut = Conv3D(
++        shortcut = layers["Conv"](
+             features,
+-            (1, 1, 1),
++            (1,) * dimensions,
+             strides=stride,
+             use_bias=use_bias,
+             name=f"resunit{resnet_unit_label}_block{block_id}_shortcut_conv",
+diff --git a/cellfinder/core/classify/tools.py b/cellfinder/core/classify/tools.py
+index 4b41f86e..6a81860d 100644
+--- a/cellfinder/core/classify/tools.py
++++ b/cellfinder/core/classify/tools.py
+@@ -1,5 +1,5 @@
+ import os
+-from typing import Optional
++from typing import Optional, Tuple
+ 
+ import keras
+ from keras import Model
+@@ -13,6 +13,52 @@ def model_input_channels(model: Model) -> int:
+     return tuple(model.inputs[0].shape)[-1]
+ 
+ 
++def _load_existing_model(
++    existing_model: os.PathLike, dimensions: int
++) -> Model:
++    """
++    Load a saved model, checking its input rank matches `dimensions`.
++    """
++    logger.debug(f"Loading model: {existing_model}")
++    model = keras.models.load_model(existing_model)
++    if len(model.input_shape) != dimensions + 2:
++        raise ValueError(
++            f"Loaded model expects {len(model.input_shape) - 2}D input, "
++            f"but dimensions={dimensions} was requested."
++        )
++    return model
++
++
++def _default_shape(dimensions: int, num_channels: int) -> Tuple[int, ...]:
++    """
++    The input shape used for a new model when none is given.
++    """
++    spatial = (50, 50) if dimensions == 2 else (50, 50, 20)
++    return (*spatial, num_channels)
++
++
++def _set_model_weights(
++    model: Model, model_weights: Optional[os.PathLike]
++) -> None:
++    """
++    Set a new model's weights from `model_weights`, which must be provided.
++    """
++    logger.debug(f"Setting model weights according to: {model_weights}")
++    if model_weights is None:
++        raise OSError(
++            "`model_weights` must be provided for inference "
++            "or continued training."
++        )
++    try:
++        model.optimizer.build(model.trainable_variables)
++        model.load_weights(model_weights)
++    except (OSError, ValueError) as e:
++        raise ValueError(
++            f"Error loading weights: {model_weights}.\n"
++            "Provided weights don't match the model architecture.\n"
++        ) from e
++
++
+ def get_model(
+     existing_model: Optional[os.PathLike] = None,
+     model_weights: Optional[os.PathLike] = None,
+@@ -21,8 +67,14 @@ def get_model(
+     inference: bool = False,
+     continue_training: bool = False,
+     num_channels: int = 2,
++    dimensions: int = 3,
++    shape: Optional[Tuple[int, ...]] = None,
+ ) -> Model:
+     """Returns the correct model based on the arguments passed
++
++    One of `existing_model` or `network_depth` must be given; `existing_model`
++    takes precedence when both are.
++
+     :param existing_model: An existing, trained model. This is returned if it
+     exists
+     :param model_weights: This file is used to set the model weights if it
+@@ -36,37 +88,36 @@ def get_model(
+     exists. E.g. by using the default one
+     :param num_channels: Number of input channels for a freshly built model.
+     ``2`` for the standard signal+background model, ``1`` for a single-channel
+-    (signal-only) model. Ignored when ``existing_model`` is loaded.
++    (signal-only) model. Ignored when ``existing_model`` is loaded or when
++    ``shape`` is given.
++    :param dimensions: Whether a 3D or 2D network is expected. Checked against
++    the rank of a loaded ``existing_model``, and used to pick the default shape
++    when ``shape`` is None. A new model's rank otherwise follows ``shape``.
++    :param shape: The input shape (excluding the batch dimension) to use when
++    creating a new model. If None, a default for `dimensions` with
++    `num_channels` channels is used.
+     :return: A keras model
+ 
+     """
+-    if existing_model is not None or network_depth is None:
+-        logger.debug(f"Loading model: {existing_model}")
+-        model = keras.models.load_model(existing_model)
++    if existing_model is not None:
++        model = _load_existing_model(existing_model, dimensions)
++    elif network_depth is None:
++        raise ValueError(
++            "Either `existing_model` or `network_depth` must be provided."
++        )
+     else:
+         logger.debug(f"Creating a new instance of model: {network_depth}")
+         model = build_model(
+-            shape=(50, 50, 20, num_channels),
+             network_depth=network_depth,
+             learning_rate=learning_rate,
++            shape=(
++                _default_shape(dimensions, num_channels)
++                if shape is None
++                else shape
++            ),
+         )
+         if inference or continue_training:
+-            logger.debug(
+-                f"Setting model weights according to: {model_weights}",
+-            )
+-            if model_weights is None:
+-                raise OSError(
+-                    "`model_weights` must be provided for inference "
+-                    "or continued training."
+-                )
+-            try:
+-                model.optimizer.build(model.trainable_variables)
+-                model.load_weights(model_weights)
+-            except (OSError, ValueError) as e:
+-                raise ValueError(
+-                    f"Error loading weights: {model_weights}.\n"
+-                    "Provided weights don't match the model architecture.\n"
+-                ) from e
++            _set_model_weights(model, model_weights)
+ 
+     if inference:
+         model.trainable = False
+diff --git a/cellfinder/core/tools/tools.py b/cellfinder/core/tools/tools.py
+index f8800908..606b1508 100644
+--- a/cellfinder/core/tools/tools.py
++++ b/cellfinder/core/tools/tools.py
+@@ -21,6 +21,14 @@ def inner_function(*args, **kwargs):
+     return inner_function
+ 
+ 
++def validate_dimensions(dimensions: int) -> None:
++    """
++    Raise `ValueError` unless `dimensions` is 2 or 3.
++    """
++    if dimensions not in (2, 3):
++        raise ValueError(f"dimensions must be 2 or 3, got {dimensions!r}")
++
++
+ def get_max_possible_int_value(dtype: Type[np.number]) -> int:
+     """
+     Returns the maximum allowed integer for a numpy array of given type.
+diff --git a/tests/core/test_unit/test_classify/test_classify.py b/tests/core/test_unit/test_classify/test_classify.py
+index 9d386d23..8782456e 100644
+--- a/tests/core/test_unit/test_classify/test_classify.py
++++ b/tests/core/test_unit/test_classify/test_classify.py
+@@ -8,14 +8,30 @@
+ from cellfinder.core.classify.resnet import build_model
+ 
+ 
+-def test_classify_single_channel_runs(synthetic_single_spot, tmp_path):
+-    """Single-channel data classifies end to end with a 1-channel model."""
++@pytest.mark.parametrize(
++    "dimensions,model_shape,voxel_sizes",
++    [
++        (3, (50, 50, 20, 1), (5, 1, 1)),
++        (2, (50, 50, 1), (1, 1)),
++    ],
++)
++def test_classify_single_channel_runs(
++    synthetic_single_spot, tmp_path, dimensions, model_shape, voxel_sizes
++):
++    """Single-channel data classifies end to end with a 1-channel model,
++    from a z-stack in 3D and from a single plane in 2D."""
+     signal_array, _background, c_xyz = synthetic_single_spot
++    x, y, z = (int(c) for c in c_xyz)
++    if dimensions == 2:
++        signal_array = signal_array[z]
++        point = (x, y, 0)
++    else:
++        point = (x, y, z)
+     signal_array = signal_array.astype(np.uint16)
+-    points = [Cell(tuple(int(c) for c in c_xyz), Cell.UNKNOWN)]
++    points = [Cell(point, Cell.UNKNOWN)]
+ 
+-    model = build_model(shape=(50, 50, 20, 1), network_depth="18-layer")
+-    model_path = tmp_path / "model_1ch.keras"
++    model = build_model(shape=model_shape, network_depth="18-layer")
++    model_path = tmp_path / f"model_{dimensions}d_1ch.keras"
+     model.save(model_path)
+ 
+     result = classify.main(
+@@ -23,8 +39,8 @@ def test_classify_single_channel_runs(synthetic_single_spot, tmp_path):
+         signal_array=signal_array,
+         background_array=None,
+         n_free_cpus=0,
+-        voxel_sizes=(5, 1, 1),
+-        network_voxel_sizes=(5, 1, 1),
++        voxel_sizes=voxel_sizes,
++        network_voxel_sizes=voxel_sizes,
+         batch_size=1,
+         cube_height=50,
+         cube_width=50,
+@@ -32,12 +48,96 @@ def test_classify_single_channel_runs(synthetic_single_spot, tmp_path):
+         trained_model=model_path,
+         model_weights=None,
+         network_depth="18",
++        dimensions=dimensions,
+     )
+ 
+     assert len(result) == len(points)
+     assert all(cell.type in (Cell.CELL, Cell.NO_CELL) for cell in result)
+ 
+ 
++@pytest.mark.parametrize(
++    "signal_ndim,background_ndim,match",
++    [
++        (2, 3, "Signal data must be 3D"),
++        (3, 2, "Background data must be 3D"),
++    ],
++)
++def test_validate_3d_arrays_raises(signal_ndim, background_ndim, match):
++    """3D classification rejects arrays that are not 3D."""
++    signal = np.zeros((4,) * signal_ndim, dtype=np.uint16)
++    background = np.zeros((4,) * background_ndim, dtype=np.uint16)
++
++    with pytest.raises(IOError, match=match):
++        classify._validate_3d_arrays(signal, background)
++
++
++def test_promote_2d_arrays_adds_z_axis():
++    """2D signal and background arrays gain a singleton z axis, and
++    2-element voxel sizes gain a z entry."""
++    signal, background, voxel_sizes, network_voxel_sizes = (
++        classify._promote_2d_arrays(
++            np.zeros((40, 40), dtype=np.uint16),
++            np.zeros((40, 40), dtype=np.uint16),
++            (1, 1),
++            (1, 1),
++        )
++    )
++
++    assert signal.shape == (1, 40, 40)
++    assert background.shape == (1, 40, 40)
++    assert voxel_sizes == (1.0, 1, 1)
++    assert network_voxel_sizes == (1.0, 1, 1)
++
++
++def test_promote_2d_arrays_matches_network_z_to_data():
++    """3D inputs pass through unchanged, but the network z voxel size is
++    matched to the data so the depth-1 cube is not rescaled in z."""
++    signal, background, voxel_sizes, network_voxel_sizes = (
++        classify._promote_2d_arrays(
++            np.zeros((10, 40, 40), dtype=np.uint16),
++            None,
++            (5, 1, 1),
++            (2, 1, 1),
++        )
++    )
++
++    assert signal.shape == (10, 40, 40)
++    assert background is None
++    assert voxel_sizes == (5, 1, 1)
++    assert network_voxel_sizes == (5, 1, 1)
++
++
++@pytest.mark.parametrize(
++    "signal_ndim,background_ndim,match",
++    [
++        (4, 2, "signal data"),
++        (2, 4, "background data"),
++    ],
++)
++def test_promote_2d_arrays_bad_ndim_raises(
++    signal_ndim, background_ndim, match
++):
++    """Arrays that are neither 2D nor 3D are rejected."""
++    signal = np.zeros((4,) * signal_ndim, dtype=np.uint16)
++    background = np.zeros((4,) * background_ndim, dtype=np.uint16)
++
++    with pytest.raises(IOError, match=match):
++        classify._promote_2d_arrays(signal, background, (1, 1), (1, 1))
++
++
++def test_squeeze_depth1_batch():
++    """A depth-1 batch loses its z axis; a deeper one is rejected."""
++    assert classify._squeeze_depth1_batch(np.zeros((2, 1, 8, 8)), 1).shape == (
++        2,
++        8,
++        8,
++    )
++
++    deep = np.zeros((2, 3, 8, 8))
++    with pytest.raises(ValueError, match="depth-1 cube, but got depth 3"):
++        classify._squeeze_depth1_batch(deep, 1)
++
++
+ def test_classify_channel_mismatch_raises(synthetic_single_spot, mocker):
+     """A model whose channel count differs from the data raises clearly."""
+     signal_array, _background, c_xyz = synthetic_single_spot
+diff --git a/tests/core/test_unit/test_classify/test_cube_gen.py b/tests/core/test_unit/test_classify/test_cube_gen.py
+index aca28572..cea4f9e4 100644
+--- a/tests/core/test_unit/test_classify/test_cube_gen.py
++++ b/tests/core/test_unit/test_classify/test_cube_gen.py
+@@ -1169,6 +1169,38 @@ def test_dataset_cuboid_bad_arg(tmp_path):
+         )
+ 
+ 
++@pytest.mark.parametrize(
++    "plane_size,center,data_voxel_sizes",
++    [
++        ((40, 40), (20, 20, 5), (5, 1, 1)),
++        ((60, 60), (30, 30, 5), (5, 2, 2)),
++    ],
++    ids=["unscaled", "rescaled_xy"],
++)
++def test_depth1_cube_squeezes_to_2d(plane_size, center, data_voxel_sizes):
++    """
++    A depth-1 cube (used for 2D classification) squeezes its singleton z
++    axis to give a 2D (y, x, c) image. The in-plane (y, x) dimensions are
++    rescaled via the interpolation path when the data and network voxel
++    sizes differ, with the z axis held at size 1 either way.
++    """
++    volume = np.zeros((10, *plane_size, 2), dtype=np.uint16)
++    dataset = CuboidArrayDataset(
++        points=[Cell(center, Cell.UNKNOWN)],
++        data_voxel_sizes=data_voxel_sizes,
++        network_voxel_sizes=(5, 1, 1),
++        network_cuboid_voxels=(1, 8, 8),
++        axis_order=("z", "y", "x"),
++        augment=False,
++        signal_array=volume[..., 0],
++        background_array=volume[..., 1],
++    )
++    item = dataset[0]
++    z_axis = dataset.output_axis_order.index("z")
++    assert item.shape[z_axis] == 1
++    assert item.squeeze(z_axis).shape == (8, 8, 2)
++
++
+ def test_point_has_full_cuboid_unscaled():
+     """
+     Tests that only cuboids that have full cubes around the point's center
+diff --git a/tests/core/test_unit/test_classify/test_resnet.py b/tests/core/test_unit/test_classify/test_resnet.py
+new file mode 100644
+index 00000000..99e2e20f
+--- /dev/null
++++ b/tests/core/test_unit/test_classify/test_resnet.py
+@@ -0,0 +1,28 @@
++import numpy as np
++import pytest
++
++from cellfinder.core.classify.resnet import build_model
++
++
++@pytest.mark.parametrize(
++    "shape",
++    [
++        (50, 50, 1),
++        (50, 50, 2),
++        (50, 50, 20, 1),
++        (50, 50, 20, 2),
++    ],
++)
++def test_build_model_dimensionality(shape):
++    """The network rank follows the input shape, and it runs a batch."""
++    model = build_model(shape=shape, network_depth="18-layer")
++    assert model.input_shape == (None, *shape)
++    assert model.output_shape == (None, 2)
++
++    out = model(np.zeros((2, *shape), dtype="float32"), training=False)
++    assert tuple(out.shape) == (2, 2)
++
++
++def test_unsupported_dimensionality_raises():
++    with pytest.raises(ValueError, match="Unsupported spatial dimensionality"):
++        build_model(shape=(50,))
+diff --git a/tests/core/test_unit/test_classify/test_tools.py b/tests/core/test_unit/test_classify/test_tools.py
+index cafca696..7e877de4 100644
+--- a/tests/core/test_unit/test_classify/test_tools.py
++++ b/tests/core/test_unit/test_classify/test_tools.py
+@@ -73,3 +73,33 @@ def test_get_model_loads_keras_weights(tmp_path, num_channels):
+     assert np.allclose(
+         source.predict(x, verbose=0), model.predict(x, verbose=0)
+     )
++
++
++@pytest.mark.parametrize("shape", [None, (50, 50, 2)])
++def test_get_model_builds_2d(shape):
++    model = tools.get_model(
++        network_depth="18-layer",
++        dimensions=2,
++        shape=shape,
++    )
++    # batch + y + x + channels
++    assert len(model.input_shape) == 4
++    assert model.input_shape == (None, 50, 50, 2)
++
++
++def test_get_model_without_model_or_depth():
++    with pytest.raises(
++        ValueError,
++        match="Either `existing_model` or `network_depth` must be provided.",
++    ):
++        tools.get_model(existing_model=None, network_depth=None)
++
++
++def test_get_model_dimension_mismatch_on_load(tmp_path):
++    model_path = tmp_path / "model_3d.keras"
++    build_model(shape=(50, 50, 20, 2), network_depth="18-layer").save(
++        model_path
++    )
++
++    with pytest.raises(ValueError, match="expects 3D input"):
++        tools.get_model(existing_model=model_path, dimensions=2)
+diff --git a/tests/core/test_unit/test_tools/test_tools_general.py b/tests/core/test_unit/test_tools/test_tools_general.py
+index 94942fc4..497afc42 100644
+--- a/tests/core/test_unit/test_tools/test_tools_general.py
++++ b/tests/core/test_unit/test_tools/test_tools_general.py
+@@ -336,3 +336,15 @@ def sample_func(*, a, b=2):
+         match="sample_func takes 2 positional arguments but 3 were given",
+     ):
+         sample_func(1, 2, 3)
++
++
++@pytest.mark.parametrize("dimensions", [2, 3])
++def test_validate_dimensions_ok(dimensions):
++    # should not raise
++    tools.validate_dimensions(dimensions)
++
++
++@pytest.mark.parametrize("dimensions", [0, 1, 4, "2"])
++def test_validate_dimensions_bad(dimensions):
++    with pytest.raises(ValueError):
++        tools.validate_dimensions(dimensions)

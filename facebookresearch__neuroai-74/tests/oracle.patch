@@ -1,0 +1,692 @@
+diff --git a/neuralbench-repo/neuralbench/conftest.py b/neuralbench-repo/neuralbench/conftest.py
+new file mode 100644
+index 000000000..43d7ca783
+--- /dev/null
++++ b/neuralbench-repo/neuralbench/conftest.py
+@@ -0,0 +1,78 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Shared pytest fixtures for neuralbench tests."""
++
++import typing as tp
++from collections.abc import Callable
++from pathlib import Path
++
++import pytest
++
++from .data import Data
++
++# Bypass multiprocessing in the test sandbox; ``Test2024Eeg`` is tiny enough
++# that in-process execution is fast.
++_NO_CLUSTER: tp.Any = {"cluster": None}
++
++
++@pytest.fixture(scope="session")
++def test2024eeg_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
++    """Session-scoped temp directory for the ``Test2024Eeg`` synthetic study.
++
++    The synthetic ``.fif`` files (~15 MB / timeline) are generated lazily on the
++    first ``Study.run()`` call.  Sharing one directory across test modules
++    (``test_data.py``, ``test_utils.py``) avoids regenerating them per-module.
++    """
++    root = tmp_path_factory.mktemp("test2024eeg")
++    (root / "Test2024Eeg").mkdir(exist_ok=True)
++    return root
++
++
++@pytest.fixture(scope="session")
++def build_data(
++    test2024eeg_path: Path,
++) -> Callable[..., Data]:
++    """Factory fixture that builds a tiny ``Data`` over the ``Test2024Eeg`` study.
++
++    Returns a callable so each test can vary ``seed`` (and optionally
++    ``use_weighted_sampler``) without re-threading the study path or the
++    rest of the config.  ``event_field="subject"`` keeps all 3 subjects in
++    the train split so ``compute_class_weights_from_dataset`` sees no
++    class-index gaps -- a quiet workaround for a separate latent bug.
++    """
++
++    def _factory(
++        *,
++        seed: int | None,
++        use_weighted_sampler: bool = False,
++    ) -> Data:
++        config: tp.Any = dict(
++            study={
++                "name": "Test2024Eeg",
++                "path": test2024eeg_path,
++                "infra_timelines": _NO_CLUSTER,
++            },
++            neuro={"name": "MneRaw", "event_types": "Eeg"},
++            target={
++                "name": "LabelEncoder",
++                "event_field": "subject",
++                "event_types": "Word",
++            },
++            channel_positions={"name": "ChannelPositions"},
++            trigger_event_type="Word",
++            start=0.0,
++            duration=0.5,
++            batch_size=4,
++            num_workers=0,
++            persistent_workers=False,
++            pin_memory=False,
++            seed=seed,
++            use_weighted_sampler=use_weighted_sampler,
++        )
++        return Data(**config)
++
++    return _factory
+diff --git a/neuralbench-repo/neuralbench/data.py b/neuralbench-repo/neuralbench/data.py
+index 5c45d8346..327fcb1c6 100644
+--- a/neuralbench-repo/neuralbench/data.py
++++ b/neuralbench-repo/neuralbench/data.py
+@@ -5,7 +5,10 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ import logging
++import typing as tp
+ 
++import numpy as np
++import torch
+ from torch.utils.data import DataLoader
+ from tqdm import tqdm
+ 
+@@ -22,7 +25,7 @@
+     SklearnSplit,
+     TextPreprocessor,
+ )
+-from .utils import make_weighted_sampler
++from .utils import make_weighted_sampler, seed_worker
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
+@@ -48,6 +51,7 @@ class Data(ns.BaseModel):
+     pin_memory: bool = True
+     persistent_workers: bool = True
+     prefetch_factor: int | None = None
++    seed: int | None = None
+     # Others
+     summary_columns: list[str] = []
+ 
+@@ -117,6 +121,38 @@ def prepare(self) -> dict[str, DataLoader]:
+         dataset = segmenter.apply(events)
+         dataset.prepare()
+ 
++        # Derive four independent RNG streams from ``self.seed`` so that each
++        # consumer (train DataLoader shuffle + train worker base-seeds, train
++        # WeightedRandomSampler multinomial draws, val worker base-seeds,
++        # test worker base-seeds) is a pure function of its own sub-seed.
++        # Per-split DataLoader generators matter when ``num_workers > 0``:
++        # ``DataLoader.__iter__`` consumes one int64 from ``generator`` to
++        # derive each worker's base seed, so sharing one generator across
++        # splits would couple the train shuffle stream to how often Lightning
++        # iterates val/test (sanity check, per-epoch validation, etc.).
++        loader_gens: dict[str, torch.Generator | None]
++        sampler_gen: torch.Generator | None
++        worker_init_fn: tp.Callable[[int], None] | None
++        if self.seed is None:
++            LOGGER.info(
++                "Data.seed=None; dataloader shuffling and weighted sampling "
++                "will follow the caller's global torch RNG state."
++            )
++            loader_gens = {"train": None, "val": None, "test": None}
++            sampler_gen = None
++            worker_init_fn = None
++        else:
++            train_state, sampler_state, val_state, test_state = np.random.SeedSequence(
++                self.seed
++            ).generate_state(4)
++            loader_gens = {
++                "train": torch.Generator().manual_seed(int(train_state)),
++                "val": torch.Generator().manual_seed(int(val_state)),
++                "test": torch.Generator().manual_seed(int(test_state)),
++            }
++            sampler_gen = torch.Generator().manual_seed(int(sampler_state))
++            worker_init_fn = seed_worker
++
+         # Create the dataloaders
+         loaders = {}
+         for split in tqdm(["train", "val", "test"], desc="Preparing segments"):
+@@ -125,7 +161,9 @@ def prepare(self) -> dict[str, DataLoader]:
+ 
+             sampler = None
+             if split == "train" and self.use_weighted_sampler:
+-                sampler = make_weighted_sampler(split_dataset, logger=LOGGER)
++                sampler = make_weighted_sampler(
++                    split_dataset, logger=LOGGER, generator=sampler_gen
++                )
+ 
+             persistent_workers = self.persistent_workers and self.num_workers > 0
+             loaders[split] = DataLoader(
+@@ -139,6 +177,8 @@ def prepare(self) -> dict[str, DataLoader]:
+                 pin_memory=self.pin_memory,
+                 persistent_workers=persistent_workers,
+                 prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
++                generator=loader_gens[split],
++                worker_init_fn=worker_init_fn,
+             )
+ 
+         return loaders
+diff --git a/neuralbench-repo/neuralbench/defaults/config.yaml b/neuralbench-repo/neuralbench/defaults/config.yaml
+index 4cc56dbc6..9b159f38b 100644
+--- a/neuralbench-repo/neuralbench/defaults/config.yaml
++++ b/neuralbench-repo/neuralbench/defaults/config.yaml
+@@ -87,6 +87,7 @@ data:
+       cpus_per_task: !!python/name:neuralbench.config_manager.N_CPUS
+   batch_size: 64
+   num_workers: !!python/name:neuralbench.config_manager.N_CPUS
++  seed: 33
+ brain_model_config:
+   name: EEGNet
+ loss:
+diff --git a/neuralbench-repo/neuralbench/defaults/grid.yaml b/neuralbench-repo/neuralbench/defaults/grid.yaml
+index f5b63f8a7..ff87cd5e3 100644
+--- a/neuralbench-repo/neuralbench/defaults/grid.yaml
++++ b/neuralbench-repo/neuralbench/defaults/grid.yaml
+@@ -4,11 +4,15 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
+-# Model seed: controls weight initialization, dropout, and batch ordering via
+-# pl.seed_everything(). Each seed produces one independent run.
+-# Data split seeds (valid_random_state, test_random_state) are intentionally
+-# kept fixed (=33 in each task config) so that all runs share the same
+-# train/val/test partition, and variance reflects model stochasticity only.
++# Experiment.seed: controls model-side stochasticity (weight initialization,
++# dropout) via pl.seed_everything(). Each seed produces one independent run.
++#
++# Data-side seeds are intentionally kept fixed across the grid so variance
++# across runs reflects model stochasticity only:
++# - data.seed (=33 in defaults/config.yaml) seeds the DataLoader shuffle,
++#   WeightedRandomSampler draws, and per-worker numpy/random RNGs.
++# - Split seeds (valid_random_state, test_random_state in each task config)
++#   keep the train/val/test partition identical across runs.
+ seed:
+   - 33
+   - 34
+diff --git a/neuralbench-repo/neuralbench/main.py b/neuralbench-repo/neuralbench/main.py
+index 608ec1077..ad1bc0e0e 100644
+--- a/neuralbench-repo/neuralbench/main.py
++++ b/neuralbench-repo/neuralbench/main.py
+@@ -393,8 +393,10 @@ def run(self) -> dict[str, tp.Any]:
+         logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+         logging.getLogger("exca").propagate = False
+         logging.getLogger("neuralset").propagate = False
+-        # Seed before preparing dataloaders so train shuffling and any worker
+-        # randomness are reproducible for a given experiment seed.
++        # Defense-in-depth seeding at the top of ``run()``.  Data-side
++        # determinism (shuffle, weighted sampler, worker RNGs) is driven by
++        # ``Data.seed`` via explicit ``torch.Generator``s and is immune to
++        # the global RNG state when set.
+         pl.seed_everything(self.seed, workers=True)
+         self.setup_run()
+         loaders = self.data.prepare()
+diff --git a/neuralbench-repo/neuralbench/test_data.py b/neuralbench-repo/neuralbench/test_data.py
+new file mode 100644
+index 000000000..ee1608300
+--- /dev/null
++++ b/neuralbench-repo/neuralbench/test_data.py
+@@ -0,0 +1,158 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Tests for ``neuralbench.data.Data`` RNG plumbing.
++
++Uses the synthetic ``Test2024Eeg`` study from neuralset (3 timelines, ~12 train
++Word events) so we exercise the real ``SegmentDataset`` + ``DataLoader``
++pipeline instead of mocking it.  Each test compares the first-epoch index
++sequence from ``train_loader.sampler``, which is the ground-truth signal that
++``Data.seed`` actually controls shuffling.
++
++The ``build_data`` factory fixture (see ``conftest.py``) owns the Data
++construction config, so tests here only have to vary ``seed`` /
++``use_weighted_sampler``.
++"""
++
++import random
++from collections.abc import Callable
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader
++
++from .data import Data
++
++
++def _train_indices(loaders: dict[str, DataLoader]) -> list[int]:
++    """Return the first-epoch train-loader index sequence.
++
++    For ``shuffle=True``, ``loader.sampler`` is a ``RandomSampler`` whose
++    generator was set in ``Data.prepare``; for ``use_weighted_sampler=True``
++    it's the ``WeightedRandomSampler`` we constructed.  In both cases iterating
++    the sampler yields the per-epoch index permutation, which is the
++    seed-controlled signal we care about.
++    """
++    return list(iter(loaders["train"].sampler))  # type: ignore[arg-type]
++
++
++def test_train_indices_deterministic_for_given_seed(
++    build_data: Callable[..., Data],
++) -> None:
++    """Two ``Data`` instances with the same ``seed`` must shuffle identically."""
++    loaders_a = build_data(seed=7).prepare()
++    loaders_b = build_data(seed=7).prepare()
++    assert _train_indices(loaders_a) == _train_indices(loaders_b)
++
++
++def test_train_indices_diverge_for_different_seeds(
++    build_data: Callable[..., Data],
++) -> None:
++    """Changing ``seed`` must change the train-loader shuffle sequence."""
++    loaders_a = build_data(seed=7).prepare()
++    loaders_b = build_data(seed=8).prepare()
++    assert _train_indices(loaders_a) != _train_indices(loaders_b)
++
++
++def test_train_indices_independent_of_global_rng(
++    build_data: Callable[..., Data],
++) -> None:
++    """The headline property: mutating the global torch / numpy / random state
++    between two ``prepare()`` calls with the same ``seed`` must not shift the
++    shuffle.  This is the test that earns the explicit-generator plumbing."""
++    loaders_a = build_data(seed=7).prepare()
++
++    torch.manual_seed(999)
++    np.random.seed(999)
++    random.seed(999)
++
++    loaders_b = build_data(seed=7).prepare()
++    assert _train_indices(loaders_a) == _train_indices(loaders_b)
++
++
++def test_seed_none_falls_back_to_global_rng(
++    build_data: Callable[..., Data],
++) -> None:
++    """``seed=None`` -> shuffle is reproducible only via the global torch RNG."""
++    torch.manual_seed(123)
++    indices_a = _train_indices(build_data(seed=None).prepare())
++
++    torch.manual_seed(123)
++    indices_b = _train_indices(build_data(seed=None).prepare())
++
++    assert indices_a == indices_b
++
++    torch.manual_seed(999)
++    indices_c = _train_indices(build_data(seed=None).prepare())
++    assert indices_c != indices_a
++
++
++def test_weighted_sampler_is_seeded_independently_of_global_rng(
++    build_data: Callable[..., Data],
++) -> None:
++    """``WeightedRandomSampler`` draws are determined by ``Data.seed`` and
++    immune to global-RNG changes between calls."""
++    loaders_a = build_data(seed=7, use_weighted_sampler=True).prepare()
++
++    torch.manual_seed(999)
++
++    loaders_b = build_data(seed=7, use_weighted_sampler=True).prepare()
++    assert _train_indices(loaders_a) == _train_indices(loaders_b)
++
++    loaders_c = build_data(seed=8, use_weighted_sampler=True).prepare()
++    assert _train_indices(loaders_a) != _train_indices(loaders_c)
++
++
++def test_train_shuffle_decoupled_from_val_test_loader_generators(
++    build_data: Callable[..., Data],
++) -> None:
++    """Per-split generators: consuming the val/test loader generators (as
++    multi-process workers do for base-seed derivation) must not shift the
++    train shuffle.  Simulates the production ``num_workers > 0`` regime
++    in-process, where every ``iter(val_loader)`` / ``iter(test_loader)``
++    draws one int64 from the loader's generator.  Under the previous shared-
++    generator design this test would fail because all three loaders pulled
++    from the same stream.
++    """
++    loaders = build_data(seed=7).prepare()
++
++    # Mimic what ``_MultiProcessingDataLoaderIter.__init__`` does each
++    # ``iter(loader)``: draw one int64 from ``loader.generator`` to derive
++    # the worker base seed.  Repeated draws stand in for Lightning's sanity-
++    # check + per-epoch validation + final test cadence.
++    for _ in range(20):
++        torch.empty((), dtype=torch.int64).random_(
++            generator=loaders["val"].generator  # type: ignore[arg-type]
++        )
++    for _ in range(5):
++        torch.empty((), dtype=torch.int64).random_(
++            generator=loaders["test"].generator  # type: ignore[arg-type]
++        )
++
++    train_indices_after_val_test = _train_indices(loaders)
++
++    # Fresh ``Data`` with the same seed, no val/test consumption.
++    fresh = build_data(seed=7).prepare()
++    train_indices_fresh = _train_indices(fresh)
++
++    assert train_indices_after_val_test == train_indices_fresh
++
++
++def test_per_split_loader_generators_have_distinct_seeds(
++    build_data: Callable[..., Data],
++) -> None:
++    """The three split DataLoaders must own independent generators with
++    distinct base seeds, derived from the same ``Data.seed`` via
++    ``SeedSequence``."""
++    loaders = build_data(seed=7).prepare()
++    train_seed = loaders["train"].generator.initial_seed()  # type: ignore[union-attr]
++    val_seed = loaders["val"].generator.initial_seed()  # type: ignore[union-attr]
++    test_seed = loaders["test"].generator.initial_seed()  # type: ignore[union-attr]
++
++    assert len({train_seed, val_seed, test_seed}) == 3, (
++        f"Expected three distinct sub-seeds, got "
++        f"train={train_seed}, val={val_seed}, test={test_seed}"
++    )
+diff --git a/neuralbench-repo/neuralbench/test_main.py b/neuralbench-repo/neuralbench/test_main.py
+index 03ef5bbcd..47cd154d4 100644
+--- a/neuralbench-repo/neuralbench/test_main.py
++++ b/neuralbench-repo/neuralbench/test_main.py
+@@ -32,11 +32,12 @@ def __init__(self, **kwargs) -> None:
+         self.kwargs = kwargs
+ 
+ 
+-def test_prepare_pl_module_seeds_before_and_after_model_build(monkeypatch) -> None:
+-    """Model construction should ignore prior RNG usage and reset training RNG."""
+-    seed = 123
++def _make_experiment_with_capturing_build(
++    monkeypatch, seed: int
++) -> tuple[Experiment, list[torch.Tensor]]:
++    """Build a minimal ``Experiment`` whose ``build_brain_model`` captures the
++    first ``torch.rand(4)`` it draws after each ``prepare_pl_module`` call."""
+     build_draws: list[torch.Tensor] = []
+-    post_draws: list[torch.Tensor] = []
+ 
+     def fake_build_brain_model(**kwargs):
+         del kwargs
+@@ -62,6 +63,14 @@ def fake_build_brain_model(**kwargs):
+         test_full_retrieval_metrics=[],
+         seed=seed,
+     )
++    return experiment, build_draws
++
++
++def test_prepare_pl_module_seeds_before_and_after_model_build(monkeypatch) -> None:
++    """Model construction should ignore prior RNG usage and reset training RNG."""
++    seed = 123
++    experiment, build_draws = _make_experiment_with_capturing_build(monkeypatch, seed)
++    post_draws: list[torch.Tensor] = []
+ 
+     for pre_draws in (3, 17):
+         torch.manual_seed(999)
+@@ -78,8 +87,35 @@ def fake_build_brain_model(**kwargs):
+     assert torch.allclose(post_draws[1], expected)
+ 
+ 
++def test_prepare_pl_module_different_seeds_diverge(monkeypatch) -> None:
++    """Different ``Experiment.seed`` values should drive different model-build RNGs.
++
++    Companion to :func:`test_prepare_pl_module_seeds_before_and_after_model_build`,
++    which proves the same-seed determinism direction.  This one locks in that
++    changing the seed actually changes the model-construction stream, catching
++    future regressions where ``prepare_pl_module`` would accidentally hardcode
++    a constant seed.
++    """
++    experiment_a, draws_a = _make_experiment_with_capturing_build(monkeypatch, seed=7)
++    experiment_a.prepare_pl_module(train_loader=tp.cast(DataLoader, object()))
++
++    experiment_b, draws_b = _make_experiment_with_capturing_build(monkeypatch, seed=8)
++    experiment_b.prepare_pl_module(train_loader=tp.cast(DataLoader, object()))
++
++    assert not torch.allclose(draws_a[0], draws_b[0])
++
++
+ def test_run_seeds_before_preparing_dataloaders(monkeypatch) -> None:
+-    """The experiment seed should be applied before data.prepare() runs."""
++    """``Experiment.run()`` calls ``pl.seed_everything(self.seed, workers=True)``
++    as its first action, before ``setup_run`` and ``data.prepare``.
++
++    Data-side determinism (shuffle, weighted sampler, worker RNGs) is driven
++    by ``Data.seed`` via explicit ``torch.Generator``s, but this call still
++    matters for (a) the ``Data.seed=None`` fallback path, where the shuffle
++    inherits the global torch RNG, and (b) any RNG-consuming code in
++    ``setup_run`` / ``data.prepare`` that runs before ``prepare_pl_module``
++    reseeds for model build.
++    """
+     events: list[str] = []
+     seed_calls: list[tuple[int | None, bool]] = []
+ 
+diff --git a/neuralbench-repo/neuralbench/test_utils.py b/neuralbench-repo/neuralbench/test_utils.py
+index db148c754..0e56cba0a 100644
+--- a/neuralbench-repo/neuralbench/test_utils.py
++++ b/neuralbench-repo/neuralbench/test_utils.py
+@@ -5,6 +5,12 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ 
++import logging
++import random
++from collections.abc import Callable
++from types import SimpleNamespace
++
++import numpy as np
+ import pytest
+ import torch
+ from torch import nn
+@@ -12,7 +18,9 @@
+ from neuraltrain.models.common import ChannelMerger, FourierEmb
+ from neuraltrain.models.preprocessor import OnTheFlyPreprocessor
+ 
++from .data import Data
+ from .modules import ChannelProjection, DownstreamWrapper, DownstreamWrapperModel
++from .utils import make_weighted_sampler, seed_worker
+ 
+ 
+ def test_downstream_wrapper():
+@@ -440,3 +448,126 @@ def test_channel_projection_bipolar_end_to_end():
+     out = wrapped_model(**{"input": raw_input.clone()}).reshape(B, len(target), T)
+     assert torch.allclose(out[:, 0, :], raw_input[:, 0, :] - raw_input[:, 1, :])
+     assert torch.allclose(out[:, 1, :], raw_input[:, 1, :] - raw_input[:, 2, :])
++
++
++# ---------------------------------------------------------------------------
++# seed_worker
++# ---------------------------------------------------------------------------
++
++
++def test_seed_worker_seeds_numpy_and_random(monkeypatch) -> None:
++    """seed_worker must reseed numpy and Python random from torch's per-worker seed."""
++    fake_worker_info = SimpleNamespace(seed=42)
++    monkeypatch.setattr(torch.utils.data, "get_worker_info", lambda: fake_worker_info)
++
++    np.random.seed(0)
++    random.seed(0)
++    seed_worker(worker_id=0)
++    after_np = np.random.rand(3)
++    after_py = [random.random() for _ in range(3)]
++
++    np.random.seed(0)
++    random.seed(0)
++    seed_worker(worker_id=0)
++    again_np = np.random.rand(3)
++    again_py = [random.random() for _ in range(3)]
++
++    assert np.allclose(after_np, again_np)
++    assert after_py == again_py
++
++    np.random.seed(0)
++    random.seed(0)
++    monkeypatch.setattr(
++        torch.utils.data, "get_worker_info", lambda: SimpleNamespace(seed=999)
++    )
++    seed_worker(worker_id=0)
++    different_np = np.random.rand(3)
++    assert not np.allclose(after_np, different_np)
++
++
++def test_seed_worker_raises_when_called_outside_worker(monkeypatch) -> None:
++    """seed_worker should fail loudly when called outside a DataLoader worker."""
++    monkeypatch.setattr(torch.utils.data, "get_worker_info", lambda: None)
++    with pytest.raises(AssertionError):
++        seed_worker(worker_id=0)
++
++
++# ---------------------------------------------------------------------------
++# make_weighted_sampler
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture(scope="module")
++def train_segment_dataset(build_data: Callable[..., Data]):
++    """Real ``SegmentDataset`` over the ``Test2024Eeg`` synthetic study.
++
++    Built once per module so each sampler test reuses the same dataset and
++    avoids re-running the (already memoised) ``Study.run`` pipeline.  Using
++    a real dataset means ``compute_class_weights_from_dataset`` runs end-to-
++    end -- no stubs, no mocks -- and the tests exercise the same code path
++    as production.
++    """
++    return build_data(seed=0).prepare()["train"].dataset
++
++
++def test_make_weighted_sampler_with_generator_is_deterministic(
++    train_segment_dataset,
++) -> None:
++    """Two samplers built with the same generator-seed must draw the same indices."""
++    sampler_a = make_weighted_sampler(
++        train_segment_dataset,
++        logger=logging.getLogger("t"),
++        generator=torch.Generator().manual_seed(7),
++    )
++    sampler_b = make_weighted_sampler(
++        train_segment_dataset,
++        logger=logging.getLogger("t"),
++        generator=torch.Generator().manual_seed(7),
++    )
++
++    assert list(iter(sampler_a)) == list(iter(sampler_b))
++
++
++def test_make_weighted_sampler_with_different_generators_diverges(
++    train_segment_dataset,
++) -> None:
++    """Different generator seeds must produce different index sequences."""
++    indices_7 = list(
++        iter(
++            make_weighted_sampler(
++                train_segment_dataset,
++                logger=logging.getLogger("t"),
++                generator=torch.Generator().manual_seed(7),
++            )
++        )
++    )
++    indices_8 = list(
++        iter(
++            make_weighted_sampler(
++                train_segment_dataset,
++                logger=logging.getLogger("t"),
++                generator=torch.Generator().manual_seed(8),
++            )
++        )
++    )
++
++    assert indices_7 != indices_8
++
++
++def test_make_weighted_sampler_without_generator_follows_global_rng(
++    train_segment_dataset,
++) -> None:
++    """Backward compat: with ``generator=None`` the sampler follows the global RNG."""
++    torch.manual_seed(123)
++    sampler_a = make_weighted_sampler(
++        train_segment_dataset, logger=logging.getLogger("t")
++    )
++    indices_a = list(iter(sampler_a))
++
++    torch.manual_seed(123)
++    sampler_b = make_weighted_sampler(
++        train_segment_dataset, logger=logging.getLogger("t")
++    )
++    indices_b = list(iter(sampler_b))
++
++    assert indices_a == indices_b
+diff --git a/neuralbench-repo/neuralbench/utils.py b/neuralbench-repo/neuralbench/utils.py
+index e59e463a0..9bc4fca1f 100644
+--- a/neuralbench-repo/neuralbench/utils.py
++++ b/neuralbench-repo/neuralbench/utils.py
+@@ -7,6 +7,7 @@
+ """Utility functions."""
+ 
+ import logging
++import random
+ import typing as tp
+ from copy import copy
+ from hashlib import sha1
+@@ -24,6 +25,27 @@
+ LOGGER = logging.getLogger(__name__)
+ 
+ 
++def seed_worker(worker_id: int) -> None:
++    """Seed the per-worker ``numpy`` and ``random`` RNGs from torch's per-worker seed.
++
++    PyTorch already seeds the per-worker ``torch`` RNG from the parent
++    ``DataLoader``'s ``generator`` (when set) at worker spawn time, but
++    ``numpy.random`` and Python's ``random`` modules are left untouched.  This
++    helper mirrors :func:`lightning.pytorch.utilities.seed.pl_worker_init_function`
++    but without relying on the ``PL_SEED_WORKERS`` environment variable, so that
++    :class:`~neuralbench.data.Data` can make worker-side determinism a function
++    of its own ``seed`` field rather than a Lightning side-effect.
++    """
++    del worker_id  # Pulled from worker_info to match PyTorch's per-worker seed
++    worker_info = torch.utils.data.get_worker_info()
++    assert worker_info is not None, (
++        "seed_worker must be called inside a DataLoader worker"
++    )
++    seed = worker_info.seed % (2**32)
++    np.random.seed(seed)
++    random.seed(seed)
++
++
+ def model_hash(model: nn.Module) -> str:
+     hasher = sha1()
+     for p in model.parameters():
+@@ -223,8 +245,22 @@ def compute_class_weights_from_dataset(
+ def make_weighted_sampler(
+     dataset: SegmentDataset,
+     logger: logging.Logger,
++    generator: torch.Generator | None = None,
+ ) -> torch.utils.data.WeightedRandomSampler:
+-    """Create a weighted random sampler for the given dataset to handle class imbalance."""
++    """Create a weighted random sampler for the given dataset to handle class imbalance.
++
++    Parameters
++    ----------
++    dataset
++        Training dataset whose targets drive the class-weight computation.
++    logger
++        Logger forwarded to :func:`compute_class_weights_from_dataset`.
++    generator
++        Optional ``torch.Generator`` used by the returned sampler.  When set,
++        successive iterations of the sampler draw from this generator instead
++        of the global ``torch`` RNG, so the sampling sequence is determined
++        solely by the generator's seed.
++    """
+     loss_kwargs, y_true = compute_class_weights_from_dataset(
+         dataset,
+         logger=logger,
+@@ -236,6 +272,7 @@ def make_weighted_sampler(
+         weights=weights.tolist(),
+         num_samples=len(weights),
+         replacement=True,
++        generator=generator,
+     )
+     return sampler
+ 

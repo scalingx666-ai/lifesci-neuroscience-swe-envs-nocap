@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** OS notes update - mesa 25 tap no longer needed
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `b3c0be2986e4`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,277 @@
+diff --git a/src/Analysis/FlowExtractor.php b/src/Analysis/FlowExtractor.php
+index 1888f5c8..7cc0a8bb 100644
+--- a/src/Analysis/FlowExtractor.php
++++ b/src/Analysis/FlowExtractor.php
+@@ -27,7 +27,22 @@ class FlowExtractor
+ 
+     private array $useMap;
+ 
+-    public function __construct()
++    /**
++     * Variable names bound by the foreach loops currently being descended into, innermost last.
++     *
++     * A relation read is only an N+1 when it is read off the thing the loop is iterating. Without
++     * this the heuristic counted every property fetch, so `$this->service->handle()` inside any
++     * loop registered as a query — the single largest source of false markers.
++     *
++     * @var list<string>
++     */
++    private array $loopVars = [];
++
++    /**
++     * @param  bool  $relationsAutoloaded  Whether the application batches relation access, which
++     *                                     makes a relation read inside a loop not an N+1 at all.
++     */
++    public function __construct(private readonly bool $relationsAutoloaded = false)
+     {
+         $this->printer = new PrettyPrinter;
+         $this->useMap = [];
+@@ -209,13 +224,16 @@ private function stmtToStep(Node\Stmt $stmt, bool $inLoop = false): ?array
+             $expr = $this->shortExpr($stmt->expr);
+             $value = $this->shortExpr($stmt->valueVar);
+             $label = "foreach ({$expr} as {$value})";
++            $this->loopVars[] = $this->rootVariableName($stmt->valueVar) ?? '';
+             $body = $this->stmtsToSteps($stmt->stmts, true);
++            $n1 = $this->hasQueryInside($stmt->stmts);
++            array_pop($this->loopVars);
+ 
+             return [
+                 'type' => 'loop',
+                 'label' => $label,
+                 'body' => $body,
+-                'n1' => $this->hasQueryInside($stmt->stmts),
++                'n1' => $n1,
+             ];
+         }
+ 
+@@ -614,12 +632,22 @@ private function hasQueryInside(array $stmts): bool
+ 
+     private function isQuery(Node\Expr $expr): bool
+     {
+-        // $model->relation  (Property Fetch on model variable is highly suspicious in loops)
++        // $order->customer — a relation read, but only where `$order` is what the loop is
++        // iterating. Any property fetch used to answer yes here, including the receiver of an
++        // ordinary call reached through the chain below: `$this->service->handle()` in a loop was
++        // counted as a query. Measured on a real application, that one branch produced 28 of 33
++        // markers.
++        //
++        // Where the application autoloads relations, even the genuine shape is batched, so there
++        // is no per-iteration query left to warn about.
+         if ($expr instanceof Node\Expr\PropertyFetch) {
+-            $obj = $this->shortExpr($expr->var);
++            if ($this->relationsAutoloaded) {
++                return false;
++            }
++
++            $root = $this->rootVariableName($expr);
+ 
+-            // If it's $this->relation or $item->relation, it's often an N+1
+-            return true;
++            return $root !== null && in_array($root, $this->loopVars, true);
+         }
+ 
+         // $model->save() / $model->relation()->get()
+@@ -654,6 +682,25 @@ private function isQuery(Node\Expr $expr): bool
+         return false;
+     }
+ 
++    /**
++     * The variable a fetch chain is rooted at: `$order->customer->address` is rooted at `order`.
++     *
++     * Null for anything not ultimately rooted in a plain variable — `$this`, a static call, a
++     * function result — none of which is the thing a foreach binds.
++     */
++    private function rootVariableName(Node\Expr $expr): ?string
++    {
++        while ($expr instanceof Node\Expr\PropertyFetch || $expr instanceof Node\Expr\NullsafePropertyFetch) {
++            $expr = $expr->var;
++        }
++
++        if ($expr instanceof Node\Expr\Variable && is_string($expr->name)) {
++            return $expr->name;
++        }
++
++        return null;
++    }
++
+     private function baseName(string $fqcn): string
+     {
+         $short = $this->useMap[$fqcn] ?? $fqcn;
+diff --git a/src/Analysis/RelationAutoloading.php b/src/Analysis/RelationAutoloading.php
+new file mode 100644
+index 00000000..65782600
+--- /dev/null
++++ b/src/Analysis/RelationAutoloading.php
+@@ -0,0 +1,48 @@
++<?php
++
++declare(strict_types=1);
++
++namespace LaraMint\LaravelBrain\Analysis;
++
++use Illuminate\Database\Eloquent\Model;
++use ReflectionClass;
++use Throwable;
++
++/**
++ * Whether the application batches relation access instead of querying per model.
++ *
++ * `Model::automaticallyEagerLoadRelationships()` makes Eloquent load a relation for a whole
++ * collection the first time any member of it is touched. Where it is on, the shape that the N+1
++ * heuristic looks for — a relation read inside a loop — is not an N+1 at all, and flagging it
++ * teaches people to ignore the marker.
++ *
++ * It arrived in Laravel 12.8, and this package supports 9 through 13, so the class is asked at
++ * runtime through reflection rather than called outright. Both readable spellings break half the
++ * matrix, in opposite directions: `method_exists(Model::class, '...')` is "always true" to
++ * analysis running against 12.8 or later, and calling the method outright is an undefined static
++ * method to analysis running against 11 or earlier. A local variable does not help — the name is
++ * constant-folded back into the literal. Reflection is the form that asks the same question
++ * without asserting an answer the analysed version has already decided.
++ *
++ * Asking the framework also beats scanning providers for the call, which would miss it being set
++ * from a package, a config flag, or a conditional.
++ */
++class RelationAutoloading
++{
++    public static function isEnabled(): bool
++    {
++        try {
++            $model = new ReflectionClass(Model::class);
++
++            if (! $model->hasMethod('isAutomaticallyEagerLoadingRelationships')) {
++                return false;
++            }
++
++            return (bool) $model->getMethod('isAutomaticallyEagerLoadingRelationships')->invoke(null);
++        } catch (Throwable) {
++            // No application booted — a scan run outside one, or a unit test. Answering "off"
++            // keeps the heuristic at its historical strength rather than silently disarming it.
++            return false;
++        }
++    }
++}
+diff --git a/src/Graph/GraphBuilder.php b/src/Graph/GraphBuilder.php
+index f25d6ac5..0b0e8d68 100644
+--- a/src/Graph/GraphBuilder.php
++++ b/src/Graph/GraphBuilder.php
+@@ -25,6 +25,7 @@
+ use LaraMint\LaravelBrain\Analysis\ModelDefinition;
+ use LaraMint\LaravelBrain\Analysis\PhpStructureInspector;
+ use LaraMint\LaravelBrain\Analysis\ProjectFileIndex;
++use LaraMint\LaravelBrain\Analysis\RelationAutoloading;
+ use LaraMint\LaravelBrain\Analysis\RouteDefinition;
+ use LaraMint\LaravelBrain\Analysis\ScheduleEntry;
+ use LaraMint\LaravelBrain\Analysis\SourceDirectories;
+@@ -126,7 +127,7 @@ class GraphBuilder
+     public function __construct()
+     {
+         $this->graph = new Graph;
+-        $this->flowExtractor = new FlowExtractor;
++        $this->flowExtractor = new FlowExtractor(RelationAutoloading::isEnabled());
+         $this->parser = new PhpFileParser;
+     }
+ 
+diff --git a/tests/Unit/FlowExtractorTest.php b/tests/Unit/FlowExtractorTest.php
+index a20b2386..3df05958 100644
+--- a/tests/Unit/FlowExtractorTest.php
++++ b/tests/Unit/FlowExtractorTest.php
+@@ -7,7 +7,7 @@
+ use PhpParser\NodeVisitorAbstract;
+ 
+ /** Flow steps for the first method of a class written inline. */
+-function flowFor(string $body): array
++function flowFor(string $body, bool $relationsAutoloaded = false): array
+ {
+     $parsed = (new PhpFileParser)->parseCode(<<<PHP
+         <?php
+@@ -40,7 +40,7 @@ public function enterNode(Node $node): ?int
+     });
+     $traverser->traverse($parsed['ast'] ?? []);
+ 
+-    return $found === null ? [] : (new FlowExtractor)->extract($found, $parsed['useMap'] ?? []);
++    return $found === null ? [] : (new FlowExtractor($relationsAutoloaded))->extract($found, $parsed['useMap'] ?? []);
+ }
+ 
+ it('shows the work inside a DB::transaction, not just the wrapper', function () {
+@@ -166,3 +166,80 @@ public function enterNode(Node $node): ?int
+     }
+     expect($levels)->toBeLessThanOrEqual(32)->and($levels)->toBeGreaterThan(1);
+ });
++
++it('flags a relation read off the value a loop is iterating', function () {
++    $steps = flowFor('        foreach ($orders as $order) {
++            $order->customer;
++        }');
++
++    expect($steps[0]['n1'] ?? false)->toBeTrue();
++});
++
++it('follows the relation chain back to the loop value', function () {
++    $steps = flowFor('        foreach ($orders as $order) {
++            $order->customer->address;
++        }');
++
++    expect($steps[0]['n1'] ?? false)->toBeTrue();
++});
++
++it('does not call an ordinary collaborator call in a loop a query', function () {
++    // `$this->service->handle()` reached the rule through the method-call chain, whose receiver
++    // is a property fetch. Measured on a real application, treating every property fetch as a
++    // query produced 28 of 33 markers — a pattern that appears in almost any loop.
++    $steps = flowFor('        foreach ($rows as $row) {
++            $this->releaseClaim->execute($row);
++        }');
++
++    expect($steps[0]['n1'] ?? false)->toBeFalse();
++});
++
++it('does not flag reading a property of something the loop does not bind', function () {
++    $steps = flowFor('        foreach ($rows as $row) {
++            $this->config->timeout;
++        }');
++
++    expect($steps[0]['n1'] ?? false)->toBeFalse();
++});
++
++it('still flags an explicit query in a loop, whatever it is called on', function () {
++    // Narrowing the relation rule must not lose the case that was never in doubt.
++    $steps = flowFor('        foreach ($ids as $id) {
++            $warehouse = \App\Models\Warehouse::query()->find($id);
++        }');
++
++    expect($steps[0]['n1'] ?? false)->toBeTrue();
++});
++
++it('leaves a relation read alone when the application autoloads relations', function () {
++    // Model::automaticallyEagerLoadRelationships() batches the whole collection on first touch,
++    // so the per-iteration query the marker warns about does not happen.
++    $steps = flowFor('        foreach ($orders as $order) {
++            $order->customer;
++        }', relationsAutoloaded: true);
++
++    expect($steps[0]['n1'] ?? false)->toBeFalse();
++});
++
++it('still flags an explicit query even when relations are autoloaded', function () {
++    // Autoloading batches relation access. It does not batch a query somebody wrote out.
++    $steps = flowFor('        foreach ($ids as $id) {
++            \App\Models\Warehouse::query()->find($id);
++        }', relationsAutoloaded: true);
++
++    expect($steps[0]['n1'] ?? false)->toBeTrue();
++});
++
++it('forgets a loop variable once the loop has ended', function () {
++    // The extractor is reused across every method it charts, so a name left bound after its loop
++    // closes goes on flagging reads of that name — in the next loop, and in the next method.
++    $steps = flowFor('        foreach ($orders as $order) {
++            $order->customer;
++        }
++        foreach ($rows as $row) {
++            $order->customer;
++        }');
++
++    expect($steps[0]['n1'] ?? false)->toBeTrue()
++        ->and($steps[1]['n1'] ?? false)->toBeFalse();
++});

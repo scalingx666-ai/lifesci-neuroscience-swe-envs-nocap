@@ -1,0 +1,1780 @@
+diff --git a/connectomics/data/io/__init__.py b/connectomics/data/io/__init__.py
+index 029657e1e..2b0c28ce3 100644
+--- a/connectomics/data/io/__init__.py
++++ b/connectomics/data/io/__init__.py
+@@ -8,6 +8,7 @@
+     utils.py           - RGB/seg conversion, mask splitting
+ """
+ 
++from .affinity import read_hdf5_affinity_threshold
+ from .io import (
+     get_vol_shape,
+     read_hdf5,
+@@ -24,6 +25,7 @@
+ 
+ __all__ = [
+     "read_hdf5",
++    "read_hdf5_affinity_threshold",
+     "write_hdf5",
+     "read_images",
+     "read_volume",
+diff --git a/connectomics/data/io/affinity.py b/connectomics/data/io/affinity.py
+new file mode 100644
+index 000000000..78ca4a2b2
+--- /dev/null
++++ b/connectomics/data/io/affinity.py
+@@ -0,0 +1,134 @@
++"""Chunk-aligned HDF5 affinity thresholding."""
++
++import numbers
++import operator
++import os
++from collections.abc import Sequence
++from typing import Optional
++
++import h5py
++import numpy as np
++
++from connectomics.utils.shared_buffer import (
++    SharedArray,
++    attach,
++    process_parallel_available,
++    run_process_tasks,
++)
++
++
++def _blocks(x0, x1, step):
++    while x0 < x1:
++        end = min((x0 // step + 1) * step, x1)
++        yield x0, end
++        x0 = end
++
++
++def _read_blocks(filename, dataset, bbox, channels, threshold, blocks, out):
++    x0, _, y0, y1, z0, z1 = bbox
++    with h5py.File(filename, "r") as stream:
++        ds = stream[dataset]
++        dtype = ds.dtype.newbyteorder("=")
++        lut = (
++            np.arange(65536, dtype=np.uint16).view(np.float16) > threshold
++            if dtype == np.float16
++            else None
++        )
++        for start, end in blocks:
++            raw = np.empty((1, end - start, y1 - y0, z1 - z0), dtype)
++            for k, channel in enumerate(channels):
++                ds.read_direct(raw, np.s_[channel : channel + 1, start:end, y0:y1, z0:z1])
++                target = out[k : k + 1, start - x0 : end - x0]
++                if lut is not None:
++                    target[:] = lut[raw.view(np.uint16)]
++                else:
++                    np.greater(raw, threshold, out=target)
++
++
++def _reader_worker(task):
++    filename, dataset, bbox, channels, threshold, blocks, path, shape = task
++    buf = attach(path, shape, np.bool_, writable=True)
++    try:
++        _read_blocks(filename, dataset, bbox, channels, threshold, blocks, buf.array)
++    finally:
++        buf.close()
++
++
++def read_hdf5_affinity_threshold(
++    filename: str,
++    threshold,
++    dataset: Optional[str] = None,
++    channels: Optional[Sequence[int]] = None,
++    bbox: Optional[Sequence[int]] = None,
++    num_workers: Optional[int] = None,
++    buffer_dir: Optional[str] = None,
++) -> np.ndarray:
++    """Read affinities and compare with the same native NumPy threshold semantics.
++
++    Channels preserve NumPy indexing order, duplicates and negative indices.
++    The bounding box is ``(x0, x1, y0, y1, z0, z1)``. Float16 comparisons
++    include all bit patterns, with no range or finiteness restriction.
++
++    Processes avoid h5py's global lock and read chunk-aligned X blocks. Shared
++    output storage uses ``buffer_dir`` (default: writable /dev/shm, else the
++    temporary directory) and counts toward memory limits. Scripts must guard
++    process entry with ``if __name__ == "__main__":`` for forkserver/spawn.
++    The returned C-contiguous bool array can feed
++    ``connected_components_affinity_3d_slab`` directly (which owns a copy in
++    process mode). One-worker and unavailable-process cases use private storage.
++    """
++    scalar = np.asarray(threshold)
++    if (
++        scalar.ndim != 0
++        or scalar.dtype.kind not in "buif"
++        or not isinstance(scalar.item(), numbers.Real)
++    ):
++        raise TypeError("threshold must be a real scalar")
++    workers = num_workers
++    if workers is None:
++        workers = (
++            len(os.sched_getaffinity(0))
++            if hasattr(os, "sched_getaffinity")
++            else os.cpu_count() or 1
++        )
++    if workers < 1:
++        raise ValueError("num_workers must be positive")
++    with h5py.File(filename, "r") as stream:
++        dataset = list(stream.keys())[0] if dataset is None else dataset
++        ds = stream[dataset]
++        if ds.ndim != 4:
++            raise ValueError("Expected a four-dimensional affinity dataset")
++        selected = tuple(operator.index(c) for c in ((0, 1, 2) if channels is None else channels))
++        if any(c < -ds.shape[0] or c >= ds.shape[0] for c in selected):
++            raise IndexError("Channel index out of range")
++        selected = tuple(c % ds.shape[0] for c in selected)
++        box = (0, ds.shape[1], 0, ds.shape[2], 0, ds.shape[3]) if bbox is None else tuple(bbox)
++        if (
++            len(box) != 6
++            or any(not isinstance(v, numbers.Integral) for v in box)
++            or any(
++                not 0 <= lo <= hi <= size for lo, hi, size in zip(box[::2], box[1::2], ds.shape[1:])
++            )
++        ):
++            raise ValueError("Invalid bounding box")
++        step = ds.chunks[1] if ds.chunks else 32
++    shape = (len(selected), *(hi - lo for lo, hi in zip(box[::2], box[1::2])))
++    blocks = list(_blocks(box[0], box[1], step))
++    if not all(shape) or workers == 1 or len(blocks) <= 1 or not process_parallel_available():
++        out = np.empty(shape, np.bool_)
++        if all(shape):
++            _read_blocks(filename, dataset, box, selected, threshold, blocks, out)
++        return out
++    workers = min(workers, len(blocks))
++    buf = SharedArray.create(shape, np.bool_, buffer_dir)
++    try:
++        tasks = [
++            (str(filename), dataset, box, selected, threshold, blocks[i::workers], buf.path, shape)
++            for i in range(workers)
++        ]
++        run_process_tasks(_reader_worker, tasks, workers, preload=[__name__])
++        buf.release_path()
++        return buf.array
++    except BaseException:
++        buf.close()
++        raise
+diff --git a/connectomics/decoding/decoders/affinity_cc_slab.py b/connectomics/decoding/decoders/affinity_cc_slab.py
+new file mode 100644
+index 000000000..49ff71125
+--- /dev/null
++++ b/connectomics/decoding/decoders/affinity_cc_slab.py
+@@ -0,0 +1,431 @@
++"""Slab-wise connected components on directed short-range affinities."""
++
++import mmap
++import multiprocessing as mp
++import os
++import sys
++from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
++from queue import Queue
++from threading import Lock
++from typing import Optional
++
++import cc3d
++import fastremap
++import numpy as np
++from numba import njit, prange
++
++from connectomics.data.processing import get_seg_type
++from connectomics.decoding.utils import cast2dtype
++from connectomics.utils.shared_buffer import (
++    SharedArray,
++    attach,
++    process_parallel_available,
++    run_process_tasks,
++)
++
++from .segmentation_kernels import _affinity_foreground_mask
++
++UINT32_LIMIT = 1 << 32
++SLAB_VOXEL_LIMIT = (1 << 32) - 1
++_fork_launch_lock = Lock()
++_fork_state: tuple  # Assigned by the initializer only in child processes.
++
++
++@njit(nogil=True, cache=True)
++def _build_graph(hard, x0, x1, eo):
++    graph = np.zeros((x1 - x0, hard.shape[2], hard.shape[3]), np.uint8)
++    for x in range(x1 - x0):
++        for y in range(graph.shape[1]):
++            for z in range(graph.shape[2]):
++                if x + 1 < graph.shape[0] and hard[0, x0 + x + eo, y, z]:
++                    graph[x, y, z] |= 1
++                    graph[x + 1, y, z] |= 2
++                if y + 1 < graph.shape[1] and hard[1, x0 + x, y + eo, z]:
++                    graph[x, y, z] |= 4
++                    graph[x, y + 1, z] |= 8
++                if z + 1 < graph.shape[2] and hard[2, x0 + x, y, z + eo]:
++                    graph[x, y, z] |= 16
++                    graph[x, y, z + 1] |= 32
++    return graph
++
++
++@njit(nogil=True, cache=True)
++def _compact_first_appearance(local, out, table):
++    count = 0
++    source = local.reshape(-1)
++    target = out.reshape(-1)
++    max_local = 0
++    for i in range(source.size):
++        v = np.int64(source[i])
++        max_local = max(max_local, v)
++        assert 0 <= v < len(table)
++        if v:
++            if table[v] == 0:
++                count += 1
++                table[v] = count
++            target[i] = table[v]
++        else:
++            target[i] = 0
++    # cc3d ids are dense; clear the used table prefix, not the volume.
++    for i in range(max_local + 1):
++        table[i] = 0
++    return count
++
++
++@njit(parallel=True, cache=True)
++def _add_offset(seg, offset):
++    flat = seg.reshape(-1)
++    for i in prange(flat.size):
++        if flat[i]:
++            flat[i] += offset
++
++
++@njit(nogil=True, cache=True)
++def _index(value, base, size):
++    idx = np.int64(value) - np.int64(base)
++    assert 0 <= idx < size, "Label outside table (possible truncation)"
++    return idx
++
++
++@njit(nogil=True, cache=True)
++def _root(parent, value, base):
++    value = np.int64(value)
++    while True:
++        idx = _index(value, base, len(parent))
++        p = np.int64(parent[idx])
++        if p == 0 or p == value:
++            return value
++        pi = _index(p, base, len(parent))
++        pp = np.int64(parent[pi])
++        if pp:
++            parent[idx] = pp
++        value = p
++
++
++@njit(nogil=True, cache=True)
++def _union_plane(left, right, edges, parent, base=0):
++    for y in range(edges.shape[0]):
++        for z in range(edges.shape[1]):
++            if edges[y, z]:
++                a, b = left[y, z], right[y, z]
++                assert a != 0 and b != 0
++                ra, rb = _root(parent, a, base), _root(parent, b, base)
++                if ra != rb:
++                    parent[_index(max(ra, rb), base, len(parent))] = min(ra, rb)
++
++
++@njit(nogil=True, cache=True)
++def _compress_roots(parent, base=0):
++    for i in range(len(parent)):
++        parent[i] = _root(parent, np.int64(i) + np.int64(base), base)
++
++
++@njit(nogil=True, cache=True)
++def _renumber_by_roots(seg, parent, base=0):
++    newid = np.zeros(len(parent), dtype=parent.dtype)
++    count = 0
++    flat = seg.reshape(-1)
++    for i in range(flat.size):
++        v = flat[i]
++        if v:
++            root = parent[_index(v, base, len(parent))]
++            ri = _index(root, base, len(parent))
++            if newid[ri] == 0:
++                count += 1
++                newid[ri] = count
++            flat[i] = newid[ri]
++    return count
++
++
++@njit(nogil=True, cache=True)
++def _final_ids_from_roots(parent):
++    """After _compress_roots: parent[i] = root of local id i; rewrite to final ids.
++
++    Local ids follow global first-C-order appearance (slabs are X-contiguous and
++    compacted in C order, offsets increase with X), and unions keep the smaller
++    root, so each root is its component's earliest local id. Ranking roots by id
++    therefore equals first-appearance numbering (fastremap.renumber order).
++    """
++    rank = np.zeros(len(parent), parent.dtype)
++    count = 0
++    for i in range(1, len(parent)):
++        if parent[i] == i:
++            count += 1
++            rank[i] = count
++    for i in range(1, len(parent)):
++        parent[i] = rank[parent[i]]
++    return count
++
++
++@njit(parallel=True, cache=True)
++def _apply_final_ids(seg, final, out):
++    """out[v] = final[seg[v]] (final[0] == 0); out may alias seg."""
++    for i in prange(seg.size):
++        out[i] = final[seg[i]]
++
++
++def _slab_foreground(hard, x0, x1, eo):
++    """Rows x0:x1 of _affinity_foreground_mask(hard, eo), from a 1-row halo."""
++    lo, hi = max(0, x0 - 1), min(hard.shape[1], x1 + 1)
++    fg = _affinity_foreground_mask(hard[:, lo:hi], eo)
++    return fg[x0 - lo : x1 - lo]
++
++
++def _local_slab(hard, seg, eo, bounds, table):
++    x0, x1 = bounds
++    fg = _slab_foreground(hard, x0, x1, eo)
++    graph = _build_graph(hard, x0, x1, eo)
++    labels = np.ascontiguousarray(cc3d.color_connectivity_graph(graph, connectivity=6))
++    del graph
++    labels *= fg
++    return int(_compact_first_appearance(labels, seg[x0:x1], table))
++
++
++def _slab_worker(task):
++    hard_path, hard_shape, seg_path, seg_shape, eo, bounds = task
++    hard = attach(hard_path, hard_shape, np.bool_)
++    try:
++        seg = attach(seg_path, seg_shape, np.uint32, writable=True)
++        try:
++            process = mp.current_process()
++            cache = getattr(process, "_pytc_compaction_tables", None)
++            if cache is None:
++                cache = {}
++                process._pytc_compaction_tables = cache
++            length = (bounds[1] - bounds[0]) * seg_shape[1] * seg_shape[2] + 1
++            if length not in cache:
++                cache[length] = np.zeros(length, np.uint32)
++            table = cache[length]
++            return _local_slab(hard.array, seg.array, eo, bounds, table)
++        finally:
++            seg.close()
++    finally:
++        hard.close()
++
++
++def _init_fork_worker(hard, seg, eo, table_size):
++    # Written only in children: simultaneous parent calls never share call state.
++    global _fork_state
++    _fork_state = (hard, seg, eo, np.zeros(table_size, np.uint32))
++
++
++def _fork_worker(bounds):
++    hard, seg, eo, table = _fork_state
++    return _local_slab(hard, seg, eo, bounds, table)
++
++
++def _precompile_workers(hard):
++    """Exercise every worker kernel signature before inheriting Numba state."""
++    if hard.flags.c_contiguous:
++        tiny = np.zeros((3, 2, 2, 2), bool)
++    elif hard.flags.f_contiguous:
++        tiny = np.zeros((3, 2, 2, 2), bool, order="F")
++    else:
++        tiny = np.zeros((3, 2, 2, 4), bool)[:, :, :, ::2]
++    tiny.flags.writeable = hard.flags.writeable
++    _build_graph(tiny, 0, 2, 0)
++    out = np.zeros((2, 2, 2), np.uint32)
++    table = np.zeros(9, np.uint32)
++    # cc3d chooses its unsigned label width from the graph size.
++    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64):
++        _compact_first_appearance(np.zeros(out.shape, dtype), out, table)
++
++
++def _run_fork_tasks(hard, seg, eo, ranges, workers):
++    table_size = (ranges[0][1] - ranges[0][0]) * seg.shape[1] * seg.shape[2] + 1
++    executor = ProcessPoolExecutor(
++        max_workers=workers,
++        mp_context=mp.get_context("fork"),
++        initializer=_init_fork_worker,
++        initargs=(hard, seg, eo, table_size),
++    )
++    futures = []
++    try:
++        # Serialize warm-up and fork launches, not worker execution. Concurrent
++        # launches can overlap library at-fork hooks or inherit an active compiler.
++        with _fork_launch_lock:
++            _precompile_workers(hard)
++            futures = [executor.submit(_fork_worker, bounds) for bounds in ranges]
++        return [future.result() for future in futures]
++    finally:
++        for future in futures:
++            future.cancel()
++        executor.shutdown(wait=True, cancel_futures=True)
++
++
++def _resolve_parallel(parallel, workers):
++    if parallel not in ("auto", "processes", "fork", "forkserver", "threads"):
++        raise ValueError("Invalid parallel mode")
++    if parallel == "auto":
++        parallel = "processes" if process_parallel_available() and workers > 1 else "threads"
++    fork_available = sys.platform.startswith("linux") and "fork" in mp.get_all_start_methods()
++    if parallel == "processes":
++        parallel = "fork" if fork_available else "forkserver"
++    if parallel in ("fork", "forkserver") and not process_parallel_available():
++        raise RuntimeError("Process parallelism is unavailable in this process")
++    if parallel == "fork" and not fork_available:
++        raise RuntimeError("Fork parallelism requires Linux with the fork start method")
++    return parallel
++
++
++def _finish(seg):
++    seg = fastremap.refit(seg)
++    if seg.size and not np.any(seg == 0):
++        seg[0, 0, 0] = 0
++    return cast2dtype(seg)
++
++
++def _layout(shape, edge_offset, num_workers, slab_size, parallel):
++    if len(shape) != 4 or shape[0] < 3:
++        raise ValueError("Expected (>=3, X, Y, Z) affinities")
++    if edge_offset not in (0, 1):
++        raise ValueError("Invalid edge_offset or parallel mode")
++    workers = num_workers
++    if workers is None:
++        workers = (
++            len(os.sched_getaffinity(0))
++            if hasattr(os, "sched_getaffinity")
++            else os.cpu_count() or 1
++        )
++    if workers < 1 or (slab_size is not None and slab_size < 1):
++        raise ValueError("num_workers and slab_size must be positive")
++    x, y, z = shape[1:]
++    slab = (
++        slab_size
++        if slab_size is not None
++        else min(max(1, x), max(1, min(SLAB_VOXEL_LIMIT, 2**28) // max(1, y * z)))
++    )
++    if slab * y * z > SLAB_VOXEL_LIMIT:
++        raise ValueError("Slab exceeds the voxel limit")
++    ranges = [(a, min(x, a + slab)) for a in range(0, x, slab)]
++    workers = min(workers, max(1, len(ranges)))
++    return ranges, workers, _resolve_parallel(parallel, workers)
++
++
++def connected_components_affinity_3d_slab(
++    hard_aff: np.ndarray,
++    edge_offset: int = 0,
++    num_workers: Optional[int] = None,
++    slab_size: Optional[int] = None,
++    parallel: str = "auto",
++    finalize: bool = True,
++    buffer_dir: Optional[str] = None,
++) -> np.ndarray:
++    """Label hard affinities in C-order, matching converged parallel-numba labels.
++
++    Only the first three channels are used. "auto" selects processes when available
++    with more than one effective worker, otherwise threads. "processes" uses "fork"
++    on Linux where available, otherwise "forkserver" (with spawn fallback).
++    Explicit "fork" requires Linux and a non-daemonic caller.
++
++    On Linux the default process mode forks the calling process. Forking a process
++    whose other threads hold locks can deadlock children. Children only run
++    precompiled nogil Numba kernels and cc3d for labeling; use parallel="forkserver"
++    or "threads" when that is a concern. Fork inherits hard affinities without a
++    copy and stores uint32 labels in an anonymous shared mapping. Forkserver/spawn
++    copies hard affinities into shared files in buffer_dir, alongside label storage;
++    scripts using that mode need a main-module guard.
++    With ``finalize=False``, return labels before refit and the background-corner rule.
++    """
++    return _connected_components_slab(
++        hard_aff, edge_offset, num_workers, slab_size, parallel, finalize, buffer_dir
++    )
++
++
++def _connected_components_slab(
++    hard,
++    edge_offset=0,
++    num_workers=None,
++    slab_size=None,
++    parallel="auto",
++    finalize=True,
++    buffer_dir=None,
++):
++    """Consume an array or transfer ownership of a SharedArray on every exit path."""
++    hard_buffer = hard if isinstance(hard, SharedArray) else None
++    label_buffer = None
++    anonymous = None
++    try:
++        source = hard.array if hard_buffer is not None else hard
++        ranges, workers, mode = _layout(source.shape, edge_offset, num_workers, slab_size, parallel)
++        shape = source.shape[1:]
++        if not all(shape):
++            empty = np.zeros(shape, np.uint32)
++            return _finish(empty) if finalize else empty
++        if mode == "fork":
++            hard = np.asarray(source[:3], dtype=np.bool_)
++            anonymous = mmap.mmap(-1, int(np.prod(shape)) * np.dtype(np.uint32).itemsize)
++            seg = np.frombuffer(anonymous, np.uint32).reshape(shape)
++            counts = _run_fork_tasks(hard, seg, edge_offset, ranges, workers)
++        elif mode == "forkserver":
++            if hard_buffer is None:
++                hard_buffer = SharedArray.create((3, *shape), np.bool_, buffer_dir)
++                hard_buffer.array[:] = source[:3]
++            hard = hard_buffer.array
++            label_buffer = SharedArray.create(shape, np.uint32, buffer_dir)
++            seg = label_buffer.array
++            tasks = [
++                (hard_buffer.path, hard.shape, label_buffer.path, shape, edge_offset, b)
++                for b in ranges
++            ]
++            counts = run_process_tasks(_slab_worker, tasks, workers, preload=[__name__])
++            hard_buffer.release_path()
++            label_buffer.release_path()
++        else:
++            hard = np.asarray(source[:3], dtype=np.bool_)
++            seg = np.empty(shape, np.uint32)
++            tables = Queue()
++            for _ in range(workers):
++                tables.put(
++                    np.zeros((ranges[0][1] - ranges[0][0]) * shape[1] * shape[2] + 1, np.uint32)
++                )
++
++            def work(bounds):
++                table = tables.get()
++                try:
++                    return _local_slab(hard, seg, edge_offset, bounds, table)
++                finally:
++                    tables.put(table)
++
++            if workers == 1:
++                counts = list(map(work, ranges))
++            else:
++                with ThreadPoolExecutor(max_workers=workers) as pool:
++                    counts = list(pool.map(work, ranges))
++        total = sum(counts)
++        dtype = np.dtype(np.uint64 if total >= UINT32_LIMIT else np.uint32)
++        if seg.dtype != dtype:
++            seg = seg.astype(dtype)
++        offset = 0
++        for bounds, count in zip(ranges, counts):
++            _add_offset(seg[bounds[0] : bounds[1]], np.int64(offset))
++            offset += count
++        parent = np.zeros(total + 1, dtype)
++        for b, _ in ranges[1:]:
++            _union_plane(seg[b - 1], seg[b], hard[0, b - 1 + edge_offset], parent)
++        hard = None
++        source = None
++        if hard_buffer is not None:
++            hard_buffer.close()
++        _compress_roots(parent)
++        components = int(_final_ids_from_roots(parent))
++        has_background = any(np.any(seg[a:b] == 0) for a, b in ranges)
++        target = np.dtype(get_seg_type(components)) if finalize and has_background else dtype
++        out = seg if target == seg.dtype else np.empty(shape, target)
++        _apply_final_ids(seg.reshape(-1), parent, out.reshape(-1))
++        result = _finish(out) if finalize and not has_background else out
++        if label_buffer is not None and np.shares_memory(result, label_buffer.array):
++            label_buffer.release_path()
++            label_buffer = None  # The returned array now owns the mapping lifetime.
++        return result
++    finally:
++        if hard_buffer is not None:
++            hard_buffer.close()
++        if label_buffer is not None:
++            label_buffer.close()
++        if anonymous is not None:
++            # frombuffer keeps the mapping alive while any returned view exists.
++            try:
++                anonymous.close()
++            except BufferError:
++                pass
+diff --git a/connectomics/decoding/decoders/segmentation.py b/connectomics/decoding/decoders/segmentation.py
+index d41c53e02..5dea60e83 100644
+--- a/connectomics/decoding/decoders/segmentation.py
++++ b/connectomics/decoding/decoders/segmentation.py
+@@ -15,7 +15,8 @@
+ from __future__ import annotations
+ 
+ import warnings
+-from typing import Optional, Sequence, Tuple
++from collections.abc import Sequence
++from typing import Optional
+ 
+ import cc3d
+ import fastremap
+@@ -78,9 +79,9 @@ def decode_instance_binary_contour_distance(
+     contour_channels: Optional[Sequence[int]] = (1,),
+     distance_channels: Optional[Sequence[int]] = (2,),
+     binary_channel_reduction: str = "mean",
+-    binary_threshold: Tuple[float, float] = (0.9, 0.85),
+-    contour_threshold: Optional[Tuple[float, float]] = (0.8, 1.1),
+-    distance_threshold: Tuple[float, float] = (0.5, 0),
++    binary_threshold: tuple[float, float] = (0.9, 0.85),
++    contour_threshold: Optional[tuple[float, float]] = (0.8, 1.1),
++    distance_threshold: tuple[float, float] = (0.5, 0),
+     precomputed_seed: Optional[np.ndarray] = None,
+     min_seed_size: int = 32,
+     min_instance_size: int = 0,
+@@ -290,12 +291,12 @@ def decode_instance_binary_contour_distance(
+ def decode_distance_watershed(
+     predictions: np.ndarray,
+     distance_channels: Optional[Sequence[int]] = (0,),
+-    distance_threshold: Tuple[float, float] = (0.5, 0),
++    distance_threshold: tuple[float, float] = (0.5, 0),
+     min_seed_size: int = 50,
+     min_instance_size: int = 0,
+     use_fast_edt: bool = True,
+     edt_parallel: int = 4,
+-    edt_anisotropy: Optional[Tuple[float, ...]] = None,
++    edt_anisotropy: Optional[tuple[float, ...]] = None,
+     edt_downsample_factor: int = 1,
+     return_seed: bool = False,
+     **kwargs,  # Accept but ignore unused parameters for compatibility
+@@ -413,6 +414,7 @@ def decode_distance_watershed(
+             f"No foreground voxels found with threshold {distance_threshold[1]}. "
+             "Returning empty segmentation.",
+             UserWarning,
++            stacklevel=2,
+         )
+         empty_seg = np.zeros(distance.shape, dtype=np.uint32)
+         if return_seed:
+@@ -428,6 +430,7 @@ def decode_distance_watershed(
+             f"No seed voxels found with threshold {distance_threshold[0]}. "
+             "Returning empty segmentation.",
+             UserWarning,
++            stacklevel=2,
+         )
+         empty_seg = np.zeros(distance.shape, dtype=np.uint32)
+         if return_seed:
+@@ -446,6 +449,7 @@ def decode_distance_watershed(
+             f"No seeds remain after removing small objects (min_size={min_seed_size}). "
+             "Returning empty segmentation.",
+             UserWarning,
++            stacklevel=2,
+         )
+         empty_seg = np.zeros(distance.shape, dtype=np.uint32)
+         if return_seed:
+@@ -502,12 +506,12 @@ def decode_affinity_cc(
+     edge_offset: int = 0,
+     orphan_fill: bool = False,
+     affinity_channels: Optional[Sequence[int]] = None,
++    num_workers: Optional[int] = None,
++    parallel: str = "auto",
++    buffer_dir: Optional[str] = None,
+ ) -> np.ndarray:
+     r"""Convert affinity predictions to instance segmentation via connected components.
+ 
+-    This function implements fast connected component labeling on affinity graphs,
+-    providing 10-100x speedup when Numba is available compared to standard methods.
+-
+     The algorithm uses only **short-range affinities** (first 3 channels, or the
+     first 3 of ``affinity_channels`` if supplied) to build a connectivity graph,
+     then performs flood-fill to identify connected components. Each component
+@@ -534,9 +538,13 @@ def decode_affinity_cc(
+             - ``"cc3d"`` (default): Fast, predictable startup; ignores directed affinity graph
+               and runs connected components on foreground voxels.
+             - ``"numba"``: Multi-threaded affinity-graph CC via parallel min-label sweeps
+-              (first call may incur JIT compile overhead). Bit-exact with ``"numba_serial"``.
++              (first call may incur JIT compile overhead). Same partition as
++              ``"numba_serial"``; identical labels for ``edge_offset=0``.
+             - ``"numba_serial"``: Original single-threaded DFS flood-fill kept as a reference
+               fallback.
++            - ``"slab"``: Slab graph CC, exactly equal to ``numba`` when its sweeps
++              converge. Serial labels can differ for ``edge_offset=1`` because its
++              seed order differs from first-voxel order. Opt-in parallelism.
+             - ``"cupy"``: Single-GPU min-label sweeps via cupy. Same partition as
+               ``"numba_serial"``; bit-exact for ``edge_offset=0``. Requires cupy and
+               enough GPU memory for ~17×volume bytes.
+@@ -545,13 +553,29 @@ def decode_affinity_cc(
+             to source voxel ``v``. ``0`` = source-index (BANIS's ``comp_affinities``
+             stores the edge at ``v``). ``1`` = destination-index
+             (``affinity_mode=deepem``, zwatershed, abiss store the edge at ``v+1``).
+-            Only used when ``backend="numba"``. Default: ``0``.
++            Used by the numba and slab backends. Default: ``0``.
+         orphan_fill (bool): If True, recover voxels with positive but sub-threshold
+             short-range affinities by running a second CC on the leftover foreground
+             mask and assigning new labels. Default: ``False`` (BANIS reference
+             behavior; avoids allocating the full ``(short > 0).any(axis=0)`` bool
+             volume).
+ 
++        num_workers (int, optional): Worker count for slab only; defaults to CPU affinity.
++        parallel (str): Slab only: "auto", "processes", "fork", "forkserver", "threads".
++            Auto uses processes when available with multiple effective workers,
++            otherwise threads. Processes uses fork on Linux where available, otherwise
++            forkserver with spawn fallback. Explicit fork requires Linux and a
++            non-daemonic caller. On Linux the default process mode forks the calling
++            process; forking a process whose other threads hold locks can deadlock
++            children. Children only run precompiled nogil Numba kernels and cc3d for
++            labeling. Use parallel="forkserver" or "threads" when that is a concern.
++            Forkserver/spawn scripts need a main-module guard.
++        buffer_dir (str, optional): Slab forkserver shared-buffer directory; defaults
++            to writable /dev/shm, else the temporary directory. Hard affinities use
++            3 bytes/voxel and labels initially use 4 bytes/voxel. Fork uses an ordinary
++            hard array inherited by children and anonymous shared labels instead.
++            All storage counts toward memory limits.
++
+     Returns:
+         numpy.ndarray: Instance segmentation mask of shape :math:`(Z, Y, X)` with
+             dtype uint32. Each connected component has a unique ID >= 1, background is 0.
+@@ -592,19 +616,48 @@ def decode_affinity_cc(
+ 
+     # Extract short-range affinities (first 3 channels) and binarize
+     short_range_aff = affinities[:3]
+-    hard_aff = short_range_aff > threshold
+ 
+     # Connected components
+     backend_normalized = str(backend).lower()
+     if backend_normalized == "auto":
+         backend_normalized = "numba" if NUMBA_AVAILABLE else "cc3d"
+ 
+-    if backend_normalized in ("numba", "numba_serial"):
++    if backend_normalized != "slab" or not NUMBA_AVAILABLE:
++        hard_aff = short_range_aff > threshold
++
++    if backend_normalized == "slab" and NUMBA_AVAILABLE:
++        from connectomics.utils.shared_buffer import SharedArray
++
++        from .affinity_cc_slab import _connected_components_slab, _layout
++
++        _, _, mode = _layout(short_range_aff.shape, int(edge_offset), num_workers, None, parallel)
++        if mode == "forkserver" and short_range_aff.size:
++            buf = SharedArray.create(short_range_aff.shape, np.bool_, buffer_dir)
++            try:
++                np.greater(short_range_aff, threshold, out=buf.array)
++            except BaseException:
++                buf.close()
++                raise
++            hard_input = buf
++        else:
++            hard_input = short_range_aff > threshold
++        segmentation = _connected_components_slab(
++            hard_input,
++            edge_offset=int(edge_offset),
++            num_workers=num_workers,
++            parallel=parallel,
++            finalize=not orphan_fill,
++            buffer_dir=buffer_dir,
++        )
++        if not orphan_fill:
++            return segmentation
++    elif backend_normalized in ("numba", "numba_serial", "slab"):
+         if not NUMBA_AVAILABLE:
+             warnings.warn(
+                 "Numba backend requested but numba is not available; falling back to cc3d. "
+                 "Install numba>=0.60.0 or set backend='cc3d'.",
+                 UserWarning,
++                stacklevel=2,
+             )
+             segmentation = cc3d.connected_components(hard_aff.any(axis=0))
+         elif backend_normalized == "numba_serial":
+@@ -628,7 +681,7 @@ def decode_affinity_cc(
+     else:
+         raise ValueError(
+             f"Unknown backend '{backend}'. Expected one of "
+-            "['cc3d', 'numba', 'numba_serial', 'cupy', 'auto']."
++            "['cc3d', 'numba', 'numba_serial', 'slab', 'cupy', 'auto']."
+         )
+ 
+     # Recover foreground voxels with sub-threshold positive affinities
+diff --git a/connectomics/utils/shared_buffer.py b/connectomics/utils/shared_buffer.py
+new file mode 100644
+index 000000000..be48356bf
+--- /dev/null
++++ b/connectomics/utils/shared_buffer.py
+@@ -0,0 +1,122 @@
++"""Private file-backed arrays and safe process pools.
++
++Storage is reserved before mapping where fallocate is supported. The truncate
++fallback does not reserve storage; callers must ensure sufficient free space.
++"""
++
++import errno
++import mmap
++import multiprocessing as mp
++import os
++import tempfile
++from concurrent.futures import ProcessPoolExecutor
++
++import numpy as np
++
++
++def default_buffer_dir():
++    return (
++        "/dev/shm"
++        if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
++        else tempfile.gettempdir()
++    )
++
++
++class SharedArray:
++    """Own a mapped array and its optional attachment path.
++
++    Arrays use a memoryview base so closing with live views safely defers unmapping
++    until those views are collected. Drop views before close for immediate release.
++    """
++
++    def __init__(self, path, mapping, shape, dtype, owner):
++        self.path = path
++        self._mapping = mapping
++        self._owner = owner
++        self.array = np.frombuffer(mapping, dtype=dtype).reshape(shape)
++
++    @classmethod
++    def create(cls, shape, dtype, buffer_dir=None):
++        size = int(np.prod(shape)) * np.dtype(dtype).itemsize
++        fd, path = tempfile.mkstemp(
++            dir=buffer_dir or default_buffer_dir(), prefix="pytc-", suffix=".buf"
++        )
++        mapping = None
++        try:
++            try:
++                if hasattr(os, "posix_fallocate"):
++                    os.posix_fallocate(fd, 0, size)
++                else:
++                    os.ftruncate(fd, size)
++            except OSError as exc:
++                if exc.errno not in (errno.EOPNOTSUPP, errno.EINVAL):
++                    raise
++                os.ftruncate(fd, size)
++            mapping = mmap.mmap(fd, size)
++            return cls(path, mapping, shape, dtype, True)
++        except BaseException:
++            if mapping is not None:
++                mapping.close()
++            os.unlink(path)
++            raise
++        finally:
++            os.close(fd)
++
++    def release_path(self):
++        if self._owner:
++            try:
++                os.unlink(self.path)
++            except FileNotFoundError:
++                pass
++            self._owner = False
++
++    def close(self):
++        self.release_path()
++        self.array = None
++        if self._mapping is not None:
++            try:
++                self._mapping.close()
++            except BufferError:
++                pass
++            self._mapping = None
++
++
++def attach(path, shape, dtype, writable=False):
++    with open(path, "r+b" if writable else "rb") as stream:
++        mapping = mmap.mmap(
++            stream.fileno(), 0, access=mmap.ACCESS_WRITE if writable else mmap.ACCESS_READ
++        )
++    try:
++        return SharedArray(path, mapping, shape, dtype, False)
++    except BaseException:
++        mapping.close()
++        raise
++
++
++def process_parallel_available():
++    return os.name == "posix" and not mp.current_process().daemon
++
++
++def process_pool_context():
++    return mp.get_context("forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn")
++
++
++def run_process_tasks(fn, tasks, num_workers, preload=()):
++    """Run ordered tasks with safe worker-failure propagation.
++
++    On forkserver contexts this replaces multiprocessing's process-global preload
++    list, including any list configured by the application. It only affects a
++    server started after this call; an already running server is unchanged.
++    """
++    context = process_pool_context()
++    if context.get_start_method() == "forkserver":
++        context.set_forkserver_preload(list(preload))
++    executor = ProcessPoolExecutor(max_workers=num_workers, mp_context=context)
++    futures = []
++    try:
++        futures = [executor.submit(fn, task) for task in tasks]
++        return [future.result() for future in futures]
++    finally:
++        for future in futures:
++            future.cancel()
++        executor.shutdown(wait=True, cancel_futures=True)
+diff --git a/tests/unit/test_affinity_cc_slab.py b/tests/unit/test_affinity_cc_slab.py
+new file mode 100644
+index 000000000..73d40c00f
+--- /dev/null
++++ b/tests/unit/test_affinity_cc_slab.py
+@@ -0,0 +1,558 @@
++"""Exact-output gates for the standalone affinity CC experiment."""
++
++import sys
++import warnings
++
++import cc3d
++import fastremap
++import numpy as np
++import pytest
++
++from connectomics.decoding.decoders import affinity_cc_slab as fc
++from connectomics.decoding.decoders.segmentation import decode_affinity_cc
++from connectomics.utils.shared_buffer import process_parallel_available
++
++PROCESS_MODES = [
++    pytest.param(
++        "fork",
++        marks=pytest.mark.skipif(
++            not sys.platform.startswith("linux") or "fork" not in fc.mp.get_all_start_methods(),
++            reason="Linux fork unavailable",
++        ),
++    ),
++    "forkserver",
++]
++
++
++def assert_partition_equal(actual, expected):
++    # Canonicalize by first C-order appearance, preserving background.
++    def canonical(labels):
++        flat = labels.ravel()
++        _, first, inverse = np.unique(flat, return_index=True, return_inverse=True)
++        order = np.argsort(first)
++        ranks = np.empty(order.size, dtype=np.int64)
++        ranks[order] = np.arange(1, order.size + 1)
++        ranks[np.unique(flat) == 0] = 0
++        return ranks[inverse]
++
++    np.testing.assert_array_equal(actual == 0, expected == 0)
++    np.testing.assert_array_equal(canonical(actual), canonical(expected))
++
++
++def numba_reference(data, **kwargs):
++    with warnings.catch_warnings():
++        warnings.simplefilter("error", RuntimeWarning)
++        return decode_affinity_cc(data, backend="numba", **kwargs)
++
++
++def check(hard, eo, slab, workers, parallel="threads"):
++    actual = fc.connected_components_affinity_3d_slab(
++        hard, eo, slab_size=slab, num_workers=workers, parallel=parallel
++    )
++    ref = numba_reference(hard.astype(np.float32), threshold=0.5, edge_offset=eo)
++    assert actual.dtype == ref.dtype
++    np.testing.assert_array_equal(actual, ref)
++    serial = decode_affinity_cc(
++        hard.astype(np.float32), threshold=0.5, backend="numba_serial", edge_offset=eo
++    )
++    assert_partition_equal(actual, serial)
++
++
++def edge(hard, a, b, eo):
++    axis = next(i for i in range(3) if a[i] != b[i])
++    lo = list(min(a, b))
++    lo[axis] += eo
++    hard[(axis,) + tuple(lo)] = True
++
++
++def fixture(kind, eo):
++    hard = np.zeros((3, 8, 7, 6), bool)
++    if kind == "full":
++        hard[:] = True
++    elif kind == "singleton":
++        hard[0, -1 if eo == 0 else 0, 2, 2] = True
++    elif kind == "faces":
++        for axis in range(3):
++            index = [axis, slice(None), slice(None), slice(None)]
++            index[axis + 1] = -1 if eo == 0 else 0
++            hard[tuple(index)] = True
++    elif kind == "snake":
++        points = [
++            (x, y, 2) for y in range(7) for x in (range(8) if y % 2 == 0 else range(7, -1, -1))
++        ]
++        for a, b in zip(points, points[1:]):
++            edge(hard, a, b, eo)
++    elif kind in ("ring", "u"):
++        for x in range(7):
++            for y in (1, 5):
++                edge(hard, (x, y, 2), (x + 1, y, 2), eo)
++        for y in range(1, 5):
++            edge(hard, (7, y, 2), (7, y + 1, 2), eo)
++            if kind == "ring":
++                edge(hard, (0, y, 2), (0, y + 1, 2), eo)
++    return hard
++
++
++@pytest.mark.parametrize("eo", [0, 1])
++@pytest.mark.parametrize("slab", [1, 2, 3, 8])
++@pytest.mark.parametrize("workers", [1, 3])
++@pytest.mark.parametrize("kind", ["empty", "full", "singleton", "faces", "snake", "ring", "u"])
++def test_structured(kind, workers, slab, eo):
++    check(fixture(kind, eo), eo, slab, workers)
++
++
++@pytest.mark.parametrize("seed", range(5))
++@pytest.mark.parametrize("shape", [(3, 17, 9, 11), (3, 40, 23, 7)])
++@pytest.mark.parametrize("p", [0.3, 0.55, 0.7])
++@pytest.mark.parametrize("eo", [0, 1])
++def test_random(seed, shape, p, eo):
++    hard = np.random.default_rng(seed).random(shape) < p
++    # Full matrix on the random fixtures, including repeated table reuse.
++    for slab in (1, 2, 3, shape[1]):
++        for workers in (1, 3):
++            check(hard, eo, slab, workers)
++
++
++@pytest.mark.parametrize("eo", [0, 1])
++@pytest.mark.parametrize("p", [0.05, 0.5, 0.95])
++def test_slab_foreground_matches_global_mask(eo, p):
++    from connectomics.decoding.decoders.segmentation_kernels import _affinity_foreground_mask
++
++    hard = np.random.default_rng(3).random((3, 11, 7, 5)) < p
++    full = _affinity_foreground_mask(hard, eo)
++    for slab in (1, 2, 4, 11):
++        for x0 in range(0, 11, slab):
++            x1 = min(x0 + slab, 11)
++            np.testing.assert_array_equal(fc._slab_foreground(hard, x0, x1, eo), full[x0:x1])
++
++
++@pytest.mark.parametrize("axis", range(3))
++@pytest.mark.parametrize("eo", [0, 1])
++def test_bits(axis, eo):
++    hard = np.zeros((3, 4, 4, 4), bool)
++    a, b = [1, 1, 1], [1, 1, 1]
++    b[axis] += 1
++    edge(hard, tuple(a), tuple(b), eo)
++    graph = fc._build_graph(hard, 0, 4, eo)
++    assert graph[tuple(a)] == 1 << (2 * axis)
++    assert graph[tuple(b)] == 1 << (2 * axis + 1)
++    labels = cc3d.color_connectivity_graph(graph, connectivity=6)
++    assert labels[tuple(a)] == labels[tuple(b)]
++    for slab in (2, 4):
++        check(hard, eo, slab, 1)
++
++
++def test_above_uint32_roots():
++    base = 2**32 - 3
++    seg = np.array([0, 1, 8], np.uint64).reshape(1, 1, 3)
++    fc._add_offset(seg, np.int64(2**32 + 5))
++    np.testing.assert_array_equal(seg.ravel(), [0, 2**32 + 6, 2**32 + 13])
++    parent = np.zeros(64, np.uint64)
++    left = np.array([[base + 1]], np.uint64)
++    right = np.array([[base + 40]], np.uint64)
++    fc._union_plane(left, right, np.ones((1, 1), bool), parent, base)
++    fc._compress_roots(parent, base)
++    assert parent[1] == parent[40] == base + 1
++    assert parent[2] == base + 2
++    original = np.array([base + 40, base + 1, base + 2], np.uint64).reshape(1, 1, 3)
++    resolved = parent[(original - np.uint64(base)).astype(np.int64)]
++    expected, _ = fastremap.renumber(resolved, preserve_zero=True)
++    fc._renumber_by_roots(original, parent, base)
++    np.testing.assert_array_equal(original, expected)
++    np.testing.assert_array_equal(original.ravel(), [1, 1, 2])
++    bad = np.array([[[base + 64]]], np.uint64)
++    with pytest.raises(AssertionError):
++        fc._renumber_by_roots(bad, parent, base)
++    with pytest.raises(AssertionError):
++        fc._union_plane(
++            left, np.array([[base + 64]], np.uint64), np.ones((1, 1), bool), parent, base
++        )
++
++
++def test_first_appearance():
++    seg = np.array([0, 7, 7, 3, 0, 9, 3, 1], np.uint32).reshape(2, 2, 2)
++    expected, _ = fastremap.renumber(seg, preserve_zero=True)
++    parent = np.zeros(10, np.uint32)
++    fc._compress_roots(parent)
++    fc._renumber_by_roots(seg, parent)
++    np.testing.assert_array_equal(seg, expected)
++
++
++@pytest.mark.parametrize("seed", range(5))
++def test_final_ids_match_first_appearance_renumber(seed):
++    # Labels in first-appearance order (as produced by slab compaction + offsets),
++    # merged with min-root unions; ranking roots must equal fastremap.renumber.
++    rng = np.random.default_rng(seed)
++    n_labels = 60
++    seg = np.zeros(400, np.uint32)
++    seg[rng.random(400) < 0.8] = 1
++    nz = np.flatnonzero(seg)
++    seg[nz] = np.sort(rng.integers(1, n_labels + 1, nz.size))
++    seg[nz[:n_labels]] = np.arange(1, n_labels + 1)  # every label appears, in order
++    seg[nz] = np.maximum.accumulate(seg[nz])
++    parent = np.zeros(n_labels + 1, np.uint32)
++    for _ in range(25):
++        a, b = rng.integers(1, n_labels + 1, 2)
++        fc._union_plane(
++            np.array([[a]], np.uint32), np.array([[b]], np.uint32), np.ones((1, 1), bool), parent
++        )
++    fc._compress_roots(parent)
++    roots = parent[seg]
++    count = fc._final_ids_from_roots(parent)
++    out = np.empty_like(seg)
++    fc._apply_final_ids(seg, parent, out)
++    expected, _ = fastremap.renumber(roots.copy(), preserve_zero=True)
++    np.testing.assert_array_equal(out, expected)
++    assert count == len(np.unique(roots[roots != 0]))
++
++
++@pytest.mark.parametrize("shape", [(3, 0, 4, 5), (3, 4, 0, 5), (3, 4, 5, 0)])
++def test_empty_axes(shape):
++    hard = np.zeros(shape, np.float32)
++    with pytest.raises(ValueError) as reference:
++        decode_affinity_cc(hard, backend="numba")
++    with pytest.raises(type(reference.value)):
++        decode_affinity_cc(hard, backend="slab", parallel="threads")
++    actual = fc.connected_components_affinity_3d_slab(hard, parallel="threads", finalize=False)
++    assert actual.shape == shape[1:]
++    assert actual.size == 0 and actual.dtype == np.uint32
++
++
++@pytest.mark.parametrize("eo", [0, 1])
++@pytest.mark.parametrize("orphan", [False, True])
++@pytest.mark.parametrize("full", [False, True])
++def test_decoder_channels(eo, orphan, full):
++    data = (
++        np.ones((6, 8, 7, 6), np.float32)
++        if full
++        else np.random.default_rng(2).random((6, 8, 7, 6), dtype=np.float32)
++    )
++    kwargs = {"edge_offset": eo, "orphan_fill": orphan, "affinity_channels": [5, 3, 1]}
++    actual = decode_affinity_cc(data, backend="slab", parallel="threads", num_workers=3, **kwargs)
++    expected = numba_reference(data, **kwargs)
++    assert_partition_equal(actual, decode_affinity_cc(data, backend="numba_serial", **kwargs))
++    assert actual.dtype == expected.dtype
++    np.testing.assert_array_equal(actual, expected)
++
++
++def test_unfinalized_and_promotion(monkeypatch):
++    from connectomics.decoding.decoders.segmentation_kernels import (
++        connected_components_affinity_3d_numba_parallel,
++    )
++
++    hard = np.random.default_rng(5).random((3, 8, 7, 6)) > 0.7
++    monkeypatch.setattr(fc, "UINT32_LIMIT", 5)
++    result = fc.connected_components_affinity_3d_slab(
++        hard, slab_size=3, parallel="threads", finalize=False
++    )
++    assert result.dtype == np.uint64
++    np.testing.assert_array_equal(result, connected_components_affinity_3d_numba_parallel(hard))
++    check(hard, 0, 3, 3)
++    full = np.ones_like(hard)
++    result = fc.connected_components_affinity_3d_slab(
++        full, slab_size=3, parallel="threads", finalize=False
++    )
++    assert result.dtype == np.uint32
++    assert np.all(result == 1)
++
++
++@pytest.mark.parametrize(
++    "kwargs", [{"edge_offset": 2}, {"parallel": "bad"}, {"num_workers": 0}, {"slab_size": 0}]
++)
++def test_invalid(kwargs):
++    with pytest.raises(ValueError):
++        fc.connected_components_affinity_3d_slab(np.ones((3, 4, 4, 4)), **kwargs)
++
++
++def test_shape_and_voxel_guards(monkeypatch):
++    for shape in [(2, 3, 4, 5), (3, 4, 5)]:
++        with pytest.raises(ValueError):
++            fc.connected_components_affinity_3d_slab(np.ones(shape))
++    monkeypatch.setattr(fc, "SLAB_VOXEL_LIMIT", 10)
++    with pytest.raises(ValueError):
++        fc.connected_components_affinity_3d_slab(np.ones((3, 4, 4, 4)), slab_size=1)
++
++
++def test_serpentine():
++    hard = np.zeros((3, 24, 24, 24), bool)
++    points = []
++    for z in range(24):
++        plane = [
++            (x, y, z) for y in range(24) for x in (range(24) if y % 2 == 0 else range(23, -1, -1))
++        ]
++        points.extend(plane if z % 2 == 0 else plane[::-1])
++    for a, b in zip(points, points[1:]):
++        edge(hard, a, b, 0)
++    actual = fc.connected_components_affinity_3d_slab(
++        hard, slab_size=3, num_workers=3, parallel="threads"
++    )
++    assert_partition_equal(actual, decode_affinity_cc(hard, backend="numba_serial"))
++
++
++def test_no_numba(monkeypatch):
++    from connectomics.decoding.decoders import segmentation
++
++    data = np.ones((3, 4, 4, 4))
++    monkeypatch.setattr(segmentation, "NUMBA_AVAILABLE", False)
++    with pytest.warns(UserWarning, match="falling back"):
++        actual = decode_affinity_cc(data, backend="slab")
++    np.testing.assert_array_equal(actual, decode_affinity_cc(data, backend="cc3d"))
++
++
++@pytest.mark.skipif(not process_parallel_available(), reason="Processes unavailable")
++@pytest.mark.parametrize("eo", [0, 1])
++@pytest.mark.parametrize("parallel", PROCESS_MODES)
++def test_process_owned_and_transferred(tmp_path, eo, parallel):
++    buf = tmp_path / "buf"
++    buf.mkdir()
++    hard = np.random.default_rng(7).random((3, 40, 23, 7)) < 0.55
++    expected = numba_reference(hard, edge_offset=eo)
++    actual = fc.connected_components_affinity_3d_slab(
++        hard, edge_offset=eo, slab_size=8, num_workers=2, parallel=parallel, buffer_dir=str(buf)
++    )
++    np.testing.assert_array_equal(actual, expected)
++    assert actual.dtype == expected.dtype
++    assert_partition_equal(actual, decode_affinity_cc(hard, backend="numba_serial", edge_offset=eo))
++    data = np.ones_like(hard, dtype=np.float32)
++    actual = decode_affinity_cc(
++        data,
++        backend="slab",
++        edge_offset=eo,
++        orphan_fill=bool(eo),
++        num_workers=2,
++        parallel=parallel,
++        buffer_dir=str(buf),
++    )
++    expected = numba_reference(data, edge_offset=eo, orphan_fill=bool(eo))
++    assert_partition_equal(
++        actual,
++        decode_affinity_cc(data, backend="numba_serial", edge_offset=eo, orphan_fill=bool(eo)),
++    )
++    np.testing.assert_array_equal(actual, expected)
++    assert actual.dtype == expected.dtype
++    assert not list(buf.iterdir())
++
++
++def test_transferred_cleanup_on_validation(tmp_path):
++    from connectomics.utils.shared_buffer import SharedArray
++
++    buf = SharedArray.create((3, 2, 2, 2), bool, tmp_path)
++    with pytest.raises(ValueError):
++        fc._connected_components_slab(buf, parallel="invalid")
++    assert not list(tmp_path.iterdir())
++
++
++@pytest.mark.skipif(not process_parallel_available(), reason="Processes unavailable")
++@pytest.mark.parametrize("parallel", PROCESS_MODES)
++def test_process_safety_subprocess(tmp_path, parallel):
++    from tests.unit.test_shared_buffer import _run_child
++
++    _run_child(
++        tmp_path,
++        """
++import os
++import threading
++from concurrent.futures import ThreadPoolExecutor
++import numpy as np
++from connectomics.decoding.decoders.segmentation import decode_affinity_cc
++from connectomics.utils.shared_buffer import process_pool_context
++from connectomics.decoding.decoders import affinity_cc_slab as fc
++fc.SLAB_VOXEL_LIMIT = 4 * 9 * 7
++MODE = MODE_VALUE
++original_initializer = fc._init_fork_worker
++
++def forbid_compile(*args, **kwargs):
++    raise AssertionError("Worker attempted Numba compilation")
++
++def checked_initializer(*args):
++    original_initializer(*args)
++    fc._build_graph._compile_for_args = forbid_compile
++    fc._compact_first_appearance._compile_for_args = forbid_compile
++
++def daemon_check(data):
++    expected = decode_affinity_cc(data, backend="numba")
++    actual = decode_affinity_cc(data, backend="slab", parallel="auto", num_workers=2)
++    np.testing.assert_array_equal(actual, expected)
++    try:
++        decode_affinity_cc(data, backend="slab", parallel=MODE, num_workers=2)
++    except RuntimeError:
++        return True
++    raise AssertionError("Explicit processes accepted inside daemon")
++
++if __name__ == "__main__":
++    data = np.random.default_rng(5).random((3, 12, 9, 7), dtype=np.float32)
++    expected = decode_affinity_cc(data, backend="numba")
++    if MODE == "fork":
++        fc._init_fork_worker = checked_initializer
++    def decode(mode, value=data):
++        return decode_affinity_cc(value, backend="slab", parallel=mode, num_workers=2)
++    lock = threading.Lock()
++    held = threading.Event()
++    release = threading.Event()
++    def hold_lock():
++        with lock:
++            held.set()
++            release.wait()
++    holder = threading.Thread(target=hold_lock)
++    holder.start()
++    held.wait()
++    try:
++        for _ in range(3):
++            np.testing.assert_array_equal(decode(MODE), expected)
++        with ThreadPoolExecutor(1) as pool:
++            np.testing.assert_array_equal(pool.submit(decode, MODE).result(), expected)
++    finally:
++        release.set()
++        holder.join()
++    other = data * .8
++    other_expected = decode("threads", other)
++    for second_mode in (MODE, "forkserver"):
++        with ThreadPoolExecutor(2) as pool:
++            first = pool.submit(decode, MODE)
++            second = pool.submit(decode, second_mode, other)
++            np.testing.assert_array_equal(first.result(), expected)
++            np.testing.assert_array_equal(second.result(), other_expected)
++    with process_pool_context().Pool(1) as pool:
++        assert pool.apply(daemon_check, (data,))
++""".replace("MODE_VALUE", repr(parallel)),
++    )
++
++
++@pytest.mark.skipif(not process_parallel_available(), reason="Processes unavailable")
++@pytest.mark.parametrize("parallel", PROCESS_MODES)
++def test_slab_worker_failure_subprocess(tmp_path, parallel):
++    from tests.unit.test_shared_buffer import _run_child
++
++    buf = tmp_path / "buf"
++    buf.mkdir()
++    _run_child(
++        tmp_path,
++        f"""
++import os
++import numpy as np
++from concurrent.futures.process import BrokenProcessPool
++from connectomics.decoding.decoders import affinity_cc_slab as fc
++from connectomics.utils.shared_buffer import SharedArray
++
++def fail(task):
++    raise ValueError("worker failure")
++
++def die(task):
++    os._exit(1)
++
++if __name__ == "__main__":
++    mode = {parallel!r}
++    worker_name = "_fork_worker" if mode == "fork" else "_slab_worker"
++    original_worker = getattr(fc, worker_name)
++    for worker, error in [(fail, ValueError), (die, BrokenProcessPool)]:
++        setattr(fc, worker_name, worker)
++        buf = SharedArray.create((3, 4, 4, 4), bool, {str(buf)!r})
++        buf.array[:] = True
++        try:
++            fc._connected_components_slab(buf, parallel=mode, num_workers=2,
++                                          slab_size=2, buffer_dir={str(buf)!r})
++        except error:
++            pass
++        else:
++            raise AssertionError("Worker failure did not propagate")
++        assert not os.listdir({str(buf)!r})
++    setattr(fc, worker_name, original_worker)
++    hard = np.ones((3, 4, 4, 4), bool)
++    actual = fc.connected_components_affinity_3d_slab(
++        hard, parallel=mode, num_workers=2, slab_size=2, buffer_dir={str(buf)!r})
++    expected = fc.connected_components_affinity_3d_slab(hard, parallel="threads")
++    np.testing.assert_array_equal(actual, expected)
++    assert actual.dtype == expected.dtype
++    assert not os.listdir({str(buf)!r})
++""",
++    )
++
++
++def test_process_buffer_lifetime_without_pool(tmp_path, monkeypatch):
++    from connectomics.utils.shared_buffer import SharedArray
++
++    monkeypatch.setattr(fc, "process_parallel_available", lambda: True)
++    monkeypatch.setattr(
++        fc, "run_process_tasks", lambda fn, tasks, *args, **kwargs: list(map(fn, tasks))
++    )
++    hard = np.ones((3, 4, 4, 4), bool)
++    expected = numba_reference(hard)
++    actual = fc.connected_components_affinity_3d_slab(
++        hard, parallel="forkserver", num_workers=2, slab_size=2, buffer_dir=str(tmp_path)
++    )
++    np.testing.assert_array_equal(actual, expected)
++    assert not list(tmp_path.iterdir())
++
++    labels = fc.connected_components_affinity_3d_slab(
++        hard,
++        parallel="forkserver",
++        num_workers=2,
++        slab_size=2,
++        finalize=False,
++        buffer_dir=str(tmp_path),
++    )
++    assert labels.dtype == np.uint32
++    np.testing.assert_array_equal(labels, np.ones(hard.shape[1:], np.uint32))
++    assert not list(tmp_path.iterdir())
++
++    def fail(*args, **kwargs):
++        raise ValueError("injected finalization failure")
++
++    monkeypatch.setattr(fc, "_finish", fail)
++    buf = SharedArray.create(hard.shape, bool, tmp_path)
++    buf.array[:] = hard
++    with pytest.raises(ValueError, match="finalization"):
++        fc._connected_components_slab(
++            buf, parallel="forkserver", num_workers=2, slab_size=2, buffer_dir=str(tmp_path)
++        )
++    assert not list(tmp_path.iterdir())
++
++
++@pytest.mark.parametrize(
++    "platform,methods,expected",
++    [
++        ("linux", ["fork", "forkserver", "spawn"], "fork"),
++        ("linux", ["spawn"], "forkserver"),
++        ("darwin", ["fork", "spawn"], "forkserver"),
++        ("win32", ["spawn"], "forkserver"),
++    ],
++)
++def test_resolve_parallel(monkeypatch, platform, methods, expected):
++    monkeypatch.setattr(fc.sys, "platform", platform)
++    monkeypatch.setattr(fc.mp, "get_all_start_methods", lambda: methods)
++    monkeypatch.setattr(fc, "process_parallel_available", lambda: True)
++    for mode in ("auto", "processes"):
++        assert fc._resolve_parallel(mode, 2) == expected
++    assert fc._resolve_parallel("auto", 1) == "threads"
++    assert fc._resolve_parallel("forkserver", 2) == "forkserver"
++    if expected == "forkserver":
++        with pytest.raises(RuntimeError):
++            fc._resolve_parallel("fork", 2)
++    monkeypatch.setattr(fc, "process_parallel_available", lambda: False)
++    assert fc._resolve_parallel("auto", 2) == "threads"
++    for mode in ("fork", "forkserver", "processes"):
++        with pytest.raises(RuntimeError):
++            fc._resolve_parallel(mode, 2)
++
++
++@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux fork")
++def test_fork_inherits_without_shared_files(monkeypatch):
++    from connectomics.utils.shared_buffer import SharedArray
++
++    def forbidden(*args, **kwargs):
++        raise AssertionError("Fork must not allocate shared files")
++
++    monkeypatch.setattr(SharedArray, "create", forbidden)
++    hard = np.random.default_rng(9).random((3, 8, 7, 12)) > 0.6
++    for value in (hard, np.asfortranarray(hard), hard[:, :, :, ::2]):
++        value.flags.writeable = False
++        actual = fc.connected_components_affinity_3d_slab(
++            value, parallel="fork", num_workers=2, slab_size=3, finalize=False
++        )
++        expected = fc.connected_components_affinity_3d_slab(
++            value, parallel="threads", num_workers=2, slab_size=3, finalize=False
++        )
++        np.testing.assert_array_equal(actual, expected)
++        assert actual.dtype == expected.dtype
++    decode_affinity_cc(hard, backend="slab", parallel="fork", num_workers=2)
++    assert not hasattr(fc, "_fork_state")
+diff --git a/tests/unit/test_affinity_threshold_reader.py b/tests/unit/test_affinity_threshold_reader.py
+new file mode 100644
+index 000000000..043618622
+--- /dev/null
++++ b/tests/unit/test_affinity_threshold_reader.py
+@@ -0,0 +1,130 @@
++"""Exact native NumPy comparisons for HDF5 affinities."""
++
++import h5py
++import numpy as np
++import pytest
++
++from connectomics.data.io import read_hdf5_affinity_threshold as read
++from connectomics.utils.shared_buffer import process_parallel_available
++
++THRESHOLDS = [
++    -np.inf,
++    -1.0,
++    -0.0,
++    0.0,
++    1e-8,
++    0.3,
++    0.5,
++    0.66,
++    0.7,
++    0.66015625,
++    0.999,
++    1.0,
++    2.0,
++    np.inf,
++    np.nan,
++    np.float32(0.66),
++    np.float16(0.66),
++]
++
++
++def write(path, data, chunked=True):
++    with h5py.File(path, "w") as f:
++        f.create_dataset(
++            "main",
++            data=data,
++            chunks=(1, min(4, data.shape[1]), data.shape[2], data.shape[3]) if chunked else None,
++            compression="lzf" if chunked else None,
++        )
++
++
++@pytest.mark.parametrize("threshold", THRESHOLDS)
++@pytest.mark.parametrize("dtype", ["f2", ">f2"])
++def test_all_float16_patterns(tmp_path, threshold, dtype):
++    data = np.arange(65536, dtype=np.uint16).view(np.float16).reshape(1, 16, 64, 64).astype(dtype)
++    path = tmp_path / "a.h5"
++    write(path, data)
++    actual = read(path, threshold, channels=[0], num_workers=1)
++    np.testing.assert_array_equal(actual, data > threshold)
++    assert actual.dtype == bool and actual.flags.c_contiguous
++
++
++@pytest.mark.parametrize("dtype", ["f2", ">f2", "f4", "u1", "bool"])
++@pytest.mark.parametrize("chunked", [False, True])
++@pytest.mark.parametrize("channels", [(2, 0, 1), (1, 1, 0), (-1, 0, 1)])
++@pytest.mark.parametrize("bbox", [None, (3, 17, 2, 7, 1, 5)])
++def test_dtypes_channels_bbox(tmp_path, dtype, chunked, channels, bbox):
++    data = (np.random.default_rng(0).random((6, 18, 8, 6)) * 2).astype(dtype)
++    path = tmp_path / "a.h5"
++    write(path, data, chunked)
++    actual = read(path, 0.66, channels=channels, bbox=bbox, num_workers=1)
++    expected = data[list(channels)]
++    if bbox is not None:
++        a, b, c, d, e, f = bbox
++        expected = expected[:, a:b, c:d, e:f]
++    np.testing.assert_array_equal(actual, expected > 0.66)
++
++
++@pytest.mark.parametrize(
++    "kwargs,error",
++    [
++        ({"channels": [6]}, IndexError),
++        ({"channels": [-7]}, IndexError),
++        ({"bbox": [0, 19, 0, 8, 0, 6]}, ValueError),
++        ({"bbox": [1]}, ValueError),
++        ({"threshold": [0.5]}, TypeError),
++        ({"threshold": 1j}, TypeError),
++        ({"num_workers": 0}, ValueError),
++    ],
++)
++def test_invalid(tmp_path, kwargs, error):
++    path = tmp_path / "a.h5"
++    write(path, np.ones((6, 18, 8, 6), np.float32))
++    args = {"threshold": 0.5, "num_workers": 1}
++    args.update(kwargs)
++    with pytest.raises(error):
++        read(path, **args)
++
++
++@pytest.mark.skipif(not process_parallel_available(), reason="Processes unavailable")
++def test_process_reader_and_decode(tmp_path):
++    from connectomics.decoding.decoders.affinity_cc_slab import (
++        connected_components_affinity_3d_slab,
++    )
++    from connectomics.decoding.decoders.segmentation import decode_affinity_cc
++
++    data = np.random.default_rng(0).choice(
++        np.array([0.659, 0.66, 0.661, 0, 1], np.float16), (3, 18, 8, 6)
++    )
++    path = tmp_path / "a.h5"
++    buf = tmp_path / "buf"
++    buf.mkdir()
++    write(path, data)
++    kwargs = {"channels": [2, 0, 1], "bbox": (3, 17, 2, 7, 1, 5)}
++    actual = read(path, 0.66, num_workers=3, buffer_dir=str(buf), **kwargs)
++    np.testing.assert_array_equal(actual, read(path, 0.66, num_workers=1, **kwargs))
++    hard = read(path, 0.66, num_workers=3, buffer_dir=str(buf))
++    actual = connected_components_affinity_3d_slab(hard, num_workers=2, parallel="threads")
++    from tests.unit.test_affinity_cc_slab import assert_partition_equal, numba_reference
++
++    expected = numba_reference(data, threshold=0.66)
++    assert_partition_equal(actual, decode_affinity_cc(data, 0.66, backend="numba_serial"))
++    np.testing.assert_array_equal(actual, expected)
++    assert actual.dtype == expected.dtype
++    assert not list(buf.iterdir())
++
++
++@pytest.mark.skipif(not process_parallel_available(), reason="Processes unavailable")
++def test_corrupt_chunk_cleanup(tmp_path):
++    path = tmp_path / "a.h5"
++    buf = tmp_path / "buf"
++    buf.mkdir()
++    write(path, np.zeros((3, 18, 8, 6), np.float16))
++    with h5py.File(path, "r") as f:
++        chunk = f["main"].id.get_chunk_info(0)
++    with open(path, "r+b") as f:
++        f.seek(chunk.byte_offset)
++        f.write(b"\xff" * chunk.size)
++    with pytest.raises(OSError, match="read|decompress|filter|inflate"):
++        read(path, 0.66, num_workers=3, buffer_dir=str(buf))
++    assert not list(buf.iterdir())
+diff --git a/tests/unit/test_shared_buffer.py b/tests/unit/test_shared_buffer.py
+new file mode 100644
+index 000000000..6e73c314a
+--- /dev/null
++++ b/tests/unit/test_shared_buffer.py
+@@ -0,0 +1,125 @@
++"""Storage ownership and worker failure contracts."""
++
++import errno
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from connectomics.utils import shared_buffer as sb
++
++
++def _fd_count():
++    return len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else 0
++
++
++@pytest.mark.parametrize("failure", ["reserve", "truncate", "map", "view"])
++def test_create_failure(tmp_path, monkeypatch, failure):
++    before = _fd_count()
++
++    def fail(*args, **kwargs):
++        raise OSError(errno.ENOSPC, "injected")
++
++    if failure == "reserve":
++        monkeypatch.setattr(os, "posix_fallocate", fail, raising=False)
++    elif failure == "truncate":
++        monkeypatch.delattr(os, "posix_fallocate", raising=False)
++        monkeypatch.setattr(os, "ftruncate", fail)
++    elif failure == "map":
++        monkeypatch.setattr(sb.mmap, "mmap", fail)
++    else:
++        monkeypatch.setattr(sb.np, "frombuffer", fail)
++    with pytest.raises(OSError, match="injected"):
++        sb.SharedArray.create((16,), np.uint32, tmp_path)
++    assert not list(tmp_path.iterdir())
++    assert _fd_count() == before
++
++
++def test_unsupported_reservation_and_lifetime(tmp_path, monkeypatch):
++    def unsupported(*args):
++        raise OSError(errno.EOPNOTSUPP, "unsupported")
++
++    monkeypatch.setattr(os, "posix_fallocate", unsupported, raising=False)
++    buf = sb.SharedArray.create((4,), np.uint32, tmp_path)
++    buf.array[:] = [1, 2, 3, 4]
++    attached = sb.attach(buf.path, (4,), np.uint32)
++    np.testing.assert_array_equal(attached.array, buf.array)
++    attached.close()
++    array = buf.array
++    buf.release_path()
++    buf.release_path()
++    buf.close()
++    buf.close()
++    np.testing.assert_array_equal(array, [1, 2, 3, 4])
++    assert not list(tmp_path.iterdir())
++
++
++def _run_child(tmp_path, code):
++    script = tmp_path / "child.py"
++    root = Path(__file__).resolve().parents[2]
++    script.write_text(
++        "import connectomics\n"
++        "from pathlib import Path\n"
++        f"assert Path(connectomics.__file__).resolve().is_relative_to(Path({str(root)!r}))\n" + code
++    )
++    env = os.environ.copy()
++    env["PYTHONPATH"] = str(root)
++    result = subprocess.run(
++        [sys.executable, str(script)],
++        capture_output=True,
++        text=True,
++        timeout=300,
++        env=env,
++        cwd=root,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++
++
++@pytest.mark.skipif(
++    not hasattr(os, "posix_fallocate") or sys.platform != "linux", reason="Linux reservation test"
++)
++def test_real_reservation_failure(tmp_path):
++    buf = tmp_path / "buf"
++    buf.mkdir()
++    _run_child(
++        tmp_path,
++        f"""
++import resource, signal, os
++from connectomics.utils.shared_buffer import SharedArray
++signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
++resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, 1 << 20))
++try:
++    SharedArray.create((16 << 20,), "u1", {str(buf)!r})
++except OSError:
++    assert not os.listdir({str(buf)!r})
++else:
++    raise AssertionError("Reservation unexpectedly succeeded")
++""",
++    )
++
++
++@pytest.mark.skipif(not sb.process_parallel_available(), reason="Processes unavailable")
++def test_worker_failure_and_order(tmp_path):
++    _run_child(
++        tmp_path,
++        """
++import os
++from concurrent.futures.process import BrokenProcessPool
++from connectomics.utils.shared_buffer import run_process_tasks
++
++def die(value):
++    os._exit(1)
++
++if __name__ == "__main__":
++    assert run_process_tasks(abs, [-3, -1, -2], 2) == [3, 1, 2]
++    try:
++        run_process_tasks(die, [1], 1)
++    except BrokenProcessPool:
++        pass
++    else:
++        raise AssertionError("Worker death did not propagate")
++""",
++    )
+diff --git a/tests/unit/test_v3_guardrails.py b/tests/unit/test_v3_guardrails.py
+index d40f32bc4..d4eafb617 100644
+--- a/tests/unit/test_v3_guardrails.py
++++ b/tests/unit/test_v3_guardrails.py
+@@ -49,7 +49,9 @@ def _forbidden_imports(root: Path, forbidden_prefixes: tuple[str, ...]) -> list[
+                 imported_modules = [_resolve_import_from(module_name, node)]
+ 
+             for imported_module in imported_modules:
+-                if imported_module.startswith(forbidden_prefixes):
++                if isinstance(node, (ast.Import, ast.ImportFrom)) and imported_module.startswith(
++                    forbidden_prefixes
++                ):
+                     rel = path.relative_to(REPO_ROOT)
+                     violations.append(f"{rel}:{node.lineno}: {imported_module}")
+     return violations
+@@ -193,3 +195,20 @@ def test_connectomics_inference_public_api_snapshot():
+         "is_2d_inference_mode",
+         "TTAPredictor",
+     }
++
++
++def test_data_io_public_api_snapshot():
++    import connectomics.data.io as io
++
++    assert set(io.__all__) == {
++        "read_hdf5",
++        "read_hdf5_affinity_threshold",
++        "write_hdf5",
++        "read_images",
++        "read_volume",
++        "save_volume",
++        "get_vol_shape",
++        "volume_exists",
++        "LoadVolumed",
++        "rgb_to_seg",
++    }

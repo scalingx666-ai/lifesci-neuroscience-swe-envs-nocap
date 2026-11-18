@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** [AUTO] pre-commit update
+
+## Description
+
+Automated changes by [create-pull-request](https://github.com/peter-evans/create-pull-request) GitHub action
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `193e31956243`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

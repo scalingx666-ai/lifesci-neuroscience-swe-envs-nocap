@@ -1,0 +1,14 @@
+# Issue
+
+**Title:** Use of `global` at module level
+
+## Description
+
+Declaring variables as global at module-level is redundant. Initialize them instead.
+
+Silence these LGTM.com warnings:
+https://lgtm.com/projects/g/OpenNFT/OpenNFT/alerts/?severity=warning
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `33c17b30884e`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,510 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 82d63e1e..458f954d 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -272,9 +272,13 @@ jobs:
+       # first, each holding 2–5 combined points. We ship ONLY the section whose
+       # heading matches the version being released — `cat`ting the whole file
+       # was how every update ended up showing a dozen notes from releases the
+-      # user had already installed. Two fallbacks keep a release shippable: an
+-      # unmatched version falls back to the topmost section (someone forgot to
+-      # rename the heading), and a missing file to the one-line placeholder.
++      # user had already installed.
++      #
++      # SILENT IS THE DEFAULT. A release announces itself only when its own
++      # `## <version>` section has points; no section, an empty section or a
++      # missing file all ship silently (see below). There is deliberately no
++      # fallback to the topmost section any more: that fallback re-announced the
++      # previous release's notes whenever a version had none of its own.
+       #
+       # The leading HTML comment (the authoring rules) is stripped, and the
+       # `## <version>` heading line itself is not emitted — GitHub already
+@@ -295,16 +299,18 @@ jobs:
+               BEGIN { want = "## " ver }
+               incomment { if (index($0, "-->")) incomment = 0; next }
+               index($0, "<!--") { if (!index($0, "-->")) incomment = 1; next }
+-              /^##[ \t]/ { nsec++; cur = ($0 == want) ? 2 : (nsec == 1 ? 1 : 0); next }
+-              cur == 1 { first[++nfirst] = $0 }
+-              cur == 2 { hit[++nhit] = $0 }
+-              END { if (nhit > 0) emit(hit, nhit); else emit(first, nfirst) }
++              /^##[ \t]/ { cur = ($0 == want); next }
++              cur { hit[++nhit] = $0 }
++              END { emit(hit, nhit) }
+             ' docs/RELEASE_NOTES.md)
+           else
+             body=''
+           fi
++          # No points for this version = a silent update: the release still
++          # ships and installs everywhere, but the marker (an HTML comment, so
++          # the GitHub page never shows it) keeps the in-app What's New closed.
+           if [ -z "$body" ]; then
+-            body='See the assets below to download and install this version.'
++            body=$'See the assets below to download and install this version.\n<!-- baalda:silent -->'
+           fi
+           echo "Release notes for v$VERSION:"
+           echo "$body"
+diff --git a/.github/workflows/staging-release.yml b/.github/workflows/staging-release.yml
+index 5c48ed04..96f68c81 100644
+--- a/.github/workflows/staging-release.yml
++++ b/.github/workflows/staging-release.yml
+@@ -497,6 +497,10 @@ jobs:
+                 echo
+                 echo "$section"
+               } >> "$RUNNER_TEMP/staging-notes.md"
++            else
++              # No queued points is a silent release, exactly as in release.yml
++              # (silent is the default): testers get the update without What's New.
++              printf '\n<!-- baalda:silent -->\n' >> "$RUNNER_TEMP/staging-notes.md"
+             fi
+           fi
+ 
+diff --git a/app/apps/desktop/src-tauri/src/lib.rs b/app/apps/desktop/src-tauri/src/lib.rs
+index 4511b0db..77d8b345 100644
+--- a/app/apps/desktop/src-tauri/src/lib.rs
++++ b/app/apps/desktop/src-tauri/src/lib.rs
+@@ -19,6 +19,7 @@ pub mod keychain;
+ pub mod notefile;
+ pub mod oauth;
+ pub mod parse;
++mod relaunch;
+ mod state;
+ pub mod stats;
+ pub mod tree;
+@@ -159,6 +160,9 @@ pub fn run() {
+             // managed to render, instead of the app running invisibly. Tauri v2
+             // window methods are callable off the main thread and show() on a
+             // visible window is a no-op, so this needs no coordination.
++            // A silent update restarted us while another app was in front:
++            // hand focus straight back (see `relaunch.rs`).
++            relaunch::apply_on_launch(app.handle());
+             #[cfg(desktop)]
+             if let Some(win) = app.get_webview_window("main") {
+                 // While it is still hidden, so the first frame is already the
+@@ -173,18 +177,25 @@ pub fn run() {
+                         "[window] frontend never revealed the window in 1500ms; showing it anyway"
+                     );
+                     let _ = win.show();
+-                    let _ = win.set_focus();
++                    let background =
++                        win.app_handle().state::<relaunch::BackgroundLaunch>().get();
++                    if !background {
++                        let _ = win.set_focus();
++                    }
+                 });
+             }
+             Ok(())
+         })
+         .manage(AppState::default())
++        .manage(relaunch::BackgroundLaunch::default())
+         // Native clipboard (`clipboard_write`): the webview's navigator.clipboard
+         // is tied to WebKit's transient user activation, which an await (e.g.
+         // minting a share link) outlives — a native call has no such rule.
+         .manage(clipboard::ClipboardState::default())
+         .invoke_handler(tauri::generate_handler![
+             clipboard::clipboard_write,
++            relaunch::set_background_relaunch,
++            relaunch::launched_in_background,
+             commands::pick_vault,
+             commands::open_vault,
+             commands::get_last_vault,
+diff --git a/app/apps/desktop/src-tauri/src/relaunch.rs b/app/apps/desktop/src-tauri/src/relaunch.rs
+new file mode 100644
+index 00000000..8c068577
+--- /dev/null
++++ b/app/apps/desktop/src-tauri/src/relaunch.rs
+@@ -0,0 +1,122 @@
++//! Background relaunch after a silent update.
++//!
++//! An auto-update restarts the app. When Baalda was behind another app at that
++//! moment, the new process must not jump in front of it — but on macOS tao
++//! calls `activateIgnoringOtherApps(true)` in `applicationDidFinishLaunching`,
++//! and Tauri exposes no way to turn that off. So the old process leaves a
++//! marker just before it restarts, and the new one reads it in `setup` (which
++//! runs AFTER that activation) and hides itself again, handing focus back to
++//! the app the user was in. The main window is still hidden at that point
++//! (`visible: false`), so nothing flashes; clicking the Dock icon brings it back
++//! with the What's New modal already waiting.
++//!
++//! The marker carries a timestamp and is honoured only while fresh: a restart
++//! that never happened must not make some later, manual launch hide itself.
++
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use tauri::{AppHandle, Manager, Runtime, State};
++
++use crate::error::AppError;
++
++const MARKER: &str = "background-relaunch";
++
++/// How long a marker stays valid. Long enough for a Windows installer (the
++/// marker is written before the download there, because the process exits
++/// inside `install`), short enough that a failed restart is forgotten.
++pub const MARKER_TTL_MS: u64 = 10 * 60 * 1000;
++
++/// Whether THIS process was started by a background relaunch. Read by the
++/// frontend (so its first reveal does not take focus) and by the reveal
++/// backstop in `lib.rs`.
++#[derive(Default)]
++pub struct BackgroundLaunch(AtomicBool);
++
++impl BackgroundLaunch {
++    pub fn get(&self) -> bool {
++        self.0.load(Ordering::Relaxed)
++    }
++}
++
++fn now_ms() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_millis() as u64)
++        .unwrap_or(0)
++}
++
++fn marker_path<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
++    app.path().app_config_dir().ok().map(|d| d.join(MARKER))
++}
++
++/// True when a marker written at `written_ms` still applies at `now_ms`.
++pub fn marker_is_fresh(written_ms: u64, now_ms: u64) -> bool {
++    now_ms >= written_ms && now_ms - written_ms <= MARKER_TTL_MS
++}
++
++/// Consume the marker (always deleting it) and report whether it applies.
++pub fn take_marker<R: Runtime>(app: &AppHandle<R>) -> bool {
++    let Some(path) = marker_path(app) else { return false };
++    let Ok(raw) = std::fs::read_to_string(&path) else { return false };
++    let _ = std::fs::remove_file(&path);
++    raw.trim()
++        .parse::<u64>()
++        .map(|written| marker_is_fresh(written, now_ms()))
++        .unwrap_or(false)
++}
++
++/// Called by `setup`: if this launch is a background relaunch, remember it and
++/// give focus back to whatever the user was using.
++pub fn apply_on_launch<R: Runtime>(app: &AppHandle<R>) {
++    if !take_marker(app) {
++        return;
++    }
++    app.state::<BackgroundLaunch>().0.store(true, Ordering::Relaxed);
++    #[cfg(target_os = "macos")]
++    if let Err(e) = app.hide() {
++        log::warn!("[relaunch] could not hide after a background relaunch: {e}");
++    }
++}
++
++/// Write (`background: true`) or clear the marker for the next launch.
++#[tauri::command]
++pub fn set_background_relaunch<R: Runtime>(
++    app: AppHandle<R>,
++    background: bool,
++) -> Result<(), AppError> {
++    let Some(path) = marker_path(&app) else { return Ok(()) };
++    if !background {
++        let _ = std::fs::remove_file(&path);
++        return Ok(());
++    }
++    if let Some(dir) = path.parent() {
++        std::fs::create_dir_all(dir).map_err(|e| AppError(e.to_string()))?;
++    }
++    std::fs::write(&path, now_ms().to_string()).map_err(|e| AppError(e.to_string()))
++}
++
++/// Was this process started by a background relaunch?
++#[tauri::command]
++pub fn launched_in_background(state: State<'_, BackgroundLaunch>) -> bool {
++    state.get()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn fresh_marker_applies() {
++        assert!(marker_is_fresh(1_000, 1_000));
++        assert!(marker_is_fresh(1_000, 1_000 + MARKER_TTL_MS));
++    }
++
++    #[test]
++    fn stale_or_future_marker_is_ignored() {
++        assert!(!marker_is_fresh(1_000, 1_001 + MARKER_TTL_MS));
++        // A clock that went backwards must not make a marker live forever.
++        assert!(!marker_is_fresh(5_000, 1_000));
++    }
++}
+diff --git a/app/apps/desktop/src/App.tsx b/app/apps/desktop/src/App.tsx
+index 3a06de97..22442c7f 100644
+--- a/app/apps/desktop/src/App.tsx
++++ b/app/apps/desktop/src/App.tsx
+@@ -43,7 +43,7 @@ import {
+   justUpdatedTo,
+   useUpdateState,
+ } from "./lib/updater";
+-import { notesForVersion, releaseNoteLines } from "./lib/releaseNotes";
++import { isSilentRelease, notesForVersion, releaseNoteLines } from "./lib/releaseNotes";
+ import { runConfetti } from "./lib/celebrate/celebrate";
+ import { viewerFor } from "./lib/formats";
+ import { onOpenFileRequest } from "./lib/openFileRequest";
+@@ -686,6 +686,11 @@ function WhatsNewModal() {
+     let cancelled = false;
+     void justUpdatedTo().then((stash) => {
+       if (cancelled || !stash) return;
++      // A silent release (its notes section left empty) updates without a word.
++      if (isSilentRelease(stash.notes, stash.version)) {
++        clearJustUpdated();
++        return;
++      }
+       // Only the section for the version we were actually given, and at most
+       // five points of it. The body used to be the whole cumulative notes file,
+       // so every update opened on twelve bullets from releases already
+diff --git a/app/apps/desktop/src/lib/__tests__/autoUpdate.test.ts b/app/apps/desktop/src/lib/__tests__/autoUpdate.test.ts
+index 630c8c12..35303736 100644
+--- a/app/apps/desktop/src/lib/__tests__/autoUpdate.test.ts
++++ b/app/apps/desktop/src/lib/__tests__/autoUpdate.test.ts
+@@ -23,6 +23,10 @@ vi.mock("@tauri-apps/api/app", () => ({
+ vi.mock("../bridge", () => ({
+   bridgeManager: { currentBridge: () => ({ flushEgest }) },
+ }));
++vi.mock("../backgroundRelaunch", () => ({
++  recordRelaunchFocus: async () => {},
++  clearRelaunchFocus: async () => {},
++}));
+ vi.mock("../quietMoment", () => ({
+   waitForQuietMoment: () => waitForQuietMoment(),
+ }));
+diff --git a/app/apps/desktop/src/lib/__tests__/releaseNotes.test.ts b/app/apps/desktop/src/lib/__tests__/releaseNotes.test.ts
+index 7ecc70ad..23a63510 100644
+--- a/app/apps/desktop/src/lib/__tests__/releaseNotes.test.ts
++++ b/app/apps/desktop/src/lib/__tests__/releaseNotes.test.ts
+@@ -1,5 +1,10 @@
+ import { describe, it, expect } from "vitest";
+-import { notesForVersion, releaseNoteLines } from "../releaseNotes";
++import {
++  SILENT_RELEASE_MARKER,
++  isSilentRelease,
++  notesForVersion,
++  releaseNoteLines,
++} from "../releaseNotes";
+ 
+ /** A body shaped like docs/RELEASE_NOTES.md: comment header, newest-first sections. */
+ const MULTI = `<!--
+@@ -144,3 +149,24 @@ describe("releaseNoteLines", () => {
+     ]);
+   });
+ });
++
++describe("isSilentRelease", () => {
++  it("is silent when the workflow marked the body", () => {
++    const body = `See the assets below to download and install this version.\n${SILENT_RELEASE_MARKER}`;
++    expect(isSilentRelease(body, "0.1.70")).toBe(true);
++  });
++
++  it("is silent when a staging body carries the marker under its warning", () => {
++    const body = `**This is a STAGING build.**\n\n- Staging version: x\n\n${SILENT_RELEASE_MARKER}`;
++    expect(isSilentRelease(body, "0.1.70-staging.3")).toBe(true);
++  });
++
++  it("is silent when there is nothing to list", () => {
++    expect(isSilentRelease(null, "0.1.70")).toBe(true);
++    expect(isSilentRelease("See the assets below to download and install this version.", "0.1.70")).toBe(true);
++  });
++
++  it("announces a release with notes", () => {
++    expect(isSilentRelease(MULTI, "0.1.60")).toBe(false);
++  });
++});
+diff --git a/app/apps/desktop/src/lib/backgroundRelaunch.ts b/app/apps/desktop/src/lib/backgroundRelaunch.ts
+new file mode 100644
+index 00000000..c3a0b4e5
+--- /dev/null
++++ b/app/apps/desktop/src/lib/backgroundRelaunch.ts
+@@ -0,0 +1,36 @@
++// Keep a silent update's restart behind whatever app the user is in.
++//
++// Just before an update restarts the app we record whether Baalda was in the
++// background; the new process reads that in Rust `setup` and, on macOS, hides
++// itself again so it never jumps in front (see `src-tauri/src/relaunch.rs`).
++// The What's New modal is simply waiting when the user comes back.
++import { invoke } from "@tauri-apps/api/core";
++import { getCurrentWindow } from "@tauri-apps/api/window";
++
++/** Record for the next launch whether the window is focused now. Never throws. */
++export async function recordRelaunchFocus(): Promise<void> {
++  try {
++    const focused = await getCurrentWindow().isFocused();
++    await invoke("set_background_relaunch", { background: !focused });
++  } catch (e) {
++    console.warn("[update] could not record focus for the relaunch", e);
++  }
++}
++
++/** Forget the record: the restart did not happen. Never throws. */
++export async function clearRelaunchFocus(): Promise<void> {
++  try {
++    await invoke("set_background_relaunch", { background: false });
++  } catch {
++    // Harmless: a stale marker expires on its own.
++  }
++}
++
++/** Was this process started by a background relaunch? False outside Tauri. */
++export async function launchedInBackground(): Promise<boolean> {
++  try {
++    return await invoke<boolean>("launched_in_background");
++  } catch {
++    return false;
++  }
++}
+diff --git a/app/apps/desktop/src/lib/releaseNotes.ts b/app/apps/desktop/src/lib/releaseNotes.ts
+index fa3c6447..86fb09f2 100644
+--- a/app/apps/desktop/src/lib/releaseNotes.ts
++++ b/app/apps/desktop/src/lib/releaseNotes.ts
+@@ -88,3 +88,24 @@ export function releaseNoteLines(
+     .map((line) => line.replace(/\*\*(.+?)\*\*/g, "$1"))
+     .slice(0, max);
+ }
++
++/**
++ * The release workflows append this to a release body whose version section in
++ * `docs/RELEASE_NOTES.md` was left empty: "ship it, but don't announce it". It
++ * is an HTML comment, so the GitHub release page never shows it.
++ */
++export const SILENT_RELEASE_MARKER = "<!-- baalda:silent -->";
++
++/**
++ * Should the What's New modal stay closed for this update? Yes when the
++ * workflow marked it silent, and yes when there is nothing to list anyway — a
++ * modal that says "here's what changed" over an empty list tells the user an
++ * update happened and nothing else.
++ */
++export function isSilentRelease(
++  body: string | null | undefined,
++  version?: string | null,
++): boolean {
++  if (body?.includes(SILENT_RELEASE_MARKER)) return true;
++  return releaseNoteLines(notesForVersion(body, version)).length === 0;
++}
+diff --git a/app/apps/desktop/src/lib/updater.ts b/app/apps/desktop/src/lib/updater.ts
+index b043673c..da0dbe13 100644
+--- a/app/apps/desktop/src/lib/updater.ts
++++ b/app/apps/desktop/src/lib/updater.ts
+@@ -25,6 +25,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
+ import { check, type Update } from "@tauri-apps/plugin-updater";
+ import { useSyncExternalStore } from "react";
+ 
++import { clearRelaunchFocus, recordRelaunchFocus } from "./backgroundRelaunch";
+ import { bridgeManager } from "./bridge";
+ import { waitForQuietMoment } from "./quietMoment";
+ 
+@@ -152,6 +153,9 @@ export async function installUpdate(
+   }
+   // See the Windows note above: this is the flush that is guaranteed to run.
+   await flushOpenNote();
++  // Windows restarts from inside `install`, so its focus record is taken now;
++  // macOS/Linux take a fresh one right before `relaunch()` below.
++  await recordRelaunchFocus();
+   let total = 0;
+   let downloaded = 0;
+   try {
+@@ -178,9 +182,11 @@ export async function installUpdate(
+     if (options.waitForQuiet !== false) await waitForQuietMoment();
+     // Catch anything typed during the download and the wait.
+     await flushOpenNote();
++    await recordRelaunchFocus();
+     await relaunch();
+     return true;
+   } catch (e) {
++    await clearRelaunchFocus();
+     setState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
+     return false;
+   }
+@@ -231,6 +237,8 @@ async function autoInstall(): Promise<void> {
+  */
+ export async function relaunchForUpdate(): Promise<void> {
+   await flushOpenNote();
++  // A deliberate click: the restart may come back to the front.
++  await clearRelaunchFocus();
+   await relaunch();
+ }
+ 
+diff --git a/app/apps/desktop/src/lib/windowReveal.ts b/app/apps/desktop/src/lib/windowReveal.ts
+index b0597a16..a2497cf6 100644
+--- a/app/apps/desktop/src/lib/windowReveal.ts
++++ b/app/apps/desktop/src/lib/windowReveal.ts
+@@ -1,4 +1,5 @@
+ import { getCurrentWindow } from "@tauri-apps/api/window";
++import { launchedInBackground } from "./backgroundRelaunch";
+ import * as perf from "./perf";
+ 
+ /** The window starts hidden (`visible: false` in `tauri.conf.json`) so nobody
+@@ -24,8 +25,11 @@ export function revealWindowOnce(): void {
+     const win = getCurrentWindow();
+     void win
+       .show()
+-      .then(() => {
++      .then(async () => {
+         perf.mark("window-shown");
++        // After a background relaunch the app hid itself so the user's other
++        // app keeps focus; taking focus here would undo exactly that.
++        if (await launchedInBackground()) return;
+         return win.setFocus();
+       })
+       .catch((e) => console.warn("[window] show from the frontend failed", e));
+diff --git a/docs/RELEASE.md b/docs/RELEASE.md
+index 0bd43c51..ef22322b 100644
+--- a/docs/RELEASE.md
++++ b/docs/RELEASE.md
+@@ -49,9 +49,8 @@ the points to tauri-action as the GitHub release body. That body becomes
+ `latest.json`'s `notes`, which the desktop shows in the **What's New** modal on
+ the first launch after an update — so a user sees the version they just got and
+ nothing else. (It used to `cat` the whole file, which is why every update opened
+-on a dozen bullets from releases already installed.) Two fallbacks keep a
+-release shippable: an unmatched version falls back to the topmost section, and a
+-missing file to a one-line placeholder. The desktop side is the backstop:
++on a dozen bullets from releases already installed.) A version with no section
++of its own, or an empty one, gets a one-line placeholder and ships silently. The desktop side is the backstop:
+ `src/lib/releaseNotes.ts` re-selects the section for the received version and
+ caps the modal at five points.
+ 
+@@ -59,6 +58,18 @@ caps the modal at five points.
+ tester-facing warning, because the version bump only happens at promotion — the
+ base version there still names the release that already shipped.
+ 
++**Silent updates are the default.** A release announces itself only when its
++own section has points; with no section or an empty one both workflows add a
++`<!-- baalda:silent -->` marker to the release body (invisible on GitHub), and
++the desktop skips the What's New modal (`isSilentRelease`). The update still
++installs and restarts everywhere exactly as usual.
++
++**Background restarts.** An update that restarts the app while Baalda is behind
++another app keeps it there: the old process records its focus
++(`lib/backgroundRelaunch.ts` → Rust `set_background_relaunch`) and the new one
++hides itself again in `setup` on macOS, before its window is ever shown
++(`src-tauri/src/relaunch.rs`). What's New waits for the user's return.
++
+ ### What triggers a release, and what doesn't
+ 
+ | Event | Releases? |
+diff --git a/docs/RELEASE_NOTES.md b/docs/RELEASE_NOTES.md
+index 23ce5a2a..a052f595 100644
+--- a/docs/RELEASE_NOTES.md
++++ b/docs/RELEASE_NOTES.md
+@@ -11,11 +11,14 @@
+   - One or two sentences per point, ~200 characters at most. Plain language, no
+     file names, no issue numbers.
+   - `.github/workflows/release.yml` ships ONLY the section whose heading matches
+-    the version being released (falling back to the topmost section), and strips
++    the version being released (never another version's), and strips
+     this comment. Old sections are history, not release copy — they must never
+     reappear under a new version.
+   - Every staging PR adds or edits ONLY the section for the version it will ship
+     in. If that section does not exist yet, create it at the top.
++  - SILENT IS THE DEFAULT. A release shows What's New only when its own
++    `## <version>` section has points; no section or an empty one ships silently
++    (every app still installs it). Ask before each release: silent, or notes?
+ -->
+ 
+ ## 0.1.69

@@ -1,0 +1,477 @@
+diff --git a/README.md b/README.md
+index 94f987b..f7e2f5f 100644
+--- a/README.md
++++ b/README.md
+@@ -121,6 +121,8 @@ type BrainRecordFile = {
+ type BrainRecord = BrainRecordFile & { path: string };
+ ```
+ 
++Payload values are validated without invoking accessors. They may contain at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
++
+ The disposable cache lives at `node_modules/.cache/encephalon/brain.sqlite` and should not be committed. It uses SQLite WAL mode, FTS5, a repository-scoped operation lock, manifest-based freshness, and transactional table rebuilds. Canonical records remain the source of truth.
+ 
+ Artifacts must be regular, non-symlink files beneath `_artifacts/<kind>/<id>/`. Record IDs and artifact paths are checked for traversal, platform portability, Windows-reserved names, case collisions, size limits, and containment.
+diff --git a/docs/implementation-plan.md b/docs/implementation-plan.md
+index 6aa1e14..0b6c7f2 100644
+--- a/docs/implementation-plan.md
++++ b/docs/implementation-plan.md
+@@ -460,6 +460,7 @@ export type BrainRecord = BrainRecordFile & {
+ - Is required and may be any valid `JsonValue`.
+ - Runtime validation rejects `undefined`, `bigint`, functions, symbols, non-finite numbers, cyclic values, sparse arrays, non-plain objects, accessors, Maps, Sets, Dates, and typed arrays.
+ - Objects must have `Object.prototype` or a null prototype and enumerable string keys whose values are valid JSON.
++- Payload validation accepts at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
+ - The final formatted record file must not exceed 1 MiB.
+ 
+ `searchText`:
+diff --git a/encephalon/review/8c2a847d-2333-4c6c-b88e-759a47ae4150.json b/encephalon/review/8c2a847d-2333-4c6c-b88e-759a47ae4150.json
+new file mode 100644
+index 0000000..7fa5a11
+--- /dev/null
++++ b/encephalon/review/8c2a847d-2333-4c6c-b88e-759a47ae4150.json
+@@ -0,0 +1,20 @@
++{
++  "createdAt": "2026-08-08T11:55:16.632Z",
++  "id": "8c2a847d-2333-4c6c-b88e-759a47ae4150",
++  "kind": "review",
++  "payload": {
++    "summary": "Payload validation must fail closed for object descriptors that are enumerable but lack a data value, matching sparse-array handling.",
++    "lessons": [
++      "After rejecting accessor payload properties, object traversal should still require every enumerable descriptor to carry a data value before queueing it for validation.",
++      "Keep array and object descriptor handling symmetric: invalid or value-less descriptors must produce INVALID_ARGUMENT rather than silently dropping payload keys.",
++      "Hostile descriptor tests are the right place to verify future changes around accessor-free payload traversal."
++    ],
++    "verification": [
++      "When editing validateJsonValueAt, inspect both the array descriptor branch and the object descriptor branch for equivalent fail-closed behavior.",
++      "Run records tests that cover payload accessors and hostile payload descriptors before committing schema validation changes."
++    ]
++  },
++  "searchText": "payload property descriptor validation object array symmetry Pullfrog",
++  "source": "agent",
++  "subject": "review.payload-descriptor-validation"
++}
+diff --git a/src/schema.ts b/src/schema.ts
+index b461408..3f879c4 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -5,6 +5,8 @@ import { fail } from './errors.ts'
+ import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
+ 
+ export const MAX_RECORD_BYTES = 1024 * 1024
++export const MAX_PAYLOAD_DEPTH = 64
++export const MAX_PAYLOAD_NODES = 10_000
+ const MAX_SEARCH_TEXT_BYTES = 256 * 1024
+ const MAX_TEXT_BYTES = 1024
+ const MAX_ARTIFACTS = 256
+@@ -92,57 +94,187 @@ const validateStringArray = (value: unknown, field: string, item: (value: unknow
+   return fail('INVALID_ARGUMENT', `${field} must be a non-empty array of unique strings.`, { field })
+ }
+ 
+-const validateJsonAt = (value: unknown, seen: WeakSet<object>, path: string): JsonValue => {
+-  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
++type PayloadTarget = {
++  container: JsonValue[] | { [key: string]: JsonValue }
++  key: number | string
++}
++
++type PayloadWorkItem =
++  | {
++      action: 'enter'
++      depth: number
++      path: string
++      target?: PayloadTarget
++      value: unknown
++    }
++  | {
++      action: 'exit'
++      value: object
++    }
++
++const assignPayloadValue = (target: PayloadTarget | undefined, value: JsonValue) => {
++  if (target === undefined) {
+     return value
+   }
++  if (Array.isArray(target.container) && typeof target.key === 'number') {
++    target.container[target.key] = value
++    return
++  }
++  if (!Array.isArray(target.container) && typeof target.key === 'string') {
++    Object.defineProperty(target.container, target.key, {
++      configurable: true,
++      enumerable: true,
++      value,
++      writable: true,
++    })
++    return
++  }
++  return fail('INTERNAL_ERROR', 'Payload traversal target is invalid.')
++}
++
++const getPayloadPrototype = (value: object, path: string) => {
++  try {
++    return Object.getPrototypeOf(value)
++  } catch {
++    return fail('INVALID_ARGUMENT', 'payload object metadata could not be inspected.', {
++      field: path,
++    })
++  }
++}
++
++const getPayloadDescriptors = (value: object, path: string) => {
++  try {
++    return Object.getOwnPropertyDescriptors(value)
++  } catch {
++    return fail('INVALID_ARGUMENT', 'payload object descriptors could not be inspected.', {
++      field: path,
++    })
++  }
++}
++
++const assertPayloadDescriptors = (descriptors: PropertyDescriptorMap, path: string) => {
++  const descriptorKeys = Reflect.ownKeys(descriptors)
++  if (descriptorKeys.some(key => typeof key === 'symbol')) {
++    return fail('INVALID_ARGUMENT', 'payload contains a symbol-keyed property.', { field: path })
++  }
++  const accessorKey = descriptorKeys.find(key => {
++    const descriptor = Reflect.get(descriptors, key) as PropertyDescriptor | undefined
++    return descriptor !== undefined && ('get' in descriptor || 'set' in descriptor)
++  })
++  if (accessorKey !== undefined) {
++    return fail('INVALID_ARGUMENT', 'payload contains an accessor property.', { field: path })
++  }
++}
++
++const validateJsonValueAt = (
++  value: unknown,
++  path: string,
++  depth: number,
++  target: PayloadTarget | undefined,
++  stack: PayloadWorkItem[],
++  seen: WeakSet<object>,
++  nodeCount: { value: number },
++) => {
++  nodeCount.value += 1
++  if (nodeCount.value > MAX_PAYLOAD_NODES) {
++    return fail('INVALID_ARGUMENT', `payload may contain at most ${MAX_PAYLOAD_NODES} JSON nodes.`, {
++      field: path,
++    })
++  }
++  if (depth > MAX_PAYLOAD_DEPTH) {
++    return fail('INVALID_ARGUMENT', `payload may be nested at most ${MAX_PAYLOAD_DEPTH} levels deep.`, {
++      field: path,
++    })
++  }
++  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
++    return assignPayloadValue(target, value)
++  }
+   if (typeof value === 'number') {
+     if (Number.isFinite(value)) {
+-      return value
++      return assignPayloadValue(target, Object.is(value, -0) ? 0 : value)
+     }
+     return fail('INVALID_ARGUMENT', 'payload contains a non-finite number.', {
+       field: path,
+     })
+   }
+   if (Array.isArray(value)) {
+-    if (Object.getOwnPropertySymbols(value).length > 0) {
+-      return fail('INVALID_ARGUMENT', 'payload contains a symbol-keyed property.', { field: path })
+-    }
+     if (seen.has(value)) {
+       return fail('INVALID_ARGUMENT', 'payload contains a cycle.', {
+         field: path,
+       })
+     }
+-    seen.add(value)
+-    const values = Array.from({ length: value.length }, (_, index) => {
+-      if (Object.hasOwn(value, index)) {
+-        return validateJsonAt(value[index], seen, `${path}[${index}]`)
+-      }
+-      return fail('INVALID_ARGUMENT', 'payload contains a sparse array.', {
++    const descriptors = getPayloadDescriptors(value, path)
++    assertPayloadDescriptors(descriptors, path)
++    const length = descriptors.length?.value
++    if (!Number.isSafeInteger(length) || length < 0) {
++      return fail('INVALID_ARGUMENT', 'payload contains an invalid array length.', { field: path })
++    }
++    if (length > MAX_PAYLOAD_NODES - nodeCount.value) {
++      return fail('INVALID_ARGUMENT', `payload may contain at most ${MAX_PAYLOAD_NODES} JSON nodes.`, {
+         field: path,
+       })
+-    })
+-    seen.delete(value)
+-    return values
++    }
++    seen.add(value)
++    const values: JsonValue[] = new Array(length)
++    const assigned = assignPayloadValue(target, values)
++    stack.push({ action: 'exit', value })
++    for (let index = length - 1; index >= 0; index -= 1) {
++      const descriptor = descriptors[String(index)]
++      if (descriptor !== undefined && 'value' in descriptor) {
++        stack.push({
++          action: 'enter',
++          depth: depth + 1,
++          path: `${path}[${index}]`,
++          target: { container: values, key: index },
++          value: descriptor.value,
++        })
++      } else {
++        return fail('INVALID_ARGUMENT', 'payload contains a sparse array.', {
++          field: path,
++        })
++      }
++    }
++    return assigned
+   }
+   if (typeof value === 'object') {
+     const object = value as object
+-    const prototype = Object.getPrototypeOf(object)
++    const prototype = getPayloadPrototype(object, path)
+     if (prototype === Object.prototype || prototype === null) {
+-      if (Object.getOwnPropertySymbols(object).length > 0) {
+-        return fail('INVALID_ARGUMENT', 'payload contains a symbol-keyed property.', { field: path })
+-      }
+       if (seen.has(object)) {
+         return fail('INVALID_ARGUMENT', 'payload contains a cycle.', {
+           field: path,
+         })
+       }
++      const descriptors = getPayloadDescriptors(object, path)
++      assertPayloadDescriptors(descriptors, path)
+       seen.add(object)
+-      const result = Object.fromEntries(
+-        Object.entries(object).map(([key, entry]) => [key, validateJsonAt(entry, seen, `${path}.${key}`)]),
+-      ) as { [key: string]: JsonValue }
+-      seen.delete(object)
+-      return result
++      const result: { [key: string]: JsonValue } = {}
++      const assigned = assignPayloadValue(target, result)
++      stack.push({ action: 'exit', value: object })
++      const keys = Object.keys(descriptors).filter(key => descriptors[key]?.enumerable === true)
++      if (keys.length > MAX_PAYLOAD_NODES - nodeCount.value) {
++        return fail('INVALID_ARGUMENT', `payload may contain at most ${MAX_PAYLOAD_NODES} JSON nodes.`, {
++          field: path,
++        })
++      }
++      for (let index = keys.length - 1; index >= 0; index -= 1) {
++        const key = keys[index] ?? ''
++        const descriptor = descriptors[key]
++        if (descriptor !== undefined && 'value' in descriptor) {
++          stack.push({
++            action: 'enter',
++            depth: depth + 1,
++            path: `${path}.${key}`,
++            target: { container: result, key },
++            value: descriptor.value,
++          })
++        } else {
++          return fail('INVALID_ARGUMENT', 'payload contains an invalid property descriptor.', {
++            field: path,
++          })
++        }
++      }
++      return assigned
+     }
+     return fail('INVALID_ARGUMENT', 'payload contains a non-plain object.', {
+       field: path,
+@@ -151,7 +283,29 @@ const validateJsonAt = (value: unknown, seen: WeakSet<object>, path: string): Js
+   return fail('INVALID_ARGUMENT', 'payload contains a value that is not JSON serializable.', { field: path })
+ }
+ 
+-export const validateJsonValue = (value: unknown) => validateJsonAt(value, new WeakSet(), 'payload')
++export const validateJsonValue = (value: unknown) => {
++  const stack: PayloadWorkItem[] = [{ action: 'enter', depth: 0, path: 'payload', value }]
++  const seen = new WeakSet<object>()
++  const nodeCount = { value: 0 }
++  let result: JsonValue | undefined
++  while (stack.length > 0) {
++    const item = stack.pop()
++    if (item !== undefined) {
++      if (item.action === 'exit') {
++        seen.delete(item.value)
++      } else {
++        const assigned = validateJsonValueAt(item.value, item.path, item.depth, item.target, stack, seen, nodeCount)
++        if (item.target === undefined && assigned !== undefined) {
++          result = assigned
++        }
++      }
++    }
++  }
++  if (result !== undefined) {
++    return result
++  }
++  return fail('INTERNAL_ERROR', 'Payload validation did not produce a value.')
++}
+ 
+ const portableArtifactSegments = (value: unknown) => {
+   const path = requiredText(value, 'artifact')
+diff --git a/test/records.test.ts b/test/records.test.ts
+index 55c9fdd..48dac79 100644
+--- a/test/records.test.ts
++++ b/test/records.test.ts
+@@ -446,6 +446,19 @@ describe('canonical records', () => {
+         }),
+       'INVALID_ARGUMENT',
+     )
++    const cyclic: Record<string, unknown> = {}
++    cyclic.self = cyclic
++    assertErrorCode(
++      () =>
++        api.addRecord({
++          kind: 'decision',
++          payload: cyclic as never,
++          root,
++          source: 'agent',
++          subject: 'x',
++        }),
++      'INVALID_ARGUMENT',
++    )
+     assertErrorCode(
+       () =>
+         api.addRecord({
+@@ -536,6 +549,145 @@ describe('canonical records', () => {
+     )
+   })
+ 
++  test('rejects payload accessors without invoking them', () => {
++    const root = createRoot()
++    let getterCalls = 0
++    const payloadWithGetter: Record<string, unknown> = {}
++    Object.defineProperty(payloadWithGetter, 'secret', {
++      enumerable: true,
++      get: () => {
++        getterCalls += 1
++        return 'side effect'
++      },
++    })
++
++    assertErrorCode(
++      () =>
++        api.addRecord({
++          kind: 'decision',
++          payload: payloadWithGetter as never,
++          root,
++          source: 'agent',
++          subject: 'payload.accessor',
++        }),
++      'INVALID_ARGUMENT',
++    )
++    assert.equal(getterCalls, 0)
++
++    const payloadWithSetter = {}
++    Object.defineProperty(payloadWithSetter, 'secret', {
++      enumerable: true,
++      set: () => {
++        throw new Error('setter must not run')
++      },
++    })
++
++    assertErrorCode(
++      () =>
++        api.addRecord({
++          kind: 'decision',
++          payload: payloadWithSetter,
++          root,
++          source: 'agent',
++          subject: 'payload.setter',
++        }),
++      'INVALID_ARGUMENT',
++    )
++  })
++
++  test('returns stable invalid argument errors for hostile payload descriptors', () => {
++    const root = createRoot()
++    const throwingDescriptorProxy = new Proxy(
++      { summary: 'Hidden' },
++      {
++        getOwnPropertyDescriptor: () => {
++          throw new Error('descriptor trap must not escape')
++        },
++      },
++    )
++
++    assertErrorCode(
++      () =>
++        api.addRecord({
++          kind: 'decision',
++          payload: throwingDescriptorProxy,
++          root,
++          source: 'agent',
++          subject: 'payload.proxy',
++        }),
++      'INVALID_ARGUMENT',
++    )
++  })
++
++  test('bounds payload depth and total node count', () => {
++    const root = createRoot()
++    const buildNestedPayload = (depth: number) =>
++      Array.from({ length: depth }).reduce<unknown>(payload => ({ child: payload }), null)
++    const buildWidePayload = (properties: number) =>
++      Object.fromEntries(Array.from({ length: properties }, (_, index) => [`k${index}`, null]))
++
++    const deepestValid = api.addRecord({
++      id: 'payload-depth-limit',
++      kind: 'decision',
++      payload: buildNestedPayload(64) as never,
++      root,
++      source: 'agent',
++      subject: 'payload.depth.valid',
++    })
++    assert.equal(existsSync(join(root, deepestValid.path)), true)
++
++    assertErrorCode(
++      () =>
++        api.addRecord({
++          kind: 'decision',
++          payload: buildNestedPayload(65) as never,
++          root,
++          source: 'agent',
++          subject: 'payload.depth.invalid',
++        }),
++      'INVALID_ARGUMENT',
++    )
++
++    const widestValid = api.addRecord({
++      id: 'payload-node-limit',
++      kind: 'decision',
++      payload: buildWidePayload(9999),
++      root,
++      source: 'agent',
++      subject: 'payload.nodes.valid',
++    })
++    assert.equal(existsSync(join(root, widestValid.path)), true)
++
++    assertErrorCode(
++      () =>
++        api.addRecord({
++          kind: 'decision',
++          payload: buildWidePayload(10_000),
++          root,
++          source: 'agent',
++          subject: 'payload.nodes.invalid',
++        }),
++      'INVALID_ARGUMENT',
++    )
++  })
++
++  test('normalizes negative zero payload numbers before formatting', () => {
++    const root = createRoot()
++    const record = api.addRecord({
++      id: 'payload-negative-zero',
++      kind: 'decision',
++      payload: { value: -0 },
++      root,
++      source: 'agent',
++      subject: 'payload.negative-zero',
++    })
++
++    assert.equal(Object.is((record.payload as { value: number }).value, 0), true)
++    const persisted = JSON.parse(readFileSync(join(root, record.path), 'utf8')) as { payload: { value: number } }
++    assert.equal(Object.is(persisted.payload.value, 0), true)
++    assert.deepEqual(record.payload, persisted.payload)
++  })
++
+   test('reports malformed files without rewriting them', () => {
+     const root = createRoot()
+     const path = join(root, 'encephalon', 'decision', 'wrong-name.json')

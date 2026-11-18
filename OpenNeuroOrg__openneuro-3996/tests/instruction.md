@@ -1,0 +1,120 @@
+# Issue
+
+**Title:** chore(deps): Bump js-yaml from 3.14.1 to 4.3.0
+
+## Description
+
+Bumps [js-yaml](https://github.com/nodeca/js-yaml) from 3.14.1 to 4.3.0.
+<details>
+<summary>Changelog</summary>
+<p><em>Sourced from <a href="https://github.com/nodeca/js-yaml/blob/master/CHANGELOG.md">js-yaml's changelog</a>.</em></p>
+<blockquote>
+<h2>4.3.0, 3.15.0 - 2026-06-27</h2>
+<h3>Security</h3>
+<ul>
+<li>Backported <code>maxTotalMergeKeys</code> option.</li>
+</ul>
+<h2>[5.2.0] - 2026-06-26</h2>
+<h3>Added</h3>
+<ul>
+<li>Added <code>maxTotalMergeKeys</code> (10000) loader option to limit the total number of
+keys processed by YAML merge (<code>&lt;&lt;</code>) across one <code>load()</code> / <code>loadAll()</code> call.</li>
+<li>Added <code>maxAliases</code> (-1) loader option to limit the number of YAML aliases per
+document.</li>
+</ul>
+<h3>Removed</h3>
+<ul>
+<li><code>maxMergeSeqLength</code> replaced with <code>maxTotalMergeKeys</code> for limiting YAML merge
+processing.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Round-trip of integers with exponential form (&gt;= <code>1e21</code>)</li>
+</ul>
+<h2>[5.1.0] - 2026-06-23</h2>
+<h3>Added</h3>
+<ul>
+<li>Collection tags can finalize an incrementally populated carrier into a
+different result value.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>[breaking] <code>quoteStyle</code> now selects the preferred quote style; use the
+restored <code>forceQuotes</code> option to force quoting non-key strings.</li>
+</ul>
+<h2>[5.0.0] - 2026-06-20</h2>
+<h3>Added</h3>
+<ul>
+<li>Added named exports for schemas, tags, parser events and AST utilities.</li>
+<li>Reworked <code>JSON_SCHEMA</code> and <code>CORE_SCHEMA</code> with spec-compliant scalar resolution
+rules, and added <code>YAML11_SCHEMA</code>.</li>
+<li>Added <code>realMapTag</code> for lossless mappings with non-string and complex keys.
+Object-based mappings now reject complex keys instead of stringifying them.</li>
+<li>Added <code>dump()</code> <code>transform</code> option for changing the generated AST before
+rendering.</li>
+<li>Added <code>dump()</code> options <code>seqInlineFirst</code>, <code>flowBracketPadding</code>,
+<code>flowSkipCommaSpace</code>, <code>flowSkipColonSpace</code>, <code>quoteFlowKeys</code>, <code>quoteStyle</code> and
+<code>tagBeforeAnchor</code>.</li>
+<li>Added formal data layers (events and AST) for modular data pipelines.
+<ul>
+<li>Added low-level parser (to events), presenter and visitor APIs.</li>
+</ul>
+</li>
+<li>Added the <a href="https://github.com/yaml/yaml-test-suite">YAML Test Suite</a> to the
+test set.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>See the <a href="https://github.com/nodeca/js-yaml/blob/master/docs/migrate_v4_to_v5.md">migration guide</a> for upgrade notes.</li>
+<li>Rewritten in TypeScript and reorganized the public API around flat named
+exports.</li>
+</ul>
+<!-- raw HTML omitted -->
+</blockquote>
+<p>... (truncated)</p>
+</details>
+<details>
+<summary>Commits</summary>
+<ul>
+<li><a href=""><code>33d05b5</code></a> 4.3.0 released</li>
+<li><a href=""><code>663bfab</code></a> Drop demo publish, to not override new v5 one.</li>
+<li><a href=""><code>1cb8c7b</code></a> Add v4-legacy tag for publish</li>
+<li><a href=""><code>02f27af</code></a> Restore umd builds back to es5</li>
+<li><a href=""><code>8be84ed</code></a> Fix es5 compatibility</li>
+<li><a href=""><code>59423c6</code></a> Replace <code>maxMergeSeqLength</code> option with <code>maxTotalMergeKeys</code> (more robust). Ba...</li>
+<li><a href=""><code>6842ef6</code></a> doc polish</li>
+<li><a href=""><code>590dbab</code></a> 4.2.0 released</li>
+<li><a href=""><code>f944dc5</code></a> Add package.json funding field</li>
+<li><a href=""><code>f692719</code></a> Changelog update</li>
+<li>Additional commits viewable in <a href="https://github.com/nodeca/js-yaml/compare/3.14.1...4.3.0">compare view</a></li>
+</ul>
+</details>
+<br />
+
+[![Dependabot compatibility score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=js-yaml&package-manager=npm_and_yarn&previous-version=3.14.1&new-version=4.3.0)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)
+
+Dependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+---
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it
+- `@dependabot show <dependency name> ignore conditions` will show all of the ignore conditions of the specified dependency
+- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)
+You can disable automated security fix PRs for this repo from the [Security Alerts page](https://github.com/OpenNeuroOrg/openneuro/network/alerts).
+
+</details>
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `05f796630847`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

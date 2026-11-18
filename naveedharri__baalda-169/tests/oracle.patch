@@ -1,0 +1,253 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4e33993e..ba053eb7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,11 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+ ## [Unreleased]
+ 
+ ### Added
++- **`S3_KEY_PREFIX` (server, operator-only).** Optional prefix on every NEW blob object
++  key (`<prefix>/vaults/<vaultId>/<sha256>`), so staging and production can share one
++  bucket. Slashes are stripped, `..` is refused at startup, and rows keep storing the
++  full key — reads, deletes, GC and `migrate-blobs` still resolve objects written under
++  any earlier prefix.
+ - **Tree binaries sync (desktop, Stage A).** `list_binaries` walks the whole vault for
+   registry binary formats (not only `attachments/`), sharing the `attachment_hashes`
+   cache; each tree binary is registered as a server `files` row via `POST /api/files`
+diff --git a/app/.railway/railway.ts b/app/.railway/railway.ts
+index 5678d157..e5f5a015 100644
+--- a/app/.railway/railway.ts
++++ b/app/.railway/railway.ts
+@@ -68,6 +68,7 @@ const SERVER_ENV = [
+   "S3_ACCESS_KEY_ID",
+   "S3_SECRET_ACCESS_KEY",
+   "S3_FORCE_PATH_STYLE",
++  "S3_KEY_PREFIX",
+   "S3_PRESIGN_UPLOAD_TTL_SECONDS",
+   "S3_PRESIGN_DOWNLOAD_TTL_SECONDS",
+   "S3_PROXY_DOWNLOADS",
+diff --git a/app/apps/server/.env.example b/app/apps/server/.env.example
+index b13d2dc9..d7b441aa 100644
+--- a/app/apps/server/.env.example
++++ b/app/apps/server/.env.example
+@@ -144,6 +144,12 @@ MAX_NOTE_MB=10
+ # S3_ENDPOINT=
+ # S3_FORCE_PATH_STYLE=false
+ 
++# Optional path prefix for NEW object keys: <prefix>/vaults/<vaultId>/<sha256>.
++# `staging/` lets staging and production share one bucket; production leaves it
++# empty. Every row stores the FULL key, so changing this never strands what is
++# already uploaded — reads, deletes and GC keep using the stored key.
++# S3_KEY_PREFIX=
++
+ # How long the URLs handed to a client live, in seconds.
+ # Uploads get 900 (a big file on a slow line); downloads 300 (fetched at once).
+ # NOTE: a presigned URL is signed against the SERVER's clock. If this machine
+diff --git a/app/apps/server/src/blobs/config.ts b/app/apps/server/src/blobs/config.ts
+index e2306c23..97b626c9 100644
+--- a/app/apps/server/src/blobs/config.ts
++++ b/app/apps/server/src/blobs/config.ts
+@@ -145,6 +145,33 @@ export interface S3Config {
+   multipartPartBytes: number;
+ }
+ 
++/**
++ * `S3_KEY_PREFIX`, normalised: a bare path segment chain with no leading or
++ * trailing slash, no empty segments, and no traversal. Empty (the default, and
++ * what production runs with) ⇒ keys keep their historical `vaults/...` shape.
++ *
++ * `..` is REJECTED rather than resolved because a prefix is configuration, not
++ * input — an operator who typed one means something we cannot guess, and a key
++ * that climbs out of its own namespace is exactly the mistake this setting
++ * exists to prevent. Same fail-closed reflex as {@link readStorage}.
++ *
++ * Read on every call, like {@link s3Config}: it is cheap, and a function is
++ * what lets a test set a prefix without reloading the module graph.
++ */
++export function s3KeyPrefix(): string {
++  const raw = process.env.S3_KEY_PREFIX ?? "";
++  const segments = raw.trim().split("/").filter((segment) => segment !== "");
++  for (const segment of segments) {
++    if (segment === "." || segment === "..") {
++      throw new Error(
++        `S3_KEY_PREFIX must not contain \`${segment}\` (got \`${raw}\`). It is a plain key ` +
++          "prefix such as `staging`, not a relative path.",
++      );
++    }
++  }
++  return segments.join("/");
++}
++
+ /** S3 vars that have no sensible default — all of them, or no S3. */
+ const S3_REQUIRED = ["S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"] as const;
+ 
+@@ -247,6 +274,9 @@ function readStorage(): BlobProvider {
+           "to keep attachments in Postgres. Refusing to start rather than silently storing bytes in the database.",
+       );
+     }
++    // Fail here rather than on the first upload: a bad prefix is a typo in a
++    // deploy's env, and the place to find out is the deploy.
++    s3KeyPrefix();
+     return "s3";
+   }
+   throw new Error(
+diff --git a/app/apps/server/src/blobs/keys.ts b/app/apps/server/src/blobs/keys.ts
+index 72dcc5ac..60da3b01 100644
+--- a/app/apps/server/src/blobs/keys.ts
++++ b/app/apps/server/src/blobs/keys.ts
+@@ -1,3 +1,5 @@
++import { s3KeyPrefix } from "./config.js";
++
+ /**
+  * Object keys for the content-addressed blob store.
+  *
+@@ -10,7 +12,18 @@
+  * `blobs.rel_path`, and the type in `blobs.mime`; putting either in the key
+  * would make a rename an object copy, and would let an uploader choose the
+  * suffix a bucket serves.
++ *
++ * An optional `S3_KEY_PREFIX` puts everything under one more path segment
++ * (`<prefix>/vaults/<vaultId>/<sha256>`), which is what lets a staging and a
++ * production server share ONE bucket without either one's keys landing on the
++ * other's. It only ever affects keys computed from NOW on: every row stores the
++ * FULL key in `blobs.storage_key`, and reads, deletes, the GC deletion queue
++ * and `scripts/migrate-blobs.ts` all work from that stored value — so objects
++ * written under an earlier prefix (or none) keep resolving after the setting
++ * changes. Changing the prefix is therefore additive, never a migration; what
++ * it must not do is MOVE anything.
+  */
+-export function objectKey(vaultId: string, sha256: string): string {
+-  return `vaults/${vaultId}/${sha256}`;
++export function objectKey(vaultId: string, sha256: string, prefix = s3KeyPrefix()): string {
++  const base = `vaults/${vaultId}/${sha256}`;
++  return prefix ? `${prefix}/${base}` : base;
+ }
+diff --git a/app/apps/server/tests/blob-s3.test.ts b/app/apps/server/tests/blob-s3.test.ts
+index 2969f3f6..a58d3776 100644
+--- a/app/apps/server/tests/blob-s3.test.ts
++++ b/app/apps/server/tests/blob-s3.test.ts
+@@ -105,6 +105,30 @@ describe.skipIf(!enabled)("S3BlobStore against a real bucket", () => {
+     await expect(s.delete(key)).resolves.toBeUndefined();
+   });
+ 
++  it("stores a prefixed key at the prefixed path, and nowhere else", async () => {
++    // The whole point of S3_KEY_PREFIX: a staging deployment writing into the
++    // same bucket as production must not touch production's key space.
++    const s = store({ proxyDownloads: true });
++    const sha = randomUUID().replace(/-/g, "").repeat(2);
++    const key = objectKey("vault-test", sha, "prefix-test");
++    expect(key).toBe(`prefix-test/${objectKey("vault-test", sha, "")}`);
++
++    await s.put({
++      key,
++      blobId: "b-prefix",
++      vaultId: "vault-test",
++      body: Readable.from(BYTES),
++      size: BYTES.byteLength,
++      mime: "application/octet-stream",
++      sha256: SHA,
++      filename: null,
++    });
++    expect(await s.head(key)).toEqual({ size: BYTES.byteLength });
++    // Same vault, same bytes, no prefix — a different object entirely.
++    expect(await s.head(objectKey("vault-test", sha, ""))).toBeNull();
++    await s.delete(key);
++  });
++
+   it("serves a byte range with the totals a 206 needs", async () => {
+     const s = store({ proxyDownloads: true });
+     const key = objectKey("vault-test", randomUUID().replace(/-/g, "").repeat(2));
+diff --git a/app/apps/server/tests/blob-store.test.ts b/app/apps/server/tests/blob-store.test.ts
+index 32acf54b..2eeaae45 100644
+--- a/app/apps/server/tests/blob-store.test.ts
++++ b/app/apps/server/tests/blob-store.test.ts
+@@ -1,6 +1,6 @@
+ import { randomUUID } from "node:crypto";
+ import { Readable } from "node:stream";
+-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+ import { pool } from "../src/db/pool.js";
+ import { resetDb } from "./helpers/db.js";
+ import { seedOrg, seedVault } from "./helpers/seed.js";
+@@ -8,6 +8,7 @@ import { MemoryBlobStore } from "../src/blobs/memory-store.js";
+ import { PostgresBlobStore } from "../src/blobs/postgres-store.js";
+ import { BlobStoreError, type BlobStore } from "../src/blobs/store.js";
+ import { objectKey } from "../src/blobs/keys.js";
++import { s3KeyPrefix } from "../src/blobs/config.js";
+ 
+ /**
+  * ONE conformance suite, run against every provider.
+@@ -176,10 +177,47 @@ describe.each(PROVIDERS)("BlobStore conformance — $name", (provider) => {
+ });
+ 
+ describe("objectKey", () => {
++  const before = process.env.S3_KEY_PREFIX;
++  afterEach(() => {
++    if (before === undefined) delete process.env.S3_KEY_PREFIX;
++    else process.env.S3_KEY_PREFIX = before;
++  });
++
+   it("is vault-scoped and content-addressed, with no extension", () => {
+-    expect(objectKey("v1", "abc")).toBe("vaults/v1/abc");
++    expect(objectKey("v1", "abc", "")).toBe("vaults/v1/abc");
+     // Same bytes in two vaults are two objects: deleting one vault can never
+     // pull a file out from under another.
+-    expect(objectKey("v2", "abc")).not.toBe(objectKey("v1", "abc"));
++    expect(objectKey("v2", "abc", "")).not.toBe(objectKey("v1", "abc", ""));
++  });
++
++  it("puts every new key under S3_KEY_PREFIX, so two deployments can share a bucket", () => {
++    process.env.S3_KEY_PREFIX = "staging";
++    expect(objectKey("v1", "abc")).toBe("staging/vaults/v1/abc");
++    // The prefix is the ONLY difference: strip it and you are back at the key a
++    // prefix-less deployment would have written, which is why a stored
++    // `storage_key` from before the setting existed still resolves.
++    expect(objectKey("v1", "abc").endsWith(objectKey("v1", "abc", ""))).toBe(true);
++  });
++
++  it("normalises the prefix: slashes stripped, empty means none, `..` refused", () => {
++    process.env.S3_KEY_PREFIX = "/staging/";
++    expect(s3KeyPrefix()).toBe("staging");
++    expect(objectKey("v1", "abc")).toBe("staging/vaults/v1/abc");
++
++    process.env.S3_KEY_PREFIX = "a/b";
++    expect(s3KeyPrefix()).toBe("a/b");
++    expect(objectKey("v1", "abc")).toBe("a/b/vaults/v1/abc");
++
++    for (const empty of ["", "   ", "//"]) {
++      process.env.S3_KEY_PREFIX = empty;
++      expect(s3KeyPrefix()).toBe("");
++      expect(objectKey("v1", "abc")).toBe("vaults/v1/abc");
++    }
++
++    // Configuration, not input: a traversal is a typo we refuse to guess at.
++    for (const bad of ["..", "staging/../prod", "./staging"]) {
++      process.env.S3_KEY_PREFIX = bad;
++      expect(() => s3KeyPrefix()).toThrow(/S3_KEY_PREFIX/);
++    }
+   });
+ });
+diff --git a/docs/DEPLOY.md b/docs/DEPLOY.md
+index 242edc58..1d9e4700 100644
+--- a/docs/DEPLOY.md
++++ b/docs/DEPLOY.md
+@@ -354,6 +354,7 @@ confirm `/health` and a real sync round-trip, then promote.
+ | `S3_REGION` | no | `us-east-1` | AWS region. Cloudflare R2 wants `auto`. |
+ | `S3_ENDPOINT` | no | unset | Unset ⇒ real AWS S3. R2: `https://<account-id>.r2.cloudflarestorage.com`. MinIO: your host. |
+ | `S3_FORCE_PATH_STYLE` | no | `false` | `true` for MinIO and anything else without bucket-per-subdomain DNS. |
++| `S3_KEY_PREFIX` | no | unset | Path prefix for NEW object keys (`<prefix>/vaults/<vaultId>/<sha256>`), so two deployments can share one bucket. Leading/trailing slashes are stripped; `..` is a fatal startup error. Rows store the full key, so changing it never strands existing objects. |
+ | `S3_PRESIGN_UPLOAD_TTL_SECONDS` | no | `900` | Lifetime of an upload URL. Also the lifetime of the Postgres provider's signed same-origin PUT. |
+ | `S3_PRESIGN_DOWNLOAD_TTL_SECONDS` | no | `300` | Lifetime of a download URL. |
+ | `S3_PROXY_DOWNLOADS` | no | `false` | `true` streams downloads through this server instead of redirecting to the bucket. Needed when clients cannot reach the bucket (a MinIO on a private subnet); costs egress twice. |
+@@ -431,6 +432,11 @@ plus the endpoint bits for your provider:
+ | **Cloudflare R2** | `S3_REGION=auto`, `S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com` |
+ | **MinIO** | `S3_ENDPOINT=https://your-minio-host`, `S3_FORCE_PATH_STYLE=true` |
+ 
++Two deployments (staging and production, say) can share one bucket by giving
++each a different `S3_KEY_PREFIX` — set `S3_KEY_PREFIX=staging` on the staging
++server and leave it empty in production, and neither one's keys can land on the
++other's.
++
+ The server **fails closed**: `BLOB_STORAGE=s3` with any of the three required
+ vars missing is a fatal startup error naming what is absent, not a silent
+ fallback to storing bytes in the database.

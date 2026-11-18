@@ -1,0 +1,655 @@
+diff --git a/neuralfetch-repo/neuralfetch/download.py b/neuralfetch-repo/neuralfetch/download.py
+index bdb0ecf13..b46c78830 100644
+--- a/neuralfetch-repo/neuralfetch/download.py
++++ b/neuralfetch-repo/neuralfetch/download.py
+@@ -629,6 +629,26 @@ def _dl_item(self, cur_path: Path | str) -> None:
+         cmd = f'datalad get "{cur_path}"{threads_}'
+         self._datalad(cmd, self._dl_dir / self.repo_name)
+ 
++    def _expand_folders(self) -> list[Path]:
++        """Resolve :attr:`folders` into absolute paths inside the cloned repo.
++
++        Wildcard entries are glob-expanded against the working tree (which
++        already contains the BIDS layout because ``datalad clone`` populates
++        directory structure and small files even on annex-ignored remotes).
++        Bare strings are appended as-is.
++        """
++        folders = self.folders if self.folders else [Wildcard(folder="*")]
++        all_folders: list[Path] = []
++        for folder in folders:
++            if isinstance(folder, Wildcard):
++                all_folders += [
++                    Path(str(p))
++                    for p in glob(str(self._dl_dir / self.repo_name / folder.folder))
++                ]
++            else:
++                all_folders += [self._dl_dir / self.repo_name / folder]  # type: ignore[list-item]
++        return all_folders
++
+     def _download(self, overwrite: bool = False) -> None:
+         """Downloads data from datalab
+ 
+@@ -648,18 +668,7 @@ def _download(self, overwrite: bool = False) -> None:
+         # clone repo
+         self._datalad(f"datalad clone {self.repo_url}", self._dl_dir)
+ 
+-        # expand folders
+-        folders = self.folders if self.folders else [Wildcard(folder="*")]
+-
+-        all_folders: list[Path] = []
+-        for folder in folders:
+-            if isinstance(folder, Wildcard):
+-                all_folders += [
+-                    Path(str(p))
+-                    for p in glob(str(self._dl_dir / self.repo_name / folder.folder))
+-                ]
+-            else:
+-                all_folders += [self._dl_dir / self.repo_name / folder]  # type: ignore
++        all_folders = self._expand_folders()
+         print(f"Loading {len(all_folders)} folders: ", all_folders)
+ 
+         # download
+@@ -671,6 +680,179 @@ def _download(self, overwrite: bool = False) -> None:
+         print("\nDownloaded Dataset")
+ 
+ 
++class Gin(Datalad):
++    """Download datasets from G-Node Infrastructure (gin.g-node.org).
++
++    GIN-hosted repositories publish data via git-annex but their HTTPS
++    clone URL (``https://gin.g-node.org/<owner>/<repo>.git``) does not
++    expose ``.git/config`` to anonymous clients. As a result, the bare
++    ``datalad clone`` step run by :class:`Datalad` sets ``annex-ignore``
++    on the origin remote and every subsequent ``datalad get`` exits
++    successfully having done nothing -- the working tree stays full of
++    ~60-byte git-annex pointer files instead of real binary content.
++
++    This backend works around the limitation by:
++
++    1. Cloning the repo (same as :class:`Datalad`; only pointer files
++       are materialised).
++    2. Scanning the requested ``folders`` for git-annex pointer files
++       (v8 in-tree pointers and v7 symlinks under ``.git/annex/objects``).
++    3. Batch-registering ``https://gin.g-node.org/<owner>/<repo>/raw/<branch>/<relpath>``
++       URLs against each annex key via ``git annex registerurl --batch``.
++       GIN serves annexed content over plain HTTPS at that path.
++    4. Running ``git annex get --from=web --jobs=<threads>`` per folder
++       to actually pull content.
++
++    Studies pass the same arguments as :class:`Datalad` (``repo_url``,
++    ``folders``, ``threads``) and additionally set ``branch=`` when the
++    default branch is not ``master``. No other plumbing is required in
++    the study class.
++
++    Parameters
++    ----------
++    repo_url : str
++        Full HTTPS clone URL, e.g.
++        ``"https://gin.g-node.org/CUBRIC/WAND.git"``.
++    branch : str
++        Git branch served at ``/raw/<branch>/`` on GIN's HTTPS endpoint
++        (default ``"master"``; some repos use ``"main"``).
++    threads : int
++        Number of parallel ``git annex get`` jobs (default 1).
++    folders : list of str or Wildcard
++        Same semantics as :attr:`Datalad.folders`. Restricts the URL
++        registration scan as well, so we avoid walking the whole tree
++        when only a subset is requested.
++    """
++
++    branch: str = "master"
++
++    @pydantic.computed_field  # type: ignore[prop-decorator]
++    @property
++    def _https_base(self) -> str:
++        """``https://...<repo>.git`` -> ``https://...<repo>/raw/<branch>``."""
++        base = self.repo_url
++        if base.endswith(".git"):
++            base = base[:-4]
++        return f"{base}/raw/{self.branch}"
++
++    @staticmethod
++    def _read_pointer_key(path: Path) -> str | None:
++        """Return the git-annex key for *path*, or None if it's not a pointer.
++
++        Handles both modern v8 pointer files (small ASCII files whose
++        first line is ``"/annex/objects/<key>"``) and legacy v7 symlinks
++        targeting ``.git/annex/objects/.../<key>``.
++        """
++        if path.is_symlink():
++            target = os.readlink(path)
++            if "/.git/annex/objects/" in target:
++                # The annex key is the basename (also the parent dir name).
++                return Path(target).name
++            return None
++        try:
++            if path.stat().st_size > 256:
++                return None
++            with path.open("rb") as f:
++                head = f.read(256)
++        except OSError:
++            return None
++        if not head.startswith(b"/annex/objects/"):
++            return None
++        try:
++            first_line = head.split(b"\n", 1)[0].decode("ascii")
++        except UnicodeDecodeError:
++            return None
++        return first_line[len("/annex/objects/") :]
++
++    def _iter_pointers(
++        self, repo_root: Path, folders: list[Path]
++    ) -> tp.Iterator[tuple[str, Path]]:
++        """Yield ``(annex_key, repo_relative_path)`` for every pointer file."""
++        seen: set[Path] = set()
++        for folder in folders:
++            if not folder.is_dir():
++                continue
++            for path in folder.rglob("*"):
++                if path in seen:
++                    continue
++                seen.add(path)
++                if not (path.is_file() or path.is_symlink()):
++                    continue
++                key = self._read_pointer_key(path)
++                if key is None:
++                    continue
++                try:
++                    rel = path.relative_to(repo_root)
++                except ValueError:
++                    continue
++                yield key, rel
++
++    def _register_urls(self, repo_root: Path, folders: list[Path]) -> int:
++        """Register web URLs for every pointer file. Returns the count."""
++        pairs = list(self._iter_pointers(repo_root, folders))
++        if not pairs:
++            return 0
++        batch = "".join(
++            f"{key} {self._https_base}/{rel.as_posix()}\n" for key, rel in pairs
++        )
++        proc = subprocess.run(
++            ["git", "annex", "registerurl", "--batch"],
++            input=batch,
++            text=True,
++            cwd=str(repo_root),
++            capture_output=True,
++            check=False,
++        )
++        if proc.returncode != 0:
++            logger.warning(
++                "git annex registerurl exited %d:\n%s", proc.returncode, proc.stderr
++            )
++        return len(pairs)
++
++    def _annex_get_web(self, target: Path, repo_root: Path) -> None:
++        """Fetch annexed content for *target* via the built-in web remote."""
++        cmd = [
++            "git",
++            "annex",
++            "get",
++            "--from=web",
++            f"--jobs={self.threads}",
++            str(target),
++        ]
++        proc = subprocess.run(
++            cmd, cwd=str(repo_root), capture_output=True, text=True, check=False
++        )
++        if proc.returncode != 0:
++            logger.warning(
++                "git annex get --from=web exited %d on %s:\n%s",
++                proc.returncode,
++                target,
++                proc.stderr,
++            )
++
++    def _download(self, overwrite: bool = False) -> None:
++        self._datalad(f"datalad clone {self.repo_url}", self._dl_dir)
++        repo_root = self._dl_dir / self.repo_name
++
++        all_folders = self._expand_folders()
++        print(f"Loading {len(all_folders)} folders: ", all_folders, flush=True)
++
++        # registerurl --batch is slow and silent on large datasets; flush to timestamp it
++        print(
++            f"Registering GIN web URLs for pointer files under {len(all_folders)} folders...",
++            flush=True,
++        )
++        n_registered = self._register_urls(repo_root, all_folders)
++        print(f"Registered {n_registered} GIN web URLs against annex keys", flush=True)
++
++        for item in tqdm(all_folders, desc=f"Downloading {self.study}", ncols=100):
++            if not item.is_dir():
++                continue
++            self._annex_get_web(item, repo_root)
++
++        print("\nDownloaded Dataset", flush=True)
++
++
+ class Donders(BaseDownload):
+     """Download datasets from the Donders Repository (data.donders.ru.nl).
+ 
+diff --git a/neuralfetch-repo/neuralfetch/test_download.py b/neuralfetch-repo/neuralfetch/test_download.py
+index edb51d338..a7c40e308 100644
+--- a/neuralfetch-repo/neuralfetch/test_download.py
++++ b/neuralfetch-repo/neuralfetch/test_download.py
+@@ -34,6 +34,7 @@ def _concrete_subclasses() -> list[type]:
+     "Physionet": {"version": "1.0.0"},
+     "Donders": {"study_id": "DSC_123"},
+     "Datalad": {"repo_url": "https://example.com/repo.git"},
++    "Gin": {"repo_url": "https://gin.g-node.org/test/repo.git"},
+     "Synapse": {"study_id": "syn123"},
+     "Zenodo": {"record_id": "12345"},
+     "Huggingface": {"org": "abc"},
+@@ -169,6 +170,115 @@ def test_dryad_missing_token_raises(tmp_path: Path) -> None:
+         )
+ 
+ 
++def _make_gin(tmp_path: Path, **kwargs: tp.Any) -> download.Gin:
++    """Factory that builds a Gin instance rooted at *tmp_path*."""
++    defaults: dict[str, tp.Any] = {
++        "study": "test",
++        "dset_dir": tmp_path / "study",
++        "repo_url": "https://gin.g-node.org/CUBRIC/WAND.git",
++    }
++    defaults.update(kwargs)
++    return download.Gin(**defaults)
++
++
++def test_gin_https_base_strips_dot_git_and_appends_branch(tmp_path: Path) -> None:
++    """`_https_base` derives the GIN raw URL prefix from `repo_url` + `branch`."""
++    gin_master = _make_gin(tmp_path)
++    assert gin_master._https_base == "https://gin.g-node.org/CUBRIC/WAND/raw/master"
++    gin_main = _make_gin(tmp_path, branch="main")
++    assert gin_main._https_base == "https://gin.g-node.org/CUBRIC/WAND/raw/main"
++    # `.git` suffix is optional in the input
++    gin_bare = _make_gin(tmp_path, repo_url="https://gin.g-node.org/CUBRIC/WAND")
++    assert gin_bare._https_base == "https://gin.g-node.org/CUBRIC/WAND/raw/master"
++
++
++def test_gin_read_pointer_key_v8(tmp_path: Path) -> None:
++    """A v8 in-tree pointer file parses to its annex key."""
++    key = "MD5-s976320008--eea09d82b05cc6d6edb5b147f8579575"
++    pointer = tmp_path / "sub-001.meg4"
++    pointer.write_text(f"/annex/objects/{key}\n")
++    assert download.Gin._read_pointer_key(pointer) == key
++
++
++def test_gin_read_pointer_key_v7_symlink(tmp_path: Path) -> None:
++    """A v7 symlink into ``.git/annex/objects/...`` resolves to its key."""
++    key = "SHA256E-s100--abc"
++    target = f"../../../.git/annex/objects/Wp/g8/{key}/{key}"
++    symlink = tmp_path / "sub-001.res4"
++    symlink.symlink_to(target)
++    assert download.Gin._read_pointer_key(symlink) == key
++
++
++def test_gin_read_pointer_key_rejects_non_pointers(tmp_path: Path) -> None:
++    """Regular files, oversize ASCII, and non-annex symlinks return None."""
++    real = tmp_path / "real.bin"
++    real.write_bytes(b"\x00\x01\x02real binary data")
++    assert download.Gin._read_pointer_key(real) is None
++
++    big = tmp_path / "oversize.txt"
++    big.write_bytes(b"/annex/objects/foo\n" + b"x" * 1024)
++    assert download.Gin._read_pointer_key(big) is None
++
++    elsewhere = tmp_path / "elsewhere.lnk"
++    elsewhere.symlink_to("../somewhere/else.bin")
++    assert download.Gin._read_pointer_key(elsewhere) is None
++
++
++def test_gin_download_invokes_clone_register_and_get(
++    tmp_path: Path, mocker: tp.Any
++) -> None:
++    """End-to-end ``Gin._download`` wires clone -> registerurl -> annex get.
++
++    The clone step is stubbed to materialise the WAND-like directory
++    structure with one pointer file; the rest is mocked so the test stays
++    offline.
++    """
++    gin = _make_gin(
++        tmp_path,
++        folders=[download.Wildcard(folder="sub-*/ses-01/meg")],
++        threads=3,
++    )
++
++    pointer_rel = Path("sub-00395/ses-01/meg/sub-00395_ses-01_task-resting.meg4")
++    pointer_abs = gin._dl_dir / gin.repo_name / pointer_rel
++    annex_key = "MD5-s976320008--eea09d82b05cc6d6edb5b147f8579575"
++
++    def fake_clone(cmd: str, path: tp.Any) -> None:
++        # `datalad clone` should populate the working tree; emulate that
++        # by writing the pointer file under the expected repo root.
++        pointer_abs.parent.mkdir(parents=True, exist_ok=True)
++        pointer_abs.write_text(f"/annex/objects/{annex_key}\n")
++
++    mocker.patch.object(download.Gin, "_datalad", side_effect=fake_clone)
++    run_mock = mocker.patch(
++        "neuralfetch.download.subprocess.run",
++        return_value=mocker.Mock(returncode=0, stderr="", stdout=""),
++    )
++
++    gin._download()
++
++    # 1. registerurl invoked with key + correct GIN HTTPS URL
++    expected_url = (
++        "https://gin.g-node.org/CUBRIC/WAND/raw/master/" + pointer_rel.as_posix()
++    )
++    register_calls = [
++        c
++        for c in run_mock.call_args_list
++        if c.args[0][:3] == ["git", "annex", "registerurl"]
++    ]
++    assert len(register_calls) == 1
++    assert register_calls[0].kwargs["input"] == f"{annex_key} {expected_url}\n"
++    assert register_calls[0].kwargs["cwd"] == str(gin._dl_dir / gin.repo_name)
++
++    # 2. annex get --from=web invoked per resolved folder with --jobs=threads
++    get_calls = [
++        c for c in run_mock.call_args_list if c.args[0][:3] == ["git", "annex", "get"]
++    ]
++    assert len(get_calls) == 1
++    assert "--from=web" in get_calls[0].args[0]
++    assert "--jobs=3" in get_calls[0].args[0]
++
++
+ def test_globus_missing_credentials_raises(tmp_path: Path) -> None:
+     """Globus raises RuntimeError at construction when credentials env vars are missing."""
+     env = {
+diff --git a/neuralset-repo/neuralset/dataloader.py b/neuralset-repo/neuralset/dataloader.py
+index 008a297c0..35d5198a6 100644
+--- a/neuralset-repo/neuralset/dataloader.py
++++ b/neuralset-repo/neuralset/dataloader.py
+@@ -218,9 +218,6 @@ def prepare_extractors(
+         if extractors_using_slurm:
+             msg = f"Started parallel preparation of extractors {slurm_names} on slurm"
+             logger.info(msg)
+-        for extractor in other_extractors:
+-            logger.info(f"Preparing extractor: {extractor.__class__.__name__}")
+-            extractor.prepare(events)
+         for future in concurrent.futures.as_completed(futures):
+             try:
+                 future.result()  # Raise any exception from the task
+@@ -228,6 +225,12 @@ def prepare_extractors(
+                 name = future.__dict__.get("_name", "UNKNOWN")
+                 logger.warning("Error occurred while preparing extractor %s: %s", name, e)
+                 raise
++        # Some lightweight extractors wrap one of the Slurm extractors (notably
++        # ChannelPositions -> MneRaw). Preparing them before the futures finish
++        # recursively launches duplicate work for the same cache UID.
++        for extractor in other_extractors:
++            logger.info(f"Preparing extractor: {extractor.__class__.__name__}")
++            extractor.prepare(events)
+ 
+ 
+ def _get_pad_lengths(
+@@ -470,9 +473,9 @@ class Segmenter(base.Step):
+         Start time (in seconds) of the segment, with respect to the
+         :term:`trigger` event (or stride). E.g. use -1.0 if you want the
+         segment to start 1s before the event.
+-    duration: optional float
+-        Duration (in seconds) of the segment (defaults to event duration if
+-        ``trigger_query`` is used to extract segments based on specific events).
++    duration: float or None
++        Duration (in seconds) of the segment. Required: pass ``None`` to use each
++        trigger event's own duration (``trigger_query`` only).
+     trigger_query: optional Query
+         Dataframe query selecting which events act as :term:`triggers <trigger>`
+         — segments are time-locked to the matching events
+@@ -519,7 +522,7 @@ class Segmenter(base.Step):
+     # extractors
+     extractors: dict[str, BaseExtractor]
+     # dataset
+-    padding: float | None = None
++    padding: float | tp.Literal["auto"] | None = None
+     drop_incomplete: bool = False
+     drop_unused_events: bool = True
+     #
+@@ -628,5 +631,5 @@ def _remove_incomplete_segments(
+     if drop_incomplete and invalid_indices:
+         msg = f"Removing {len(invalid_indices)} segments out of {len(segments)}"
+         logger.info(msg)
+-        segments = [s for i, s in enumerate(segments) if i not in sorted(invalid_indices)]
++        segments = [s for i, s in enumerate(segments) if i not in invalid_indices]
+     return segments
+diff --git a/neuralset-repo/neuralset/events/study.py b/neuralset-repo/neuralset/events/study.py
+index b7ca3cea7..ee5468b4a 100644
+--- a/neuralset-repo/neuralset/events/study.py
++++ b/neuralset-repo/neuralset/events/study.py
+@@ -283,7 +283,8 @@ class Study(patterns.Scatter, base.Step):  # type: ignore[misc]
+     version : str
+         Cache-busting key kept in the uid; bump when loading logic changes.
+     query : Query or None
+-        Optional filter applied after loading (e.g. ``"timeline_index < 5"``).
++        Optional timeline selection, applied before loading (e.g.
++        ``"timeline_index < 5"``); filter loaded rows with ``QueryEvents``.
+ 
+     Examples
+     --------
+diff --git a/neuralset-repo/neuralset/extractors/meta.py b/neuralset-repo/neuralset/extractors/meta.py
+index eb10df9ec..0a1e4a1eb 100644
+--- a/neuralset-repo/neuralset/extractors/meta.py
++++ b/neuralset-repo/neuralset/extractors/meta.py
+@@ -113,18 +113,21 @@ class AggregatedExtractor(base.BaseExtractor):
+     event_types: str | tuple[str, ...] = "Event"
+     extractors: list[base.BaseExtractor]
+     extractor_aggregation: tp.Literal["cat", "stack", "mean", "sum"] = "cat"
+-    frequency: tp.Literal["native"] = "native"  # deferred to sub-extractors
++    frequency: float | tp.Literal["native"] = "native"  # deferred to sub-extractors
+ 
+     def model_post_init(self, log__: tp.Any) -> None:
+-        """Check that extractors are all static or all dynamic."""
++        """Check stream compatibility and propagate the common frequency."""
+         fts = self.extractors
+-        static_count = sum(isinstance(f, base.BaseStatic) for f in fts)
+-        if static_count not in [0, len(fts)]:
++        # BaseStatic extractors become temporal streams when configured with a
++        # non-zero frequency, so classify by frequency rather than inheritance.
++        static_count = sum(f.frequency == 0 for f in fts)
++        if static_count not in (0, len(fts)):
+             raise ValueError("Extractors must be either all static or all dynamic.")
+-        if not static_count:  # dynamic
+-            frequencies = set(f.frequency for f in self.extractors)
++        frequencies = {f.frequency for f in fts}
++        if not static_count:
+             if len(frequencies) > 1:
+                 raise ValueError("All extractors must have the same frequency.")
++            self.frequency = frequencies.pop()
+         all_event_types = set(c for f in fts for c in f._event_types_helper.classes)
+         self.event_types = tuple(c.__name__ for c in all_event_types)
+         super().model_post_init(log__)
+diff --git a/neuralset-repo/neuralset/extractors/neuro.py b/neuralset-repo/neuralset/extractors/neuro.py
+index 67acd807e..dd43985f7 100644
+--- a/neuralset-repo/neuralset/extractors/neuro.py
++++ b/neuralset-repo/neuralset/extractors/neuro.py
+@@ -289,7 +289,7 @@ def _exclude_from_cls_uid(cls) -> list[str]:
+ 
+     def _exclude_from_cache_uid(self) -> list[str]:
+         prev = super()._exclude_from_cache_uid()
+-        return prev + ["baseline", "offset", "scale_factor", "clamp"]
++        return prev + ["baseline", "offset", "scale_factor", "clamp", "channel_order"]
+ 
+     def model_post_init(self, log__: tp.Any) -> None:
+         super().model_post_init(log__)
+diff --git a/neuralset-repo/neuralset/extractors/test_meta.py b/neuralset-repo/neuralset/extractors/test_meta.py
+index 091f7eaaa..bcccdc165 100644
+--- a/neuralset-repo/neuralset/extractors/test_meta.py
++++ b/neuralset-repo/neuralset/extractors/test_meta.py
+@@ -131,6 +131,18 @@ def test_aggregated_extractor(
+         assert out["agg"].shape == (batch_size, 2, 1)
+ 
+ 
++def test_aggregated_extractor_accepts_temporal_static_extractors() -> None:
++    pulse = ns.extractors.Pulse(frequency=100.0, aggregation="sum")
++    meg = ns.extractors.MegExtractor(frequency=100.0, aggregation="sum")
++
++    aggregated = ns.extractors.AggregatedExtractor(
++        extractors=[pulse, meg],
++        extractor_aggregation="cat",
++    )
++
++    assert aggregated.frequency == 100.0
++
++
+ def test_extractor_pca(tmp_path: Path) -> None:
+     infra: tp.Any = {"infra": {"folder": tmp_path}}
+     fparams: tp.Any = {"name": "HuggingFaceText", "cache_n_layers": 3, **infra}
+diff --git a/neuralset-repo/neuralset/extractors/video.py b/neuralset-repo/neuralset/extractors/video.py
+index 128631ac1..e658c5409 100644
+--- a/neuralset-repo/neuralset/extractors/video.py
++++ b/neuralset-repo/neuralset/extractors/video.py
+@@ -157,7 +157,6 @@ def _get_timed_arrays(
+     )
+     def _get_data(self, events: list[evts.Video]) -> tp.Iterator[nsbase.TimedArray]:
+         # read all videos of the events
+-        logging.getLogger("neuralset").setLevel(logging.DEBUG)
+         self._warn_if_config_num_frames_mismatch()
+         freq = events[0].frequency if self.frequency == "native" else self.frequency
+         T = 1 / freq if self.clip_duration is None else self.clip_duration
+diff --git a/neuraltrain-repo/neuraltrain/models/__init__.py b/neuraltrain-repo/neuraltrain/models/__init__.py
+index 0b13c7a67..addae6bc2 100644
+--- a/neuraltrain-repo/neuraltrain/models/__init__.py
++++ b/neuraltrain-repo/neuraltrain/models/__init__.py
+@@ -4,6 +4,9 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++# flake8: noqa: F401
++# ruff: noqa: F401
++
+ # Import modules to ensure configs are registered with DiscriminatedModel
+ from . import bendr as _bendr  # noqa: F401
+ from . import common as _common  # noqa: F401
+@@ -23,5 +26,7 @@
+ from . import simplerconv as _simplerconv  # noqa: F401
+ from . import sit as _sit  # noqa: F401
+ from . import transformer as _transformer  # noqa: F401
++from .base import BaseBrainModelConfig as BaseBrainModelConfig
+ from .base import BaseModelConfig as BaseModelConfig  # used for configs
++from .base import BrainModelBuildContext as BrainModelBuildContext
+ from .simpleconv import SimpleConvTimeAgg as SimpleConvTimeAgg
+diff --git a/neuraltrain-repo/neuraltrain/models/common.py b/neuraltrain-repo/neuraltrain/models/common.py
+index c7a2d3e5e..b38d2e001 100644
+--- a/neuraltrain-repo/neuraltrain/models/common.py
++++ b/neuraltrain-repo/neuraltrain/models/common.py
+@@ -16,7 +16,7 @@
+ from torch import nn
+ from torchvision.ops import MLP
+ 
+-from neuraltrain.models.base import BaseModelConfig
++from . import base as model_base
+ 
+ INVALID_POS_VALUE = -0.1  # See ns.extractors.ChannelPositions.INVALID_VALUE
+ 
+@@ -131,7 +131,7 @@ def forward(self, x):
+         raise NotImplementedError
+ 
+ 
+-class SubjectLayers(BaseModelConfig):
++class SubjectLayers(model_base.BaseModelConfig):
+     """Configuration for per-subject linear projections.
+ 
+     Parameters
+@@ -297,7 +297,7 @@ def __repr__(self):
+         return f"SubjectLayersModel({C}, {D}, {S})"
+ 
+ 
+-class FourierEmb(BaseModelConfig):
++class FourierEmb(model_base.BaseModelConfig):
+     """Configuration for Fourier positional embedding.
+ 
+     Parameters
+@@ -410,7 +410,7 @@ def forward(self, positions: torch.Tensor) -> torch.Tensor:
+         return emb
+ 
+ 
+-class ChannelMerger(BaseModelConfig):
++class ChannelMerger(model_base.BaseBrainModelConfig):
+     """Configuration for the ChannelMerger module.
+ 
+     Parameters
+@@ -664,7 +664,7 @@ def forward(self, x: torch.Tensor) -> torch.Tensor:
+         return self.scaler(x)
+ 
+ 
+-class Mlp(BaseModelConfig):
++class Mlp(model_base.BaseModelConfig):
+     """Multilayer perceptron, e.g. for use as projection head.
+ 
+     Notes
+@@ -730,7 +730,7 @@ def build(
+         )
+ 
+ 
+-class TemporalDownsampling(BaseModelConfig):
++class TemporalDownsampling(model_base.BaseModelConfig):
+     """Temporal downsampling via a 2-D convolution over the time axis.
+ 
+     Parameters
+diff --git a/neuraltrain-repo/neuraltrain/utils.py b/neuraltrain-repo/neuraltrain/utils.py
+index 384d10060..f40bba20b 100644
+--- a/neuraltrain-repo/neuraltrain/utils.py
++++ b/neuraltrain-repo/neuraltrain/utils.py
+@@ -304,12 +304,17 @@ def build(
+         run_id: str | None = None,
+     ) -> tp.Any:
+         import wandb
+-
+-        if self.offline:
+-            login_kwargs = {"key": "X" * 40}
+-        else:
+-            login_kwargs = {"host": self.host}  # type: ignore
+-        wandb.login(**login_kwargs)  # type: ignore
++        from lightning.fabric.utilities.rank_zero import rank_zero_only
++
++        # Under Slurm/srun every distributed rank executes this method. W&B
++        # authentication starts a local service, and concurrent login attempts
++        # can race and fail before Lightning's rank-zero logger guard applies.
++        if getattr(rank_zero_only, "rank", 0) == 0:
++            if self.offline:
++                login_kwargs = {"key": "X" * 40}
++            else:
++                login_kwargs = {"host": self.host}  # type: ignore
++            wandb.login(**login_kwargs)  # type: ignore
+         from lightning.pytorch.loggers import WandbLogger
+ 
+         if isinstance(xp_config, pydantic.BaseModel):
+diff --git a/neuraltrain-repo/project_example/main.py b/neuraltrain-repo/project_example/main.py
+index 4ad47bd4c..cb1b3e454 100644
+--- a/neuraltrain-repo/project_example/main.py
++++ b/neuraltrain-repo/project_example/main.py
+@@ -28,7 +28,8 @@
+ from torch.utils.data import DataLoader
+ 
+ import neuralset as ns
+-from neuraltrain import BaseLoss, BaseMetric, BaseModelConfig, LightningOptimizer
++from neuraltrain import BaseLoss, BaseMetric, LightningOptimizer
++from neuraltrain.models import BaseBrainModelConfig, BrainModelBuildContext
+ from neuraltrain.utils import CsvLoggerConfig, WandbLoggerConfig
+ 
+ from .pl_module import BrainModule
+@@ -77,7 +78,7 @@ class Experiment(pydantic.BaseModel):
+     # Reproducibility
+     seed: int = 33
+     # Model
+-    brain_model_config: BaseModelConfig
++    brain_model_config: BaseBrainModelConfig
+     load_checkpoint: bool = True
+     save_checkpoints: bool = False
+     # Loss
+@@ -196,11 +197,13 @@ def _build_brain_module(self, train_loader: DataLoader) -> BrainModule:
+         batch = next(iter(train_loader))
+         n_chans, n_times = batch.data["input"].shape[1:]
+         n_classes = train_loader.dataset.triggers.code.nunique()
+-        brain_model = self.brain_model_config.build(
++        # build_from_context injects by name, so any model builds from one context
++        ctx = BrainModelBuildContext(
+             n_spatial_locations=n_chans,
+             n_temporal_samples=n_times,
+             n_outputs=n_classes,
+         )
++        brain_model = self.brain_model_config.build_from_context(ctx)
+         return BrainModule(
+             model=brain_model,
+             loss=self.loss.build(),

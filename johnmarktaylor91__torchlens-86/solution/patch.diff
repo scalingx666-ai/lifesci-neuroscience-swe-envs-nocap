@@ -1,0 +1,517 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 90fff8fb50..53406670ab 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -38,6 +38,7 @@ test = [
+     "pillow",
+     "pytest",
+     "requests",
++    "soxr",
+     "timm",
+     "torchaudio",
+     "torch_geometric",
+diff --git a/tests/test_real_world_models.py b/tests/test_real_world_models.py
+index bb4451082e..a41421e872 100644
+--- a/tests/test_real_world_models.py
++++ b/tests/test_real_world_models.py
+@@ -1193,7 +1193,6 @@ def test_bert():
+     assert validate_saved_activations(model, [], model_inputs)
+ 
+ 
+-@pytest.mark.slow
+ def test_t5_small():
+     transformers = pytest.importorskip("transformers")
+     tokenizer = transformers.AutoTokenizer.from_pretrained("t5-small")
+diff --git a/tests/test_toy_models.py b/tests/test_toy_models.py
+index 8f6b646553..57f0c704e3 100644
+--- a/tests/test_toy_models.py
++++ b/tests/test_toy_models.py
+@@ -2012,12 +2012,13 @@ def test_scatter_gather():
+     )
+ 
+ 
+-def test_no_grad_block(small_input):
++def test_no_grad_block():
+     model = example_models.NoGradBlockModel()
+-    assert validate_saved_activations(model, small_input)
++    x = torch.rand(2, 32)
++    assert validate_saved_activations(model, x)
+     show_model_graph(
+         model,
+-        small_input,
++        x,
+         save_only=True,
+         vis_opt="unrolled",
+         vis_outpath=opj(VIS_OUTPUT_DIR, "toy-networks", "no_grad_block"),
+@@ -2148,12 +2149,13 @@ def test_shared_param_branch(input_2d):
+     )
+ 
+ 
+-def test_model_calling_model(small_input):
++def test_model_calling_model():
+     model = example_models.ModelCallingModelModel()
+-    assert validate_saved_activations(model, small_input)
++    x = torch.rand(2, 32)
++    assert validate_saved_activations(model, x)
+     show_model_graph(
+         model,
+-        small_input,
++        x,
+         save_only=True,
+         vis_opt="unrolled",
+         vis_outpath=opj(VIS_OUTPUT_DIR, "toy-networks", "model_calling_model"),
+diff --git a/torchlens/constants.py b/torchlens/constants.py
+index f1487bfa4f..74564c0a3b 100644
+--- a/torchlens/constants.py
++++ b/torchlens/constants.py
+@@ -166,6 +166,7 @@
+     "flops_forward",
+     "flops_backward",
+     "func_rng_states",
++    "func_autocast_state",
+     "func_argnames",
+     "num_func_args_total",
+     "num_position_args",
+diff --git a/torchlens/data_classes/tensor_log.py b/torchlens/data_classes/tensor_log.py
+index b35e283215..3f9cffeb39 100644
+--- a/torchlens/data_classes/tensor_log.py
++++ b/torchlens/data_classes/tensor_log.py
+@@ -102,6 +102,7 @@ def __init__(self, fields_dict: Dict):
+         self.flops_forward = fields_dict["flops_forward"]
+         self.flops_backward = fields_dict["flops_backward"]
+         self.func_rng_states = fields_dict["func_rng_states"]
++        self.func_autocast_state = fields_dict["func_autocast_state"]
+         self.func_argnames = fields_dict["func_argnames"]
+         self.num_func_args_total = fields_dict["num_func_args_total"]
+         self.num_position_args = fields_dict["num_position_args"]
+diff --git a/torchlens/decorate_torch.py b/torchlens/decorate_torch.py
+index 0805b79459..0e1cfd91d0 100644
+--- a/torchlens/decorate_torch.py
++++ b/torchlens/decorate_torch.py
+@@ -13,6 +13,7 @@
+ from .helper_funcs import (
+     get_vars_of_type_from_obj,
+     identity,
++    log_current_autocast_state,
+     log_current_rng_states,
+     make_random_barcode,
+     nested_getattr,
+@@ -27,6 +28,34 @@
+ funcs_not_to_log = ["numpy", "__array__", "size", "dim"]
+ print_funcs = ["__repr__", "__str__", "_str"]
+ 
++# Names of torch factory functions that accept a ``device`` kwarg.
++# When a ``torch.device`` context manager is active (TorchFunctionMode),
++# normal C dispatch injects the device automatically — but our Python
++# wrappers bypass that dispatch, so we must inject it ourselves.
++_DEVICE_CONSTRUCTOR_NAMES: set = set()
++
++# Lazy imports cached at first use.
++_torch_function_mode_len = None
++_DeviceContext = None
++
++
++def _get_active_device():
++    """Return the device from the innermost active DeviceContext, or None."""
++    global _DeviceContext
++    if _DeviceContext is None:
++        from torch.utils._device import DeviceContext
++
++        _DeviceContext = DeviceContext
++    try:
++        from torch.overrides import _get_current_function_mode_stack
++
++        for mode in reversed(_get_current_function_mode_stack()):
++            if isinstance(mode, _DeviceContext):
++                return mode.device
++    except (ImportError, AttributeError):
++        pass
++    return None
++
+ 
+ def torch_func_decorator(func: Callable, func_name: str):
+     """Wrap a torch function with toggle-gated logging.
+@@ -40,6 +69,23 @@ def torch_func_decorator(func: Callable, func_name: str):
+     def wrapped_func(*args, **kwargs):
+         # Fast path: if logging is off, pass through immediately.
+         if not _state._logging_enabled or _state._active_model_log is None:
++            # Python wrappers bypass PyTorch's C-level TorchFunctionMode
++            # dispatch, so torch.device('meta') context won't inject the
++            # device kwarg automatically.  Handle it here.
++            if (
++                _DEVICE_CONSTRUCTOR_NAMES
++                and func_name in _DEVICE_CONSTRUCTOR_NAMES
++                and "device" not in kwargs
++            ):
++                try:
++                    from torch.overrides import _len_torch_function_stack
++
++                    if _len_torch_function_stack() > 0:
++                        device = _get_active_device()
++                        if device is not None:
++                            kwargs = {**kwargs, "device": device}
++                except (ImportError, AttributeError):
++                    pass
+             return func(*args, **kwargs)
+ 
+         model_log = _state._active_model_log
+@@ -74,6 +120,7 @@ def wrapped_func(*args, **kwargs):
+         model_log.current_function_call_barcode = func_call_barcode
+         start_time = time.time()
+         func_rng_states = log_current_rng_states()
++        func_autocast_state = log_current_autocast_state()
+         out_orig = func(*args, **kwargs)
+         func_time_elapsed = time.time() - start_time
+         is_bottom_level_func = model_log.current_function_call_barcode == func_call_barcode
+@@ -81,8 +128,16 @@ def wrapped_func(*args, **kwargs):
+         if func_name in ["__setitem__", "zero_", "__delitem__"]:
+             out_orig = args[0]
+ 
+-        was_inplace = len(args) > 0 and id(out_orig) == id(args[0])
+-        if was_inplace:
++        same_object_returned = len(args) > 0 and id(out_orig) == id(args[0])
++        # True in-place ops (add_, mul_, etc.) modify the tensor and return self.
++        # No-op functions (to(same_dtype), contiguous() on contiguous tensor)
++        # also return self but don't modify anything.
++        # Both cases need safe_copy so logging doesn't overwrite the original's
++        # label, but only true in-place ops should propagate the new label back.
++        was_inplace = same_object_returned and (
++            func_name.endswith("_") or func_name.startswith("__i")
++        )
++        if same_object_returned:
+             out_orig = safe_copy(out_orig)
+ 
+         # Log all output tensors
+@@ -104,6 +159,7 @@ def wrapped_func(*args, **kwargs):
+                 out_orig,
+                 func_time_elapsed,
+                 func_rng_states,
++                func_autocast_state,
+                 is_bottom_level_func,
+             )
+ 
+@@ -272,6 +328,20 @@ def decorate_all_once():
+     except (ImportError, AttributeError):
+         pass  # JIT internals may change across PyTorch versions
+ 
++    # Build the set of device constructor function names so the fast-path
++    # wrapper can inject the device kwarg when a torch.device context is active.
++    try:
++        from torch.utils._device import _device_constructors
++
++        # Clear the lru_cache so it re-evaluates with wrapped functions.
++        _device_constructors.cache_clear()
++        for ctor in _device_constructors():
++            name = getattr(ctor, "__name__", None)
++            if name:
++                _DEVICE_CONSTRUCTOR_NAMES.add(name)
++    except (ImportError, AttributeError):
++        pass
++
+     # Permanently install torch.identity
+     new_identity = torch_func_decorator(identity, "identity")
+     torch.identity = new_identity
+diff --git a/torchlens/helper_funcs.py b/torchlens/helper_funcs.py
+index b8df1dd4f3..9552cff060 100644
+--- a/torchlens/helper_funcs.py
++++ b/torchlens/helper_funcs.py
+@@ -78,6 +78,59 @@ def set_rng_from_saved_states(rng_states: Dict):
+         torch.cuda.set_rng_state(rng_states["torch_cuda"], "cuda")
+ 
+ 
++# ---------------------------------------------------------------------------
++# Autocast state capture/restore
++# ---------------------------------------------------------------------------
++
++_AUTOCAST_DEVICES = ("cpu", "cuda")
++
++
++def log_current_autocast_state() -> Dict:
++    """Capture the current autocast enabled/dtype state for all supported devices.
++
++    Returns:
++        Dict mapping device name to {enabled: bool, dtype: torch.dtype}.
++    """
++    state = {}
++    for device in _AUTOCAST_DEVICES:
++        try:
++            state[device] = {
++                "enabled": torch.is_autocast_enabled(device),
++                "dtype": torch.get_autocast_dtype(device),
++            }
++        except (RuntimeError, TypeError):
++            pass
++    return state
++
++
++class AutocastRestore:
++    """Context manager that restores saved autocast states.
++
++    Usage::
++
++        with AutocastRestore(saved_state):
++            result = func(*args, **kwargs)
++    """
++
++    __slots__ = ("_autocast_state", "_contexts")
++
++    def __init__(self, autocast_state: Dict):
++        self._autocast_state = autocast_state
++        self._contexts = []
++
++    def __enter__(self):
++        for device, state in self._autocast_state.items():
++            if state["enabled"]:
++                ctx = torch.amp.autocast(device, dtype=state["dtype"])
++                ctx.__enter__()
++                self._contexts.append(ctx)
++        return self
++
++    def __exit__(self, *exc_info):
++        for ctx in reversed(self._contexts):
++            ctx.__exit__(*exc_info)
++
++
+ def _safe_copy_arg(arg):
+     """Copy a single argument safely, avoiding deepcopy on arbitrary objects.
+ 
+diff --git a/torchlens/logging_funcs.py b/torchlens/logging_funcs.py
+index 938b12e9c2..309172bc33 100644
+--- a/torchlens/logging_funcs.py
++++ b/torchlens/logging_funcs.py
+@@ -194,6 +194,7 @@ def log_source_tensor_exhaustive(
+         "flops_forward": 0,
+         "flops_backward": 0,
+         "func_rng_states": log_current_rng_states(),
++        "func_autocast_state": {},
+         "func_argnames": tuple([]),
+         "num_func_args_total": 0,
+         "num_position_args": 0,
+@@ -344,6 +345,7 @@ def log_function_output_tensors(
+     out_orig: Any,
+     func_time_elapsed: float,
+     func_rng_states: Dict,
++    func_autocast_state: Dict,
+     is_bottom_level_func: bool,
+ ):
+     if self.logging_mode == "exhaustive":
+@@ -358,6 +360,7 @@ def log_function_output_tensors(
+             out_orig,
+             func_time_elapsed,
+             func_rng_states,
++            func_autocast_state,
+             is_bottom_level_func,
+         )
+     elif self.logging_mode == "fast":
+@@ -371,6 +374,7 @@ def log_function_output_tensors(
+             out_orig,
+             func_time_elapsed,
+             func_rng_states,
++            func_autocast_state,
+             is_bottom_level_func,
+         )
+ 
+@@ -386,6 +390,7 @@ def log_function_output_tensors_exhaustive(
+     out_orig: Any,
+     func_time_elapsed: float,
+     func_rng_states: Dict,
++    func_autocast_state: Dict,
+     is_bottom_level_func: bool,
+ ):
+     """Logs tensor or set of tensors that were computed from a function call.
+@@ -433,6 +438,7 @@ def log_function_output_tensors_exhaustive(
+     fields_dict["func_call_stack"] = _get_func_call_stack(self.num_context_lines)
+     fields_dict["func_time_elapsed"] = func_time_elapsed
+     fields_dict["func_rng_states"] = func_rng_states
++    fields_dict["func_autocast_state"] = func_autocast_state
+     from . import _state as _st
+ 
+     fields_dict["func_argnames"] = _st._func_argnames.get(func_name.strip("_"), ())
+@@ -647,6 +653,7 @@ def log_function_output_tensors_fast(
+     out_orig: Any,
+     func_time_elapsed: float,
+     func_rng_states: Dict,
++    func_autocast_state: Dict,
+     is_bottom_level_func: bool,
+ ):
+     # Collect information.
+@@ -748,6 +755,7 @@ def log_function_output_tensors_fast(
+         orig_tensor_entry.tensor_fsize_nice = human_readable_size(get_tensor_memory_amount(out))
+         orig_tensor_entry.func_time_elapsed = func_time_elapsed
+         orig_tensor_entry.func_rng_states = func_rng_states
++        orig_tensor_entry.func_autocast_state = func_autocast_state
+         orig_tensor_entry.func_position_args_non_tensor = non_tensor_args
+         orig_tensor_entry.func_keyword_args_non_tensor = non_tensor_kwargs
+ 
+@@ -1208,16 +1216,22 @@ def _get_hash_from_args(args, kwargs):
+     return make_short_barcode_from_input(args_to_hash)
+ 
+ 
+-def _append_arg_hash(arg, prefix, args_to_hash):
++def _append_arg_hash(arg, prefix, args_to_hash, _depth=0):
+     """Append hash-relevant info for a single arg, preserving structure."""
+-    if hasattr(arg, "tl_tensor_label_raw"):
++    if _depth > 10:
++        args_to_hash.append(f"{prefix}_deep")
++        return
++    if isinstance(arg, torch.Tensor):
++        # Use shape/dtype only — formatting a tensor can trigger wrapped
++        # methods (item, __format__) which re-enter logging and cause
++        # infinite recursion.
+         args_to_hash.append(f"{prefix}_tensor{arg.shape}")
+     elif isinstance(arg, dict):
+         for k, v in arg.items():
+-            _append_arg_hash(v, f"{prefix}_dk{k}", args_to_hash)
++            _append_arg_hash(v, f"{prefix}_dk{k}", args_to_hash, _depth + 1)
+     elif isinstance(arg, (list, tuple, set)):
+         for i, elem in enumerate(arg):
+-            _append_arg_hash(elem, f"{prefix}_i{i}", args_to_hash)
++            _append_arg_hash(elem, f"{prefix}_i{i}", args_to_hash, _depth + 1)
+     elif isinstance(arg, torch.nn.Parameter):
+         pass  # exclude parameters from hash (same as before)
+     else:
+diff --git a/torchlens/model_funcs.py b/torchlens/model_funcs.py
+index bafe00774c..bc3a839073 100644
+--- a/torchlens/model_funcs.py
++++ b/torchlens/model_funcs.py
+@@ -413,6 +413,7 @@ def decorated_forward(*args, **kwargs):
+             [args, kwargs], torch.Tensor, [torch.nn.Parameter], search_depth=5
+         )
+         input_tensor_labels = set()
++        input_tensor_labels_at_entry = []
+         for t in input_tensors:
+             if (not hasattr(t, "tl_tensor_label_raw")) and hasattr(t, "tl_buffer_address"):
+                 log_source_tensor(model_log, t, "buffer", getattr(t, "tl_buffer_address"))
+@@ -433,6 +434,7 @@ def decorated_forward(*args, **kwargs):
+             tensor_entry.module_entry_exit_thread_output.append(
+                 ("+", module_pass_label[0], module_pass_label[1])
+             )
++            input_tensor_labels_at_entry.append(t.tl_tensor_label_raw)
+ 
+         # Check the buffers.
+         for buffer_name, buffer_tensor in module.named_buffers():
+@@ -472,8 +474,8 @@ def decorated_forward(*args, **kwargs):
+             )
+             module.tl_tensors_exited_labels.append(t.tl_tensor_label_raw)
+ 
+-        for t in input_tensors:
+-            tensor_entry = model_log._raw_tensor_dict[t.tl_tensor_label_raw]
++        for entry_label in input_tensor_labels_at_entry:
++            tensor_entry = model_log._raw_tensor_dict[entry_label]
+             input_module_thread = tensor_entry.module_entry_exit_thread_output[:]
+             if (
+                 "+",
+diff --git a/torchlens/trace_model.py b/torchlens/trace_model.py
+index df05918ef8..288aa7f57f 100644
+--- a/torchlens/trace_model.py
++++ b/torchlens/trace_model.py
+@@ -26,10 +26,15 @@
+ 
+ 
+ def _get_input_arg_names(model, input_args):
+-    input_arg_names = list(inspect.getfullargspec(model.forward).args)
++    spec = inspect.getfullargspec(model.forward)
++    input_arg_names = list(spec.args)
+     if "self" in input_arg_names:
+         input_arg_names.remove("self")
+     input_arg_names = input_arg_names[0 : len(input_args)]
++    # Handle *args: generate synthetic names for uncovered positions
++    if len(input_arg_names) < len(input_args) and spec.varargs is not None:
++        for i in range(len(input_arg_names), len(input_args)):
++            input_arg_names.append(f"{spec.varargs}_{i}")
+     return input_arg_names
+ 
+ 
+diff --git a/torchlens/validation/core.py b/torchlens/validation/core.py
+index f83790b8ac..a2ea12b4aa 100644
+--- a/torchlens/validation/core.py
++++ b/torchlens/validation/core.py
+@@ -15,6 +15,7 @@
+     pass
+ 
+ from ..helper_funcs import (
++    AutocastRestore,
+     log_current_rng_states,
+     set_rng_from_saved_states,
+     tuple_tolerant_assign,
+@@ -325,6 +326,12 @@ def _check_whether_func_on_saved_parents_yields_saved_tensor(
+         return True
+ 
+     if perturb:
++        # Empty tensor parents cannot be meaningfully perturbed
++        for p_label in layers_to_perturb:
++            p_entry = self[p_label]
++            if p_entry.tensor_contents is not None and p_entry.tensor_contents.numel() == 0:
++                return True
++
+         # SKIP_PERTURBATION_ENTIRELY is checked at the caller level
+         # (validate_parents_of_saved_layer), but structural positions and
+         # custom checks are per-perturbed-layer:
+@@ -341,12 +348,13 @@ def _check_whether_func_on_saved_parents_yields_saved_tensor(
+ 
+     input_args = _prepare_input_args_for_validating_layer(self, layer, layers_to_perturb)
+ 
+-    # Set the saved rng value:
++    # Restore saved rng and autocast state:
+     layer_func = layer.func_applied
+     current_rng_states = log_current_rng_states()
+     set_rng_from_saved_states(layer.func_rng_states)
+     try:
+-        recomputed_output = layer_func(*input_args["args"], **input_args["kwargs"])
++        with AutocastRestore(layer.func_autocast_state):
++            recomputed_output = layer_func(*input_args["args"], **input_args["kwargs"])
+     except Exception as e:
+         if verbose:
+             print(
+diff --git a/torchlens/validation/exemptions.py b/torchlens/validation/exemptions.py
+index 588a4f4dd7..839058bed8 100644
+--- a/torchlens/validation/exemptions.py
++++ b/torchlens/validation/exemptions.py
+@@ -51,6 +51,7 @@
+     "scatter_": {2},  # index tensor
+     "masked_fill_": {1},  # mask tensor
+     "_pad_packed_sequence": {1},  # lengths tensor
++    "type_as": {1},  # type template tensor (value irrelevant)
+ }
+ 
+ 
+@@ -103,6 +104,12 @@ def _check_setitem_exempt(self, layer: TensorLog, layers_to_perturb: List[str])
+     ):
+         return True
+ 
++    # Case 3: perturbed layer is the destination (args[0]) and it's all-zeros/all-ones.
++    # __setitem__ overwrites the destination, so perturbing a "blank slate" destination
++    # (e.g. new_zeros used in BART position embeddings) has no effect.
++    if torch.equal(perturbed_tensor, args[0]) and _check_if_arg_is_special_val(args[0]):
++        return True
++
+     return False
+ 
+ 
+@@ -209,6 +216,15 @@ def posthoc_perturb_check(
+     if layer_to_validate_parents_for.tensor_dtype == torch.bool:
+         return True
+ 
++    # topk/sort indices — discrete output insensitive to value perturbation
++    if func_name in ("topk", "sort") and layer_to_validate_parents_for.tensor_dtype in (
++        torch.int,
++        torch.long,
++        torch.int32,
++        torch.int64,
++    ):
++        return True
++
+     # to() with tensor arg — type casting
+     if func_name == "to" and len(args) > 1 and isinstance(args[1], torch.Tensor):
+         return True
+@@ -255,8 +271,8 @@ def posthoc_perturb_check(
+     ):
+         return True
+ 
+-    # max with multiple args — binary max
+-    if func_name == "max" and len(args) > 1:
++    # max/min with multiple args — binary max/min
++    if func_name in ("max", "min") and len(args) > 1:
+         return True
+ 
+     # max non-floating-point — discrete

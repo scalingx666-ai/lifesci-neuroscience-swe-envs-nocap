@@ -1,0 +1,279 @@
+diff --git a/include/lsl_cpp.h b/include/lsl_cpp.h
+index c10e0390b..406b12ba2 100644
+--- a/include/lsl_cpp.h
++++ b/include/lsl_cpp.h
+@@ -1668,7 +1668,7 @@ class continuous_resolver {
+ 	std::vector<stream_info> results() {
+ 		lsl_streaminfo buffer[1024];
+ 		return std::vector<stream_info>(
+-			buffer, buffer + lsl_resolver_results(obj.get(), buffer, sizeof(buffer)));
++			buffer, buffer + check_error(lsl_resolver_results(obj.get(), buffer, sizeof(buffer))));
+ 	}
+ 
+ 	/// Move constructor for stream_inlet
+diff --git a/src/resolve_attempt_udp.cpp b/src/resolve_attempt_udp.cpp
+index 852660025..3e9542cb4 100644
+--- a/src/resolve_attempt_udp.cpp
++++ b/src/resolve_attempt_udp.cpp
+@@ -12,11 +12,11 @@
+ using namespace lsl;
+ 
+ resolve_attempt_udp::resolve_attempt_udp(asio::io_context &io, const udp &protocol,
+-	const std::vector<udp::endpoint> &targets, const std::string &query, result_container &results,
+-	std::mutex &results_mut, double cancel_after, cancellable_registry *registry)
+-	: io_(io), results_(results), results_mut_(results_mut), cancel_after_(cancel_after),
+-	  cancelled_(false), targets_(targets), query_(query), unicast_socket_(io),
+-	  broadcast_socket_(io), multicast_socket_(io), recv_socket_(io), cancel_timer_(io) {
++	const std::vector<udp::endpoint> &targets, const std::string &query, resolver_impl &resolver,
++	double cancel_after)
++	: io_(io), resolver_(resolver), cancel_after_(cancel_after), cancelled_(false),
++	  targets_(targets), query_(query), unicast_socket_(io), broadcast_socket_(io),
++	  multicast_socket_(io), recv_socket_(io), cancel_timer_(io) {
+ 	// open the sockets that we might need
+ 	recv_socket_.open(protocol);
+ 	try {
+@@ -56,7 +56,7 @@ resolve_attempt_udp::resolve_attempt_udp(asio::io_context &io, const udp &protoc
+ 		query_msg_.c_str());
+ 
+ 	// register ourselves as a candidate for cancellation
+-	if (registry) register_at(registry);
++	register_at(&resolver);
+ }
+ 
+ resolve_attempt_udp::~resolve_attempt_udp() {
+@@ -115,22 +115,30 @@ void resolve_attempt_udp::handle_receive_outcome(err_t err, std::size_t len) {
+ 				std::string uid = info.uid();
+ 				{
+ 					// update the results
+-					std::lock_guard<std::mutex> lock(results_mut_);
+-					if (results_.find(uid) == results_.end())
+-						results_[uid] = std::make_pair(info, lsl_clock()); // insert new result
++					std::lock_guard<std::mutex> lock(resolver_.results_mut_);
++					auto it = resolver_.results_.find(uid);
++					if (it == resolver_.results_.end())
++						// insert new result, store iterator in it
++						it = resolver_.results_.emplace(uid, std::make_pair(info, lsl_clock()))
++								 .first;
+ 					else
+-						results_[uid].second = lsl_clock(); // update only the receive time
++						it->second.second = lsl_clock(); // update only the receive time
++					auto &stored_info = it->second.first;
+ 					// ... also update the address associated with the result (but don't
+ 					// override the address of an earlier record for this stream since this
+ 					// would be the faster route)
+ 					if (remote_endpoint_.address().is_v4()) {
+-						if (results_[uid].first.v4address().empty())
+-							results_[uid].first.v4address(remote_endpoint_.address().to_string());
++						if (stored_info.v4address().empty())
++							stored_info.v4address(remote_endpoint_.address().to_string());
+ 					} else {
+-						if (results_[uid].first.v6address().empty())
+-							results_[uid].first.v6address(remote_endpoint_.address().to_string());
++						if (stored_info.v6address().empty())
++							stored_info.v6address(remote_endpoint_.address().to_string());
+ 					}
+ 				}
++				// prepone the next cancellation check, i.e. when all needed streams are found,
++				// cancel immediately rather than when a wave timer is due half a second later
++				if (resolver_.check_cancellation_criteria())
++					resolver_.cancel_ongoing_resolve();
+ 			}
+ 		} catch (std::exception &e) {
+ 			LOG_F(WARNING, "resolve_attempt_udp: hiccup while processing the received data: %s",
+diff --git a/src/resolve_attempt_udp.h b/src/resolve_attempt_udp.h
+index 34f6ec3fc..2518480d2 100644
+--- a/src/resolve_attempt_udp.h
++++ b/src/resolve_attempt_udp.h
+@@ -53,8 +53,7 @@ class resolve_attempt_udp : public cancellable_obj,
+ 	 */
+ 	resolve_attempt_udp(asio::io_context &io, const udp &protocol,
+ 		const std::vector<udp::endpoint> &targets, const std::string &query,
+-		result_container &results, std::mutex &results_mut, double cancel_after = 5.0,
+-		cancellable_registry *registry = nullptr);
++		resolver_impl &resolver, double cancel_after = 5.0);
+ 
+ 	/// Destructor
+ 	~resolve_attempt_udp();
+@@ -90,10 +89,8 @@ class resolve_attempt_udp : public cancellable_obj,
+ 	// data shared with the resolver_impl
+ 	/// reference to the IO service that executes our actions
+ 	asio::io_context &io_;
+-	/// shared result container
+-	result_container &results_;
+-	/// shared mutex that protects the results
+-	std::mutex &results_mut_;
++	/// the resolver associated with this attempt
++	resolver_impl &resolver_;
+ 
+ 	// constant over the lifetime of this attempt
+ 	/// the timeout for giving up
+diff --git a/src/resolver_impl.cpp b/src/resolver_impl.cpp
+index 056cf0953..9757a53c3 100644
+--- a/src/resolver_impl.cpp
++++ b/src/resolver_impl.cpp
+@@ -49,11 +49,9 @@ resolver_impl::resolver_impl()
+ 	// generate the list of protocols to use
+ 	if (cfg_->allow_ipv6()) {
+ 		udp_protocols_.push_back(udp::v6());
+-		tcp_protocols_.push_back(tcp::v6());
+ 	}
+ 	if (cfg_->allow_ipv4()) {
+ 		udp_protocols_.push_back(udp::v4());
+-		tcp_protocols_.push_back(tcp::v4());
+ 	}
+ }
+ 
+@@ -90,6 +88,9 @@ resolver_impl *resolver_impl::create_resolver(
+ 
+ std::vector<stream_info_impl> resolver_impl::resolve_oneshot(
+ 	const std::string &query, int minimum, double timeout, double minimum_time) {
++	if(status == resolver_status::running_continuous)
++		throw std::logic_error("resolve_oneshot called during continuous operation");
++
+ 	check_query(query);
+ 	// reset the IO service & set up the query parameters
+ 	io_->restart();
+@@ -113,6 +114,8 @@ std::vector<stream_info_impl> resolver_impl::resolve_oneshot(
+ 	// start the first wave of resolve packets
+ 	next_resolve_wave();
+ 
++	status = resolver_status::started_oneshot;
++
+ 	// run the IO operations until finished
+ 	if (!cancelled_) {
+ 		io_->run();
+@@ -125,6 +128,9 @@ std::vector<stream_info_impl> resolver_impl::resolve_oneshot(
+ }
+ 
+ void resolver_impl::resolve_continuous(const std::string &query, double forget_after) {
++	if(status == resolver_status::running_continuous)
++		throw std::logic_error("resolve_continuous called during another continuous operation");
++
+ 	check_query(query);
+ 	// reset the IO service & set up the query parameters
+ 	io_->restart();
+@@ -139,9 +145,13 @@ void resolver_impl::resolve_continuous(const std::string &query, double forget_a
+ 	next_resolve_wave();
+ 	// spawn a thread that runs the IO operations
+ 	background_io_ = std::make_shared<std::thread>([shared_io = io_]() { shared_io->run(); });
++	status = resolver_status::running_continuous;
+ }
+ 
+ std::vector<stream_info_impl> resolver_impl::results(uint32_t max_results) {
++	if (status == resolver_status::empty)
++		throw std::logic_error("results() called before starting a resolve operation");
++
+ 	std::vector<stream_info_impl> output;
+ 	std::lock_guard<std::mutex> lock(results_mut_);
+ 	double expired_before = lsl_clock() - forget_after_;
+@@ -160,13 +170,7 @@ std::vector<stream_info_impl> resolver_impl::results(uint32_t max_results) {
+ // === timer-driven async handlers ===
+ 
+ void resolver_impl::next_resolve_wave() {
+-	std::size_t num_results = 0;
+-	{
+-		std::lock_guard<std::mutex> lock(results_mut_);
+-		num_results = results_.size();
+-	}
+-	if (cancelled_ || expired_ ||
+-		(minimum_ && (num_results >= (std::size_t)minimum_) && lsl_clock() >= wait_until_)) {
++	if (check_cancellation_criteria()) {
+ 		// stopping criteria satisfied: cancel the ongoing operations
+ 		cancel_ongoing_resolve();
+ 	} else {
+@@ -191,11 +195,11 @@ void resolver_impl::next_resolve_wave() {
+ 
+ void resolver_impl::udp_multicast_burst() {
+ 	// start one per IP stack under consideration
+-	int failures = 0;
++	unsigned int failures = 0;
+ 	for (auto protocol: udp_protocols_) {
+ 		try {
+-			std::make_shared<resolve_attempt_udp>(*io_, protocol, mcast_endpoints_, query_,
+-				results_, results_mut_, cfg_->multicast_max_rtt(), this)
++			std::make_shared<resolve_attempt_udp>(
++				*io_, protocol, mcast_endpoints_, query_, *this, cfg_->multicast_max_rtt())
+ 				->begin();
+ 		} catch (std::exception &e) {
+ 			if (++failures == udp_protocols_.size())
+@@ -210,12 +214,12 @@ void resolver_impl::udp_multicast_burst() {
+ void resolver_impl::udp_unicast_burst(err_t err) {
+ 	if (err == asio::error::operation_aborted) return;
+ 
+-	int failures = 0;
++	unsigned int failures = 0;
+ 	// start one per IP stack under consideration
+ 	for (auto protocol: udp_protocols_) {
+ 		try {
+-			std::make_shared<resolve_attempt_udp>(*io_, protocol, ucast_endpoints_, query_,
+-				results_, results_mut_, cfg_->unicast_max_rtt(), this)
++			std::make_shared<resolve_attempt_udp>(
++				*io_, protocol, ucast_endpoints_, query_, *this, cfg_->unicast_max_rtt())
+ 				->begin();
+ 		} catch (std::exception &e) {
+ 			if (++failures == udp_protocols_.size())
+@@ -234,6 +238,19 @@ void resolver_impl::cancel() {
+ 	cancel_ongoing_resolve();
+ }
+ 
++bool resolver_impl::check_cancellation_criteria()
++{
++	std::size_t num_results = 0;
++	{
++		std::lock_guard<std::mutex> lock(results_mut_);
++		num_results = results_.size();
++	}
++	if (cancelled_ || expired_) return true;
++	if (minimum_ && (num_results >= (std::size_t)minimum_) && lsl_clock() >= wait_until_)
++		return true;
++	return false;
++}
++
+ void resolver_impl::cancel_ongoing_resolve() {
+ 	// make sure that ongoing handler loops terminate
+ 	expired_ = true;
+diff --git a/src/resolver_impl.h b/src/resolver_impl.h
+index eade0c737..de855ddbf 100644
+--- a/src/resolver_impl.h
++++ b/src/resolver_impl.h
+@@ -124,7 +124,13 @@ class resolver_impl : public cancellable_registry {
+ 	 */
+ 	void cancel();
+ 
++	enum class resolver_status {
++		empty, started_oneshot, running_continuous
++	};
++
+ private:
++	friend class resolve_attempt_udp;
++
+ 	/// This function starts a new wave of resolves.
+ 	void next_resolve_wave();
+ 
+@@ -134,6 +140,9 @@ class resolver_impl : public cancellable_registry {
+ 	/// Start a new resolver attempt on the known peers.
+ 	void udp_unicast_burst(err_t err);
+ 
++	/// Check if cancellation criteria (minimum number of results, timeout) are met
++	bool check_cancellation_criteria();
++
+ 	/// Cancel the currently ongoing resolve, if any.
+ 	void cancel_ongoing_resolve();
+ 
+@@ -143,8 +152,6 @@ class resolver_impl : public cancellable_registry {
+ 	const api_config *cfg_;
+ 	/// UDP protocols under consideration
+ 	std::vector<udp> udp_protocols_;
+-	/// TCP protocols under consideration
+-	std::vector<tcp> tcp_protocols_;
+ 	/// the list of multicast endpoints under consideration
+ 	std::vector<udp::endpoint> mcast_endpoints_;
+ 	/// the list of per-host UDP endpoints under consideration
+@@ -157,6 +164,7 @@ class resolver_impl : public cancellable_registry {
+ 	std::atomic<bool> expired_;
+ 
+ 	// reinitialized for each query
++	resolver_status status{resolver_status::empty};
+ 	/// our current query string
+ 	std::string query_;
+ 	/// the minimum number of results that we want

@@ -1,0 +1,512 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 8505c46a..7af5dc71 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -189,6 +189,10 @@ Pure TS with dependency-injected I/O so it runs under vitest in Node. `adapter.t
+ 
+ ### Desktop — sync (`src/lib/sync/`)
+ - `docSession.ts` (`syncManager`) — owns the registry, current `DocSync`, presence, attachments.
++  Each sync lifetime gets a fresh `VaultRegistry`; teardown permanently retires the previous one.
++  Never rebind a retired registry: suspended requests must retain the old scope and cannot write
++  another vault's files, identity map, baseline, progress, or selection. Flush the editor before
++  switching the vault epoch, and gate late note-open completions on that epoch.
+ - `syncManager.ts` (`DocSync`) — `HocuspocusProvider` over the bridge's `Y.Doc`; doc name
+   `vault:<vaultId>/note:<docId>`. Token is a **function** re-minted per (re)connect via `POST /api/sync-token`;
+   403 → `no-access`. WS URL derived from the server URL (`deriveWsUrl`): ALWAYS same-origin
+diff --git a/app/apps/desktop/src/__tests__/tabStore.test.ts b/app/apps/desktop/src/__tests__/tabStore.test.ts
+index 404dcc22..e71ca1fd 100644
+--- a/app/apps/desktop/src/__tests__/tabStore.test.ts
++++ b/app/apps/desktop/src/__tests__/tabStore.test.ts
+@@ -324,3 +324,18 @@ describe("settings dialogs swap instead of stacking", () => {
+     expect(useStore.getState().settingsDialog).toBe("account");
+   });
+ });
++
++it("a note-open response from the previous vault cannot replace or clear the next vault's selection", async () => {
++  let release!: (value: any) => void;
++  const delayed = new Promise<any>(resolve => { release = resolve; });
++  ipcMock.getNoteMeta.mockReturnValueOnce(delayed);
++  useStore.setState({ vault: { path: "/a", name: "A", epoch: 1 }, openFolderIsSynced: false });
++  const oldOpen = open("Same.md");
++  useStore.setState({ vault: { path: "/b", name: "B", epoch: 2 }, openingNotePath: "Same.md",
++    openNote: { path: "B.md", id: "b-note", title: "B" }, openTabs: ["B.md"] });
++  release({ path: "Same.md", id: "a-note", title: "A" });
++  await oldOpen;
++  expect(useStore.getState().openNote?.id).toBe("b-note");
++  expect(useStore.getState().openTabs).toEqual(["B.md"]);
++  expect(useStore.getState().openingNotePath).toBe("Same.md");
++});
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/bulkThreshold.test.ts b/app/apps/desktop/src/lib/sync/__tests__/bulkThreshold.test.ts
+index 1ec59eec..e69cb3d3 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/bulkThreshold.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/bulkThreshold.test.ts
+@@ -233,7 +233,8 @@ describe("site 4 — pushing note CONTENT", () => {
+   });
+ 
+   it("…and `enable`'s own bulk engine, which had it first", () => {
+-    expect(source).toContain("useBulkPath(this.registry.mappedNotes().length)");
++    const enable = source.slice(source.indexOf("async enable("), source.indexOf("private teardown("));
++    expect(enable).toContain("useBulkPath(registry.mappedNotes().length)");
+   });
+ });
+ 
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/docSessionRegistryIsolation.test.ts b/app/apps/desktop/src/lib/sync/__tests__/docSessionRegistryIsolation.test.ts
+new file mode 100644
+index 00000000..ebd8860c
+--- /dev/null
++++ b/app/apps/desktop/src/lib/sync/__tests__/docSessionRegistryIsolation.test.ts
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: Apache-2.0
++import { beforeEach, afterEach, expect, it, vi } from "vitest";
++
++const api = vi.hoisted(() => ({
++  listVaults: vi.fn(async () => [
++    { id: "collection-a", organization_id: "org-a", name: "A" },
++    { id: "collection-b", organization_id: "org-b", name: "B" },
++  ]),
++  listFolderRegistry: vi.fn(async () => ({ folders: [], tombstones: [] })),
++  listNoteRegistryPaged: vi.fn(async (_id: string) => ({ notes: [] as any[], tombstones: [] as string[] })),
++  listFilesWithBytes: vi.fn(async () => []),
++}));
++vi.mock("../../auth/authManager", () => ({ api, authManager: { api } }));
++vi.mock("../../ipc", () => ({
++  getVaultConfig: vi.fn(async () => null),
++  setVaultConfig: vi.fn(async () => {}),
++  listTree: vi.fn(async () => ({ id: "root", name: "", path: "", isDir: true, children: [], childrenLoaded: true })),
++  listTags: vi.fn(async () => []),
++  listNoteTitles: vi.fn(async () => []),
++  writeNoteIfMissing: vi.fn(async () => true),
++  isVaultMismatch: vi.fn(() => false),
++  vaultRootExists: vi.fn(async () => true),
++}));
++vi.mock("../crdtGc", () => ({ collectCrdtGarbage: vi.fn(async () => {}) }));
++import * as ipc from "../../ipc";
++import { SyncManager } from "../docSession";
++import { vaultScopes } from "../vaultScope";
++
++const session = (org: string) => ({ user: { id: "user", name: "Test", email: "test@example.com" }, activeOrganizationId: org });
++const target = (letter: string, epoch: number) => ({ orgId: `org-${letter}`, name: letter, path: `/vault-${letter}`, epoch });
++let manager: SyncManager;
++beforeEach(() => {
++  vi.clearAllMocks();
++  api.listNoteRegistryPaged.mockImplementation(async () => ({ notes: [], tombstones: [] }));
++  manager = new SyncManager();
++  // Exercise the real registry and session lifetime; exclude sockets and blobs.
++  vi.spyOn(manager as any, "startVaultEngine").mockImplementation(() => {});
++  vi.spyOn(manager as any, "setupAttachments").mockImplementation(() => {});
++});
++afterEach(() => { manager.disable(); vaultScopes.end(); });
++
++it("a delayed listing from A cannot materialize files, maps, or counts into B", async () => {
++  let arrived!: () => void;
++  const requested = new Promise<void>(resolve => { arrived = resolve; });
++  let release!: (value: any) => void;
++  const delayed = new Promise<any>(resolve => { release = resolve; });
++  api.listNoteRegistryPaged.mockImplementation(async (id) => {
++    if (id === "collection-a") { arrived(); return delayed; }
++    return { notes: [], tombstones: [] };
++  });
++  const openingA = manager.enable(session("org-a"), target("a", 1));
++  await requested;
++  const registryA = manager.registry;
++  await manager.enable(session("org-b"), target("b", 2));
++  const registryB = manager.registry;
++  vi.mocked(ipc.setVaultConfig).mockClear();
++  release({ notes: [{ id: "a-note", rel_path: "Only-in-A.md" }], tombstones: [] });
++  expect((await openingA).ok).toBe(false);
++  expect(registryB).not.toBe(registryA);
++  expect(registryB.vaultId).toBe("collection-b");
++  expect(registryB.mappedNotes()).toEqual([]);
++  expect(ipc.writeNoteIfMissing).not.toHaveBeenCalled();
++  expect(ipc.setVaultConfig).not.toHaveBeenCalled();
++  expect(await registryA.primeLocal("org-b")).toBe(false);
++});
++
++it("a delayed unsuccessful local prime cannot reconcile A in the next session", async () => {
++  let release!: (value: null) => void;
++  const delayed = new Promise<null>(resolve => { release = resolve; });
++  vi.mocked(ipc.getVaultConfig).mockReturnValueOnce(delayed);
++  const openingA = manager.enable(session("org-a"), target("a", 1));
++  await manager.enable(session("org-b"), target("b", 2));
++  api.listVaults.mockClear();
++  release(null);
++  expect((await openingA).ok).toBe(false);
++  expect(api.listVaults).not.toHaveBeenCalled();
++  expect(manager.registry.vaultId).toBe("collection-b");
++});
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/docSessionVaultScope.test.ts b/app/apps/desktop/src/lib/sync/__tests__/docSessionVaultScope.test.ts
+index e61decfc..eaa5142a 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/docSessionVaultScope.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/docSessionVaultScope.test.ts
+@@ -101,8 +101,9 @@ function session(orgId = ORG_A): SessionInfo {
+ beforeEach(() => {
+   vi.useRealTimers();
+   fakeRegistry.reset.mockClear();
++  fakeRegistry.setProgressSink.mockClear();
+   fakeRegistry.pull.mockClear();
+-  fakeRegistry.reconcile.mockClear().mockImplementation(async () => ({ seeded: false }));
++  fakeRegistry.reconcile.mockReset().mockImplementation(async () => ({ seeded: false }));
+   // A vault with nothing mapped and nothing confirmed is the neutral starting
+   // point; tests that care set these explicitly.
+   fakeRegistry.mappedNotes.mockReturnValue([]);
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/inboundApply.test.ts b/app/apps/desktop/src/lib/sync/__tests__/inboundApply.test.ts
+index 1ee60d9e..52bfb6bb 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/inboundApply.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/inboundApply.test.ts
+@@ -2425,6 +2425,33 @@ describe("offline reconciliation — ready.tombstones", () => {
+ });
+ 
+ describe("access grants", () => {
++  it("does not call a note created during a slow listing an access grant", async () => {
++    const clock = vi.spyOn(Date, "now");
++    const started = Date.parse("2026-10-01T10:00:00Z");
++    clock.mockReturnValue(started);
++    try {
++      const disk = new FakeDisk();
++      install(disk);
++      const state: ServerState = { notes: [], tombstones: [] };
++      const api = fakeApi(state);
++      const list = api.listNoteRegistryPaged.bind(api);
++      vi.mocked(api.listNoteRegistryPaged).mockImplementationOnce(async (...args) => {
++        const result = await list(...args);
++        clock.mockReturnValue(started + 30_000);
++        return result;
++      });
++      const reg = new VaultRegistry(api);
++      const grants: unknown[] = [];
++      const host = recordingHost();
++      host.host.accessGranted = (event) => grants.push(event);
++      reg.setInboundHost(host.host);
++      await reg.reconcile({ organizationId: ORG, vaultName: "v" });
++      state.notes = [{ id: "new", rel_path: "new.md", created_at: new Date(started + 10_000).toISOString() } as ServerState["notes"][number]];
++      await reg.pull();
++      expect(grants).toEqual([]);
++    } finally { clock.mockRestore(); }
++  });
++
+   it("the first pull fires nothing; a later pull adding two readable notes fires once with count 2", async () => {
+     const disk = new FakeDisk();
+     disk.notes.set("a.md", "d1");
+diff --git a/app/apps/desktop/src/lib/sync/docSession.ts b/app/apps/desktop/src/lib/sync/docSession.ts
+index d02aebd7..670c8d53 100644
+--- a/app/apps/desktop/src/lib/sync/docSession.ts
++++ b/app/apps/desktop/src/lib/sync/docSession.ts
+@@ -393,9 +393,13 @@ const DOC_STATUS_OWNS_BADGE: ReadonlySet<SyncStatus> = new Set<SyncStatus>([
+ ]);
+ 
+ export class SyncManager implements InboundHost {
+-  readonly registry = new VaultRegistry(api);
++  registry = new VaultRegistry(api);
+ 
+   constructor() {
++    this.configureRegistry();
++  }
++
++  private configureRegistry(): void {
+     // Every confirmed push, on every path (batch, per-doc uploader, one-step
+     // create, open-note confirm), clears that doc's failure rows: the sidebar
+     // badge and the failure list must never disagree.
+@@ -4832,6 +4836,7 @@ export class SyncManager implements InboundHost {
+     // Retire whatever was running for the previous vault BEFORE any await, so no
+     // old-vault work can interleave with this reconcile.
+     this.teardown();
++    const registry = this.registry;
+     const scope = vaultScopes.begin({
+       orgId: vault.orgId,
+       vaultPath: vault.path,
+@@ -4845,11 +4850,11 @@ export class SyncManager implements InboundHost {
+     let cleanupActive = false;
+     const progress = new SyncProgressReporter({
+       onProgress: (p) => {
+-        if (cleanupActive) return;
++        if (!scope.isCurrent() || cleanupActive) return;
+         this.logRunPhase(p);
+         this.onSyncProgress?.(this.withRefusals(this.withUploadBacklog(p)));
+       },
+-      onDocState: (patch) => this.onDocState?.(patch),
++      onDocState: (patch) => { if (scope.isCurrent()) this.onDocState?.(patch); },
+     });
+     this.progress = progress;
+     // The registry writes into the SHARED reporter, but its COUNTERS are muted
+@@ -4860,7 +4865,7 @@ export class SyncManager implements InboundHost {
+     // they are keyed by docId, so concurrent writers cannot garble them.
+     const cleanup = new SyncProgressReporter({
+       onProgress: (p) => {
+-        if (!cleanupActive) return;
++        if (!scope.isCurrent() || !cleanupActive) return;
+         this.logRunPhase(p);
+         this.onSyncProgress?.(p);
+       },
+@@ -4868,7 +4873,7 @@ export class SyncManager implements InboundHost {
+     });
+     this.cleanupProgress = cleanup;
+     const counterOwned = (): boolean => this.bulkPhase || this.contentRunInFlight() || this.downloadPhase;
+-    this.registry.setProgressSink({
++    registry.setProgressSink({
+       phase: (p, t) => {
+         if (p === "removing") {
+           cleanupActive = true;
+@@ -4904,7 +4909,7 @@ export class SyncManager implements InboundHost {
+     // the doc. Best-effort: a folder with no (or a foreign) stamp doesn't prime,
+     // and a broken config must not fail the enable.
+     try {
+-      if (await this.registry.primeLocal(vault.orgId)) {
++      if (await registry.primeLocal(vault.orgId)) {
+         if (!scope.isCurrent()) return { ok: false, reason: "vault changed", scope };
+         this.primed = true;
+         // Sidebar badges + `store.docIdByPath`, immediately.
+@@ -4928,6 +4933,7 @@ export class SyncManager implements InboundHost {
+     } catch (e) {
+       console.warn("[sync] local prime failed; falling back to reconcile-first", e);
+     }
++    if (!scope.isCurrent()) return { ok: false, reason: "vault changed", scope };
+     // ---- PHASE B: the networked reconcile. Unchanged. ----
+     try {
+       // The registry reads the vault tree itself (the FULL recursive walk); it
+@@ -4938,13 +4944,13 @@ export class SyncManager implements InboundHost {
+       this.enableReconciling = true;
+       let reconciled: { seeded: boolean };
+       try {
+-        reconciled = await this.registry.reconcile({
++        reconciled = await registry.reconcile({
+           organizationId: session.activeOrganizationId,
+           vaultName: vault.name,
+           seedIfEmpty: vault.seedIfEmpty,
+         });
+       } finally {
+-        this.enableReconciling = false;
++        if (scope.isCurrent()) this.enableReconciling = false;
+       }
+       const { seeded } = reconciled;
+       // The user may have switched vaults during the reconcile. Bringing sync up
+@@ -4979,7 +4985,7 @@ export class SyncManager implements InboundHost {
+       // two id spaces.
+       this.lastCrdtSweepAt = Date.now();
+       void collectCrdtGarbage(
+-        { registryDocIds: () => this.registry.allDocIds() },
++        { registryDocIds: () => registry.allDocIds() },
+         { epoch: scope.vaultEpoch ?? undefined, pinned: this.crdtSweepPinned() },
+       );
+       this.setupAttachments(scope);
+@@ -5007,7 +5013,7 @@ export class SyncManager implements InboundHost {
+       // Background, like the content run it replaces — `enable` must return as
+       // soon as the vault is usable or "Turn on sync" blocks the UI for the
+       // whole backfill.
+-      if (useBulkPath(this.registry.mappedNotes().length)) {
++      if (useBulkPath(registry.mappedNotes().length)) {
+         this.bulkRun = this.runBulkEngine(scope).catch((e) => {
+           console.warn("[sync] bulk sync failed", e);
+         });
+@@ -5016,7 +5022,7 @@ export class SyncManager implements InboundHost {
+         // the pull's), but never leave deferred notes without a file.
+         void this.materializeDeferred();
+       }
+-      if (!useBulkPath(this.registry.mappedNotes().length) && this.vaultEngineLiveOnly) {
++      if (!useBulkPath(registry.mappedNotes().length) && this.vaultEngineLiveOnly) {
+         // The prime window sized the channel from the LOCAL doc map and put it
+         // in live-only mode; the reconcile then found a vault below the
+         // threshold. Nothing is going to page it down over HTTP, so give the
+@@ -6158,6 +6164,7 @@ export class SyncManager implements InboundHost {
+   private teardown(): void {
+     this.enabled = false;
+     this.primed = false;
++    this.enableReconciling = false;
+     // Link refusals name paths in the vault we are leaving.
+     resetLinkRefusals();
+     // A pending badge hold belongs to the vault we are leaving; letting it fire
+@@ -6295,11 +6302,12 @@ export class SyncManager implements InboundHost {
+     this.clearVaultPresence();
+     this.stopVaultEngine();
+     this.closeCurrent();
+-    // The registry is a process singleton: a surviving `serverVaultId` + path
+-    // maps are precisely what let vault A's ids be applied to vault B's tree.
+-    // (`reset` also disposes its config-checkpointer synchronously, so a pending
+-    // flush can't write this vault's doc map into the next one.)
+-    this.registry.reset();
++    // Never rebind an object with suspended async work to another vault. A
++    // reset alone lets old awaits resume against the next session's live scope.
++    if (this.registry.retire) this.registry.retire();
++    else this.registry.reset(); // lightweight test doubles
++    this.registry = new VaultRegistry(api);
++    this.configureRegistry();
+     // Nulls the store's `syncProgress`, so a half-finished count from the vault we
+     // just left is never on screen.
+     this.cleanupProgress?.dispose();
+diff --git a/app/apps/desktop/src/lib/sync/registry.ts b/app/apps/desktop/src/lib/sync/registry.ts
+index bd5380a5..52098ccb 100644
+--- a/app/apps/desktop/src/lib/sync/registry.ts
++++ b/app/apps/desktop/src/lib/sync/registry.ts
+@@ -796,6 +796,7 @@ export class VaultRegistry {
+   private prefetchedListings: {
+     vaultId: string;
+     p: Promise<[FolderRegistry, NoteRegistry]>;
++    startedAt: number;
+   } | null = null;
+   /** The org this registry is reconciling under (see `VaultSyncConfig.organizationId`). */
+   private organizationId: string | null = null;
+@@ -876,11 +877,10 @@ export class VaultRegistry {
+    * a teammate's brand-new note is new content, not a grant. A row whose
+    * creation time the server does not send is not counted.
+    */
+-  private detectAccessGrants(serverNotes: RegisteredNote[]): void {
+-    const now = Date.now();
++  private detectAccessGrants(serverNotes: RegisteredNote[], startedAt: number): void {
+     const ids = new Set(serverNotes.map((n) => noteDocId(n)));
+     const prev = this.lastListed;
+-    this.lastListed = { ids, at: now };
++    this.lastListed = { ids, at: startedAt };
+     if (!prev) return;
+     const paths: string[] = [];
+     for (const n of serverNotes) {
+@@ -1340,12 +1340,22 @@ export class VaultRegistry {
+     cb(colors);
+   }
+ 
+-  /**
+-   * Forget everything about the vault this registry was reconciled against.
+-   * MUST be called on every vault switch / disable: this instance is a process
+-   * singleton, so a surviving `serverVaultId` + path maps are exactly what let
+-   * vault A's server ids be applied to vault B's tree.
+-   */
++  /** A retired registry must never be rebound, even by suspended work. */
++  private retired = false;
++
++  /** End this instance permanently. Suspended work can never adopt a new scope. */
++  retire(): void {
++    this.retired = true;
++    this.reset();
++    this.setInboundHost(null);
++    this.setMapListener(null);
++    this.setNoteMetaListener(null);
++    this.setColorListener(null);
++    this.setFailureListener(null);
++    this.setPushedListener(null);
++  }
++
++  /** Clear cached state. Session teardown must use retire(), then a new instance. */
+   reset(): void {
+     // Synchronously first: a pending flush must never outlive the vault.
+     this.checkpoint?.dispose();
+@@ -1409,6 +1419,7 @@ export class VaultRegistry {
+   /** True when this registry's contents belong to a vault that is no longer the
+    *  open one. Bail silently — "the user moved on" is not an error. */
+   private stale(): boolean {
++    if (this.retired) return true;
+     if (this.bound != null && !this.bound.isCurrent()) return true;
+     // A vanished vault root (#221) is the same answer for a different reason:
+     // whatever this pass meant to write belongs to a folder that is not there.
+@@ -3522,6 +3533,7 @@ export class VaultRegistry {
+    * Returns whether anything was adopted.
+    */
+   async primeLocal(orgId: string): Promise<boolean> {
++    if (this.retired) return false;
+     this.bound = this.scopes.current();
+     const cfg = await this.loadConfig();
+     if (this.stale()) return false;
+@@ -3562,6 +3574,7 @@ export class VaultRegistry {
+   }
+ 
+   private async reconcileNow(input: ReconcileInput): Promise<{ seeded: boolean }> {
++    if (this.retired) return { seeded: false };
+     // Bind this registry to the vault the reconcile is FOR — this is the one
+     // operation allowed to (re)claim it. Every await below is a chance for the
+     // user to switch vaults; each `stale()` checkpoint drops the rest of the work
+@@ -3794,6 +3807,7 @@ export class VaultRegistry {
+     // did not say", which is what stops the reconciler inferring a delete — and
+     // a server that predates `limit`/`after` ignores them, answers everything
+     // with no `nextAfter`, and is therefore asked exactly once.
++    const startedAt = Date.now();
+     const p = Promise.all([
+       this.api.listFolderRegistry(vaultId),
+       this.api.listNoteRegistryPaged(vaultId, { limit: PULL_PAGE_LIMIT }),
+@@ -3803,7 +3817,7 @@ export class VaultRegistry {
+     p.catch(() => {
+       /* surfaced at the await in takeListings */
+     });
+-    this.prefetchedListings = { vaultId, p };
++    this.prefetchedListings = { vaultId, p, startedAt };
+   }
+ 
+   /**
+@@ -3867,6 +3881,10 @@ export class VaultRegistry {
+     this.failed = [];
+     this.limitReached = null;
+     this.accountReadOnly = false;
++    // Notes created while a paged listing was in flight are new content, not
++    // permission grants. The cutoff is the request start, never its completion.
++    const listingStartedAt = this.prefetchedListings?.vaultId === vaultId
++      ? this.prefetchedListings.startedAt : Date.now();
+     const [folderRegistry, noteRegistry] = await this.takeListings(vaultId);
+     if (this.stale()) return false;
+     // The empty state of a member who can read nothing yet reads this.
+@@ -3946,7 +3964,7 @@ export class VaultRegistry {
+     void this.learnFileAuthorship(vaultId);
+     // Access GRANTS: notes readable now that were not in the previous pass's
+     // listing. Measured against the listing, before anything below maps them.
+-    this.detectAccessGrants(serverNotes);
++    this.detectAccessGrants(serverNotes, listingStartedAt);
+     // A note listed again is readable again: its "you lost this" report line
+     // (kept locally / deleted by a teammate) no longer holds this session.
+     reconcileReport.forgetReadable(new Set(serverNotes.map((n) => noteDocId(n))));
+diff --git a/app/apps/desktop/src/store.ts b/app/apps/desktop/src/store.ts
+index 7a1c035c..328683ca 100644
+--- a/app/apps/desktop/src/store.ts
++++ b/app/apps/desktop/src/store.ts
+@@ -1890,6 +1890,8 @@ function vaultScopedSyncReset() {
+     rootFrozen: false,
+     // Tabs are paths, and paths only mean something inside the vault that
+     // minted them — every vault leave/switch spreads this reset.
++    openNote: null,
++    openingNotePath: null,
+     openTabs: [] as string[],
+     virtualTabs: [] as VirtualTab[],
+     activeVirtualTab: null as string | null,
+@@ -1981,7 +1983,6 @@ async function unsyncLocalTeardown(
+ export const useStore = create<AppStore>((set, get) => ({
+   vault: null,
+   tree: null,
+-  openNote: null,
+   openVirtualTab: (tab) =>
+     set((s) => ({ virtualTabs: upsertTab(s.virtualTabs, tab), activeVirtualTab: tab.id, homeActivation: null })),
+   activateVirtualTab: (id) => set({ activeVirtualTab: id, homeActivation: null }),
+@@ -2077,7 +2078,6 @@ export const useStore = create<AppStore>((set, get) => ({
+   },
+   landingVault: false,
+   switchingVault: null,
+-  openingNotePath: null,
+   organizations: [],
+   members: [],
+   pendingInvitations: [],
+@@ -2639,7 +2639,7 @@ export const useStore = create<AppStore>((set, get) => ({
+     } finally {
+       // Only the newest open clears it: two quick clicks would otherwise have the
+       // first one's completion cancel the second one's indicator.
+-      if (get().openingNotePath === path) set({ openingNotePath: null });
++      if (stillOpening()) set({ openingNotePath: null });
+     }
+   },
+ 
+@@ -3936,6 +3936,10 @@ export const useStore = create<AppStore>((set, get) => ({
+         rememberOrgVault(previousOrgId, currentVaultPath);
+       }
+ 
++      // Finish the editor's durable write before changing the vault epoch.
++      await bridgeManager.currentBridge()?.flushEgest();
++      if (superseded()) return;
++
+       // Stop syncing the vault we're leaving before anything else. Everything
+       // below awaits the network, and one branch swaps the Rust vault slot
+       // (applyVaultFolder) while the other leaves the old folder on screen with a
+diff --git a/docs/RELEASE_NOTES.md b/docs/RELEASE_NOTES.md
+index ac5dd30d..31653923 100644
+--- a/docs/RELEASE_NOTES.md
++++ b/docs/RELEASE_NOTES.md
+@@ -24,7 +24,7 @@
+ ## 0.1.84
+ 
+ - Connections: choose from recent server addresses in Account settings. Switching safely pauses the previous vault; one server syncs at a time.
+-
++- Vaults: switching during sync keeps each vault's notes, selection, and progress separate. Newly created notes no longer appear as access changes after a slow listing.
+ - Sync: protect populated notes during read-only recovery and retry failed folder deletions without recreating them for the team.
+ - Access: named members can see empty restricted folders. Owners and admins can inspect future permission and membership changes through MCP or the server API.
+ - Large vaults: reduce database work when resolving access to deleted notes and folders.

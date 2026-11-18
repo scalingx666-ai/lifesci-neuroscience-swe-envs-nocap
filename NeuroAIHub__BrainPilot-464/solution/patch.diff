@@ -1,0 +1,479 @@
+diff --git a/docker/sandbox/Dockerfile b/docker/sandbox/Dockerfile
+index 4a210479..157a12fc 100644
+--- a/docker/sandbox/Dockerfile
++++ b/docker/sandbox/Dockerfile
+@@ -43,7 +43,7 @@ RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi
+ # (protocol ← runtime), not the whole monorepo (web/cli/backend-core).
+ RUN npx tsc -b packages/runtime
+ 
+-# ---- python-baseline: node + python3 + pip + curl + Git + 镜像源 ----
++# ---- python-baseline: node + python3 + pip + curl + Git + rg/file + 镜像源 ----
+ #   cpu 链的根，也是 gpu-base 的父（共享运行时依赖只构建一次，被两条链复用）。
+ FROM node:22-slim AS python-baseline
+ ARG APT_MIRROR=""
+@@ -75,8 +75,14 @@ CMD ["node", "packages/runtime/dist/server.js"]
+ #   不在此安装 → monorepo 代码变更只重建下面的业务层，base 层完全复用。
+ #   ⚠️ base tag 写死（经典构建器不支持 FROM ${ARG}）；升级须同步三处（见文件头）。
+ FROM ghcr.io/neuroaihub/brainpilot-gpu-base:cu124-torch2.6.0 AS gpu
+-# Older published GPU base tags may predate workspace checkpoints.
+-RUN command -v git >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*)
++# Older published GPU base tags may predate workspace checkpoints and the
++# agent's code/file inspection tools, so the thin image guarantees all three.
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends git ripgrep file \
++    && rm -rf /var/lib/apt/lists/* \
++    && git --version >/dev/null \
++    && rg --version >/dev/null \
++    && file --version >/dev/null
+ WORKDIR /app
+ COPY --from=builder /app/node_modules ./node_modules
+ COPY --from=builder /app/packages ./packages
+diff --git a/docker/sandbox/Dockerfile.gpu-base b/docker/sandbox/Dockerfile.gpu-base
+index b877ecc9..640e0608 100644
+--- a/docker/sandbox/Dockerfile.gpu-base
++++ b/docker/sandbox/Dockerfile.gpu-base
+@@ -25,7 +25,7 @@ ENV APT_MIRROR=${APT_MIRROR} \
+     PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
+     TORCH_WHEEL_BASE=${TORCH_WHEEL_BASE}
+ 
+-# python3 + pip + curl + 镜像源（与 cpu sandbox 共享同一段，curl 供 HEALTHCHECK 用）
++# Python + network/file tools（与 cpu sandbox 共享同一段，curl 供 HEALTHCHECK 用）
+ COPY docker/sandbox/_python-base.sh /tmp/_python-base.sh
+ RUN bash /tmp/_python-base.sh
+ 
+diff --git a/docker/sandbox/_python-base.sh b/docker/sandbox/_python-base.sh
+index 852fb9e6..d4973116 100755
+--- a/docker/sandbox/_python-base.sh
++++ b/docker/sandbox/_python-base.sh
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env bash
+-# _python-base.sh — cpu/gpu sandbox 共享的 python3 + pip + curl + Git + 镜像源安装段。
++# _python-base.sh — cpu/gpu sandbox 共享的 Python、网络与文件工具安装段。
+ # 由 Dockerfile 的 python-baseline stage 直接 RUN（gpu-base 继承该 stage，无需重跑）。
+-# curl/ca-certificates 供 HEALTHCHECK 探活；Git 供 GoT workspace checkpoint
+-# 捕获、diff 与恢复使用。它们都是 cpu/gpu 运行时依赖，故装在此共享层。
++# curl/ca-certificates 供 HEALTHCHECK 探活；Git 供 GoT workspace checkpoint；
++# ripgrep/file 供 agent 搜索代码与识别上传文件。它们都是 cpu/gpu 运行时依赖。
+ # 镜像源来自 ENV（Dockerfile 经 build-arg 透传），为空则用镜像自带官方源
+ # （pypi.org / deb.debian.org）。
+ set -euo pipefail
+@@ -11,12 +11,14 @@ set -euo pipefail
+ [ -n "${APT_MIRROR:-}" ] && sed -i "s|http://deb.debian.org|$APT_MIRROR|g" \
+   /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+ apt-get update && apt-get install -y --no-install-recommends \
+-  python3 python3-pip python3-venv curl ca-certificates git
++  python3 python3-pip python3-venv curl ca-certificates git ripgrep file
+ rm -rf /var/lib/apt/lists/*
+ 
+ # Fail the image build rather than shipping a runtime whose checkpoint feature
+ # can only report unavailable.
+ git --version >/dev/null
++rg --version >/dev/null
++file --version >/dev/null
+ 
+ # pip 源：PIP_INDEX_URL 注入则固化 /etc/pip.conf，否则用 pip 官方默认
+ if [ -n "${PIP_INDEX_URL:-}" ]; then
+diff --git a/packages/backend-core/src/app.ts b/packages/backend-core/src/app.ts
+index 28af532b..301d19f7 100644
+--- a/packages/backend-core/src/app.ts
++++ b/packages/backend-core/src/app.ts
+@@ -32,6 +32,7 @@ import {
+   readLocalSettings,
+   writeLocalSettings,
+   resolveProvider,
++  resolveProfileApiKey,
+   readProviders,
+   createProfile,
+   updateProfile,
+@@ -392,15 +393,21 @@ export function createApp(options: CreateAppOptions): Hono {
+     const { profiles, selectedProfileId } = await readProviders(dataDir);
+     const p = profiles.find((x) => x.id === c.req.param("id"));
+     if (!p) return c.json({ error: "not found" }, 404);
+-    const result = await probeProvider(
+-      {
+-        baseUrl: p.baseUrl,
+-        apiKey: p.apiKey,
+-        model: p.models[0],
+-        api: p.api ?? deriveProviderApi(p.adapter) ?? "anthropic-messages",
+-      },
+-      { fetchFn: options.fetchFn, timeoutMs: options.providerProbeTimeoutMs },
+-    );
++    const apiKey = await resolveProfileApiKey(p, { dataDir, env });
++    const result = p.apiKeyEnv && !apiKey
++      ? {
++          status: "error" as const,
++          message: `Environment variable $${p.apiKeyEnv} is not set.`,
++        }
++      : await probeProvider(
++          {
++            baseUrl: p.baseUrl,
++            apiKey,
++            model: p.models[0],
++            api: p.api ?? deriveProviderApi(p.adapter) ?? "anthropic-messages",
++          },
++          { fetchFn: options.fetchFn, timeoutMs: options.providerProbeTimeoutMs },
++        );
+     // #69/#364: persist both the provider outcome and the model actually used
+     // by the protocol-aware probe. Other configured models remain explicitly
+     // unknown rather than inheriting a result from a model we did not call.
+diff --git a/packages/backend-core/src/config.ts b/packages/backend-core/src/config.ts
+index c07e8655..3b32fb69 100644
+--- a/packages/backend-core/src/config.ts
++++ b/packages/backend-core/src/config.ts
+@@ -391,6 +391,27 @@ export async function resolveProvider(
+   return { apiKey, baseUrl, model, source };
+ }
+ 
++/**
++ * Resolve the secret referenced by one stored profile without ever copying it
++ * into providers.json. Environment variables take precedence over the local
++ * .env file, matching resolveProvider's existing fallback order.
++ */
++export async function resolveProfileApiKey(
++  profile: Pick<StoredProviderProfile, "apiKey" | "apiKeyEnv">,
++  options: ResolveProviderOptions,
++): Promise<string> {
++  if (profile.apiKey) return profile.apiKey;
++  const name = profile.apiKeyEnv?.trim();
++  if (!name) return "";
++
++  const env = options.env ?? process.env;
++  const envValue = env[name];
++  if (envValue) return envValue;
++
++  const dotenv = await parseDotenv(configPaths(options.dataDir).dotenv);
++  return dotenv[name] ?? "";
++}
++
+ /** Masked, frontend-facing settings (never leak the raw key). */
+ export interface LocalSettings {
+   model: string;
+diff --git a/packages/backend-core/test/app.test.ts b/packages/backend-core/test/app.test.ts
+index 979540e6..2130e660 100644
+--- a/packages/backend-core/test/app.test.ts
++++ b/packages/backend-core/test/app.test.ts
+@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
+ import { createRequire } from "node:module";
+ import path from "node:path";
+ import { createApp } from "../src/app.js";
++import { bootstrapEnvProvider } from "../src/config.js";
+ import type { Orchestrator, RuntimeHandle } from "../src/orchestrator.js";
+ import { StaticRuntimeOrchestrator } from "../src/static-orchestrator.js";
+ 
+@@ -919,6 +920,27 @@ describe("Hono app — local config routes", () => {
+       return { app, id };
+     }
+ 
++    async function makeEnvProfile(
++      fetchFn: unknown,
++      appEnv: Record<string, string | undefined>,
++    ) {
++      const dir = await mkdtemp(path.join(tmpdir(), "bp-prov-env-"));
++      const profile = await bootstrapEnvProvider(dir, {
++        ANTHROPIC_API_KEY: "bootstrap-only-secret",
++        ANTHROPIC_BASE_URL: "https://gw.example.com/api",
++        ANTHROPIC_MODEL: "env-model",
++      });
++      const app = createApp({
++        orchestrator: fakeOrchestrator(),
++        fetchFn: fetchFn as never,
++        serveWeb: false,
++        dataDir: dir,
++        env: appEnv,
++        providerProbeTimeoutMs: 50,
++      });
++      return { app, id: profile!.id };
++    }
++
+     it("reports unavailable for an unreachable gateway", async () => {
+       const fetchFn = vi.fn(async () => {
+         throw new TypeError("fetch failed");
+@@ -945,6 +967,33 @@ describe("Hono app — local config routes", () => {
+       expect(body.model_health[0]!.checked_at).toBeGreaterThan(0);
+     });
+ 
++    it("resolves an env-backed profile key when probing (#461)", async () => {
++      const fetchFn = vi.fn(async (_url: string, init: RequestInit) => {
++        expect((init.headers as Record<string, string>)["x-api-key"]).toBe("live-env-secret");
++        return new Response("{}", { status: 200 });
++      });
++      const { app, id } = await makeEnvProfile(fetchFn, {
++        ANTHROPIC_API_KEY: "live-env-secret",
++      });
++
++      const response = await app.request(`/api/provider/profiles/${id}/test`, { method: "POST" });
++      expect((await response.json()) as { health_status: string }).toMatchObject({
++        health_status: "healthy",
++      });
++      expect(fetchFn).toHaveBeenCalledTimes(1);
++    });
++
++    it("reports a configuration error when an env-backed key is missing (#461)", async () => {
++      const fetchFn = vi.fn();
++      const { app, id } = await makeEnvProfile(fetchFn, {});
++
++      const response = await app.request(`/api/provider/profiles/${id}/test`, { method: "POST" });
++      const body = (await response.json()) as { health_status: string; health_message: string };
++      expect(body.health_status).toBe("unavailable");
++      expect(body.health_message).toContain("$ANTHROPIC_API_KEY");
++      expect(fetchFn).not.toHaveBeenCalled();
++    });
++
+     it("marks only the model used by the probe and leaves untested models unknown", async () => {
+       const fetchFn = vi.fn(async (_url: string, _init?: RequestInit) =>
+         new Response("{}", { status: 200 }),
+diff --git a/packages/protocol/src/events.ts b/packages/protocol/src/events.ts
+index 8f20a8fe..89855413 100644
+--- a/packages/protocol/src/events.ts
++++ b/packages/protocol/src/events.ts
+@@ -69,6 +69,8 @@ const envelope = {
+   run_id: z.string().optional(),
+   thread_id: z.string().optional(),
+   agent_name: z.string().optional(),
++  /** Stable identity for persistence + SSE replay deduplication. */
++  _event_id: z.string().optional(),
+   /** ISO8601 emit timestamp (legacy `_ts`). */
+   _ts: z.string().optional(),
+ };
+diff --git a/packages/protocol/test/events.test.ts b/packages/protocol/test/events.test.ts
+index 540c537d..b974101a 100644
+--- a/packages/protocol/test/events.test.ts
++++ b/packages/protocol/test/events.test.ts
+@@ -24,8 +24,13 @@ describe("AG-UI event union — NEW events", () => {
+       status: "interrupted",
+       duration_ms: 4100,
+       reason: "user_requested",
++      _event_id: "event-1",
+       _ts: "2026-07-27T00:00:00.000Z",
+-    })).toMatchObject({ status: "interrupted", duration_ms: 4100 });
++    })).toMatchObject({
++      status: "interrupted",
++      duration_ms: 4100,
++      _event_id: "event-1",
++    });
+   });
+   it("round-trips system_message (all four levels)", () => {
+     for (const level of ["info", "warning", "error", "fatal"] as const) {
+diff --git a/packages/runtime/src/__tests__/event-mapping.test.ts b/packages/runtime/src/__tests__/event-mapping.test.ts
+index 9ebee5d7..93b8e4ed 100644
+--- a/packages/runtime/src/__tests__/event-mapping.test.ts
++++ b/packages/runtime/src/__tests__/event-mapping.test.ts
+@@ -17,6 +17,23 @@ import type { IAgentSession, PiAgentEvent } from "../types.js";
+  * (via parseEvent) and that the expected types appear in order.
+  */
+ describe("event mapping (Pi -> AG-UI via parseEvent)", () => {
++  it("assigns a unique stable transport identity to each emitted event", () => {
++    const first = ev.textMessageContent(
++      { sessionId: "identity", agentName: "principal" },
++      "message-1",
++      "same",
++    ) as AgUiEvent & { _event_id?: string };
++    const second = ev.textMessageContent(
++      { sessionId: "identity", agentName: "principal" },
++      "message-1",
++      "same",
++    ) as AgUiEvent & { _event_id?: string };
++
++    expect(parseEvent(first)._event_id).toBe(first._event_id);
++    expect(first._event_id).toMatch(/^[0-9a-f-]{36}$/);
++    expect(second._event_id).not.toBe(first._event_id);
++  });
++
+   it("keeps each terminal event bound to its originating run", async () => {
+     const bus = new EventBus();
+     const captured: AgUiEvent[] = [];
+diff --git a/packages/runtime/src/events.ts b/packages/runtime/src/events.ts
+index b5729e32..d6acb4cc 100644
+--- a/packages/runtime/src/events.ts
++++ b/packages/runtime/src/events.ts
+@@ -4,8 +4,8 @@
+  * `@brainpilot/protocol` exactly. We validate via `parseEvent` in tests.
+  *
+  * The protocol event envelope carries `session_id`, optional `run_id`,
+- * `thread_id`, `agent_name`, and `_ts`. We always inject `session_id` and
+- * `agent_name` + `_ts`; `run_id` when known.
++ * `thread_id`, `agent_name`, `_event_id`, and `_ts`. We always inject
++ * `session_id`, a unique `_event_id`, and `_ts`; agent/run fields when known.
+  */
+ import { randomUUID } from "node:crypto";
+ import type {
+@@ -33,9 +33,14 @@ function envelope(ctx: Ctx): {
+   agent_name?: string;
+   run_id?: string;
+   thread_id?: string;
++  _event_id: string;
+   _ts: string;
+ } {
+-  const e: ReturnType<typeof envelope> = { session_id: ctx.sessionId, _ts: ts() };
++  const e: ReturnType<typeof envelope> = {
++    session_id: ctx.sessionId,
++    _event_id: randomUUID(),
++    _ts: ts(),
++  };
+   if (ctx.agentName !== undefined) e.agent_name = ctx.agentName;
+   if (ctx.runId !== undefined) e.run_id = ctx.runId;
+   if (ctx.threadId !== undefined) e.thread_id = ctx.threadId;
+diff --git a/packages/web/src/__tests__/demoTruncatedExport.test.ts b/packages/web/src/__tests__/demoTruncatedExport.test.ts
+index 316467c9..002085f0 100644
+--- a/packages/web/src/__tests__/demoTruncatedExport.test.ts
++++ b/packages/web/src/__tests__/demoTruncatedExport.test.ts
+@@ -82,11 +82,12 @@ describe("demo replay tolerates truncated/orphaned events", () => {
+ });
+ 
+ describe("normalizeAgUiEvent preserves transport metadata keys", () => {
+-  it("keeps _ts (and _seq) instead of mangling to Ts/Seq", () => {
++  it("keeps transport metadata instead of mangling leading underscores", () => {
+     const raw = {
+       type: "TEXT_MESSAGE_CONTENT",
+       _ts: "2026-06-22T08:43:24.619Z",
+       _seq: 42,
++      _event_id: "event-42",
+       agent_name: "principal",
+       message_id: "m1",
+       delta: "hi",
+@@ -95,6 +96,7 @@ describe("normalizeAgUiEvent preserves transport metadata keys", () => {
+     // The timestamp the demo timeline sorts on must survive normalization.
+     expect(norm._ts).toBe("2026-06-22T08:43:24.619Z");
+     expect(norm._seq).toBe(42);
++    expect(norm._eventId).toBe("event-42");
+     expect(norm).not.toHaveProperty("Ts");
+     expect(norm).not.toHaveProperty("Seq");
+     // Internal snake_case still camelizes.
+diff --git a/packages/web/src/__tests__/messageStreamIdempotency.test.ts b/packages/web/src/__tests__/messageStreamIdempotency.test.ts
+index 7422dc02..a36a66cb 100644
+--- a/packages/web/src/__tests__/messageStreamIdempotency.test.ts
++++ b/packages/web/src/__tests__/messageStreamIdempotency.test.ts
+@@ -10,7 +10,7 @@ import type { ChatMessage, WebSocketEvent } from "../contracts/backend";
+  * same deltas landed twice in one message bubble.
+  *
+  * Fix: stream-append events (CONTENT / REASONING_CONTENT / TOOL_CALL_ARGS) are
+- * idempotent via stable event identity (_ts + type + id + delta) and by
++ * idempotent via stable transport identity (_eventId) and by
+  * ignoring further appends once a message is finalized (streaming:false).
+  * Intentionally repeated model text (distinct events) must still survive.
+  */
+@@ -119,6 +119,61 @@ describe("message stream idempotency (#314)", () => {
+     expect(msgs[0]!.content).toBe("yesyesyes");
+   });
+ 
++  it("preserves identical deltas emitted in the same millisecond (#463)", () => {
++    const sameTimestamp = "2026-08-17T09:00:00.123Z";
++    const stream = [
++      {
++        type: "TEXT_MESSAGE_START",
++        messageId: "msg_same_ms",
++        role: "assistant",
++        _eventId: "start-1",
++        _ts: sameTimestamp,
++      },
++      ...["content-1", "content-2", "content-3"].map((_eventId) => ({
++        type: "TEXT_MESSAGE_CONTENT",
++        messageId: "msg_same_ms",
++        delta: "/",
++        _eventId,
++        _ts: sameTimestamp,
++      })),
++    ] as WebSocketEvent[];
++
++    let messages = fold(stream);
++    expect(messages[0]!.content).toBe("///");
++
++    // Replaying those exact persisted events remains idempotent.
++    for (const event of stream.slice(1)) {
++      messages = reduceMessagesForEvent(messages, event);
++    }
++    expect(messages[0]!.content).toBe("///");
++  });
++
++  it("preserves same-millisecond repeats in reasoning and tool arguments (#463)", () => {
++    const sameTimestamp = "2026-08-17T09:00:00.123Z";
++    const events = [
++      { type: "TOOL_CALL_START", toolCallId: "tc_same_ms", toolCallName: "bash" },
++      ...["tool-1", "tool-2"].map((_eventId) => ({
++        type: "TOOL_CALL_ARGS",
++        toolCallId: "tc_same_ms",
++        delta: "{",
++        _eventId,
++        _ts: sameTimestamp,
++      })),
++      { type: "REASONING_MESSAGE_START", messageId: "reason_same_ms" },
++      ...["reason-1", "reason-2"].map((_eventId) => ({
++        type: "REASONING_MESSAGE_CONTENT",
++        messageId: "reason_same_ms",
++        delta: "x",
++        _eventId,
++        _ts: sameTimestamp,
++      })),
++    ] as WebSocketEvent[];
++
++    const messages = fold(events);
++    expect(messages.find((message) => message.id === "tc_same_ms")?.toolInput).toBe("{{");
++    expect(messages.find((message) => message.id === "reason_same_ms")?.content).toBe("xx");
++  });
++
+   it("still streams live CONTENT without _ts (identity optional)", () => {
+     // Live / unit paths may omit transport _ts. Incremental append must work.
+     let msgs = fold([
+diff --git a/packages/web/src/contexts/messageReducer.ts b/packages/web/src/contexts/messageReducer.ts
+index adffee57..8547ccbd 100644
+--- a/packages/web/src/contexts/messageReducer.ts
++++ b/packages/web/src/contexts/messageReducer.ts
+@@ -107,19 +107,23 @@ export function agUiMessageToChatMessage(msg: AgUiMessage): ChatMessage {
+ 
+ /**
+  * Stable identity for a stream-append event so history rehydrate + SSE ring
+- * buffer replay can merge idempotently (#314). Requires transport `_ts` (always
+- * set by the runtime EventBus envelope). Events without `_ts` (unit tests /
+- * legacy) return null and fall back to "always apply while streaming".
++ * buffer replay can merge idempotently (#314, #463). New runtime events carry
++ * `_eventId`, which remains unique even when identical deltas are emitted in
++ * the same millisecond. Legacy events fall back to the old timestamp key;
++ * events without either identity return null and always apply while streaming.
+  *
+- * Key = type + stream id + _ts + delta. Distinct CONTENT events that happen to
+- * carry the same text (intentional model repetition) still differ when `_ts`
+- * differs, so they are not collapsed.
++ * The transport ID is persisted in events.jsonl and replayed unchanged over
++ * SSE, so the same event dedupes while distinct repeated deltas survive.
+  */
+ function streamAppendKey(event: WebSocketEvent, streamId: string, delta: string): string | null {
+   const raw = event as Record<string, unknown>;
++  const eventId = raw._eventId;
++  if (typeof eventId === "string" && eventId) {
++    return `${event.type}\0${streamId}\0event:${eventId}`;
++  }
+   const ts = raw._ts;
+   if (typeof ts !== "string" || !ts) return null;
+-  return `${event.type}\0${streamId}\0${ts}\0${delta}`;
++  return `${event.type}\0${streamId}\0legacy:${ts}\0${delta}`;
+ }
+ 
+ function withAppliedStreamKey(msg: ChatMessage, key: string | null): ChatMessage {
+diff --git a/packages/web/src/contracts/backend.ts b/packages/web/src/contracts/backend.ts
+index 4135200a..a8d98d0d 100644
+--- a/packages/web/src/contracts/backend.ts
++++ b/packages/web/src/contracts/backend.ts
+@@ -590,8 +590,8 @@ function normalizeStringArray(value: unknown): string[] {
+ }
+ 
+ function camelizeKey(key: string): string {
+-  // Preserve a leading-underscore prefix: `_ts` / `_seq` are AG-UI transport
+-  // metadata whose underscore is significant. Without this guard the regex
++  // Preserve a leading-underscore prefix: `_ts` / `_seq` / `_event_id` are
++  // AG-UI transport metadata whose underscore is significant. Without this guard the regex
+   // turns `_ts` into `Ts`, so `normalizeAgUiEvent` strips the timestamp and the
+   // demo replay's timeline collapses (every event lands at ms=0). Only internal
+   // snake_case boundaries (e.g. `agent_name` → `agentName`) are camelized.
+@@ -1201,10 +1201,8 @@ export function normalizeTraceGraph(rawValue: unknown): TraceGraph {
+ 
+ /**
+  * Normalize a raw AG-UI event JSON from the wire (snake_case) to the
+- * camelCase TypeScript shape. Fields are passed through 1:1; `_seq` is
+- * intentionally dropped — the new contract relies on AG-UI's
+- * messageId/toolCallId for state aggregation rather than transport-level
+- * sequence numbers.
++ * camelCase TypeScript shape. Fields are passed through 1:1, including
++ * leading-underscore transport metadata (`_ts`, `_seq`, `_eventId`).
+  */
+ export function normalizeAgUiEvent(rawValue: unknown): AgUiEvent {
+   const raw = asDict(rawValue);

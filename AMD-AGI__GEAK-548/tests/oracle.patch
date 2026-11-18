@@ -1,0 +1,418 @@
+diff --git a/docs/reference/run-e2e-contract.md b/docs/reference/run-e2e-contract.md
+index d6a27671f..3bcb65989 100644
+--- a/docs/reference/run-e2e-contract.md
++++ b/docs/reference/run-e2e-contract.md
+@@ -22,7 +22,7 @@ Run the external orchestrator entry point as follows.
+ python interface/run_e2e.py <handoff.json> <result.json> [--dry-run]
+ ```
+ 
+-- Exit code `0`: `result.json.status` is `ok` or `no_gain`.
++- Exit code `0`: `result.json.status` is `ok`, `no_gain` or `timeout`.
+ - Exit code `1`: a crash; `result.json.status == "error"` with an `error` field.
+ - Exit code `2`: bad usage or unreadable handoff.
+ - `--dry-run`: print the mapped `e2e_workflow.js` args and the prompt and
+@@ -191,6 +191,29 @@ alias for existing callers. If `orchestrator_best_tput_same_config` is absent,
+ the same-config fields are `null` and `baseline_alignment.status` is
+ `unavailable`; GEAK never treats raw-session divergence as measurement drift.
+ 
++### When there is no result to report
++
++When no workflow return exists and none can be rebuilt from disk (see Handoff
++resilience below), `result.json` reports the failure instead:
++
++```jsonc
++{
++  "schema_version": 2,
++  "status": "timeout | error",
++  "error_class": "timeout | llm_unreachable | workflow_parse_error | cli_failed | sdk_import_failed | interrupted | normalize_failed | runner_error",
++  "error": "no workflow return within the 32400s budget (furthest phase on disk: search)",
++  "phase_reached": "setup | search | finalize | validate"
++}
++```
++
++- `llm_unreachable`: Claude Code could not reach the model API (connection
++  refused or dropped, DNS, no route, proxy or TLS failure). `error` keeps the
++  original message, which contains Claude Code's `API Error: ...` reply.
++- `phase_reached` is the furthest phase the eval dir shows: `setup` until
++  Setup's baseline summary exists, `search` until the final phase fences the
++  GPUs (`.final_phase_fence`), then the fenced stage. It is absent when the eval
++  dir does not exist.
++
+ ## Handoff resilience
+ 
+ The workflow return (the JSON object carrying `eval_dir` and `accepted_*`) is the
+diff --git a/interface/run_e2e.md b/interface/run_e2e.md
+index 1351f78da..f672c4217 100644
+--- a/interface/run_e2e.md
++++ b/interface/run_e2e.md
+@@ -13,7 +13,7 @@ changes while the workflow evolves internally.
+ python interface/run_e2e.py <handoff.json> <result.json> [--dry-run]
+ ```
+ 
+-* Exit code `0` → `result.json.status` is `ok` or `no_gain`.
++* Exit code `0` → `result.json.status` is `ok`, `no_gain` or `timeout`.
+ * Exit code `1` → a crash; `result.json.status == "error"` with an `error` field.
+ * Exit code `2` → bad usage / unreadable handoff.
+ * `--dry-run` → print the mapped `e2e_workflow.js` args + the prompt and
+@@ -577,6 +577,29 @@ Set `BENCH_LAUNCHER=native` in the environment to force the adapter launch; it
+ outranks every other resolution path and is the escape hatch when the
+ orchestrator's script cannot run.
+ 
++### When there is no result to report
++
++When no workflow return exists and none can be rebuilt from disk (see Handoff
++resilience below), `result.json` reports the failure instead:
++
++```jsonc
++{
++  "schema_version": 2,
++  "status": "timeout | error",
++  "error_class": "timeout | llm_unreachable | workflow_parse_error | cli_failed | sdk_import_failed | interrupted | normalize_failed | runner_error",
++  "error": "no workflow return within the 32400s budget (furthest phase on disk: search)",
++  "phase_reached": "setup | search | finalize | validate"
++}
++```
++
++* `llm_unreachable` → Claude Code could not reach the model API (connection
++  refused or dropped, DNS, no route, proxy or TLS failure). `error` keeps the
++  original message, which contains Claude Code's `API Error: ...` reply.
++* `phase_reached` → the furthest phase the eval dir shows: `setup` until Setup's
++  baseline summary exists, `search` until the final phase fences the GPUs
++  (`.final_phase_fence`), then the fenced stage. Absent when the eval dir does
++  not exist.
++
+ ## Handoff resilience (the workflow return is never the single point of failure)
+ 
+ The workflow return (the JSON object carrying `eval_dir` + `accepted_*`) is the
+diff --git a/interface/run_e2e.py b/interface/run_e2e.py
+index 67625a531..881c84673 100644
+--- a/interface/run_e2e.py
++++ b/interface/run_e2e.py
+@@ -2497,9 +2497,9 @@ def _invoke_via_cli(prompt: str, timeout_s: int) -> str:
+         timeout=timeout_s,
+     )
+     if proc.returncode != 0:
+-        raise RuntimeError(
+-            f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-2000:]}"
+-        )
++        # A failed API call exits 1 with stderr empty: the error is in the stdout JSON.
++        detail = (proc.stderr or "")[-2000:] or (proc.stdout or "")[-2000:]
++        raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {detail}")
+     # claude -p --output-format json wraps the assistant text; try to unwrap.
+     out = proc.stdout.strip()
+     try:
+@@ -2706,6 +2706,15 @@ def _parse_last_json_line(raw: str) -> dict:
+     )
+ 
+ 
++# Claude Code's reply when it cannot reach the model API. 2.1.177 says "Unable to
++# connect to API (<code>)" for every connection failure; 2.1.309 and 2.1.316 say
++# e.g. "Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)".
++_LLM_UNREACHABLE_RE = re.compile(
++    r"API Error: (?:Unable to connect to API|Connection (?:error|refused|dropped|lost before)"
++    r"|Can't reach the API server|No internet route|Couldn't connect through your proxy)"
++)
++
++
+ def _classify_error(exc: BaseException) -> str:
+     """Map an internal failure onto a stable ``error_class`` for Hyperloom.
+ 
+@@ -2716,11 +2725,15 @@ def _classify_error(exc: BaseException) -> str:
+     # anyio.fail_after raises builtins.TimeoutError on budget expiry.
+     if isinstance(exc, TimeoutError):
+         return "timeout"
++    msg = str(exc)
++    # The CLI turns a failed API call into an "API Error: ..." reply, so an outage
++    # arrives as agent output inside a parse error or a failed CLI's message.
++    if _LLM_UNREACHABLE_RE.search(msg):
++        return "llm_unreachable"
+     if isinstance(exc, WorkflowParseError):
+         return "workflow_parse_error"
+     if isinstance(exc, ImportError):
+         return "sdk_import_failed"
+-    msg = str(exc)
+     if "claude CLI failed" in msg:
+         return "cli_failed"
+     return "runner_error"
+@@ -4953,6 +4966,9 @@ def _update_baseline_alignment_reports(result: dict[str, Any]) -> list[str]:
+ WORKFLOW_RETURN_FILE = "workflow_return.json"
+ KERNEL_JOURNEY_FILE = "kernel_journey.json"
+ FINAL_REPORT_FILE = "final_report.md"
++# run_reaper.py's FENCE_FILE; its "stage" is the final-phase stage that took the GPUs.
++FINAL_PHASE_FENCE_FILE = ".final_phase_fence"
++FINAL_PHASE_STAGES = ("finalize", "validate")
+ 
+ # ---------------------------------------------------------------------------
+ # KB write-back, salvage path
+@@ -6819,9 +6835,13 @@ def _recover_completed_no_gain(eval_dir: Path) -> dict | None:
+     """
+     official = _read_json(eval_dir / "baseline" / "baseline_official.json")
+     summary = _read_json(eval_dir / "baseline" / "bench_summary.json")
++    # bench_summarize.py writes the selected metric basis (output, total or an
++    # interactivity axis) to throughput_tok_s_median; output_throughput_tok_s_median
++    # is an alias it fills only on the output axis, so an AgentX baseline has it null.
+     baseline_tput = (
+         official.get("baseline_throughput_tok_s")
+         or official.get("plateau_median_tok_s")
++        or summary.get("throughput_tok_s_median")
+         or summary.get("output_throughput_tok_s_median")
+     )
+     if not baseline_tput:
+@@ -6853,6 +6873,30 @@ def _recover_completed_no_gain(eval_dir: Path) -> dict | None:
+     }
+ 
+ 
++def _phase_reached(eval_dir: str | Path | None) -> str:
++    """The furthest workflow phase an eval dir shows, for a result with no workflow return.
++
++    ``setup`` until Setup's baseline summary exists, then ``search`` until the final
++    phase fences the GPUs, then the fenced stage (``finalize`` or ``validate``).
++    ``""`` when there is no eval dir to read.
++    """
++    if not eval_dir:
++        return ""
++    root = Path(eval_dir)
++    try:
++        if not root.is_dir():
++            return ""
++        fence = _read_json(root / FINAL_PHASE_FENCE_FILE)
++        stage = fence.get("stage") if isinstance(fence, dict) else None
++        if stage in FINAL_PHASE_STAGES:
++            return stage
++        if (root / "baseline" / "bench_summary.json").is_file():
++            return "search"
++    except OSError:
++        return ""
++    return "setup"
++
++
+ def _persist_workflow_return(eval_dir: Path, wf: dict) -> None:
+     """Persist the authoritative workflow return beside the artifacts (best-effort)."""
+     try:
+@@ -7858,12 +7902,21 @@ def _emit(wf: dict | None = None, *, error: object = None,
+                 if wf.get("recovered_from_disk"):
+                     out["recovered_from_disk"] = True
+             else:
++                phase = _phase_reached(eval_dir_hint)
++                message = str(error or "")
++                if not message and error_class == "timeout":
++                    # anyio.fail_after raises a TimeoutError with no message.
++                    message = f"no workflow return within the {timeout_s}s budget"
++                    if phase:
++                        message += f" (furthest phase on disk: {phase})"
+                 out = {
+                     "schema_version": SCHEMA_VERSION,
+                     "status": "timeout" if error_class == "timeout" else "error",
+                     "error_class": error_class or "runner_error",
+-                    "error": str(error or ""),
++                    "error": message,
+                 }
++                if phase:
++                    out["phase_reached"] = phase
+         except Exception as norm_exc:  # normalize blew up: still emit an error.
+             out = {
+                 "schema_version": SCHEMA_VERSION,
+diff --git a/interface/test_run_e2e_dispatch.py b/interface/test_run_e2e_dispatch.py
+index d6ed80ea2..e6ba5ae93 100644
+--- a/interface/test_run_e2e_dispatch.py
++++ b/interface/test_run_e2e_dispatch.py
+@@ -1977,6 +1977,49 @@ def test_stable_error_classes(self):
+         )
+         self.assertEqual(rx._classify_error(ValueError("other")), "runner_error")
+ 
++    # Claude Code's replies, verbatim, to a refused, unresolvable and reset model API
++    # endpoint: 2.1.177 first, then 2.1.309 / 2.1.316.
++    UNREACHABLE_REPLIES = (
++        "API Error: Unable to connect to API (ConnectionRefused)",
++        "API Error: Unable to connect to API (FailedToOpenSocket)",
++        "API Error: Unable to connect to API (ECONNRESET)",
++        "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)",
++        "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
++        ("API Error: Connection dropped (ECONNRESET). Check the gateway set in "
++         "ANTHROPIC_BASE_URL, then try again."),
++    )
++
++    def test_an_unreachable_model_api_is_not_a_parse_error(self):
++        """The CLI answers a failed API call with an "API Error: ..." reply, which reaches
++        run_e2e as agent output; an outage must not read as malformed workflow output."""
++        for reply in self.UNREACHABLE_REPLIES:
++            with self.subTest(reply=reply):
++                with self.assertRaises(rx.WorkflowParseError) as ctx:
++                    rx._parse_last_json_line(f"{reply}\n{reply}")
++                self.assertEqual(rx._classify_error(ctx.exception), "llm_unreachable")
++                self.assertIn(reply, str(ctx.exception))
++                cli = RuntimeError(f'claude CLI failed (rc=1): {{"result": "{reply}"}}')
++                self.assertEqual(rx._classify_error(cli), "llm_unreachable")
++        self.assertEqual(
++            rx._classify_error(TimeoutError(self.UNREACHABLE_REPLIES[0])), "timeout")
++
++    def test_connection_errors_outside_the_model_api_keep_their_class(self):
++        """A bench or server connection error in the transcript is the run's own; only
++        Claude Code's API Error reply names the model endpoint."""
++        for text in (
++            ("aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host "
++             "127.0.0.1:8000 ssl:default [Connection refused]"),
++            "curl: (7) Failed to connect to localhost port 8000: Connection refused",
++            "Error: connect ECONNREFUSED 127.0.0.1:8000",
++            ("API Error: 500 Internal server error. This is a server-side issue, usually "
++             "temporary — try again in a moment."),
++        ):
++            with self.subTest(text=text):
++                self.assertEqual(
++                    rx._classify_error(rx.WorkflowParseError(f"Last 2000 chars:\n{text}")),
++                    "workflow_parse_error",
++                )
++
+ 
+ # =========================================================================== #
+ # SDK invocation + completion gate
+@@ -2213,6 +2256,19 @@ def test_nonzero_exit_raises_a_classifiable_error(self):
+         self.assertIn("TAIL", msg)
+         self.assertEqual(rx._classify_error(ctx.exception), "cli_failed")
+ 
++    def test_a_failed_api_call_reported_on_stdout_reaches_the_error(self):
++        """claude -p reports a failed API call in its stdout JSON and exits 1 with
++        stderr empty."""
++        self._fake_which("/usr/bin/claude")
++        reply = ("API Error: Connection refused — a firewall or proxy may be blocking it "
++                 "(ECONNREFUSED)")
++        self._fake_subprocess(_FakeProc(returncode=1, stdout=json.dumps(
++            {"type": "result", "is_error": True, "result": reply}, ensure_ascii=False)))
++        with self.assertRaises(RuntimeError) as ctx:
++            rx._invoke_via_cli("P", 10)
++        self.assertIn(reply, str(ctx.exception))
++        self.assertEqual(rx._classify_error(ctx.exception), "llm_unreachable")
++
+     def test_json_wrapper_variants_are_unwrapped_or_passed_through(self):
+         self._fake_which("/usr/bin/claude")
+         self._fake_subprocess(_FakeProc(stdout='  {"text": "FROM-TEXT"}  '))
+@@ -3269,6 +3325,43 @@ def invoke_then_term(prompt, timeout_s, eval_dir, ps_args=None):
+         self.assertEqual(out["error_class"], "timeout")
+         self.assertIn("self-stop to flush interface files", out["error"])
+ 
++    def test_a_silent_timeout_says_what_ran_out_and_how_far_the_run_got(self):
++        """anyio.fail_after raises TimeoutError() with no message; the result must
++        still name the budget and the furthest phase on disk."""
++        self.write_json(self.eval_dir / "baseline" / "bench_summary.json",
++                        {"metric_basis": "aggregate_output_tok_s",
++                         "throughput_tok_s_median": 400.0})
++
++        def silent_timeout(prompt, timeout_s, eval_dir, ps_args=None):
++            raise TimeoutError()
++
++        self.patch_rx("invoke_workflow", silent_timeout)
++        rc, _stdout = self._run(self._handoff())
++        self.assertEqual(rc, 0)
++        out = json.loads(self.result_path.read_text())
++        self.assertEqual(out["status"], "timeout")
++        self.assertEqual(out["error_class"], "timeout")
++        self.assertEqual(out["phase_reached"], "search")
++        self.assertEqual(
++            out["error"],
++            "no workflow return within the 43200s budget (furthest phase on disk: search)")
++
++    def test_an_unreachable_model_api_is_reported_as_such(self):
++        reply = ("API Error: Connection refused — a firewall or proxy may be blocking it "
++                 "(ECONNREFUSED)")
++
++        def outage(prompt, timeout_s, eval_dir, ps_args=None):
++            return rx._parse_last_json_line(f"{reply}\n{reply}")
++
++        self.patch_rx("invoke_workflow", outage)
++        rc, _stdout = self._run(self._handoff())
++        self.assertEqual(rc, 1)
++        out = json.loads(self.result_path.read_text())
++        self.assertEqual(out["status"], "error")
++        self.assertEqual(out["error_class"], "llm_unreachable")
++        self.assertIn("Could not parse a JSON workflow return", out["error"])
++        self.assertIn(reply, out["error"])
++
+     def test_recovery_failure_after_a_crashed_workflow_is_contained(self):
+         """Both the post-crash recovery and the one inside _emit raise; the run
+         must degrade to a parseable error file, never propagate."""
+diff --git a/interface/test_run_e2e_recovery.py b/interface/test_run_e2e_recovery.py
+index 8f9740faf..ed0addddf 100644
+--- a/interface/test_run_e2e_recovery.py
++++ b/interface/test_run_e2e_recovery.py
+@@ -13,6 +13,7 @@
+ import importlib.util
+ import json
+ import os
++import re
+ import signal
+ import subprocess
+ from pathlib import Path
+@@ -581,6 +582,73 @@ def test_no_baseline_still_errors(tmp_path):
+     assert rx._recover_completed_no_gain(eval_dir) is None
+ 
+ 
++def _make_agentx_no_gain_eval_dir(tmp_path: Path, basis: str) -> Path:
++    """An AgentX run that finished without a win, as the workflow leaves it: Setup's
++    summary is off the output axis, where bench_summarize.py leaves the output
++    throughput alias null, and nothing writes baseline_official.json."""
++    eval_dir = tmp_path / "e2e_agentx_nogain"
++    (eval_dir / "baseline").mkdir(parents=True)
++    (eval_dir / "final").mkdir(parents=True)
++    (eval_dir / "bench_e2e.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
++    (eval_dir / "final" / "final_launch.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
++    (eval_dir / "baseline" / "bench_summary.json").write_text(json.dumps({
++        "metric_basis": basis,
++        "throughput_tok_s_median": 113.325,
++        "output_throughput_tok_s_median": None,
++    }), encoding="utf-8")
++    return eval_dir
++
++
++@pytest.mark.parametrize("basis", ["p90_intvty_inferencex", "aggregate_total_token_tok_s"])
++def test_no_gain_recovery_reads_the_selected_metric_basis(tmp_path, basis):
++    """Off the output axis only throughput_tok_s_median carries the baseline; a
++    finished no-win run must still recover as no_gain, not fall through to an error."""
++    eval_dir = _make_agentx_no_gain_eval_dir(tmp_path, basis)
++    wf = rx._recover_workflow_return(eval_dir.parent)
++    assert wf is not None and wf.get("recovered_no_gain") is True
++    assert wf["baseline_throughput_tok_s"] == pytest.approx(113.325)
++    assert wf["final_throughput_tok_s"] == pytest.approx(113.325)
++    out = rx.normalize_result(_handoff(eval_dir), wf)
++    assert out["status"] == "no_gain"
++    assert out["metric_basis"] == basis
++    assert out["baseline_throughput_tok_s"] == pytest.approx(113.325)
++
++
++def test_no_gain_recovery_still_reads_a_summary_with_only_the_output_alias(tmp_path):
++    eval_dir = _make_no_gain_eval_dir(tmp_path)
++    (eval_dir / "baseline" / "baseline_official.json").unlink()
++    wf = rx._recover_completed_no_gain(eval_dir)
++    assert wf is not None
++    assert wf["baseline_throughput_tok_s"] == pytest.approx(601.786)
++
++
++def test_phase_reached_follows_what_each_phase_leaves_on_disk(tmp_path):
++    assert rx._phase_reached("") == ""
++    assert rx._phase_reached(tmp_path / "absent") == ""
++    eval_dir = tmp_path / "e2e_phase"
++    eval_dir.mkdir()
++    assert rx._phase_reached(eval_dir) == "setup"
++    (eval_dir / "baseline").mkdir()
++    (eval_dir / "baseline" / "bench_summary.json").write_text("{}", encoding="utf-8")
++    assert rx._phase_reached(eval_dir) == "search"
++    fence = eval_dir / rx.FINAL_PHASE_FENCE_FILE
++    for stage in ("finalize", "validate"):
++        fence.write_text(json.dumps({"stage": stage, "at": "t", "stopped": 0}), encoding="utf-8")
++        assert rx._phase_reached(str(eval_dir)) == stage
++    fence.write_text("[]", encoding="utf-8")
++    assert rx._phase_reached(eval_dir) == "search"
++
++
++def test_phase_fence_matches_the_reaper_and_the_workflow():
++    spec = importlib.util.spec_from_file_location(
++        "run_reaper", rx.E2E_DIR / "scripts" / "run_reaper.py")
++    reaper = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(reaper)
++    assert reaper.FENCE_FILE == rx.FINAL_PHASE_FENCE_FILE
++    workflow = rx.E2E_SCRIPT.read_text(encoding="utf-8")
++    assert set(re.findall(r"finalPhaseFence\('(\w+)'", workflow)) == set(rx.FINAL_PHASE_STAGES)
++
++
+ def test_workflow_done_marker_ignores_final_launch(tmp_path):
+     """final/final_launch.sh (Finalize, pre-Validate) must NOT count as done;
+     only the post-Validate terminal markers (director_e2e_validation.json /

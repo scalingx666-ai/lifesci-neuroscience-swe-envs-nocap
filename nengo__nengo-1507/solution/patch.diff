@@ -1,0 +1,656 @@
+diff --git a/.ci/test.sh b/.ci/test.sh
+index 1e0c065e98..672279b30f 100755
+--- a/.ci/test.sh
++++ b/.ci/test.sh
+@@ -15,6 +15,7 @@ if [[ "$COMMAND" == "install" ]]; then
+     conda install --quiet jupyter matplotlib numpy="$NUMPY"
+     if [[ "$SCIPY" == "true" ]]; then
+         conda install --quiet scipy
++        pip install scikit-learn
+     fi
+     pip install pytest
+     pip install -e .
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 42c7a1f10c..3f1f87b7fe 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -61,6 +61,14 @@ Release History
+   <https://www.nengo.ai/nengo/getting_started.html#installing-numpy>`__
+   if you need to upgrade.
+   (`#1481 <https://github.com/nengo/nengo/pull/1481>`__)
++- Solvers are now explicitly marked as compositional or non-compositional
++  depending on whether they must act on full connection weight matrices
++  when solving for weights.
++  (`#1507 <https://github.com/nengo/nengo/pull/1507>`__)
++- Solvers no longer take encoders as an argument. Instead, encoders will
++  be applied to the targets before the solve function for compositional solvers
++  and applied by the Transform builder for non-compositional solvers.
++  (`#1507 <https://github.com/nengo/nengo/pull/1507>`__)
+ 
+ **Fixed**
+ 
+diff --git a/nengo/builder/connection.py b/nengo/builder/connection.py
+index 15701e7606..87af40363b 100644
+--- a/nengo/builder/connection.py
++++ b/nengo/builder/connection.py
+@@ -7,7 +7,7 @@
+ from nengo.builder.node import SimPyFunc
+ from nengo.builder.operator import Copy, ElementwiseInc
+ from nengo.connection import Connection
+-from nengo.transforms import Convolution
++from nengo.transforms import Convolution, Dense
+ from nengo.ensemble import Ensemble, Neurons
+ from nengo.exceptions import BuildError, ObsoleteError
+ from nengo.neurons import Direct
+@@ -107,6 +107,19 @@ def build_decoders(model, conn, rng):
+     eval_points = get_eval_points(model, conn, rng)
+     targets = get_targets(conn, eval_points)
+ 
++    if conn.solver.weights and not conn.solver.compositional:
++        # solver is solving for the whole weight matrix, so apply
++        # transform/encoders to targets
++        if not isinstance(conn.transform, Dense):
++            raise BuildError(
++                "Non-compositional solvers only work with Dense transforms")
++        transform = conn.transform.sample(rng=rng)
++        targets = np.dot(targets, transform.T)
++        # weight solvers only allowed on ensemble->ensemble connections
++        assert isinstance(conn.post_obj, Ensemble)
++        post_enc = model.params[conn.post_obj].scaled_encoders
++        targets = np.dot(targets, post_enc.T[conn.post_slice])
++
+     x = np.dot(eval_points, encoders.T / conn.pre_obj.radius)
+     wrapped_solver = (model.decoder_cache.wrap_solver(solve_for_decoders)
+                       if model.seeded[conn] else solve_for_decoders)
+@@ -116,7 +129,7 @@ def build_decoders(model, conn, rng):
+     return eval_points, decoders.T, solver_info
+ 
+ 
+-def solve_for_decoders(conn, gain, bias, x, targets, rng, E=None):
++def solve_for_decoders(conn, gain, bias, x, targets, rng):
+     activities = conn.pre_obj.neuron_type.rates(x, gain, bias)
+     if np.count_nonzero(activities) == 0:
+         raise BuildError(
+@@ -124,7 +137,7 @@ def solve_for_decoders(conn, gain, bias, x, targets, rng, E=None):
+             "This is because no evaluation points fall in the firing "
+             "ranges of any neurons." % (conn, conn.pre_obj))
+ 
+-    decoders, solver_info = conn.solver(activities, targets, rng=rng, E=E)
++    decoders, solver_info = conn.solver(activities, targets, rng=rng)
+     return decoders, solver_info
+ 
+ 
+@@ -244,21 +257,33 @@ def get_prepost_signal(is_pre):
+         if conn.solver.weights:
+             model.sig[conn]['out'] = model.sig[conn.post_obj.neurons]['in']
+ 
+-            if isinstance(conn.post_obj, Ensemble):
+-                encoders = model.params[conn.post_obj].scaled_encoders.T
+-                encoders = encoders[conn.post_slice]
++            # weight solvers only allowed on ensemble->ensemble connections
++            assert isinstance(conn.post_obj, Ensemble)
+ 
+-                # post slice already applied to encoders, don't apply later
+-                post_slice = None
++            encoders = model.params[conn.post_obj].scaled_encoders.T
++            encoders = encoders[conn.post_slice]
++
++            # post slice already applied to encoders (either here or in
++            # `build_decoders`), so don't apply later
++            post_slice = None
+     else:
+         in_signal = slice_signal(model, in_signal, conn.pre_slice)
+ 
+     # Build transform
+-    weighted, weights = model.build(conn.transform,
+-                                    in_signal,
+-                                    decoders=decoders,
+-                                    encoders=encoders,
+-                                    rng=rng)
++    if conn.solver.weights and not conn.solver.compositional:
++        # special case for non-compositional weight solvers, where
++        # the solver is solving for the full weight matrix. so we don't
++        # need to combine decoders/transform/encoders.
++        weighted, weights = model.build(Dense(decoders.shape, init=decoders),
++                                        in_signal,
++                                        rng=rng)
++    else:
++        weighted, weights = model.build(conn.transform,
++                                        in_signal,
++                                        decoders=decoders,
++                                        encoders=encoders,
++                                        rng=rng)
++
+     model.sig[conn]["weights"] = weights
+ 
+     # Build synapse
+diff --git a/nengo/cache.py b/nengo/cache.py
+index a48418960d..ccb8a89bfa 100644
+--- a/nengo/cache.py
++++ b/nengo/cache.py
+@@ -643,12 +643,12 @@ def wrap_solver(self, solver_fn):  # noqa: C901
+         """
+ 
+         def cached_solver(conn, gain, bias, x, targets,
+-                          rng=np.random, E=None, **uncached_kwargs):
++                          rng=np.random, **uncached_kwargs):
+             if not self._in_context:
+                 warnings.warn("Cannot use cached solver outside of "
+                               "`with cache` block.")
+                 return solver_fn(conn, gain, bias, x, targets,
+-                                 rng=rng, E=E, **uncached_kwargs)
++                                 rng=rng, **uncached_kwargs)
+ 
+             try:
+                 key = self._get_cache_key(conn.solver,
+@@ -657,12 +657,11 @@ def cached_solver(conn, gain, bias, x, targets,
+                                           bias,
+                                           x,
+                                           targets,
+-                                          rng,
+-                                          E)
++                                          rng)
+             except FingerprintError as e:
+                 logger.debug("Failed to generate cache key: %s", e)
+                 return solver_fn(conn, gain, bias, x, targets,
+-                                 rng=rng, E=E, **uncached_kwargs)
++                                 rng=rng, **uncached_kwargs)
+ 
+             try:
+                 path, start, end = self._index[key]
+@@ -677,7 +676,7 @@ def cached_solver(conn, gain, bias, x, targets,
+                 else:
+                     logger.exception("Corrupted cache entry [%s].", key)
+                 decoders, info = solver_fn(conn, gain, bias, x, targets,
+-                                           rng=rng, E=E, **uncached_kwargs)
++                                           rng=rng, **uncached_kwargs)
+                 if not self.readonly:
+                     fd = self._get_fd()
+                     start = fd.tell()
+@@ -691,7 +690,7 @@ def cached_solver(conn, gain, bias, x, targets,
+         return cached_solver
+ 
+     def _get_cache_key(
+-            self, solver, neuron_type, gain, bias, x, targets, rng, E):
++            self, solver, neuron_type, gain, bias, x, targets, rng):
+         h = hashlib.sha1()
+ 
+         if PY2:
+@@ -715,8 +714,6 @@ def _get_cache_key(
+         h.update(struct.pack('q', state[3]))  # integer has_gauss
+         h.update(struct.pack('d', state[4]))  # float cached_gaussian
+ 
+-        if E is not None:
+-            h.update(np.ascontiguousarray(E).data)
+         return h.hexdigest()
+ 
+     def _key2path(self, key):
+diff --git a/nengo/solvers.py b/nengo/solvers.py
+index ea769fcc65..ce8092d00b 100644
+--- a/nengo/solvers.py
++++ b/nengo/solvers.py
+@@ -1,17 +1,11 @@
+-"""Functions concerned with solving for decoders or full weight matrices.
++"""Functions concerned with solving for decoders or full weight matrices."""
+ 
+-Many of the solvers in this file can solve for decoders or weight matrices,
+-depending on whether the post-population encoders `E` are provided (see below).
+-Solvers that are only intended to solve for either decoders or weights can
+-remove the `E` parameter or make it manditory as they see fit.
+-"""
+ import logging
+ import time
+ 
+ import numpy as np
+ 
+ import nengo.utils.least_squares_solvers as lstsq
+-from nengo.exceptions import ValidationError
+ from nengo.params import (
+     BoolParam, FrozenObject, NdarrayParam, NumberParam, Parameter)
+ from nengo.utils.compat import range, with_metaclass
+@@ -23,7 +17,17 @@
+ 
+ 
+ class Solver(with_metaclass(DocstringInheritor, FrozenObject)):
+-    """Decoder or weight solver."""
++    """Decoder or weight solver.
++
++    A solver can be compositional or non-compositional. Non-compositional
++    solvers must operate on the whole neuron-to-neuron weight matrix, while
++    compositional solvers operate in the decoded state space, which is then
++    combined with transform/encoders to generate the full weight matrix.
++    See the solver's ``compositional`` class attribute to determine if it is
++    compositional.
++    """
++
++    compositional = True
+ 
+     weights = BoolParam('weights')
+ 
+@@ -31,7 +35,7 @@ def __init__(self, weights=False):
+         super(Solver, self).__init__()
+         self.weights = weights
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         """Call the solver.
+ 
+         Parameters
+@@ -43,9 +47,6 @@ def __call__(self, A, Y, rng=np.random, E=None):
+             at each of the evaluation points.
+         rng : `numpy.random.RandomState`, optional (Default: ``numpy.random``)
+             A random number generator to use as required.
+-        E : (dimensions, post.n_neurons) array_like, optional (Default: None)
+-            Array of post-population encoders. Providing this tells the solver
+-            to return an array of connection weights rather than decoders.
+ 
+         Returns
+         -------
+@@ -60,24 +61,6 @@ def __call__(self, A, Y, rng=np.random, E=None):
+         """
+         raise NotImplementedError("Solvers must implement '__call__'")
+ 
+-    def mul_encoders(self, Y, E, copy=False):
+-        """Helper function that projects signal ``Y`` onto encoders ``E``.
+-
+-        Parameters
+-        ----------
+-        Y : ndarray
+-            The signal of interest.
+-        E : (dimensions, n_neurons) array_like or None
+-            Array of encoders. If None, ``Y`` will be returned unchanged.
+-        copy : bool, optional (Default: False)
+-            Whether a copy of ``Y`` should be returned if ``E`` is None.
+-        """
+-        if not self.weights and E is not None:
+-            raise ValidationError(
+-                "Encoders must be 'None' for decoder solver", attr='E')
+-
+-        return np.dot(Y, E) if E is not None else Y.copy() if copy else Y
+-
+ 
+ class SolverParam(Parameter):
+     def coerce(self, instance, solver):
+@@ -109,9 +92,8 @@ def __init__(self, weights=False, rcond=0.01):
+         super(Lstsq, self).__init__(weights=weights)
+         self.rcond = rcond
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         tstart = time.time()
+-        Y = self.mul_encoders(Y, E)
+         X, residuals2, rank, s = np.linalg.lstsq(A, Y, rcond=self.rcond)
+         t = time.time() - tstart
+         return X, {'rmses': rmses(A, X, Y),
+@@ -155,24 +137,24 @@ def __init__(self, weights=False, noise=0.1, solver=lstsq.Cholesky()):
+ class LstsqNoise(_LstsqNoiseSolver):
+     """Least-squares solver with additive Gaussian white noise."""
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         tstart = time.time()
+         sigma = self.noise * A.max()
+         A = A + rng.normal(scale=sigma, size=A.shape)
+         X, info = self.solver(A, Y, 0, rng=rng)
+         info['time'] = time.time() - tstart
+-        return self.mul_encoders(X, E), info
++        return X, info
+ 
+ 
+ class LstsqMultNoise(_LstsqNoiseSolver):
+     """Least-squares solver with multiplicative white noise."""
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         tstart = time.time()
+         A = A + rng.normal(scale=self.noise, size=A.shape) * A
+         X, info = self.solver(A, Y, 0, rng=rng)
+         info['time'] = time.time() - tstart
+-        return self.mul_encoders(X, E), info
++        return X, info
+ 
+ 
+ class _LstsqL2Solver(Solver):
+@@ -209,18 +191,18 @@ def __init__(self, weights=False, reg=0.1, solver=lstsq.Cholesky()):
+ class LstsqL2(_LstsqL2Solver):
+     """Least-squares solver with L2 regularization."""
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         tstart = time.time()
+         sigma = self.reg * A.max()
+         X, info = self.solver(A, Y, sigma, rng=rng)
+         info['time'] = time.time() - tstart
+-        return self.mul_encoders(X, E), info
++        return X, info
+ 
+ 
+ class LstsqL2nz(_LstsqL2Solver):
+     """Least-squares solver with L2 regularization on non-zero components."""
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         tstart = time.time()
+         # Compute the equivalent noise standard deviation. This equals the
+         # base amplitude (noise_amp times the overall max activation) times
+@@ -233,7 +215,7 @@ def __call__(self, A, Y, rng=np.random, E=None):
+ 
+         X, info = self.solver(A, Y, sigma, rng=rng)
+         info['time'] = time.time() - tstart
+-        return self.mul_encoders(X, E), info
++        return X, info
+ 
+ 
+ class LstsqL1(Solver):
+@@ -242,6 +224,8 @@ class LstsqL1(Solver):
+     This method is well suited for creating sparse decoders or weight matrices.
+     """
+ 
++    compositional = False
++
+     l1 = NumberParam('l1', low=0)
+     l2 = NumberParam('l2', low=0)
+ 
+@@ -278,10 +262,10 @@ def __init__(self, weights=False, l1=1e-4, l2=1e-6, max_iter=1000):
+         self.l2 = l2
+         self.max_iter = max_iter
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         import sklearn.linear_model
+         tstart = time.time()
+-        Y = self.mul_encoders(Y, E, copy=True)  # copy since 'fit' may modify Y
++        Y = np.array(Y)  # copy since 'fit' may modify Y
+ 
+         # TODO: play around with regularization constants (I just guessed).
+         #   Do we need to scale regularization by number of neurons, to get
+@@ -312,6 +296,8 @@ class LstsqDrop(Solver):
+     L2 regularization, drops those nearest to zero, and retrains remaining.
+     """
+ 
++    compositional = False
++
+     drop = NumberParam('drop', low=0, high=1)
+     solver1 = SolverParam('solver1')
+     solver2 = SolverParam('solver2')
+@@ -346,13 +332,12 @@ def __init__(self, weights=False, drop=0.25,
+         self.solver1 = solver1
+         self.solver2 = solver2
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         tstart = time.time()
+         Y, m, n, _, matrix_in = format_system(A, Y)
+ 
+         # solve for coefficients using standard solver
+         X, info0 = self.solver1(A, Y, rng=rng)
+-        X = self.mul_encoders(X, E)
+ 
+         # drop weights close to zero, based on `drop` ratio
+         Xabs = np.sort(np.abs(X.flat))
+@@ -360,7 +345,6 @@ def __call__(self, A, Y, rng=np.random, E=None):
+         X[np.abs(X) < threshold] = 0
+ 
+         # retrain nonzero weights
+-        Y = self.mul_encoders(Y, E)
+         for i in range(X.shape[1]):
+             nonzero = X[:, i] != 0
+             if nonzero.sum() > 0:
+@@ -383,6 +367,8 @@ class Nnls(Solver):
+     negative intercepts will never be silent, affecting output accuracy.
+     """
+ 
++    compositional = False
++
+     def __init__(self, weights=False):
+         """
+         .. note:: Requires
+@@ -402,12 +388,11 @@ def __init__(self, weights=False):
+         assert scipy.optimize
+         super(Nnls, self).__init__(weights=weights)
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         import scipy.optimize
+ 
+         tstart = time.time()
+         Y, m, n, _, matrix_in = format_system(A, Y)
+-        Y = self.mul_encoders(Y, E, copy=True)
+         d = Y.shape[1]
+ 
+         X = np.zeros((n, d))
+@@ -454,12 +439,11 @@ def __init__(self, weights=False, reg=0.1):
+         super(NnlsL2, self).__init__(weights=weights)
+         self.reg = reg
+ 
+-    def _solve(self, A, Y, rng, E, sigma=0.):
++    def _solve(self, A, Y, sigma=0.):
+         import scipy.optimize
+ 
+         tstart = time.time()
+         Y, m, n, _, matrix_in = format_system(A, Y)
+-        Y = self.mul_encoders(Y, E, copy=True)
+         d = Y.shape[1]
+ 
+         # form Gram matrix so we can add regularization
+@@ -477,8 +461,8 @@ def _solve(self, A, Y, rng, E, sigma=0.):
+         info = {'rmses': rmses(A, X, Y), 'residuals': residuals, 'time': t}
+         return X if matrix_in or X.shape[1] > 1 else X.ravel(), info
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
+-        return self._solve(A, Y, rng, E, sigma=self.reg * A.max())
++    def __call__(self, A, Y, rng=np.random):
++        return self._solve(A, Y, sigma=self.reg * A.max())
+ 
+ 
+ class NnlsL2nz(NnlsL2):
+@@ -491,10 +475,10 @@ class NnlsL2nz(NnlsL2):
+     negative intercepts will never be silent, affecting output accuracy.
+     """
+ 
+-    def __call__(self, A, Y, rng=np.random, E=None):
++    def __call__(self, A, Y, rng=np.random):
+         sigma = (self.reg * A.max()) * np.sqrt((A > 0).mean(axis=0))
+         sigma[sigma == 0] = 1
+-        return self._solve(A, Y, rng, E, sigma=sigma)
++        return self._solve(A, Y, sigma=sigma)
+ 
+ 
+ class NoSolver(Solver):
+@@ -502,43 +486,45 @@ class NoSolver(Solver):
+ 
+     Parameters
+     ----------
+-    values : (n_neurons, n_weights) array_like, optional (Default: None)
+-        The array of decoders or weights to use.
+-        If ``weights`` is ``False``, ``n_weights`` is the expected
+-        output dimensionality. If ``weights`` is ``True``,
+-        ``n_weights`` is the number of neurons in the post ensemble.
++    values : (n_neurons, size_out) array_like, optional (Default: None)
++        The array of decoders to use.
++        ``size_out`` is the dimensionality of the decoded signal (determined
++        by the connection function).
+         If ``None``, which is the default, the solver will return an
+         appropriately sized array of zeros.
+     weights : bool, optional (Default: False)
+-        If False, ``values`` is interpreted as decoders.
+-        If True, ``values`` is interpreted as weights.
++        If False, connection will use factored weights (decoders from this
++        solver, transform, and encoders).
++        If True, connection will use a full weight matrix (created by
++        linearly combining decoder, transform, and encoders).
+ 
+     Attributes
+     ----------
+-    values : (n_neurons, n_weights) array_like, optional (Default: None)
+-        The array of decoders or weights to use.
+-        If ``weights`` is ``False``, ``n_weights`` is the expected
+-        output dimensionality. If ``weights`` is ``True``,
+-        ``n_weights`` is the number of neurons in the post ensemble.
++    values : (n_neurons, size_out) array_like, optional (Default: None)
++        The array of decoders to use.
++        ``size_out`` is the dimensionality of the decoded signal (determined
++        by the connection function).
+         If ``None``, which is the default, the solver will return an
+         appropriately sized array of zeros.
+     weights : bool, optional (Default: False)
+-        If False, ``values`` is interpreted as decoders.
+-        If True, ``values`` is interpreted as weights.
++        If False, connection will use factored weights (decoders from this
++        solver, transform, and encoders).
++        If True, connection will use a full weight matrix (created by
++        linearly combining decoder, transform, and encoders).
+     """
+ 
++    compositional = True
++
+     values = NdarrayParam("values", optional=True, shape=("*", "*"))
+ 
+     def __init__(self, values=None, weights=False):
+         super(NoSolver, self).__init__(weights=weights)
+         self.values = values
+ 
+-    def __call__(self, A, Y, rng=None, E=None):
++    def __call__(self, A, Y, rng=None):
+         if self.values is None:
+             n_neurons = np.asarray(A).shape[1]
+-            if E is not None:
+-                return np.zeros((n_neurons, np.asarray(E).shape[1])), {}
+-            else:
+-                return np.zeros((n_neurons, np.asarray(Y).shape[1])), {}
++
++            return np.zeros((n_neurons, np.asarray(Y).shape[1])), {}
+ 
+         return self.values, {}
+diff --git a/nengo/tests/test_solvers.py b/nengo/tests/test_solvers.py
+index d139baaaa1..3fc6b592a4 100644
+--- a/nengo/tests/test_solvers.py
++++ b/nengo/tests/test_solvers.py
+@@ -8,13 +8,13 @@
+ 
+ import nengo
+ from nengo.dists import UniformHypersphere
+-from nengo.exceptions import ValidationError
++from nengo.exceptions import BuildError, ValidationError
+ from nengo.utils.compat import iteritems, range
+ from nengo.utils.numpy import rms, norm
+ from nengo.utils.stdlib import Timer
+ from nengo.utils.testing import allclose
+ from nengo.solvers import (
+-    lstsq, Lstsq, LstsqNoise, LstsqL2, LstsqL2nz,
++    lstsq, Lstsq, LstsqNoise, LstsqL2, LstsqL2nz, LstsqMultNoise,
+     LstsqL1, LstsqDrop, Nnls, NnlsL2, NnlsL2nz, NoSolver)
+ 
+ 
+@@ -96,7 +96,7 @@ def test_conjgrad(rng):
+ 
+ 
+ @pytest.mark.parametrize('Solver', [
+-    Lstsq, LstsqNoise, LstsqL2, LstsqL2nz, LstsqDrop])
++    Lstsq, LstsqNoise, LstsqL2, LstsqL2nz, LstsqDrop, LstsqMultNoise])
+ def test_decoder_solver(Solver, plt, rng):
+     solver = Solver()
+ 
+@@ -121,7 +121,9 @@ def test_decoder_solver(Solver, plt, rng):
+     plt.plot(test, test - est)
+     plt.title("relative RMSE: %0.2e" % rel_rmse)
+ 
+-    atol = 3.5e-2 if isinstance(solver, (LstsqNoise, LstsqDrop)) else 1.5e-2
++    atol = (4e-2
++            if isinstance(solver, (LstsqNoise, LstsqDrop, LstsqMultNoise))
++            else 1.5e-2)
+     assert np.allclose(test, est, atol=atol, rtol=1e-3)
+     assert rel_rmse < 0.02
+ 
+@@ -171,7 +173,7 @@ def test_weight_solver(Solver, rng):
+     W1 = np.dot(D, Eb)
+ 
+     # find weights directly
+-    W2, _ = Solver(weights=True)(Atrain, Xtrain, rng=rng, E=Eb)
++    W2, _ = Solver(weights=True)(Atrain, np.dot(Xtrain, Eb), rng=rng)
+ 
+     # assert that post inputs are close on test points
+     test = get_eval_points(n_points, dims, rng=rng)  # testing eval points
+@@ -218,6 +220,30 @@ def test_nnls(Solver, plt, rng):
+ 
+     assert np.allclose(yest, y, atol=3e-2, rtol=1e-3)
+     assert rel_rmse < 0.02
++    assert np.all(d >= 0)
++
++
++@pytest.mark.parametrize('Solver', [NnlsL2])
++def test_nnls_weights(Simulator, Solver, seed):
++    """Test NNLS solvers in the context of a network.
++
++    This also acts as a smoke test for general problems with weight solvers,
++    because it cannot be done by solving for decoders first then multiplying
++    by encoders.
++    """
++    pytest.importorskip('scipy')
++
++    with nengo.Network(seed=seed) as net:
++        a = nengo.Ensemble(26, 1)
++        b = nengo.Ensemble(29, 3)
++        c = nengo.Connection(a, b[:2],
++                             solver=Solver(weights=True),
++                             transform=nengo.dists.Uniform(-1, 1))
++
++    with Simulator(net) as sim:
++        sim.step()
++
++    assert np.all(sim.data[c].weights >= 0)
+ 
+ 
+ @pytest.mark.slow
+@@ -550,3 +576,51 @@ def test_nosolver_validation():
+         NoSolver(values="test")
+     # array_likes are okay
+     NoSolver(values=[[1], [1]])
++
++
++@pytest.mark.parametrize('solver', [
++    LstsqDrop(weights=True),
++])
++def test_non_compositional_solver(Simulator, solver, rng, seed, plt):
++    if isinstance(solver, LstsqL1):
++        pytest.importorskip('sklearn')
++    if isinstance(solver, Nnls):
++        pytest.importorskip('scipy')
++
++    assert not solver.compositional
++
++    with nengo.Network(seed=seed) as net:
++        u = nengo.Node(lambda t: 0.9*np.sin(2*np.pi*t))
++        a = nengo.Ensemble(100, 1)
++        b = nengo.Ensemble(101, 1)
++        nengo.Connection(u, a, synapse=None)
++        nengo.Connection(a, b, solver=solver, transform=-1)
++
++        up = nengo.Probe(u, synapse=0.03)
++        bp = nengo.Probe(b, synapse=0.03)
++
++    with Simulator(net) as sim:
++        sim.run(1.0)
++
++    x = sim.data[up]
++    y = sim.data[bp]
++    plt.plot(sim.trange(), -x)
++    plt.plot(sim.trange(), y)
++
++    assert np.allclose(y, -x, atol=0.1)
++
++
++def test_non_compositional_solver_transform_error(Simulator):
++    pytest.importorskip("scipy")
++
++    with nengo.Network() as net:
++        a = nengo.Ensemble(10, 1)
++        b = nengo.Ensemble(10, 1)
++        nengo.Connection(a, b, solver=Nnls(weights=True),
++                         transform=nengo.Convolution(
++                             1, (1, 1), kernel_size=(1,), strides=(1,)))
++
++    # build error for non-compositional solver with non-dense transform
++    with pytest.raises(BuildError, match="Non-compositional solvers"):
++        with Simulator(net):
++            pass

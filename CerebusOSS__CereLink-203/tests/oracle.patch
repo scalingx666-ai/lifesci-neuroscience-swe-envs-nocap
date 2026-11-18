@@ -1,0 +1,373 @@
+diff --git a/src/cbsdk/src/sdk_session.cpp b/src/cbsdk/src/sdk_session.cpp
+index d7f439a1..858a47a5 100644
+--- a/src/cbsdk/src/sdk_session.cpp
++++ b/src/cbsdk/src/sdk_session.cpp
+@@ -316,10 +316,14 @@ struct SdkSession::Impl {
+         uint32_t global_start;  ///< 1-based, inclusive
+     };
+     // Mutable so an unresolved window can still be resolved from const
+-    // accessors -- see ensureWindowResolved().
++    // accessors -- see ensureWindowResolved().  That rebuild can come from any
++    // thread while the receive thread iterates chan_segs, so the three fields
++    // below move together under window_mutex.  local_max_chans is also atomic:
++    // the per-packet dispatch path reads it without taking the mutex.
++    mutable std::mutex window_mutex;                ///< guards the three fields below
+     mutable std::vector<ChanSeg> chan_segs;         ///< the mapped ranges
+     mutable bool window_resolved = false;           ///< false => identity map (unknown)
+-    mutable uint32_t local_max_chans = cbMAXCHANS;  ///< channels this device has
++    mutable std::atomic<uint32_t> local_max_chans{cbMAXCHANS};  ///< channels this device has
+     uint32_t central_instrument = 0;                ///< instrument this session speaks for
+ 
+     /// @brief Resolve the window on first use if it could not be resolved yet
+@@ -329,16 +333,23 @@ struct SdkSession::Impl {
+     /// unresolved window silently reports the whole wire space. Retrying at the
+     /// point of use removes the timing sensitivity entirely; once resolved this
+     /// is a single bool test.
+-    void ensureWindowResolved() const {
++    /// @pre window_mutex held
++    void ensureWindowResolvedLocked() const {
+         if (!window_resolved) {
+-            const_cast<Impl*>(this)->buildChannelWindow(central_instrument);
++            const_cast<Impl*>(this)->buildChannelWindowLocked(central_instrument);
+         }
+     }
+ 
++    void ensureWindowResolved() const {
++        std::lock_guard<std::mutex> lk(window_mutex);
++        ensureWindowResolvedLocked();
++    }
++
+     /// @brief Map a local (per-device) channel id onto Central's global id
+     /// @return the global id, or 0 if this device has no such channel
+-    uint32_t toGlobalChan(const uint32_t local) const {
+-        if (local < 1 || local > local_max_chans) return 0;
++    /// @pre window_mutex held
++    uint32_t toGlobalChanLocked(const uint32_t local) const {
++        if (local < 1 || local > local_max_chans.load(std::memory_order_relaxed)) return 0;
+         // An unresolved window is the identity; a resolved but empty one means
+         // the device is not present and nothing is addressable.
+         if (!window_resolved) return local;
+@@ -349,13 +360,22 @@ struct SdkSession::Impl {
+         return 0;
+     }
+ 
++    /// @brief Locking wrapper for the one-shot callers outside the receive path
++    uint32_t toGlobalChan(const uint32_t local) const {
++        std::lock_guard<std::mutex> lk(window_mutex);
++        ensureWindowResolvedLocked();
++        return toGlobalChanLocked(local);
++    }
++
+     /// @brief Inverse of toGlobalChan()
+     ///
+     /// Returns 0 when the global id belongs to a different instrument, which is
+     /// how packets for other devices are recognised and ignored.
+-    uint32_t toLocalChan(const uint32_t global) const {
++    /// @pre window_mutex held
++    uint32_t toLocalChanLocked(const uint32_t global) const {
+         if (global < 1) return 0;
+-        if (!window_resolved) return global <= local_max_chans ? global : 0;
++        if (!window_resolved)
++            return global <= local_max_chans.load(std::memory_order_relaxed) ? global : 0;
+         for (const auto& s : chan_segs) {
+             if (global >= s.global_start && global < s.global_start + s.count)
+                 return s.local_start + (global - s.global_start);
+@@ -375,7 +395,8 @@ struct SdkSession::Impl {
+     /// range: local 1..chancount maps to global base..base+chancount-1, where
+     /// base is 1 plus the running sum of the preceding instruments' chancount.
+     /// A device reporting chancount 0 is not present.
+-    void buildChannelWindow(const uint32_t instrument) {
++    /// @pre window_mutex held
++    void buildChannelWindowLocked(const uint32_t instrument) {
+         chan_segs.clear();
+         window_resolved = false;
+         local_max_chans = cbMAXCHANS;
+@@ -409,8 +430,15 @@ struct SdkSession::Impl {
+             local_max_chans = 0;
+             return;
+         }
+-        chan_segs.push_back({1, count, base});
+-        local_max_chans = count;
++        // chancount comes off the wire and can exceed the compile-time
++        // cbMAXCHANS that sizes every local-channel buffer, notably
++        // channel_type_cache; an unclamped count writes past them and over the
++        // Impl members that follow, several of which are std::mutex.  base is
++        // deliberately not clamped -- it indexes Central's global space, which
++        // must stay exact.
++        const uint32_t local_count = std::min<uint32_t>(count, cbMAXCHANS);
++        chan_segs.push_back({1, local_count, base});
++        local_max_chans = local_count;
+     }
+ 
+     /// @brief Resolve the channel window, retrying briefly if procinfo lags
+@@ -424,8 +452,13 @@ struct SdkSession::Impl {
+     /// lifetime.
+     void resolveChannelWindow(const int attempts = 20) {
+         for (int i = 0; i < attempts; ++i) {
+-            buildChannelWindow(central_instrument);
+-            if (window_resolved) return;
++            {
++                // Released around the sleep so a concurrent packet-translation
++                // batch is not blocked for the whole retry budget.
++                std::lock_guard<std::mutex> lk(window_mutex);
++                buildChannelWindowLocked(central_instrument);
++                if (window_resolved) return;
++            }
+             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+         }
+     }
+@@ -441,7 +474,8 @@ struct SdkSession::Impl {
+ 
+     void rebuildChannelTypeCache() {
+         channel_type_cache.fill(ChannelType::ANY);
+-        for (uint32_t ch = 0; ch < local_max_chans; ++ch) {
++        const uint32_t n = local_max_chans.load(std::memory_order_relaxed);
++        for (uint32_t ch = 0; ch < n; ++ch) {
+             auto ci = getChanInfo(ch + 1);
+             channel_type_cache[ch] = ci.isOk() ? classifyChannelByCaps(ci.value()) : ChannelType::ANY;
+         }
+@@ -454,7 +488,7 @@ struct SdkSession::Impl {
+         // store, so the answer cannot depend on which one replies.  A hub has
+         // no I/O channels, but the wire layout still reserves slots at 257..,
+         // and the device happily returns the empty chaninfo sitting there.
+-        ensureWindowResolved();
++        // toGlobalChan() resolves the window first if it still needs it.
+         const uint32_t global = toGlobalChan(chan_id);
+         if (!global) {
+             return Result<cbPKT_CHANINFO>::error("Channel not present on this device");
+@@ -742,18 +776,25 @@ struct SdkSession::Impl {
+         //
+         // An identity map — NATIVE, STANDALONE, or a single-instrument
+         // Central — skips the loop entirely, so the hot path is unaffected.
+-        if (!chan_segs.empty()) {
+-            for (size_t i = 0; i < count; i++) {
+-                const uint16_t chid = packets[i].cbpkt_header.chid;
+-                // chid 0 is a sample group and the high bit marks configuration
+-                // packets; neither is a channel id.
+-                if (chid == 0 || (chid & cbPKTCHAN_CONFIGURATION)) continue;
+-                const uint32_t local = toLocalChan(chid);
+-                // 0 means the channel belongs to another instrument, which the
+-                // receive-buffer instrument filter should already have dropped.
+-                // Leave it alone rather than rewriting it to 0, which would
+-                // masquerade as a sample group.
+-                if (local) packets[i].cbpkt_header.chid = static_cast<uint16_t>(local);
++        //
++        // The lock is held once for the batch, not per packet: it only has to
++        // stop a concurrent ensureWindowResolved() refilling chan_segs under
++        // the iteration.
++        {
++            std::lock_guard<std::mutex> lk(window_mutex);
++            if (!chan_segs.empty()) {
++                for (size_t i = 0; i < count; i++) {
++                    const uint16_t chid = packets[i].cbpkt_header.chid;
++                    // chid 0 is a sample group and the high bit marks configuration
++                    // packets; neither is a channel id.
++                    if (chid == 0 || (chid & cbPKTCHAN_CONFIGURATION)) continue;
++                    const uint32_t local = toLocalChanLocked(chid);
++                    // 0 means the channel belongs to another instrument, which the
++                    // receive-buffer instrument filter should already have dropped.
++                    // Leave it alone rather than rewriting it to 0, which would
++                    // masquerade as a sample group.
++                    if (local) packets[i].cbpkt_header.chid = static_cast<uint16_t>(local);
++                }
+             }
+         }
+ 
+@@ -981,6 +1022,14 @@ Result<SdkSession> SdkSession::create(const SdkConfig& config) {
+             cbshm::Mode::CLIENT, cbshm::ShmemLayout::NATIVE, device_tag,
+             cbproto::InstrumentId::fromIndex(0));
+ 
++        // Not the same as "nothing to attach to": the owner is probably alive,
++        // and the STANDALONE fallback below would unlink and recreate these
++        // very segments, taking the device away from it.
++        if (shmem_result.isError() && cbshm::isIncompatibleLayoutError(shmem_result.error())) {
++            return Result<SdkSession>::error("Failed to attach to shared memory: " +
++                                             shmem_result.error());
++        }
++
+         // Liveness check: reject stale segments from a dead STANDALONE process.
+         // The ShmemSession destructor (triggered by reassignment) unmaps the segments;
+         // the subsequent STANDALONE creation path will shm_unlink + recreate them.
+@@ -1023,7 +1072,8 @@ Result<SdkSession> SdkSession::create(const SdkConfig& config) {
+             session.m_impl->shmem_session->getLayout() == cbshm::ShmemLayout::CENTRAL;
+         session.m_impl->central_instrument =
+             central_layout && inst_idx >= 0 ? static_cast<uint32_t>(inst_idx) : 0u;
+-        session.m_impl->buildChannelWindow(session.m_impl->central_instrument);
++        std::lock_guard<std::mutex> lk(session.m_impl->window_mutex);
++        session.m_impl->buildChannelWindowLocked(session.m_impl->central_instrument);
+     }
+ 
+     // Create device session only in STANDALONE mode
+@@ -1669,7 +1719,13 @@ Result<void> SdkSession::start() {
+ }
+ 
+ void SdkSession::stop() {
+-    if (!m_impl || !m_impl->is_running.load()) {
++    // Gate on the Impl, never on is_running: start() sets that flag last, so it
++    // is false for the whole window in which the worker threads are already
++    // live.  Returning early there skips every join below and the destructor
++    // then frees the Impl under a running thread -- which aborts with "mutex
++    // lock failed: Invalid argument" once that thread locks a destroyed mutex.
++    // Each join is guarded by its own thread's flag, so this is idempotent.
++    if (!m_impl) {
+         return;
+     }
+ 
+diff --git a/src/cbshm/include/cbshm/native_types.h b/src/cbshm/include/cbshm/native_types.h
+index 6b548ffe..2d17cfe6 100644
+--- a/src/cbshm/include/cbshm/native_types.h
++++ b/src/cbshm/include/cbshm/native_types.h
+@@ -64,8 +64,38 @@ constexpr uint32_t NATIVE_cbPKT_SPKCACHELINECNT = NATIVE_NUM_ANALOG_CHANS;
+ /// It uses scalar fields instead of arrays for per-instrument data, and uses
+ /// cbMAXCHANS (284) instead of cbCONFIG_MAXCHANS (848) for channel arrays.
+ ///
++/// @brief Layout revision of NativeConfigBuffer
++///
++/// Bump whenever a field is added, removed, or reordered.  Builds that disagree
++/// cannot share a segment: every field past the change is read at the wrong
++/// offset and the reader has no way to notice.  9.13 dropped
++/// optiontable/colortable and added segment_uid, shifting clock_offset_ns,
++/// owner_pid and segment_uid by 512 bytes — so a 9.13 CLIENT on a 9.12 segment
++/// takes its clock sync, liveness and supersession state from arbitrary bytes.
++constexpr uint32_t NATIVE_CONFIG_LAYOUT_VERSION = 2;
++
++/// @brief Pack the layout revision and the protocol version into cfg->version
++///
++/// High 8 bits are the layout revision, low 24 the cbproto version this field
++/// has always carried.  Builds before 9.13 wrote only the latter, so they read
++/// back as layout 0 -- which is how a pre-9.13 segment is recognised without a
++/// field that did not exist then.
++constexpr uint32_t makeNativeConfigVersion(const uint32_t protocol_version) {
++    return (NATIVE_CONFIG_LAYOUT_VERSION << 24) | (protocol_version & 0x00FFFFFFu);
++}
++
++/// @brief Recover the layout revision from cfg->version
++constexpr uint32_t nativeConfigLayoutVersion(const uint32_t version) {
++    return version >> 24;
++}
++
++/// @brief Recover the cbproto version from cfg->version
++constexpr uint32_t nativeConfigProtocolVersion(const uint32_t version) {
++    return version & 0x00FFFFFFu;
++}
++
+ typedef struct {
+-    uint32_t version;           ///< Buffer structure version
++    uint32_t version;           ///< Layout revision (high 8 bits) + cbproto version (low 24)
+     uint32_t sysflags;          ///< System-wide flags
+ 
+     // Single instrument status
+diff --git a/src/cbshm/include/cbshm/shmem_session.h b/src/cbshm/include/cbshm/shmem_session.h
+index 9f5c9654..f9b5f018 100644
+--- a/src/cbshm/include/cbshm/shmem_session.h
++++ b/src/cbshm/include/cbshm/shmem_session.h
+@@ -51,6 +51,18 @@ enum class ShmemLayout {
+     NATIVE           ///< Native single-instrument layout (NativeConfigBuffer)
+ };
+ 
++/// @brief Prefix on the create() error for a segment written by an incompatible build
++///
++/// Callers must tell this apart from "no segment there", whose usual answer is
++/// to become STANDALONE -- which unlinks and recreates the segments, tearing
++/// them out from under an owner that is merely a different version.
++constexpr const char* INCOMPATIBLE_LAYOUT_ERROR = "Incompatible shared memory layout: ";
++
++/// @brief Whether a create() error reports an incompatible segment layout
++inline bool isIncompatibleLayoutError(const std::string& error) {
++    return error.rfind(INCOMPATIBLE_LAYOUT_ERROR, 0) == 0;
++}
++
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ /// @brief Shared memory session for Cerebus configuration and data buffers
+ ///
+diff --git a/src/cbshm/src/shmem_session.cpp b/src/cbshm/src/shmem_session.cpp
+index 2c77ceff..9b3c16ba 100644
+--- a/src/cbshm/src/shmem_session.cpp
++++ b/src/cbshm/src/shmem_session.cpp
+@@ -644,7 +644,7 @@ struct ShmemSession::Impl {
+         if (mode == Mode::STANDALONE && layout == ShmemLayout::NATIVE) {
+             auto* cfg = nativeCfg();
+             std::memset(cfg, 0, cfg_buffer_size);
+-            cfg->version = cbVERSION_MAJOR * 100 + cbVERSION_MINOR;
++            cfg->version = makeNativeConfigVersion(cbVERSION_MAJOR * 100 + cbVERSION_MINOR);
+             cfg->instrument_status = static_cast<uint32_t>(InstrumentStatus::INACTIVE);
+             // Ownership + per-creation identity.  owner_pid detects a crashed owner;
+             // segment_uid detects a live owner that recreated this segment under the
+@@ -718,6 +718,31 @@ struct ShmemSession::Impl {
+ 
+         is_open = true;
+ 
++        // Refuse a segment whose NativeConfigBuffer layout is not ours.  Nothing
++        // downstream can detect the mismatch -- every field still reads as
++        // *something* -- so it would surface as quietly wrong clock sync and
++        // liveness state rather than as a failed attach.
++        if (mode == Mode::CLIENT && layout == ShmemLayout::NATIVE && cfg_buffer_raw) {
++            const uint32_t their_version = nativeCfg()->version;
++            const uint32_t their_layout = nativeConfigLayoutVersion(their_version);
++            if (their_layout != NATIVE_CONFIG_LAYOUT_VERSION) {
++                const uint32_t their_proto = nativeConfigProtocolVersion(their_version);
++                std::string owner_desc =
++                    their_proto ? (" (protocol " + std::to_string(their_proto / 100) + "." +
++                                   std::to_string(their_proto % 100) + ")")
++                                : std::string();
++                close();
++                return Result<void>::error(
++                    std::string(INCOMPATIBLE_LAYOUT_ERROR) +
++                    "the owner wrote config layout " + std::to_string(their_layout) +
++                    owner_desc + ", but this build requires layout " +
++                    std::to_string(NATIVE_CONFIG_LAYOUT_VERSION) +
++                    ". Layout 0 means the owner predates CereLink 9.13."
++                    " Update every process sharing this device to the same"
++                    " CereLink version.");
++            }
++        }
++
+         // Snapshot the segment identity we attached to (STANDALONE has just
+         // written it in initBuffers(); CLIENT reads what the owner wrote).  Used
+         // by isOwnerAlive() to detect later supersession.
+diff --git a/tests/unit/test_sdk_session.cpp b/tests/unit/test_sdk_session.cpp
+index bdf194cc..a1f288af 100644
+--- a/tests/unit/test_sdk_session.cpp
++++ b/tests/unit/test_sdk_session.cpp
+@@ -82,6 +82,41 @@ TEST_F(SdkSessionTest, Create_MoveConstruction) {
+     EXPECT_TRUE(session2.isRunning());  // Session is started
+ }
+ 
++/// procinfo.chancount comes off the wire and can exceed the compile-time
++/// cbMAXCHANS.  Taken verbatim it overran channel_type_cache — a
++/// std::array<ChannelType, cbMAXCHANS> in the session's Impl — and wrote over
++/// the members after it, several of which are std::mutex.  A smashed mutex
++/// makes pthread_mutex_lock return EINVAL, which libc++ raises as an uncaught
++/// "mutex lock failed: Invalid argument" on the next SDK thread to lock it.
++TEST_F(SdkSessionTest, ChannelWindow_ClampsOversizedChancount) {
++    // Own the native segments first so the session under test attaches to them
++    // as a CLIENT and reads the procinfo we plant here.
++    auto owner = cbshm::ShmemSession::create(
++        cbshm::Mode::STANDALONE, cbshm::ShmemLayout::NATIVE, "hub3",
++        cbproto::InstrumentId::fromIndex(0));
++    ASSERT_TRUE(owner.isOk()) << "Error: " << owner.error();
++
++    cbPKT_PROCINFO info;
++    std::memset(&info, 0, sizeof(info));
++    info.proc = 1;
++    info.chancount = cbMAXCHANS + 228;  // a device with more channels than we were built for
++    ASSERT_TRUE(owner.value().setProcInfo(info).isOk());
++    ASSERT_TRUE(owner.value().setInstrumentActive(true).isOk());
++
++    SdkConfig config;
++    config.device_type = DeviceType::HUB3;
++    config.autorun = false;
++
++    auto result = SdkSession::create(config);
++    ASSERT_TRUE(result.isOk()) << "Error: " << result.error();
++
++    auto& session = result.value();
++    EXPECT_FALSE(session.isStandalone()) << "expected to attach as CLIENT";
++    EXPECT_LE(session.getMaxChans(), static_cast<uint32_t>(cbMAXCHANS));
++
++    session.stop();
++}
++
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ // Session Lifecycle Tests
+ ///////////////////////////////////////////////////////////////////////////////////////////////////

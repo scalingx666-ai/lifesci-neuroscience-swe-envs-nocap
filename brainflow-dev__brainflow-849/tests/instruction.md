@@ -1,0 +1,21 @@
+# Issue
+
+**Title:** Fix chebyshev band pass and band stop returning all NaN
+
+## Description
+
+`DataFilter.perform_bandpass` and `DataFilter.perform_bandstop` return an array that is entirely NaN whenever the filter type is `CHEBYSHEV_TYPE_1` or `CHEBYSHEV_TYPE_1_ZERO_PHASE`. The exit code is still `STATUS_OK`, so nothing is raised and the NaN silently poisons whatever runs next, band powers, PSDs, the ML metrics. Butterworth and Bessel are fine, and Chebyshev low pass and high pass are fine, so only these two entry points are affected.
+
+The cause is a parameter slot mismatch against the bundled DSPFilters library. `ChebyshevI::Design::LowPass` and `HighPass` are built on `TypeI`, which takes four params in the order sample rate, order, cutoff, rippleDb, so the ripple really does belong in slot three there. `ChebyshevI::Design::BandPass` and `BandStop` are built on `TypeII`, which takes five, sample rate, order, center frequency, band width, rippleDb, as declared by `getParamInfo_3 = defaultBandwidthHzParam` and `getParamInfo_4 = defaultRippleDbParam` in `third_party/DSPFilters/include/DspFilters/ChebyshevI.h`. Both `perform_bandpass` and `perform_bandstop` wrote `params[3] = ripple` for every Chebyshev type. On the band designs that overwrote the band width with the ripple value and left slot four unwritten, and since `Dsp::Params` is a plain struct with no constructor and `clear` is never called, the design was computed from a bogus band width and an indeterminate ripple.
+
+The fix writes the ripple into `params[4]` for the band designs, leaves the band width in `params[3]`, and calls `params.clear ()` first so an unwritten slot can never be read as garbage again. Chebyshev low pass and high pass are untouched. This is why the bug survived so long: every Chebyshev call site in the repository, `python_package/examples/tests/signal_filtering.py`, `cpp_package/examples/signal_processing/src/signal_filtering.cpp` and `julia_package/brainflow/test/signal_filtering.jl`, uses low pass or high pass only. No example or test ever calls Chebyshev band pass or band stop.
+
+I built on macOS arm64 with `cmake .. && make -j8` and drove the Python binding against the freshly built `libDataHandler`. Before the change, a 4096 sample signal at 250 Hz through `perform_bandpass(..., CHEBYSHEV_TYPE_1, 1.0)` came back 4096 of 4096 NaN, and the same for `perform_bandstop`, while Butterworth and Bessel were clean. After the change, using a sum of sine probes at 1, 10, 25, 60 and 90 Hz, a 5 to 30 Hz Chebyshev band pass gives per tone gains of 0.0019, 0.9475, 0.8948, 0.0049 and 0.0002, closely tracking the Butterworth reference of 0.0012, 0.9991, 0.9544, 0.0176 and 0.0007. A 20 to 30 Hz band stop notches the 25 Hz tone to 0.0005 and leaves the others above 0.89.
+
+Two further checks confirm the specific slots. The band width is now honoured rather than being replaced by the ripple value: sweeping the band as 5 to 10, 5 to 30 and 5 to 60 Hz moves the 25 Hz gain from 0.0012 to 0.8948 to 0.9272 and the 60 Hz gain from 0.0003 to 0.0049 to 0.8890. The ripple now reaches the design and behaves monotonically: at 0.1, 1.0 and 3.0 dB the 10 Hz passband gain is 0.9943, 0.9475 and 0.8361, which is the expected deepening of passband ripple. The zero phase variant is also NaN free and correct.
+
+For regressions I ran the synthetic board examples CI already runs, `denoising.py`, `signal_filtering.py`, `transforms.py`, `downsampling.py`, `band_power.py`, `band_power_all.py`, `windowing.py`, `ica.py` and `csp.py`, and all pass. `clang-format` with the repository `.clang-format` reports no change anywhere in the file. There is no assertion based test surface for the signal processing functions, the existing coverage is demo scripts that plot rather than assert, so I could not extend one. I am happy to add a Chebyshev band pass case to the examples if you would like the path covered in CI.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `048fcaa46f6c`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

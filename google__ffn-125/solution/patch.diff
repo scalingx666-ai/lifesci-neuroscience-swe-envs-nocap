@@ -1,0 +1,200 @@
+diff --git a/ffn/jax/accelerator_utils.py b/ffn/jax/accelerator_utils.py
+new file mode 100644
+index 0000000..2f22300
+--- /dev/null
++++ b/ffn/jax/accelerator_utils.py
+@@ -0,0 +1,59 @@
++# Copyright 2026 Google Inc.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Accelerator topology and batch size utilities."""
++
++import dataclasses
++import jax
++
++
++@dataclasses.dataclass(frozen=True)
++class AcceleratorTopologyInfo:
++  global_batch_size: int
++  host_batch_size: int
++  cores_per_chip: int
++  num_chips: int
++  local_chips: int
++
++
++def get_accelerator_topology_info(
++    per_device_batch_size: int,
++) -> AcceleratorTopologyInfo:
++  """Computes topology info and batch sizes.
++
++  Args:
++    per_device_batch_size: Desired batch size per device (core).
++
++  Returns:
++    AcceleratorTopologyInfo with topology and batch size info.
++  """
++  devices = jax.local_devices()
++  if devices and hasattr(devices[0], 'core_on_chip'):
++    cores_per_chip = max(d.core_on_chip for d in devices) + 1
++  else:
++    cores_per_chip = 1
++
++  num_chips = jax.device_count() // cores_per_chip
++  local_chips = jax.local_device_count() // cores_per_chip
++
++  global_batch_size = per_device_batch_size * num_chips
++  host_batch_size = per_device_batch_size * local_chips
++
++  return AcceleratorTopologyInfo(
++      global_batch_size=global_batch_size,
++      host_batch_size=host_batch_size,
++      cores_per_chip=cores_per_chip,
++      num_chips=num_chips,
++      local_chips=local_chips,
++  )
+diff --git a/ffn/jax/input_pipeline.py b/ffn/jax/input_pipeline.py
+index f4fc4c9..36e6173 100644
+--- a/ffn/jax/input_pipeline.py
++++ b/ffn/jax/input_pipeline.py
+@@ -24,6 +24,7 @@
+ from connectomics.common import bounding_box
+ from connectomics.common import utils
+ from ffn.input import volume
++from ffn.jax import accelerator_utils
+ from ffn.jax import tracker
+ from ffn.training import examples
+ from ffn.training import inputs
+@@ -151,7 +152,10 @@ def _add_ffn_data(ex: volume.Example) -> volume.Example:
+         patches=(emt - config.image_mean) / config.image_stddev,
+     )
+ 
+-  batch_size = config.per_device_batch_size * jax.local_device_count()
++  topo_info = accelerator_utils.get_accelerator_topology_info(
++      config.per_device_batch_size
++  )
++  batch_size = topo_info.host_batch_size
+ 
+   if cfg.sampling.vsi_coords:
+     num_examples = getattr(config, 'train_num_coords', 100_000_000)
+diff --git a/ffn/jax/train.py b/ffn/jax/train.py
+index 788b5e7..2a897c4 100644
+--- a/ffn/jax/train.py
++++ b/ffn/jax/train.py
+@@ -27,6 +27,7 @@
+ from clu import parameter_overview
+ from connectomics.jax import training
+ from etils import epath
++from ffn.jax import accelerator_utils
+ from ffn.jax import input_pipeline
+ from ffn.jax import tracker
+ from ffn.training import examples
+@@ -521,13 +522,27 @@ def train_and_evaluate(
+     train_iter = checkpointed_state['train_iter']
+   initial_step = int(state.step) + 1
+ 
+-  global_batch_size = config.per_device_batch_size * jax.device_count()
+-  host_batch_size = config.per_device_batch_size * jax.local_device_count()
++  # Compute batch sizes based on chip count, not core count. Multi-core
++  # chips (e.g., tpu7x with 2 cores/chip) expose each core as a
++  # separate JAX device, which would accidentally double the batch size.
++  topo_info = accelerator_utils.get_accelerator_topology_info(
++      config.per_device_batch_size
++  )
++
++  logging.info(
++      'cores_per_chip=%d, num_chips=%d (global), local_chips=%d, '
++      'global_batch_size=%d, host_batch_size=%d',
++      topo_info.cores_per_chip,
++      topo_info.num_chips,
++      topo_info.local_chips,
++      topo_info.global_batch_size,
++      topo_info.host_batch_size,
++  )
+ 
+   # Upper bound. The real number will be lower as not all steps are
+   # taken for every example.
+   steps_per_epoch = (
+-      num_total_examples // global_batch_size * (len(fov_shifts) + 1)
++      num_total_examples // topo_info.global_batch_size * (len(fov_shifts) + 1)
+   )
+   num_train_steps = steps_per_epoch * config.num_epochs
+   logging.info(
+@@ -593,7 +608,9 @@ def train_fn(state, batch, loss_scale):
+   logging.info('Starting training loop at step %d.', initial_step)
+   hooks = []
+   report_progress = training.ReportProgress(
+-      global_batch_size, num_train_steps=num_train_steps, writer=writer
++      topo_info.global_batch_size,
++      num_train_steps=num_train_steps,
++      writer=writer,
+   )
+   if jax.process_index() == 0:
+     hooks.append(report_progress)
+@@ -608,7 +625,7 @@ def train_fn(state, batch, loss_scale):
+       info,
+       config,
+       seed_shape=tuple(train_canvas_size(info, config).tolist()[::-1]),
+-      batch_size=host_batch_size,
++      batch_size=topo_info.host_batch_size,
+       jmp_policy=jmp_policy,
+   )
+ 
+@@ -623,9 +640,9 @@ def _reshape(x):
+       per_device_data = np.split(x, len(mesh.local_devices), axis=0)
+ 
+       on_dev = jax.device_put(per_device_data, mesh.local_devices)
+-      global_shape = (
+-          len(batch_sharding.device_set) * config.per_device_batch_size,
+-      ) + per_device_data[0].shape[1:]
++      global_shape = (topo_info.global_batch_size,) + per_device_data[0].shape[
++          1:
++      ]
+       return jax.make_array_from_single_device_arrays(
+           global_shape, batch_sharding, on_dev
+       )
+@@ -672,16 +689,12 @@ def _reshape(x):
+           )
+ 
+         with training.MeasureTime(timings, 'update_seed'):
+-          host_local_seeds = []  # [b, z, y, x, 1] * num_devices
+-          dev_to_slice = batch_sharding.addressable_devices_indices_map(
+-              updated_seed.shape
+-          )
+-
+           # Ensure device order is the same as that used to build the
+           # global array in postprocess_batch().
+-          assert list(dev_to_slice.keys()) == list(mesh.local_devices)
+-          for slc in dev_to_slice.values():
+-            host_local_seeds.append(updated_seed[slc])
++          shard_by_device = {
++              s.device: s.data for s in updated_seed.addressable_shards
++          }
++          host_local_seeds = [shard_by_device[d] for d in mesh.local_devices]
+ 
+           batch_iter.update_seeds(host_local_seeds)
+ 
+diff --git a/ffn/training/mask.py b/ffn/training/mask.py
+index 06607d5..0d8093b 100644
+--- a/ffn/training/mask.py
++++ b/ffn/training/mask.py
+@@ -45,7 +45,8 @@ def crop(tensor, offset, crop_shape):
+     off_y = shape[-3] // 2 - crop_shape[1] // 2 + offset[1]
+     off_x = shape[-2] // 2 - crop_shape[0] // 2 + offset[0]
+ 
+-    # Note: native indexing syntax not used below due to TPU compatibility.
++    # Note: native indexing syntax not used below due to accelerator
++    # compatibility.
+     if len(offset) == 2:
+       cropped = tf.slice(
+           tensor,

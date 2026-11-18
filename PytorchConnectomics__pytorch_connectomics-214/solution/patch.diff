@@ -1,0 +1,3617 @@
+diff --git a/connectomics/runtime/abiss_large.py b/connectomics/runtime/abiss_large.py
+new file mode 100644
+index 000000000..d22a8e3f8
+--- /dev/null
++++ b/connectomics/runtime/abiss_large.py
+@@ -0,0 +1,970 @@
++"""Prepare and run vendored ABISS chunked decoding on large volumes.
++
++This module bridges the tutorial config in ``tutorials/waterz_decoding_large_abiss.yaml``
++to the vendored ABISS shell pipeline by:
++- converting saved affinity H5 (C, Z, Y, X) into local precomputed/CloudVolume
++- initializing WS/SEG precomputed outputs
++- writing the ABISS JSON param file expected by ``lib/abiss/scripts/init.sh``
++- running the watershed / remap / mean-edge agglomeration stages with the
++  missing environment variables wired in for local execution
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++import subprocess
++import sys
++from dataclasses import dataclass, replace
++from pathlib import Path
++from typing import Any, Dict, Mapping, Sequence
++from urllib.parse import unquote, urlparse
++
++import h5py
++import numpy as np
++import yaml  # type: ignore[import-untyped]
++
++STAGES_ALL = (
++    "watershed",
++    "remap_watershed",
++    "agglomerate_mean_edge",
++    "remap_agglomeration",
++)
++
++
++def _open_cloudvolume(cloudpath: str, **kwargs: Any) -> Any:
++    """Import CloudVolume only when an execution path actually needs it."""
++
++    from cloudvolume import CloudVolume
++
++    return CloudVolume(cloudpath, **kwargs)
++
++
++def _create_cloudvolume_info(**kwargs: Any) -> dict[str, Any]:
++    """Build CloudVolume metadata without importing the package during dry resolve."""
++
++    from cloudvolume import CloudVolume
++
++    return CloudVolume.create_new_info(**kwargs)
++
++
++@dataclass(frozen=True)
++class OutputLayerSpec:
++    """Metadata needed to initialize fresh local ABISS output layers."""
++
++    resolution_xyz: tuple[int, int, int]
++    chunk_size_xyz: tuple[int, int, int]
++
++
++@dataclass(frozen=True)
++class PreparedConfig:
++    """Everything required to plan or execute an already-prepared ABISS run."""
++
++    workdir: Path
++    secrets_dir: Path
++    param_path: Path
++    abiss_home: Path
++    param_payload: Mapping[str, Any]
++    root_tag: str
++    top_mip: int
++    stage_overlap: str = "0"
++    stage_meta: str = ""
++    stages: tuple[str, ...] = STAGES_ALL
++    runtime_secrets_dir: Path | None = None
++    output_layer_spec: OutputLayerSpec | None = None
++    write_param: bool = True
++    extra_env: Mapping[str, str] | None = None
++
++    @property
++    def seg_cloudpath(self) -> str:
++        try:
++            return str(self.param_payload["SEG_PATH"])
++        except KeyError as exc:
++            raise ValueError("ABISS param payload is missing required SEG_PATH.") from exc
++
++    @property
++    def effective_secrets_dir(self) -> Path:
++        """Directory ABISS sees as ``SECRETS`` and therefore reads ``param`` from."""
++
++        return self.runtime_secrets_dir or self.secrets_dir
++
++
++@dataclass(frozen=True)
++class StagePlan:
++    """One subprocess invocation in an ABISS-large run."""
++
++    stage: str
++    argv: tuple[str, ...]
++    env: Mapping[str, str]
++
++
++@dataclass(frozen=True)
++class RunResult:
++    """Resolved execution plan and, after execution, the discovered output volume."""
++
++    prepared: PreparedConfig
++    stage_plans: tuple[StagePlan, ...]
++    executed: bool
++    segmentation: Any | None = None
++
++    @property
++    def seg_cloudpath(self) -> str:
++        return self.prepared.seg_cloudpath
++
++
++@dataclass
++class LargeWorkflowConfig:
++    """Legacy H5-to-precomputed preparation settings used by the tutorial CLI."""
++
++    workdir: Path
++    secrets_dir: Path
++    param_path: Path
++    abiss_home: Path
++    root_tag: str
++    top_mip: int
++    stage_overlap: str
++    stage_meta: str
++    aff_cloudpath: str
++    ws_cloudpath: str
++    seg_cloudpath: str
++    scratch_cloudpath: str
++    chunkmap_cloudpath: str
++    bbox_xyz: list[int]
++    chunk_size_xyz: list[int]
++    source_h5: Path
++    source_dataset: str
++    source_num_channels: int
++    copy_block_shape_xyz: list[int]
++    aff_chunk_size_xyz: list[int]
++    seg_chunk_size_xyz: list[int]
++    resolution_xyz: list[int]
++    param_payload: Dict[str, Any]
++
++    def execution_config(
++        self,
++        *,
++        stages: Sequence[str] = STAGES_ALL,
++        write_param: bool = True,
++    ) -> PreparedConfig:
++        return PreparedConfig(
++            workdir=self.workdir,
++            secrets_dir=self.secrets_dir,
++            param_path=self.param_path,
++            abiss_home=self.abiss_home,
++            param_payload=dict(self.param_payload),
++            root_tag=self.root_tag,
++            top_mip=self.top_mip,
++            stage_overlap=self.stage_overlap,
++            stage_meta=self.stage_meta,
++            stages=tuple(stages),
++            write_param=write_param,
++        )
++
++
++def _normalize_cloudpath(value: str | Path) -> str:
++    s = str(value)
++    if "://" in s:
++        return s
++    return "file://" + str(Path(s).resolve())
++
++
++def _is_local_cloudpath(cloudpath: str) -> bool:
++    return cloudpath.startswith("file://") or "://" not in cloudpath
++
++
++def _cloudpath_to_local_path(cloudpath: str) -> Path:
++    if cloudpath.startswith("file://"):
++        parsed = urlparse(cloudpath)
++        return Path(unquote(parsed.path))
++    return Path(cloudpath)
++
++
++def _maybe_int_list(values: Sequence[Any], *, expected_len: int, name: str) -> list[int]:
++    if len(values) != expected_len:
++        raise ValueError(f"{name} must have {expected_len} values, got {values}.")
++    return [int(v) for v in values]
++
++
++def _compute_top_mip(bbox_xyz: Sequence[int], chunk_size_xyz: Sequence[int]) -> int:
++    size_xyz = [int(bbox_xyz[i + 3]) - int(bbox_xyz[i]) for i in range(3)]
++    dims = [max(1, math.ceil(size_xyz[i] / int(chunk_size_xyz[i]))) for i in range(3)]
++    mip = 0
++    while dims != [1, 1, 1]:
++        dims = [(d + 1) // 2 for d in dims]
++        mip += 1
++    return mip
++
++
++def _ensure_parent(path: Path) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++
++
++def _ensure_dir(path: Path) -> None:
++    path.mkdir(parents=True, exist_ok=True)
++
++
++def _discover_h5_dataset_and_channels(
++    source_h5: Path, configured_dataset: str | None
++) -> tuple[str, int]:
++    with h5py.File(source_h5, "r") as f:
++        if configured_dataset:
++            ds = f[configured_dataset]
++            if ds.ndim != 4:
++                raise ValueError(
++                    f"Expected source affinity H5 dataset in CZYX order, got {ds.shape}."
++                )
++            return configured_dataset, int(ds.shape[0])
++
++        datasets: list[str] = []
++
++        def _visit(name: str, obj: Any) -> None:
++            if isinstance(obj, h5py.Dataset):
++                datasets.append(name)
++
++        f.visititems(_visit)
++        if len(datasets) != 1:
++            raise ValueError(
++                f"source_dataset was not set and {source_h5} contains "
++                f"{len(datasets)} datasets: {datasets}"
++            )
++        ds = f[datasets[0]]
++        if ds.ndim != 4:
++            raise ValueError(f"Expected source affinity H5 dataset in CZYX order, got {ds.shape}.")
++        return datasets[0], int(ds.shape[0])
++
++
++def _info_exists(cloudpath: str) -> bool:
++    if not _is_local_cloudpath(cloudpath):
++        return False
++    local = _cloudpath_to_local_path(cloudpath)
++    return (local / "info").exists()
++
++
++def _create_precomputed_layer(
++    *,
++    cloudpath: str,
++    volume_size_xyz: Sequence[int],
++    voxel_offset_xyz: Sequence[int],
++    resolution_xyz: Sequence[int],
++    chunk_size_xyz: Sequence[int],
++    num_channels: int,
++    layer_type: str,
++    data_type: str,
++    encoding: str,
++    compress: bool = False,
++) -> None:
++    if _info_exists(cloudpath):
++        return
++
++    info = _create_cloudvolume_info(
++        num_channels=num_channels,
++        layer_type=layer_type,
++        data_type=data_type,
++        encoding=encoding,
++        resolution=list(resolution_xyz),
++        voxel_offset=list(voxel_offset_xyz),
++        volume_size=list(volume_size_xyz),
++        chunk_size=list(chunk_size_xyz),
++        max_mip=0,
++    )
++    vol = _open_cloudvolume(cloudpath, info=info, bounded=True, progress=False, compress=compress)
++    vol.commit_info()
++    vol.commit_provenance()
++
++
++def _validate_existing_layer(
++    *,
++    cloudpath: str,
++    volume_size_xyz: Sequence[int],
++    voxel_offset_xyz: Sequence[int],
++    expected_channels: int,
++    expected_chunk_size_xyz: Sequence[int] | None = None,
++    expected_resolution_xyz: Sequence[int] | None = None,
++    expected_layer_type: str | None = None,
++    expected_dtype: str | None = None,
++) -> None:
++    vol = _open_cloudvolume(cloudpath, progress=False)
++    shape = tuple(int(v) for v in vol.shape[:3])
++    if shape != tuple(int(v) for v in volume_size_xyz):
++        raise ValueError(
++            f"Existing precomputed layer {cloudpath} has shape {shape}, "
++            f"expected {tuple(volume_size_xyz)}."
++        )
++    offset = tuple(int(v) for v in vol.voxel_offset[:3])
++    if offset != tuple(int(v) for v in voxel_offset_xyz):
++        raise ValueError(
++            f"Existing precomputed layer {cloudpath} has voxel_offset {offset}, "
++            f"expected {tuple(voxel_offset_xyz)}."
++        )
++    channels = int(getattr(vol, "num_channels", expected_channels))
++    if channels != int(expected_channels):
++        raise ValueError(
++            f"Existing precomputed layer {cloudpath} has {channels} channels, "
++            f"expected {expected_channels}."
++        )
++    if expected_resolution_xyz is not None:
++        resolution = tuple(int(v) for v in vol.resolution[:3])
++        expected_resolution = tuple(int(v) for v in expected_resolution_xyz)
++        if resolution != expected_resolution:
++            raise ValueError(
++                f"Existing precomputed layer {cloudpath} has resolution {resolution}, "
++                f"expected {expected_resolution}."
++            )
++    if expected_layer_type is not None and str(vol.layer_type) != expected_layer_type:
++        raise ValueError(
++            f"Existing precomputed layer {cloudpath} has layer_type {vol.layer_type!r}, "
++            f"expected {expected_layer_type!r}."
++        )
++    if expected_dtype is not None and np.dtype(vol.dtype) != np.dtype(expected_dtype):
++        raise ValueError(
++            f"Existing precomputed layer {cloudpath} has dtype {vol.dtype}, "
++            f"expected {np.dtype(expected_dtype)}."
++        )
++    if expected_chunk_size_xyz is not None:
++        scales = vol.info.get("scales", [])
++        chunk_sizes = scales[0].get("chunk_sizes", []) if scales else []
++        if not chunk_sizes:
++            raise ValueError(
++                f"Existing precomputed layer {cloudpath} is missing chunk_sizes metadata."
++            )
++        chunk_size = tuple(int(v) for v in chunk_sizes[0])
++        if chunk_size != tuple(int(v) for v in expected_chunk_size_xyz):
++            raise ValueError(
++                f"Existing precomputed layer {cloudpath} has chunk_size {chunk_size}, "
++                f"expected {tuple(int(v) for v in expected_chunk_size_xyz)}."
++            )
++
++
++def _validate_abiss_upload_alignment(
++    *,
++    bbox_xyz: Sequence[int],
++    voxel_offset_xyz: Sequence[int],
++    logical_chunk_size_xyz: Sequence[int],
++    storage_chunk_size_xyz: Sequence[int],
++) -> None:
++    """Fail fast if ABISS logical chunk uploads will require non-aligned writes.
++
++    ABISS writes whole logical chunks back into the WS/SEG CloudVolume layers.
++    CloudVolume rejects non-aligned writes by default, and enabling them would be
++    unsafe here because ABISS uploads chunk outputs in parallel.
++    """
++    axis_names = "xyz"
++    bad_axes: list[str] = []
++    for axis, axis_name in enumerate(axis_names):
++        start = int(bbox_xyz[axis])
++        stop = int(bbox_xyz[axis + 3])
++        logical = int(logical_chunk_size_xyz[axis])
++        storage = int(storage_chunk_size_xyz[axis])
++        offset = int(voxel_offset_xyz[axis])
++
++        boundary = start + logical
++        while boundary < stop:
++            if (boundary - offset) % storage != 0:
++                bad_axes.append(
++                    f"{axis_name}: boundary {boundary} is not aligned to storage chunk {storage}"
++                )
++                break
++            boundary += logical
++
++    if bad_axes:
++        raise ValueError(
++            "ABISS logical chunk uploads would require non-aligned CloudVolume writes for "
++            f"seg_chunk_size_xyz={list(int(v) for v in storage_chunk_size_xyz)} and "
++            f"param.CHUNK_SIZE={list(int(v) for v in logical_chunk_size_xyz)}. "
++            "This is unsafe because ABISS uploads chunk outputs in parallel. "
++            f"Misaligned axes: {', '.join(bad_axes)}. "
++            "Use seg_chunk_size_xyz values that align with every internal CHUNK_SIZE boundary "
++            "(for the bundled tutorial, setting the Z chunk size to 80 fixes the issue)."
++        )
++
++
++def _prepare_segmentation_output_layers(
++    *,
++    ws_cloudpath: str,
++    seg_cloudpath: str,
++    bbox_xyz: Sequence[int],
++    resolution_xyz: Sequence[int],
++    chunk_size_xyz: Sequence[int],
++) -> None:
++    voxel_offset = [int(value) for value in bbox_xyz[:3]]
++    volume_size = [int(bbox_xyz[axis + 3]) - int(bbox_xyz[axis]) for axis in range(3)]
++
++    print(f"Preparing watershed output layer at {ws_cloudpath}")
++    _create_precomputed_layer(
++        cloudpath=ws_cloudpath,
++        volume_size_xyz=volume_size,
++        voxel_offset_xyz=voxel_offset,
++        resolution_xyz=resolution_xyz,
++        chunk_size_xyz=chunk_size_xyz,
++        num_channels=1,
++        layer_type="segmentation",
++        data_type="uint64",
++        encoding="raw",
++        compress=False,
++    )
++    _validate_existing_layer(
++        cloudpath=ws_cloudpath,
++        volume_size_xyz=volume_size,
++        voxel_offset_xyz=voxel_offset,
++        expected_channels=1,
++        expected_chunk_size_xyz=chunk_size_xyz,
++        expected_resolution_xyz=resolution_xyz,
++        expected_layer_type="segmentation",
++        expected_dtype="uint64",
++    )
++
++    print(f"Preparing final segmentation output layer at {seg_cloudpath}")
++    _create_precomputed_layer(
++        cloudpath=seg_cloudpath,
++        volume_size_xyz=volume_size,
++        voxel_offset_xyz=voxel_offset,
++        resolution_xyz=resolution_xyz,
++        chunk_size_xyz=chunk_size_xyz,
++        num_channels=1,
++        layer_type="segmentation",
++        data_type="uint64",
++        encoding="raw",
++        compress=False,
++    )
++    _validate_existing_layer(
++        cloudpath=seg_cloudpath,
++        volume_size_xyz=volume_size,
++        voxel_offset_xyz=voxel_offset,
++        expected_channels=1,
++        expected_chunk_size_xyz=chunk_size_xyz,
++        expected_resolution_xyz=resolution_xyz,
++        expected_layer_type="segmentation",
++        expected_dtype="uint64",
++    )
++
++    size_map_cloudpath = seg_cloudpath.rstrip("/") + "/size_map"
++    print(f"Preparing ABISS size-map output layer at {size_map_cloudpath}")
++    _create_precomputed_layer(
++        cloudpath=size_map_cloudpath,
++        volume_size_xyz=volume_size,
++        voxel_offset_xyz=voxel_offset,
++        resolution_xyz=resolution_xyz,
++        chunk_size_xyz=chunk_size_xyz,
++        num_channels=1,
++        layer_type="image",
++        data_type="uint8",
++        encoding="raw",
++        compress=False,
++    )
++    _validate_existing_layer(
++        cloudpath=size_map_cloudpath,
++        volume_size_xyz=volume_size,
++        voxel_offset_xyz=voxel_offset,
++        expected_channels=1,
++        expected_chunk_size_xyz=chunk_size_xyz,
++        expected_resolution_xyz=resolution_xyz,
++        expected_layer_type="image",
++        expected_dtype="uint8",
++    )
++
++
++def _copy_affinity_h5_to_precomputed(
++    *,
++    source_h5: Path,
++    dataset: str,
++    cloudpath: str,
++    bbox_xyz: Sequence[int],
++    block_shape_xyz: Sequence[int],
++    volume_chunk_size_xyz: Sequence[int],
++    resolution_xyz: Sequence[int],
++) -> None:
++    if _info_exists(cloudpath):
++        return
++
++    local = _cloudpath_to_local_path(cloudpath)
++    _ensure_dir(local)
++
++    with h5py.File(source_h5, "r") as f:
++        ds = f[dataset]
++        if ds.ndim != 4:
++            raise ValueError(f"Expected source affinities in CZYX order, got shape {ds.shape}.")
++        channels, zdim, ydim, xdim = (int(v) for v in ds.shape)
++        x0, y0, z0, x1, y1, z1 = [int(v) for v in bbox_xyz]
++        if not (0 <= x0 <= x1 <= xdim and 0 <= y0 <= y1 <= ydim and 0 <= z0 <= z1 <= zdim):
++            raise ValueError(
++                f"BBOX {bbox_xyz} is out of range for source affinity shape {ds.shape} (CZYX)."
++            )
++
++        _create_precomputed_layer(
++            cloudpath=cloudpath,
++            volume_size_xyz=[x1 - x0, y1 - y0, z1 - z0],
++            voxel_offset_xyz=[x0, y0, z0],
++            resolution_xyz=resolution_xyz,
++            chunk_size_xyz=[max(1, int(v)) for v in volume_chunk_size_xyz],
++            num_channels=channels,
++            layer_type="image",
++            data_type=np.dtype(ds.dtype).name,
++            encoding="raw",
++            compress=False,
++        )
++
++        vol = _open_cloudvolume(cloudpath, bounded=True, progress=False, compress=False)
++
++        bx, by, bz = [max(1, int(v)) for v in block_shape_xyz]
++        total_blocks_x = math.ceil((x1 - x0) / bx)
++        total_blocks_y = math.ceil((y1 - y0) / by)
++        total_blocks_z = math.ceil((z1 - z0) / bz)
++        total_blocks = total_blocks_x * total_blocks_y * total_blocks_z
++        done = 0
++
++        for z in range(z0, z1, bz):
++            zz = min(z + bz, z1)
++            for y in range(y0, y1, by):
++                yy = min(y + by, y1)
++                for x in range(x0, x1, bx):
++                    xx = min(x + bx, x1)
++                    block = np.asarray(ds[:, z:zz, y:yy, x:xx])
++                    block_xyzc = np.transpose(block, (3, 2, 1, 0))
++                    vol[x:xx, y:yy, z:zz] = block_xyzc
++                    done += 1
++                    if done == 1 or done == total_blocks or done % 10 == 0:
++                        print(
++                            f"Affinity copy: {done}/{total_blocks} blocks "
++                            f"({x}:{xx}, {y}:{yy}, {z}:{zz})"
++                        )
++
++
++def _load_yaml(path: Path) -> Dict[str, Any]:
++    with path.open("r", encoding="utf-8") as f:
++        return yaml.safe_load(f)
++
++
++def prepare_config(config_path: Path) -> LargeWorkflowConfig:
++    cfg = _load_yaml(config_path)
++    ab = dict(cfg.get("abiss_large", {}))
++    if not ab:
++        raise ValueError(f"Config {config_path} has no abiss_large section.")
++
++    abiss_home = Path(ab["abiss_home"]).resolve()
++    workdir = Path(ab["workdir"]).resolve()
++    secrets_dir = Path(ab["secrets_dir"]).resolve()
++    param_path = Path(ab.get("param_path", secrets_dir / "param")).resolve()
++    root_tag = str(ab.get("root_tag", "0_0_0_0"))
++    source_h5 = Path(ab["source_affinity_h5"]).resolve()
++    configured_source_dataset = ab.get("source_dataset")
++    source_dataset, source_num_channels = _discover_h5_dataset_and_channels(
++        source_h5,
++        str(configured_source_dataset) if configured_source_dataset is not None else None,
++    )
++    copy_block_shape_xyz = _maybe_int_list(
++        ab.get("copy_block_shape_xyz", [512, 512, 64]),
++        expected_len=3,
++        name="copy_block_shape_xyz",
++    )
++    aff_chunk_size_xyz = _maybe_int_list(
++        ab.get("aff_chunk_size_xyz", copy_block_shape_xyz),
++        expected_len=3,
++        name="aff_chunk_size_xyz",
++    )
++    seg_chunk_size_xyz = _maybe_int_list(
++        ab.get("seg_chunk_size_xyz", copy_block_shape_xyz),
++        expected_len=3,
++        name="seg_chunk_size_xyz",
++    )
++    resolution_xyz = _maybe_int_list(
++        ab.get("resolution_xyz", [1, 1, 1]),
++        expected_len=3,
++        name="resolution_xyz",
++    )
++
++    param = dict(ab.get("param", {}))
++
++    with h5py.File(source_h5, "r") as f:
++        ds = f[source_dataset]
++        _, zdim, ydim, xdim = (int(v) for v in ds.shape)
++
++    bbox_xyz = param.get("BBOX") or [0, 0, 0, xdim, ydim, zdim]
++    bbox_xyz = _maybe_int_list(bbox_xyz, expected_len=6, name="param.BBOX")
++    chunk_size_xyz = _maybe_int_list(
++        param.get("CHUNK_SIZE", [xdim, ydim, min(zdim, 80)]),
++        expected_len=3,
++        name="param.CHUNK_SIZE",
++    )
++
++    top_mip = int(ab.get("top_mip", _compute_top_mip(bbox_xyz, chunk_size_xyz)))
++    computed_top_mip = _compute_top_mip(bbox_xyz, chunk_size_xyz)
++    if top_mip != computed_top_mip:
++        raise ValueError(
++            f"Configured top_mip={top_mip} does not match computed top_mip={computed_top_mip} "
++            f"for BBOX={bbox_xyz} and CHUNK_SIZE={chunk_size_xyz}."
++        )
++
++    if root_tag == "0_0_0_0" and top_mip > 0:
++        root_tag = f"{top_mip}_0_0_0"
++
++    outputs_root = workdir.parent
++    aff_cloudpath = _normalize_cloudpath(
++        param.get("AFF_PATH", outputs_root / "precomputed" / "affinity")
++    )
++    ws_cloudpath = _normalize_cloudpath(param.get("WS_PATH", outputs_root / "precomputed" / "ws"))
++    seg_cloudpath = _normalize_cloudpath(
++        param.get("SEG_PATH", outputs_root / "precomputed" / "seg")
++    )
++    scratch_cloudpath = _normalize_cloudpath(param.get("SCRATCH_PATH", outputs_root / "scratch"))
++    chunkmap_cloudpath = _normalize_cloudpath(
++        param.get("CHUNKMAP_OUTPUT", outputs_root / "chunkmap")
++    )
++
++    stage_overlap = str(ab.get("overlap_mode", 0))
++    stage_meta = " ".join(str(v) for v in ab.get("meta_dirs", []))
++
++    copy_helper = Path(__file__).resolve().parents[2] / "scripts" / "copy_uri.py"
++    upload_cmd = param.get("UPLOAD_CMD", f"{sys.executable} {copy_helper}")
++    download_cmd = param.get("DOWNLOAD_CMD", f"{sys.executable} {copy_helper}")
++
++    payload = dict(param)
++    payload.update(
++        {
++            "NAME": str(param.get("NAME", config_path.stem)),
++            "AFF_PATH": aff_cloudpath,
++            "WS_PATH": ws_cloudpath,
++            "SEG_PATH": seg_cloudpath,
++            "SCRATCH_PATH": scratch_cloudpath,
++            "CHUNKMAP_INPUT": chunkmap_cloudpath,
++            "CHUNKMAP_OUTPUT": chunkmap_cloudpath,
++            "UPLOAD_CMD": upload_cmd,
++            "DOWNLOAD_CMD": download_cmd,
++            "AFF_RESOLUTION": int(param.get("AFF_RESOLUTION", 0)),
++            "AFF_CHANNELS": int(param.get("AFF_CHANNELS", source_num_channels)),
++            "BBOX": bbox_xyz,
++            "CHUNK_SIZE": chunk_size_xyz,
++        }
++    )
++    payload.setdefault("WS_HIGH_THRESHOLD", 0.9)
++    payload.setdefault("WS_LOW_THRESHOLD", 0.1)
++    payload.setdefault("WS_SIZE_THRESHOLD", 400)
++    payload.setdefault("WS_DUST_THRESHOLD", payload["WS_SIZE_THRESHOLD"])
++    payload.setdefault("AGG_THRESHOLD", 0.2)
++    payload.setdefault("PARANOID", False)
++    payload.setdefault("CHUNKED_AGG_OUTPUT", False)
++
++    return LargeWorkflowConfig(
++        workdir=workdir,
++        secrets_dir=secrets_dir,
++        param_path=param_path,
++        abiss_home=abiss_home,
++        root_tag=root_tag,
++        top_mip=top_mip,
++        stage_overlap=stage_overlap,
++        stage_meta=stage_meta,
++        aff_cloudpath=aff_cloudpath,
++        ws_cloudpath=ws_cloudpath,
++        seg_cloudpath=seg_cloudpath,
++        scratch_cloudpath=scratch_cloudpath,
++        chunkmap_cloudpath=chunkmap_cloudpath,
++        bbox_xyz=bbox_xyz,
++        chunk_size_xyz=chunk_size_xyz,
++        source_h5=source_h5,
++        source_dataset=source_dataset,
++        source_num_channels=source_num_channels,
++        copy_block_shape_xyz=copy_block_shape_xyz,
++        aff_chunk_size_xyz=aff_chunk_size_xyz,
++        seg_chunk_size_xyz=seg_chunk_size_xyz,
++        resolution_xyz=resolution_xyz,
++        param_payload=payload,
++    )
++
++
++_prepare_config = prepare_config
++
++
++def prepare(cfg: LargeWorkflowConfig, *, write_param: bool = True) -> None:
++    _ensure_dir(cfg.workdir)
++    _ensure_dir(cfg.secrets_dir)
++    _ensure_parent(cfg.param_path)
++    if _is_local_cloudpath(cfg.scratch_cloudpath):
++        _ensure_dir(_cloudpath_to_local_path(cfg.scratch_cloudpath))
++    if _is_local_cloudpath(cfg.chunkmap_cloudpath):
++        _ensure_dir(_cloudpath_to_local_path(cfg.chunkmap_cloudpath))
++
++    bbox = cfg.bbox_xyz
++    voxel_offset = bbox[:3]
++    volume_size = [bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2]]
++
++    _validate_abiss_upload_alignment(
++        bbox_xyz=bbox,
++        voxel_offset_xyz=voxel_offset,
++        logical_chunk_size_xyz=cfg.chunk_size_xyz,
++        storage_chunk_size_xyz=cfg.seg_chunk_size_xyz,
++    )
++
++    print(f"Preparing affinity precomputed at {cfg.aff_cloudpath}")
++    _copy_affinity_h5_to_precomputed(
++        source_h5=cfg.source_h5,
++        dataset=cfg.source_dataset,
++        cloudpath=cfg.aff_cloudpath,
++        bbox_xyz=bbox,
++        block_shape_xyz=cfg.copy_block_shape_xyz,
++        volume_chunk_size_xyz=cfg.aff_chunk_size_xyz,
++        resolution_xyz=cfg.resolution_xyz,
++    )
++    _validate_existing_layer(
++        cloudpath=cfg.aff_cloudpath,
++        volume_size_xyz=volume_size,
++        voxel_offset_xyz=voxel_offset,
++        expected_channels=cfg.source_num_channels,
++        expected_chunk_size_xyz=cfg.aff_chunk_size_xyz,
++        expected_resolution_xyz=cfg.resolution_xyz,
++        expected_layer_type="image",
++    )
++
++    _prepare_segmentation_output_layers(
++        ws_cloudpath=cfg.ws_cloudpath,
++        seg_cloudpath=cfg.seg_cloudpath,
++        bbox_xyz=bbox,
++        resolution_xyz=cfg.resolution_xyz,
++        chunk_size_xyz=cfg.seg_chunk_size_xyz,
++    )
++
++    if write_param:
++        _write_param(cfg.param_path, cfg.param_payload)
++
++
++def _stage_command(cfg: PreparedConfig, stage: str) -> tuple[list[str], dict[str, str]]:
++    scripts_dir = cfg.abiss_home / "scripts"
++    env = os.environ.copy()
++    if cfg.extra_env:
++        env.update({str(key): str(value) for key, value in cfg.extra_env.items()})
++    env.update(
++        {
++            "WORKER_HOME": str(cfg.abiss_home),
++            "SECRETS": str(cfg.effective_secrets_dir),
++            "OVERLAP": str(cfg.stage_overlap),
++            "META": str(cfg.stage_meta),
++        }
++    )
++
++    python_bin_dir = str(Path(sys.executable).resolve().parent)
++    existing_path = env.get("PATH", "")
++    env["PATH"] = (
++        python_bin_dir if not existing_path else python_bin_dir + os.pathsep + existing_path
++    )
++
++    if stage == "watershed":
++        env["STAGE"] = "ws"
++        cmd = ["bash", str(scripts_dir / "run_batch.sh"), "ws", str(cfg.top_mip), cfg.root_tag]
++    elif stage == "remap_watershed":
++        env["STAGE"] = "ws"
++        cmd = ["bash", str(scripts_dir / "remap_batch.sh"), "ws", str(cfg.top_mip), cfg.root_tag]
++    elif stage == "agglomerate_mean_edge":
++        env["STAGE"] = "agg"
++        cmd = ["bash", str(scripts_dir / "run_batch.sh"), "me", str(cfg.top_mip), cfg.root_tag]
++    elif stage == "remap_agglomeration":
++        env["STAGE"] = "agg"
++        cmd = ["bash", str(scripts_dir / "remap_batch.sh"), "agg", str(cfg.top_mip), cfg.root_tag]
++    else:
++        raise ValueError(f"Unknown stage: {stage}")
++
++    return cmd, env
++
++
++def _stage_plan(cfg: PreparedConfig, stage: str) -> StagePlan:
++    cmd, env = _stage_command(cfg, stage)
++    env.setdefault("AIRFLOW_TMP_DIR", str(cfg.workdir / ".airflow"))
++    return StagePlan(stage=stage, argv=tuple(cmd), env=env)
++
++
++def _write_param(param_path: Path, payload: Mapping[str, Any]) -> None:
++    _ensure_parent(param_path)
++    with param_path.open("w", encoding="utf-8") as f:
++        json.dump(dict(payload), f, indent=2, sort_keys=True)
++        f.write("\n")
++    print(f"Wrote ABISS param JSON: {param_path}")
++
++
++def _prepare_execution_outputs(cfg: PreparedConfig) -> None:
++    spec = cfg.output_layer_spec
++    if spec is None:
++        return
++
++    try:
++        bbox = _maybe_int_list(cfg.param_payload["BBOX"], expected_len=6, name="BBOX")
++        logical_chunk_size = _maybe_int_list(
++            cfg.param_payload["CHUNK_SIZE"], expected_len=3, name="CHUNK_SIZE"
++        )
++        ws_cloudpath = str(cfg.param_payload["WS_PATH"])
++        seg_cloudpath = str(cfg.param_payload["SEG_PATH"])
++    except KeyError as exc:
++        raise ValueError(f"ABISS output initialization is missing {exc.args[0]}.") from exc
++
++    _validate_abiss_upload_alignment(
++        bbox_xyz=bbox,
++        voxel_offset_xyz=bbox[:3],
++        logical_chunk_size_xyz=logical_chunk_size,
++        storage_chunk_size_xyz=spec.chunk_size_xyz,
++    )
++    _prepare_segmentation_output_layers(
++        ws_cloudpath=ws_cloudpath,
++        seg_cloudpath=seg_cloudpath,
++        bbox_xyz=bbox,
++        resolution_xyz=spec.resolution_xyz,
++        chunk_size_xyz=spec.chunk_size_xyz,
++    )
++
++    for key in ("SCRATCH_PATH", "CHUNKMAP_OUTPUT"):
++        cloudpath = cfg.param_payload.get(key)
++        if cloudpath is not None and _is_local_cloudpath(str(cloudpath)):
++            _ensure_dir(_cloudpath_to_local_path(str(cloudpath)))
++
++
++def _discover_segmentation(cloudpath: str) -> Any:
++    """Open the result layer without materializing the potentially huge volume."""
++
++    return _open_cloudvolume(cloudpath, progress=False)
++
++
++def _prepare_runtime_secrets_view(cfg: PreparedConfig) -> None:
++    """Expose source credentials beside the per-run ABISS param without copying them."""
++
++    runtime_dir = cfg.runtime_secrets_dir
++    if runtime_dir is None:
++        return
++
++    _ensure_dir(runtime_dir)
++    if not cfg.secrets_dir.is_dir():
++        return
++
++    for source in cfg.secrets_dir.iterdir():
++        # ABISS derives config.sh from the current param. Reusing either source file
++        # would risk pointing the fresh replay at a historical namespace.
++        if source.name in {"config.sh", "param"}:
++            continue
++        destination = runtime_dir / source.name
++        source_resolved = source.resolve()
++        if destination.is_symlink():
++            if destination.resolve() == source_resolved:
++                continue
++            raise RuntimeError(
++                f"Runtime credential link {destination} points somewhere other than "
++                f"the configured source {source_resolved}."
++            )
++        if destination.exists():
++            raise RuntimeError(
++                f"Runtime credential path already exists and is not a managed link: {destination}"
++            )
++        destination.symlink_to(source_resolved, target_is_directory=source.is_dir())
++
++
++def _execute_stage(cfg: PreparedConfig, plan: StagePlan) -> None:
++    airflow_tmp_dir = cfg.workdir / ".airflow"
++    airflow_tmp_dir.mkdir(parents=True, exist_ok=True)
++    for lock_file in airflow_tmp_dir.glob(".cpulock_*"):
++        lock_file.unlink(missing_ok=True)
++    print(f"Running stage {plan.stage}: {' '.join(plan.argv)}")
++    subprocess.run(
++        list(plan.argv),
++        cwd=str(cfg.workdir),
++        env=dict(plan.env),
++        check=True,
++    )
++
++
++def run_abiss_large(prepared: PreparedConfig, *, execute: bool = False) -> RunResult:
++    """Resolve or execute the canonical four-stage ABISS-large invocation.
++
++    Dry resolution is the default and performs no filesystem or subprocess I/O.
++    Execution writes the canonical sorted param JSON, runs the requested stages in
++    order, and opens the final segmentation layer for result discovery.
++    """
++
++    if not execute:
++        plans = tuple(_stage_plan(prepared, stage) for stage in prepared.stages)
++        return RunResult(prepared=prepared, stage_plans=plans, executed=False)
++
++    payload = dict(prepared.param_payload)
++    copy_helper = Path(__file__).resolve().parents[2] / "scripts" / "copy_uri.py"
++    copy_command = f"{sys.executable} {copy_helper}"
++    payload.setdefault("UPLOAD_CMD", copy_command)
++    payload.setdefault("DOWNLOAD_CMD", copy_command)
++    prepared = replace(prepared, param_payload=payload)
++    plans = tuple(_stage_plan(prepared, stage) for stage in prepared.stages)
++
++    _ensure_dir(prepared.workdir)
++    _prepare_execution_outputs(prepared)
++    _prepare_runtime_secrets_view(prepared)
++    if prepared.write_param:
++        _write_param(prepared.param_path, prepared.param_payload)
++        if prepared.runtime_secrets_dir is not None:
++            runtime_param_path = prepared.runtime_secrets_dir / "param"
++            _write_param(runtime_param_path, prepared.param_payload)
++    for plan in plans:
++        _execute_stage(prepared, plan)
++
++    segmentation = _discover_segmentation(prepared.seg_cloudpath)
++    return RunResult(
++        prepared=prepared,
++        stage_plans=plans,
++        executed=True,
++        segmentation=segmentation,
++    )
++
++
++def run_stage(cfg: PreparedConfig, stage: str) -> None:
++    _execute_stage(cfg, _stage_plan(cfg, stage))
++
++
++def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", required=True, help="YAML config file with abiss_large section")
++    parser.add_argument(
++        "--prepare-only",
++        action="store_true",
++        help="Prepare precomputed layers and param JSON, then exit",
++    )
++    parser.add_argument(
++        "--skip-prepare",
++        action="store_true",
++        help="Assume prepare step was already run",
++    )
++    parser.add_argument(
++        "--stages",
++        nargs="+",
++        choices=STAGES_ALL,
++        default=STAGES_ALL,
++        help="ABISS stages to run after preparation",
++    )
++    return parser.parse_args(argv)
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    args = parse_args(argv)
++    cfg = prepare_config(Path(args.config).resolve())
++
++    print(f"ABISS home:    {cfg.abiss_home}")
++    print(f"Workdir:       {cfg.workdir}")
++    print(f"Root tag:      {cfg.root_tag}")
++    print(f"Top mip:       {cfg.top_mip}")
++    print(f"BBOX xyz:      {cfg.bbox_xyz}")
++    print(f"Chunk size xyz:{cfg.chunk_size_xyz}")
++    print(f"Affinity src:  {cfg.source_h5}:{cfg.source_dataset}")
++    print(f"Affinity dst:  {cfg.aff_cloudpath}")
++    print(f"WS dst:        {cfg.ws_cloudpath}")
++    print(f"SEG dst:       {cfg.seg_cloudpath}")
++
++    if not args.skip_prepare:
++        prepare(cfg, write_param=args.prepare_only)
++    if args.prepare_only:
++        return 0
++
++    result = run_abiss_large(
++        cfg.execution_config(
++            stages=args.stages,
++            write_param=not args.skip_prepare,
++        ),
++        execute=True,
++    )
++
++    print("ABISS large decode completed.")
++    print(f"Final segmentation layer: {result.seg_cloudpath}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/connectomics/runtime/seuron_provenance.py b/connectomics/runtime/seuron_provenance.py
+new file mode 100644
+index 000000000..d94164b4b
+--- /dev/null
++++ b/connectomics/runtime/seuron_provenance.py
+@@ -0,0 +1,206 @@
++"""Pure helpers for resolving a Seuron provenance record to local ABISS inputs."""
++
++from __future__ import annotations
++
++import json
++from copy import deepcopy
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Dict, Iterator, Mapping, Tuple, Union
++
++REQUIRED_INPUT_ORDER = (
++    "AFF_PATH",
++    "AFF_MIP",
++    "AFF_RESOLUTION",
++    "BBOX",
++    "CHUNK_SIZE",
++    "AGG_THRESHOLD",
++    "WS_HIGH_THRESHOLD",
++    "WS_LOW_THRESHOLD",
++    "WS_SIZE_THRESHOLD",
++    "WS_DUST_THRESHOLD",
++)
++OPTIONAL_INPUT_ORDER = ("IMAGE_PATH",)
++GENERATED_OUTPUT_ORDER = (
++    "NAME",
++    "WS_PATH",
++    "WS_PREFIX",
++    "SEG_PATH",
++    "SEG_PREFIX",
++    "SCRATCH_PATH",
++    "SCRATCH_PREFIX",
++    "CHUNKMAP_OUTPUT",
++    "NG_PREFIX",
++)
++IGNORED_INFRA_ORDER = (
++    "WORKER_IMAGE",
++    "REDIS_SERVER",
++    "REDIS_DB",
++    "STATSD_HOST",
++    "STATSD_PORT",
++    "MOUNT_PATH",
++    "WORKSPACE_PATH",
++    "SKIP_SKELETON",
++)
++
++REQUIRED_INPUT = frozenset(REQUIRED_INPUT_ORDER)
++OPTIONAL_INPUT = frozenset(OPTIONAL_INPUT_ORDER)
++GENERATED_OUTPUT = frozenset(GENERATED_OUTPUT_ORDER)
++IGNORED_INFRA = frozenset(IGNORED_INFRA_ORDER)
++CLASSIFIED_KEYS = REQUIRED_INPUT | OPTIONAL_INPUT | GENERATED_OUTPUT | IGNORED_INFRA
++
++_SEGMENTATION_MARKERS = frozenset(
++    {
++        "AGG_THRESHOLD",
++        "WS_HIGH_THRESHOLD",
++        "WS_LOW_THRESHOLD",
++        "WS_SIZE_THRESHOLD",
++        "WS_DUST_THRESHOLD",
++    }
++)
++
++
++@dataclass(frozen=True)
++class ReplaySpec:
++    """The one segmentation method and subsequent igneous methods, in source order."""
++
++    seg_block: Dict[str, Any]
++    igneous_blocks: Tuple[Dict[str, Any], ...]
++
++
++@dataclass(frozen=True)
++class AbissParam(Mapping[str, Any]):
++    """Whitelisted ABISS-local parameter payload."""
++
++    param: Dict[str, Any]
++
++    def __getitem__(self, key: str) -> Any:
++        return self.param[key]
++
++    def __iter__(self) -> Iterator[str]:
++        return iter(self.param)
++
++    def __len__(self) -> int:
++        return len(self.param)
++
++    def to_dict(self) -> Dict[str, Any]:
++        """Return a detached, mutable copy suitable for execution overrides."""
++
++        return deepcopy(self.param)
++
++
++def _is_segmentation_method(method: Mapping[str, Any]) -> bool:
++    return bool(set(method) & _SEGMENTATION_MARKERS)
++
++
++def load_provenance(path: Union[str, Path]) -> ReplaySpec:
++    """Load a provenance JSON file and isolate its single ABISS segmentation method."""
++
++    provenance_path = Path(path)
++    with provenance_path.open("r", encoding="utf-8") as handle:
++        payload = json.load(handle)
++
++    if not isinstance(payload, dict):
++        raise ValueError(f"Provenance {provenance_path} must contain a JSON object.")
++    processing = payload.get("processing")
++    if not isinstance(processing, list):
++        raise ValueError(f"Provenance {provenance_path} must contain a processing list.")
++
++    segmentation: list[Dict[str, Any]] = []
++    igneous: list[Dict[str, Any]] = []
++    for index, block in enumerate(processing):
++        if not isinstance(block, dict):
++            raise ValueError(f"processing[{index}] must be an object.")
++        method = block.get("method")
++        if not isinstance(method, dict):
++            raise ValueError(f"processing[{index}].method must be an object.")
++        method_copy = deepcopy(method)
++        if _is_segmentation_method(method_copy):
++            segmentation.append(method_copy)
++        else:
++            igneous.append(method_copy)
++
++    if len(segmentation) != 1:
++        raise ValueError(
++            "Expected exactly one ABISS segmentation block in provenance processing, "
++            f"found {len(segmentation)}."
++        )
++
++    return ReplaySpec(seg_block=segmentation[0], igneous_blocks=tuple(igneous))
++
++
++def _validate_name(name: str) -> None:
++    if not name or Path(name).name != name or name in {".", ".."}:
++        raise ValueError(f"Replay name must be a non-empty path component, got {name!r}.")
++
++
++def _directory_uri(path: Path) -> str:
++    return path.as_uri().rstrip("/") + "/"
++
++
++def classify_and_map(
++    seg_block: Mapping[str, Any],
++    *,
++    name: str,
++    out_root: Union[str, Path],
++    aff_override: Union[str, Path, None] = None,
++) -> AbissParam:
++    """Validate every source key and mint an ABISS-local payload in a fresh namespace."""
++
++    if not isinstance(seg_block, Mapping):
++        raise TypeError("seg_block must be a mapping.")
++
++    unknown = set(seg_block) - CLASSIFIED_KEYS
++    if unknown:
++        raise ValueError(f"Unknown Seuron segmentation keys: {sorted(unknown)}")
++
++    missing = REQUIRED_INPUT - set(seg_block)
++    if missing:
++        raise ValueError(f"Missing required Seuron segmentation keys: {sorted(missing)}")
++
++    _validate_name(name)
++    run_root = Path(out_root).expanduser().resolve() / name
++    precomputed_root = run_root / "precomputed"
++    ws_prefix = precomputed_root / "ws"
++    seg_prefix = precomputed_root / "seg"
++    scratch_prefix = run_root / "scratch"
++    scratch_path = scratch_prefix / name
++
++    param: Dict[str, Any] = {key: deepcopy(seg_block[key]) for key in REQUIRED_INPUT_ORDER}
++    for key in OPTIONAL_INPUT_ORDER:
++        if key in seg_block:
++            param[key] = deepcopy(seg_block[key])
++    if aff_override is not None:
++        param["AFF_PATH"] = str(aff_override)
++
++    param.update(
++        {
++            "NAME": name,
++            "WS_PATH": (ws_prefix / name).as_uri(),
++            "WS_PREFIX": _directory_uri(ws_prefix),
++            "SEG_PATH": (seg_prefix / name).as_uri(),
++            "SEG_PREFIX": _directory_uri(seg_prefix),
++            "SCRATCH_PATH": scratch_path.as_uri(),
++            "SCRATCH_PREFIX": _directory_uri(scratch_prefix),
++            # The local ABISS build defaults CHUNKMAP_INPUT to this exact path.
++            # Keeping input and output aliased lets the agglomeration stages
++            # consume the watershed chunk map without adding a non-provenance
++            # compatibility key to the fail-closed payload.
++            "CHUNKMAP_OUTPUT": (scratch_path / "ws" / "chunkmap").as_uri(),
++            "NG_PREFIX": _directory_uri(precomputed_root),
++        }
++    )
++    return AbissParam(param=param)
++
++
++__all__ = [
++    "AbissParam",
++    "CLASSIFIED_KEYS",
++    "GENERATED_OUTPUT",
++    "IGNORED_INFRA",
++    "OPTIONAL_INPUT",
++    "REQUIRED_INPUT",
++    "ReplaySpec",
++    "classify_and_map",
++    "load_provenance",
++]
+diff --git a/scripts/run_abiss_large.py b/scripts/run_abiss_large.py
+index 83935cabb..0b8632795 100644
+--- a/scripts/run_abiss_large.py
++++ b/scripts/run_abiss_large.py
+@@ -1,663 +1,12 @@
+ #!/usr/bin/env python3
+-"""Prepare and run vendored ABISS chunked decoding on large volumes.
++"""Prepare and run vendored ABISS chunked decoding on large volumes."""
+ 
+-This script bridges the tutorial config in ``tutorials/waterz_decoding_large_abiss.yaml``
+-to the vendored ABISS shell pipeline by:
+-- converting saved affinity H5 (C, Z, Y, X) into local precomputed/CloudVolume
+-- initializing WS/SEG precomputed outputs
+-- writing the ABISS JSON param file expected by ``lib/abiss/scripts/init.sh``
+-- running the watershed / remap / mean-edge agglomeration stages with the
+-  missing environment variables wired in for local execution
+-"""
+-
+-from __future__ import annotations
+-
+-import argparse
+-import json
+-import math
+-import os
+-import subprocess
+ import sys
+-from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Dict, Sequence
+-from urllib.parse import unquote, urlparse
+-
+-import h5py
+-import numpy as np
+-import yaml
+-from cloudvolume import CloudVolume
+-
+-
+-STAGES_ALL = [
+-    "watershed",
+-    "remap_watershed",
+-    "agglomerate_mean_edge",
+-    "remap_agglomeration",
+-]
+-
+-
+-@dataclass
+-class PreparedConfig:
+-    workdir: Path
+-    secrets_dir: Path
+-    param_path: Path
+-    abiss_home: Path
+-    root_tag: str
+-    top_mip: int
+-    stage_overlap: str
+-    stage_meta: str
+-    aff_cloudpath: str
+-    ws_cloudpath: str
+-    seg_cloudpath: str
+-    scratch_cloudpath: str
+-    chunkmap_cloudpath: str
+-    bbox_xyz: list[int]
+-    chunk_size_xyz: list[int]
+-    source_h5: Path
+-    source_dataset: str
+-    source_num_channels: int
+-    copy_block_shape_xyz: list[int]
+-    aff_chunk_size_xyz: list[int]
+-    seg_chunk_size_xyz: list[int]
+-    resolution_xyz: list[int]
+-    param_payload: Dict[str, Any]
+-
+-
+-def _normalize_cloudpath(value: str | Path) -> str:
+-    s = str(value)
+-    if "://" in s:
+-        return s
+-    return "file://" + str(Path(s).resolve())
+-
+-
+-def _is_local_cloudpath(cloudpath: str) -> bool:
+-    return cloudpath.startswith("file://") or "://" not in cloudpath
+-
+-
+-def _cloudpath_to_local_path(cloudpath: str) -> Path:
+-    if cloudpath.startswith("file://"):
+-        parsed = urlparse(cloudpath)
+-        return Path(unquote(parsed.path))
+-    return Path(cloudpath)
+-
+-
+-def _maybe_int_list(values: Sequence[Any], *, expected_len: int, name: str) -> list[int]:
+-    if len(values) != expected_len:
+-        raise ValueError(f"{name} must have {expected_len} values, got {values}.")
+-    return [int(v) for v in values]
+-
+-
+-def _compute_top_mip(bbox_xyz: Sequence[int], chunk_size_xyz: Sequence[int]) -> int:
+-    size_xyz = [int(bbox_xyz[i + 3]) - int(bbox_xyz[i]) for i in range(3)]
+-    dims = [max(1, math.ceil(size_xyz[i] / int(chunk_size_xyz[i]))) for i in range(3)]
+-    mip = 0
+-    while dims != [1, 1, 1]:
+-        dims = [(d + 1) // 2 for d in dims]
+-        mip += 1
+-    return mip
+-
+-
+-def _ensure_parent(path: Path) -> None:
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-
+-
+-def _ensure_dir(path: Path) -> None:
+-    path.mkdir(parents=True, exist_ok=True)
+-
+-
+-def _discover_h5_dataset_and_channels(
+-    source_h5: Path, configured_dataset: str | None
+-) -> tuple[str, int]:
+-    with h5py.File(source_h5, "r") as f:
+-        if configured_dataset:
+-            ds = f[configured_dataset]
+-            if ds.ndim != 4:
+-                raise ValueError(
+-                    f"Expected source affinity H5 dataset in CZYX order, got {ds.shape}."
+-                )
+-            return configured_dataset, int(ds.shape[0])
+-
+-        datasets: list[str] = []
+-
+-        def _visit(name: str, obj: Any) -> None:
+-            if isinstance(obj, h5py.Dataset):
+-                datasets.append(name)
+-
+-        f.visititems(_visit)
+-        if len(datasets) != 1:
+-            raise ValueError(
+-                f"source_dataset was not set and {source_h5} contains {len(datasets)} datasets: {datasets}"
+-            )
+-        ds = f[datasets[0]]
+-        if ds.ndim != 4:
+-            raise ValueError(f"Expected source affinity H5 dataset in CZYX order, got {ds.shape}.")
+-        return datasets[0], int(ds.shape[0])
+-
+-
+-def _info_exists(cloudpath: str) -> bool:
+-    if not _is_local_cloudpath(cloudpath):
+-        return False
+-    local = _cloudpath_to_local_path(cloudpath)
+-    return (local / "info").exists()
+-
+-
+-def _create_precomputed_layer(
+-    *,
+-    cloudpath: str,
+-    volume_size_xyz: Sequence[int],
+-    voxel_offset_xyz: Sequence[int],
+-    resolution_xyz: Sequence[int],
+-    chunk_size_xyz: Sequence[int],
+-    num_channels: int,
+-    layer_type: str,
+-    data_type: str,
+-    encoding: str,
+-    compress: bool = False,
+-) -> None:
+-    if _info_exists(cloudpath):
+-        return
+-
+-    info = CloudVolume.create_new_info(
+-        num_channels=num_channels,
+-        layer_type=layer_type,
+-        data_type=data_type,
+-        encoding=encoding,
+-        resolution=list(resolution_xyz),
+-        voxel_offset=list(voxel_offset_xyz),
+-        volume_size=list(volume_size_xyz),
+-        chunk_size=list(chunk_size_xyz),
+-        max_mip=0,
+-    )
+-    vol = CloudVolume(cloudpath, info=info, bounded=True, progress=False, compress=compress)
+-    vol.commit_info()
+-    vol.commit_provenance()
+-
+-
+-def _validate_existing_layer(
+-    *,
+-    cloudpath: str,
+-    volume_size_xyz: Sequence[int],
+-    voxel_offset_xyz: Sequence[int],
+-    expected_channels: int,
+-    expected_chunk_size_xyz: Sequence[int] | None = None,
+-) -> None:
+-    vol = CloudVolume(cloudpath, progress=False)
+-    shape = tuple(int(v) for v in vol.shape[:3])
+-    if shape != tuple(int(v) for v in volume_size_xyz):
+-        raise ValueError(
+-            f"Existing precomputed layer {cloudpath} has shape {shape}, expected {tuple(volume_size_xyz)}."
+-        )
+-    offset = tuple(int(v) for v in vol.voxel_offset[:3])
+-    if offset != tuple(int(v) for v in voxel_offset_xyz):
+-        raise ValueError(
+-            f"Existing precomputed layer {cloudpath} has voxel_offset {offset}, expected {tuple(voxel_offset_xyz)}."
+-        )
+-    channels = int(getattr(vol, "num_channels", expected_channels))
+-    if channels != int(expected_channels):
+-        raise ValueError(
+-            f"Existing precomputed layer {cloudpath} has {channels} channels, expected {expected_channels}."
+-        )
+-    if expected_chunk_size_xyz is not None:
+-        scales = vol.info.get("scales", [])
+-        chunk_sizes = scales[0].get("chunk_sizes", []) if scales else []
+-        if not chunk_sizes:
+-            raise ValueError(f"Existing precomputed layer {cloudpath} is missing chunk_sizes metadata.")
+-        chunk_size = tuple(int(v) for v in chunk_sizes[0])
+-        if chunk_size != tuple(int(v) for v in expected_chunk_size_xyz):
+-            raise ValueError(
+-                f"Existing precomputed layer {cloudpath} has chunk_size {chunk_size}, "
+-                f"expected {tuple(int(v) for v in expected_chunk_size_xyz)}."
+-            )
+-
+-
+-def _validate_abiss_upload_alignment(
+-    *,
+-    bbox_xyz: Sequence[int],
+-    voxel_offset_xyz: Sequence[int],
+-    logical_chunk_size_xyz: Sequence[int],
+-    storage_chunk_size_xyz: Sequence[int],
+-) -> None:
+-    """Fail fast if ABISS logical chunk uploads will require non-aligned writes.
+-
+-    ABISS writes whole logical chunks back into the WS/SEG CloudVolume layers.
+-    CloudVolume rejects non-aligned writes by default, and enabling them would be
+-    unsafe here because ABISS uploads chunk outputs in parallel.
+-    """
+-    axis_names = "xyz"
+-    bad_axes: list[str] = []
+-    for axis, axis_name in enumerate(axis_names):
+-        start = int(bbox_xyz[axis])
+-        stop = int(bbox_xyz[axis + 3])
+-        logical = int(logical_chunk_size_xyz[axis])
+-        storage = int(storage_chunk_size_xyz[axis])
+-        offset = int(voxel_offset_xyz[axis])
+-
+-        boundary = start + logical
+-        while boundary < stop:
+-            if (boundary - offset) % storage != 0:
+-                bad_axes.append(
+-                    f"{axis_name}: boundary {boundary} is not aligned to storage chunk {storage}"
+-                )
+-                break
+-            boundary += logical
+-
+-    if bad_axes:
+-        raise ValueError(
+-            "ABISS logical chunk uploads would require non-aligned CloudVolume writes for "
+-            f"seg_chunk_size_xyz={list(int(v) for v in storage_chunk_size_xyz)} and "
+-            f"param.CHUNK_SIZE={list(int(v) for v in logical_chunk_size_xyz)}. "
+-            "This is unsafe because ABISS uploads chunk outputs in parallel. "
+-            f"Misaligned axes: {', '.join(bad_axes)}. "
+-            "Use seg_chunk_size_xyz values that align with every internal CHUNK_SIZE boundary "
+-            "(for the bundled tutorial, setting the Z chunk size to 80 fixes the issue)."
+-        )
+-
+-
+-def _copy_affinity_h5_to_precomputed(
+-    *,
+-    source_h5: Path,
+-    dataset: str,
+-    cloudpath: str,
+-    bbox_xyz: Sequence[int],
+-    block_shape_xyz: Sequence[int],
+-    volume_chunk_size_xyz: Sequence[int],
+-    resolution_xyz: Sequence[int],
+-) -> None:
+-    if _info_exists(cloudpath):
+-        return
+-
+-    local = _cloudpath_to_local_path(cloudpath)
+-    _ensure_dir(local)
+-
+-    with h5py.File(source_h5, "r") as f:
+-        ds = f[dataset]
+-        if ds.ndim != 4:
+-            raise ValueError(f"Expected source affinities in CZYX order, got shape {ds.shape}.")
+-        channels, zdim, ydim, xdim = (int(v) for v in ds.shape)
+-        x0, y0, z0, x1, y1, z1 = [int(v) for v in bbox_xyz]
+-        if not (0 <= x0 <= x1 <= xdim and 0 <= y0 <= y1 <= ydim and 0 <= z0 <= z1 <= zdim):
+-            raise ValueError(
+-                f"BBOX {bbox_xyz} is out of range for source affinity shape {ds.shape} (CZYX)."
+-            )
+-
+-        _create_precomputed_layer(
+-            cloudpath=cloudpath,
+-            volume_size_xyz=[x1 - x0, y1 - y0, z1 - z0],
+-            voxel_offset_xyz=[x0, y0, z0],
+-            resolution_xyz=resolution_xyz,
+-            chunk_size_xyz=[max(1, int(v)) for v in volume_chunk_size_xyz],
+-            num_channels=channels,
+-            layer_type="image",
+-            data_type=np.dtype(ds.dtype).name,
+-            encoding="raw",
+-            compress=False,
+-        )
+-
+-        vol = CloudVolume(cloudpath, bounded=True, progress=False, compress=False)
+-
+-        bx, by, bz = [max(1, int(v)) for v in block_shape_xyz]
+-        total_blocks_x = math.ceil((x1 - x0) / bx)
+-        total_blocks_y = math.ceil((y1 - y0) / by)
+-        total_blocks_z = math.ceil((z1 - z0) / bz)
+-        total_blocks = total_blocks_x * total_blocks_y * total_blocks_z
+-        done = 0
+-
+-        for z in range(z0, z1, bz):
+-            zz = min(z + bz, z1)
+-            for y in range(y0, y1, by):
+-                yy = min(y + by, y1)
+-                for x in range(x0, x1, bx):
+-                    xx = min(x + bx, x1)
+-                    block = np.asarray(ds[:, z:zz, y:yy, x:xx])
+-                    block_xyzc = np.transpose(block, (3, 2, 1, 0))
+-                    vol[x:xx, y:yy, z:zz] = block_xyzc
+-                    done += 1
+-                    if done == 1 or done == total_blocks or done % 10 == 0:
+-                        print(
+-                            f"Affinity copy: {done}/{total_blocks} blocks "
+-                            f"({x}:{xx}, {y}:{yy}, {z}:{zz})"
+-                        )
+-
+-
+-def _load_yaml(path: Path) -> Dict[str, Any]:
+-    with path.open("r", encoding="utf-8") as f:
+-        return yaml.safe_load(f)
+-
+-
+-def _prepare_config(config_path: Path) -> PreparedConfig:
+-    cfg = _load_yaml(config_path)
+-    ab = dict(cfg.get("abiss_large", {}))
+-    if not ab:
+-        raise ValueError(f"Config {config_path} has no abiss_large section.")
+-
+-    abiss_home = Path(ab["abiss_home"]).resolve()
+-    workdir = Path(ab["workdir"]).resolve()
+-    secrets_dir = Path(ab["secrets_dir"]).resolve()
+-    param_path = Path(ab.get("param_path", secrets_dir / "param")).resolve()
+-    root_tag = str(ab.get("root_tag", "0_0_0_0"))
+-    source_h5 = Path(ab["source_affinity_h5"]).resolve()
+-    configured_source_dataset = ab.get("source_dataset")
+-    source_dataset, source_num_channels = _discover_h5_dataset_and_channels(
+-        source_h5,
+-        str(configured_source_dataset) if configured_source_dataset is not None else None,
+-    )
+-    copy_block_shape_xyz = _maybe_int_list(
+-        ab.get("copy_block_shape_xyz", [512, 512, 64]),
+-        expected_len=3,
+-        name="copy_block_shape_xyz",
+-    )
+-    aff_chunk_size_xyz = _maybe_int_list(
+-        ab.get("aff_chunk_size_xyz", copy_block_shape_xyz),
+-        expected_len=3,
+-        name="aff_chunk_size_xyz",
+-    )
+-    seg_chunk_size_xyz = _maybe_int_list(
+-        ab.get("seg_chunk_size_xyz", copy_block_shape_xyz),
+-        expected_len=3,
+-        name="seg_chunk_size_xyz",
+-    )
+-    resolution_xyz = _maybe_int_list(
+-        ab.get("resolution_xyz", [1, 1, 1]),
+-        expected_len=3,
+-        name="resolution_xyz",
+-    )
+-
+-    param = dict(ab.get("param", {}))
+-
+-    with h5py.File(source_h5, "r") as f:
+-        ds = f[source_dataset]
+-        _, zdim, ydim, xdim = (int(v) for v in ds.shape)
+-
+-    bbox_xyz = param.get("BBOX") or [0, 0, 0, xdim, ydim, zdim]
+-    bbox_xyz = _maybe_int_list(bbox_xyz, expected_len=6, name="param.BBOX")
+-    chunk_size_xyz = _maybe_int_list(
+-        param.get("CHUNK_SIZE", [xdim, ydim, min(zdim, 80)]),
+-        expected_len=3,
+-        name="param.CHUNK_SIZE",
+-    )
+-
+-    top_mip = int(ab.get("top_mip", _compute_top_mip(bbox_xyz, chunk_size_xyz)))
+-    computed_top_mip = _compute_top_mip(bbox_xyz, chunk_size_xyz)
+-    if top_mip != computed_top_mip:
+-        raise ValueError(
+-            f"Configured top_mip={top_mip} does not match computed top_mip={computed_top_mip} "
+-            f"for BBOX={bbox_xyz} and CHUNK_SIZE={chunk_size_xyz}."
+-        )
+-
+-    if root_tag == "0_0_0_0" and top_mip > 0:
+-        root_tag = f"{top_mip}_0_0_0"
+-
+-    outputs_root = workdir.parent
+-    aff_cloudpath = _normalize_cloudpath(param.get("AFF_PATH", outputs_root / "precomputed" / "affinity"))
+-    ws_cloudpath = _normalize_cloudpath(param.get("WS_PATH", outputs_root / "precomputed" / "ws"))
+-    seg_cloudpath = _normalize_cloudpath(param.get("SEG_PATH", outputs_root / "precomputed" / "seg"))
+-    scratch_cloudpath = _normalize_cloudpath(param.get("SCRATCH_PATH", outputs_root / "scratch"))
+-    chunkmap_cloudpath = _normalize_cloudpath(param.get("CHUNKMAP_OUTPUT", outputs_root / "chunkmap"))
+-
+-    stage_overlap = str(ab.get("overlap_mode", 0))
+-    stage_meta = " ".join(str(v) for v in ab.get("meta_dirs", []))
+-
+-    copy_helper = Path(__file__).resolve().parent / "copy_uri.py"
+-    upload_cmd = param.get("UPLOAD_CMD", f"{sys.executable} {copy_helper}")
+-    download_cmd = param.get("DOWNLOAD_CMD", f"{sys.executable} {copy_helper}")
+-
+-    payload = dict(param)
+-    payload.update(
+-        {
+-            "NAME": str(param.get("NAME", config_path.stem)),
+-            "AFF_PATH": aff_cloudpath,
+-            "WS_PATH": ws_cloudpath,
+-            "SEG_PATH": seg_cloudpath,
+-            "SCRATCH_PATH": scratch_cloudpath,
+-            "CHUNKMAP_INPUT": chunkmap_cloudpath,
+-            "CHUNKMAP_OUTPUT": chunkmap_cloudpath,
+-            "UPLOAD_CMD": upload_cmd,
+-            "DOWNLOAD_CMD": download_cmd,
+-            "AFF_RESOLUTION": int(param.get("AFF_RESOLUTION", 0)),
+-            "AFF_CHANNELS": int(param.get("AFF_CHANNELS", source_num_channels)),
+-            "BBOX": bbox_xyz,
+-            "CHUNK_SIZE": chunk_size_xyz,
+-        }
+-    )
+-    payload.setdefault("WS_HIGH_THRESHOLD", 0.9)
+-    payload.setdefault("WS_LOW_THRESHOLD", 0.1)
+-    payload.setdefault("WS_SIZE_THRESHOLD", 400)
+-    payload.setdefault("WS_DUST_THRESHOLD", payload["WS_SIZE_THRESHOLD"])
+-    payload.setdefault("AGG_THRESHOLD", 0.2)
+-    payload.setdefault("PARANOID", False)
+-    payload.setdefault("CHUNKED_AGG_OUTPUT", False)
+-
+-    return PreparedConfig(
+-        workdir=workdir,
+-        secrets_dir=secrets_dir,
+-        param_path=param_path,
+-        abiss_home=abiss_home,
+-        root_tag=root_tag,
+-        top_mip=top_mip,
+-        stage_overlap=stage_overlap,
+-        stage_meta=stage_meta,
+-        aff_cloudpath=aff_cloudpath,
+-        ws_cloudpath=ws_cloudpath,
+-        seg_cloudpath=seg_cloudpath,
+-        scratch_cloudpath=scratch_cloudpath,
+-        chunkmap_cloudpath=chunkmap_cloudpath,
+-        bbox_xyz=bbox_xyz,
+-        chunk_size_xyz=chunk_size_xyz,
+-        source_h5=source_h5,
+-        source_dataset=source_dataset,
+-        source_num_channels=source_num_channels,
+-        copy_block_shape_xyz=copy_block_shape_xyz,
+-        aff_chunk_size_xyz=aff_chunk_size_xyz,
+-        seg_chunk_size_xyz=seg_chunk_size_xyz,
+-        resolution_xyz=resolution_xyz,
+-        param_payload=payload,
+-    )
+-
+-
+-def prepare(cfg: PreparedConfig) -> None:
+-    _ensure_dir(cfg.workdir)
+-    _ensure_dir(cfg.secrets_dir)
+-    _ensure_parent(cfg.param_path)
+-    if _is_local_cloudpath(cfg.scratch_cloudpath):
+-        _ensure_dir(_cloudpath_to_local_path(cfg.scratch_cloudpath))
+-    if _is_local_cloudpath(cfg.chunkmap_cloudpath):
+-        _ensure_dir(_cloudpath_to_local_path(cfg.chunkmap_cloudpath))
+-
+-    bbox = cfg.bbox_xyz
+-    voxel_offset = bbox[:3]
+-    volume_size = [bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2]]
+-
+-    _validate_abiss_upload_alignment(
+-        bbox_xyz=bbox,
+-        voxel_offset_xyz=voxel_offset,
+-        logical_chunk_size_xyz=cfg.chunk_size_xyz,
+-        storage_chunk_size_xyz=cfg.seg_chunk_size_xyz,
+-    )
+-
+-    print(f"Preparing affinity precomputed at {cfg.aff_cloudpath}")
+-    _copy_affinity_h5_to_precomputed(
+-        source_h5=cfg.source_h5,
+-        dataset=cfg.source_dataset,
+-        cloudpath=cfg.aff_cloudpath,
+-        bbox_xyz=bbox,
+-        block_shape_xyz=cfg.copy_block_shape_xyz,
+-        volume_chunk_size_xyz=cfg.aff_chunk_size_xyz,
+-        resolution_xyz=cfg.resolution_xyz,
+-    )
+-    _validate_existing_layer(
+-        cloudpath=cfg.aff_cloudpath,
+-        volume_size_xyz=volume_size,
+-        voxel_offset_xyz=voxel_offset,
+-        expected_channels=cfg.source_num_channels,
+-        expected_chunk_size_xyz=cfg.aff_chunk_size_xyz,
+-    )
+-
+-    print(f"Preparing watershed output layer at {cfg.ws_cloudpath}")
+-    _create_precomputed_layer(
+-        cloudpath=cfg.ws_cloudpath,
+-        volume_size_xyz=volume_size,
+-        voxel_offset_xyz=voxel_offset,
+-        resolution_xyz=cfg.resolution_xyz,
+-        chunk_size_xyz=cfg.seg_chunk_size_xyz,
+-        num_channels=1,
+-        layer_type="segmentation",
+-        data_type="uint64",
+-        encoding="raw",
+-        compress=False,
+-    )
+-    _validate_existing_layer(
+-        cloudpath=cfg.ws_cloudpath,
+-        volume_size_xyz=volume_size,
+-        voxel_offset_xyz=voxel_offset,
+-        expected_channels=1,
+-        expected_chunk_size_xyz=cfg.seg_chunk_size_xyz,
+-    )
+-
+-    print(f"Preparing final segmentation output layer at {cfg.seg_cloudpath}")
+-    _create_precomputed_layer(
+-        cloudpath=cfg.seg_cloudpath,
+-        volume_size_xyz=volume_size,
+-        voxel_offset_xyz=voxel_offset,
+-        resolution_xyz=cfg.resolution_xyz,
+-        chunk_size_xyz=cfg.seg_chunk_size_xyz,
+-        num_channels=1,
+-        layer_type="segmentation",
+-        data_type="uint64",
+-        encoding="raw",
+-        compress=False,
+-    )
+-    _validate_existing_layer(
+-        cloudpath=cfg.seg_cloudpath,
+-        volume_size_xyz=volume_size,
+-        voxel_offset_xyz=voxel_offset,
+-        expected_channels=1,
+-        expected_chunk_size_xyz=cfg.seg_chunk_size_xyz,
+-    )
+-
+-    size_map_cloudpath = cfg.seg_cloudpath.rstrip("/") + "/size_map"
+-    print(f"Preparing ABISS size-map output layer at {size_map_cloudpath}")
+-    _create_precomputed_layer(
+-        cloudpath=size_map_cloudpath,
+-        volume_size_xyz=volume_size,
+-        voxel_offset_xyz=voxel_offset,
+-        resolution_xyz=cfg.resolution_xyz,
+-        chunk_size_xyz=cfg.seg_chunk_size_xyz,
+-        num_channels=1,
+-        layer_type="image",
+-        data_type="uint8",
+-        encoding="raw",
+-        compress=False,
+-    )
+-    _validate_existing_layer(
+-        cloudpath=size_map_cloudpath,
+-        volume_size_xyz=volume_size,
+-        voxel_offset_xyz=voxel_offset,
+-        expected_channels=1,
+-        expected_chunk_size_xyz=cfg.seg_chunk_size_xyz,
+-    )
+-
+-    with cfg.param_path.open("w", encoding="utf-8") as f:
+-        json.dump(cfg.param_payload, f, indent=2, sort_keys=True)
+-        f.write("\n")
+-    print(f"Wrote ABISS param JSON: {cfg.param_path}")
+-
+-
+-def _stage_command(cfg: PreparedConfig, stage: str) -> tuple[list[str], dict[str, str]]:
+-    scripts_dir = cfg.abiss_home / "scripts"
+-    env = os.environ.copy()
+-    env.update(
+-        {
+-            "WORKER_HOME": str(cfg.abiss_home),
+-            "SECRETS": str(cfg.secrets_dir),
+-            "OVERLAP": str(cfg.stage_overlap),
+-            "META": str(cfg.stage_meta),
+-        }
+-    )
+-
+-    python_bin_dir = str(Path(sys.executable).resolve().parent)
+-    existing_path = env.get("PATH", "")
+-    env["PATH"] = python_bin_dir if not existing_path else python_bin_dir + os.pathsep + existing_path
+-
+-    if stage == "watershed":
+-        env["STAGE"] = "ws"
+-        cmd = ["bash", str(scripts_dir / "run_batch.sh"), "ws", str(cfg.top_mip), cfg.root_tag]
+-    elif stage == "remap_watershed":
+-        env["STAGE"] = "ws"
+-        cmd = ["bash", str(scripts_dir / "remap_batch.sh"), "ws", str(cfg.top_mip), cfg.root_tag]
+-    elif stage == "agglomerate_mean_edge":
+-        env["STAGE"] = "agg"
+-        cmd = ["bash", str(scripts_dir / "run_batch.sh"), "me", str(cfg.top_mip), cfg.root_tag]
+-    elif stage == "remap_agglomeration":
+-        env["STAGE"] = "agg"
+-        cmd = ["bash", str(scripts_dir / "remap_batch.sh"), "agg", str(cfg.top_mip), cfg.root_tag]
+-    else:
+-        raise ValueError(f"Unknown stage: {stage}")
+-
+-    return cmd, env
+-
+-
+-def run_stage(cfg: PreparedConfig, stage: str) -> None:
+-    cmd, env = _stage_command(cfg, stage)
+-    airflow_tmp_dir = cfg.workdir / ".airflow"
+-    airflow_tmp_dir.mkdir(parents=True, exist_ok=True)
+-    for lock_file in airflow_tmp_dir.glob(".cpulock_*"):
+-        lock_file.unlink(missing_ok=True)
+-    env.setdefault("AIRFLOW_TMP_DIR", str(airflow_tmp_dir))
+-    print(f"Running stage {stage}: {' '.join(cmd)}")
+-    subprocess.run(cmd, cwd=str(cfg.workdir), env=env, check=True)
+-
+-
+-def parse_args() -> argparse.Namespace:
+-    parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--config", required=True, help="YAML config file with abiss_large section")
+-    parser.add_argument(
+-        "--prepare-only",
+-        action="store_true",
+-        help="Prepare precomputed layers and param JSON, then exit",
+-    )
+-    parser.add_argument(
+-        "--skip-prepare",
+-        action="store_true",
+-        help="Assume prepare step was already run",
+-    )
+-    parser.add_argument(
+-        "--stages",
+-        nargs="+",
+-        choices=STAGES_ALL,
+-        default=STAGES_ALL,
+-        help="ABISS stages to run after preparation",
+-    )
+-    return parser.parse_args()
+-
+-
+-def main() -> int:
+-    args = parse_args()
+-    cfg = _prepare_config(Path(args.config).resolve())
+-
+-    print(f"ABISS home:    {cfg.abiss_home}")
+-    print(f"Workdir:       {cfg.workdir}")
+-    print(f"Root tag:      {cfg.root_tag}")
+-    print(f"Top mip:       {cfg.top_mip}")
+-    print(f"BBOX xyz:      {cfg.bbox_xyz}")
+-    print(f"Chunk size xyz:{cfg.chunk_size_xyz}")
+-    print(f"Affinity src:  {cfg.source_h5}:{cfg.source_dataset}")
+-    print(f"Affinity dst:  {cfg.aff_cloudpath}")
+-    print(f"WS dst:        {cfg.ws_cloudpath}")
+-    print(f"SEG dst:       {cfg.seg_cloudpath}")
+-
+-    if not args.skip_prepare:
+-        prepare(cfg)
+-    if args.prepare_only:
+-        return 0
+-
+-    for stage in args.stages:
+-        run_stage(cfg, stage)
+ 
+-    print("ABISS large decode completed.")
+-    print(f"Final segmentation layer: {cfg.seg_cloudpath}")
+-    return 0
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ 
++from connectomics.runtime.abiss_large import main  # noqa: E402
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+diff --git a/scripts/run_seuron_provenance.py b/scripts/run_seuron_provenance.py
+new file mode 100644
+index 000000000..158fa42c8
+--- /dev/null
++++ b/scripts/run_seuron_provenance.py
+@@ -0,0 +1,683 @@
++#!/usr/bin/env python3
++"""Resolve or execute an ABISS-local replay of a Seuron provenance record.
++
++Resolution is the default and is deliberately read-only. Pass ``--execute`` to
++run ABISS, after affinity/credential preflight and output namespace checks.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++from contextlib import contextmanager
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Any, Iterator, Mapping, Sequence
++from urllib.parse import unquote, urlparse
++
++import yaml  # type: ignore[import-untyped]
++
++_REPO_ROOT = Path(__file__).resolve().parents[1]
++if str(_REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(_REPO_ROOT))
++
++from connectomics.runtime.abiss_large import (  # noqa: E402
++    OutputLayerSpec,
++    PreparedConfig,
++    RunResult,
++    run_abiss_large,
++)
++from connectomics.runtime.seuron_provenance import (  # noqa: E402
++    GENERATED_OUTPUT,
++    ReplaySpec,
++    classify_and_map,
++    load_provenance,
++)
++
++MANIFEST_COMPATIBILITY_KEYS = (
++    "provenance_sha",
++    "whitelisted_param_sha",
++    "abiss_build_id",
++    "execution_bbox",
++)
++
++
++@dataclass(frozen=True)
++class ResolvedReplay:
++    """Fully resolved, but not prepared or executed, replay configuration."""
++
++    config_path: Path
++    provenance_path: Path
++    backend: str
++    data: str
++    out_root: Path
++    name: str
++    secrets_dir: Path
++    abiss_home: Path
++    mode: str
++    param: dict[str, Any]
++    execution_bbox: tuple[int, int, int, int, int, int]
++    score_bbox: tuple[int, int, int, int, int, int] | None
++    replay_spec: ReplaySpec
++
++    @property
++    def run_root(self) -> Path:
++        return self.out_root / self.name
++
++    @property
++    def workdir(self) -> Path:
++        return self.run_root / "work"
++
++    @property
++    def param_path(self) -> Path:
++        return self.run_root / "param"
++
++    @property
++    def manifest_path(self) -> Path:
++        return self.run_root / "manifest.json"
++
++    @property
++    def chunk_grid(self) -> tuple[int, int, int]:
++        chunk_size = self.param["CHUNK_SIZE"]
++        return tuple(
++            math.ceil(
++                (self.execution_bbox[axis + 3] - self.execution_bbox[axis]) / chunk_size[axis]
++            )
++            for axis in range(3)
++        )
++
++
++@dataclass(frozen=True)
++class AffinityMetadata:
++    """Validated affinity metadata reused to initialize fresh output layers."""
++
++    resolution_xyz: tuple[int, int, int]
++    chunk_size_xyz: tuple[int, int, int]
++
++
++def _default_secrets_dir() -> Path:
++    cloudvolume_root = os.environ.get("CLOUD_VOLUME_DIR")
++    if cloudvolume_root:
++        return Path(cloudvolume_root).expanduser() / "secrets"
++    return Path.home() / ".cloudvolume" / "secrets"
++
++
++def _filesystem_path(value: str | os.PathLike[str], *, base: Path) -> Path:
++    path = Path(os.path.expandvars(str(value))).expanduser()
++    if not path.is_absolute():
++        path = base / path
++    return path.resolve()
++
++
++def _cloudpath(value: str | os.PathLike[str], *, base: Path, local_only: bool = False) -> str:
++    text = os.path.expandvars(str(value)).strip()
++    parsed = urlparse(text)
++    if parsed.scheme:
++        if local_only and parsed.scheme != "file":
++            raise ValueError(f"--mirror must name a local path, got {text!r}.")
++        return text
++    return _filesystem_path(text, base=base).as_uri()
++
++
++def _bbox(value: Sequence[Any], *, field: str) -> tuple[int, int, int, int, int, int]:
++    if isinstance(value, (str, bytes)) or len(value) != 6:
++        raise ValueError(f"{field} must contain six XYZ coordinates, got {value!r}.")
++    bbox = tuple(int(item) for item in value)
++    if any(bbox[axis] >= bbox[axis + 3] for axis in range(3)):
++        raise ValueError(f"{field} must have positive extent on every axis, got {list(bbox)}.")
++    return bbox  # type: ignore[return-value]
++
++
++def _contains(outer: Sequence[int], inner: Sequence[int]) -> bool:
++    return all(
++        int(outer[axis]) <= int(inner[axis]) < int(inner[axis + 3]) <= int(outer[axis + 3])
++        for axis in range(3)
++    )
++
++
++def _load_replay_yaml(config_path: Path) -> dict[str, Any]:
++    with config_path.open("r", encoding="utf-8") as handle:
++        payload = yaml.safe_load(handle) or {}
++    if not isinstance(payload, dict):
++        raise ValueError(f"Config {config_path} must contain a YAML mapping.")
++    replay = payload.get("seuron_replay")
++    if not isinstance(replay, dict):
++        raise ValueError(f"Config {config_path} has no seuron_replay mapping.")
++    return dict(replay)
++
++
++def _selected_mode(args: argparse.Namespace, replay: Mapping[str, Any]) -> str:
++    mode = args.mode or replay.get("mode", "fresh")
++    if args.overwrite:
++        if args.mode not in (None, "overwrite"):
++            raise ValueError("--overwrite conflicts with a non-overwrite --mode.")
++        mode = "overwrite"
++    mode = str(mode)
++    if mode not in {"fresh", "resume", "overwrite"}:
++        raise ValueError(f"Unsupported replay mode {mode!r}.")
++    return mode
++
++
++def resolve_replay(args: argparse.Namespace) -> ResolvedReplay:
++    """Resolve YAML, CLI precedence, and provenance without touching outputs."""
++
++    config_path = Path(args.config).expanduser().resolve()
++    replay = _load_replay_yaml(config_path)
++    config_base = config_path.parent
++    cli_base = Path.cwd()
++
++    backend = str(replay.get("backend", "abiss_local"))
++    if backend != "abiss_local":
++        raise ValueError(
++            f"Backend {backend!r} is not implemented; Phase 1 supports only 'abiss_local'."
++        )
++    data = str(replay.get("data", "local"))
++    if data != "local":
++        raise ValueError(f"Data mode {data!r} is not implemented; Phase 1 supports only 'local'.")
++
++    provenance_value = replay.get("provenance_path")
++    if provenance_value is None:
++        raise ValueError("seuron_replay.provenance_path is required.")
++    provenance_path = _filesystem_path(provenance_value, base=config_base)
++
++    out_root_value = args.out_root if args.out_root is not None else replay.get("out_root")
++    if out_root_value is None:
++        raise ValueError("seuron_replay.out_root or --out-root is required.")
++    out_root = _filesystem_path(
++        out_root_value,
++        base=cli_base if args.out_root is not None else config_base,
++    )
++
++    name_value = args.name if args.name is not None else replay.get("name")
++    if name_value is None:
++        raise ValueError("seuron_replay.name or --name is required.")
++    name = str(name_value)
++    if not name or Path(name).name != name or name in {".", ".."}:
++        raise ValueError(f"Replay name must be one non-empty path component, got {name!r}.")
++
++    secrets_value = args.secrets_dir
++    if secrets_value is None:
++        secrets_value = replay.get("secrets_dir", _default_secrets_dir())
++    secrets_dir = _filesystem_path(
++        secrets_value,
++        base=cli_base if args.secrets_dir is not None else config_base,
++    )
++
++    abiss_value = args.abiss_home if args.abiss_home is not None else replay.get("abiss_home")
++    if abiss_value is None:
++        raise ValueError("seuron_replay.abiss_home or --abiss-home is required.")
++    abiss_home = _filesystem_path(
++        abiss_value,
++        base=cli_base if args.abiss_home is not None else config_base,
++    )
++
++    aff_override = None
++    if args.aff_path is not None:
++        aff_override = _cloudpath(args.aff_path, base=cli_base)
++    elif args.mirror is not None:
++        aff_override = _cloudpath(args.mirror, base=cli_base, local_only=True)
++    elif replay.get("aff_path") is not None:
++        aff_override = _cloudpath(replay["aff_path"], base=config_base)
++    elif replay.get("mirror") is not None:
++        aff_override = _cloudpath(replay["mirror"], base=config_base, local_only=True)
++
++    spec = load_provenance(provenance_path)
++    mapped = classify_and_map(
++        spec.seg_block,
++        name=name,
++        out_root=out_root,
++        aff_override=aff_override,
++    )
++    param = dict(mapped.param)
++
++    exec_value = args.exec_bbox if args.exec_bbox is not None else replay.get("exec_bbox")
++    execution_bbox = _bbox(
++        exec_value if exec_value is not None else param["BBOX"],
++        field="execution bbox",
++    )
++    param["BBOX"] = list(execution_bbox)
++
++    score_value = args.score_bbox if args.score_bbox is not None else replay.get("score_bbox")
++    score_bbox = _bbox(score_value, field="score bbox") if score_value is not None else None
++    if score_bbox is not None and not _contains(execution_bbox, score_bbox):
++        raise ValueError(
++            f"score bbox {list(score_bbox)} must be contained in execution bbox "
++            f"{list(execution_bbox)}."
++        )
++
++    return ResolvedReplay(
++        config_path=config_path,
++        provenance_path=provenance_path,
++        backend=backend,
++        data=data,
++        out_root=out_root,
++        name=name,
++        secrets_dir=secrets_dir,
++        abiss_home=abiss_home,
++        mode=_selected_mode(args, replay),
++        param=param,
++        execution_bbox=execution_bbox,
++        score_bbox=score_bbox,
++        replay_spec=spec,
++    )
++
++
++def _top_mip(chunk_grid: Sequence[int]) -> int:
++    dims = [max(1, int(value)) for value in chunk_grid]
++    mip = 0
++    while dims != [1, 1, 1]:
++        dims = [(value + 1) // 2 for value in dims]
++        mip += 1
++    return mip
++
++
++def _output_chunk_size(chunk_size_xyz: Sequence[int] | None, fallback: Sequence[int]) -> list[int]:
++    """Storage chunk size for the WS/SEG/size-map output layers.
++
++    ABISS uploads whole ``CHUNK_SIZE`` blocks back into these layers in parallel, so the
++    layer's storage chunk must divide ``CHUNK_SIZE`` on every axis or CloudVolume would
++    reject the non-aligned writes (see ``_validate_abiss_upload_alignment``). The affinity
++    layer's own chunk size (which must divide the 1008^3 source blocks, e.g. [144,144,72])
++    does not generally divide ``CHUNK_SIZE`` [512,512,256], so it cannot be reused here.
++    We take each ``CHUNK_SIZE`` axis halved down to a reasonable tile (<=256); halving an
++    even value preserves divisibility.
++    """
++    if not chunk_size_xyz:
++        return [int(v) for v in fallback]
++    out: list[int] = []
++    for value in chunk_size_xyz:
++        tile = int(value)
++        while tile > 256 and tile % 2 == 0:
++            tile //= 2
++        out.append(tile)
++    return out
++
++
++def prepare_execution(
++    resolved: ResolvedReplay,
++    affinity_metadata: AffinityMetadata | None = None,
++) -> PreparedConfig:
++    """Build the runtime executor input without creating files."""
++
++    top_mip = _top_mip(resolved.chunk_grid)
++    root_tag = f"{top_mip}_0_0_0" if top_mip else "0_0_0_0"
++    runtime_cloudvolume_root = resolved.run_root / ".cloudvolume"
++    return PreparedConfig(
++        workdir=resolved.workdir,
++        secrets_dir=resolved.secrets_dir,
++        param_path=resolved.param_path,
++        abiss_home=resolved.abiss_home,
++        param_payload=dict(resolved.param),
++        root_tag=root_tag,
++        top_mip=top_mip,
++        runtime_secrets_dir=runtime_cloudvolume_root / "secrets",
++        output_layer_spec=(
++            OutputLayerSpec(
++                resolution_xyz=affinity_metadata.resolution_xyz,
++                chunk_size_xyz=_output_chunk_size(
++                    resolved.param.get("CHUNK_SIZE"), affinity_metadata.chunk_size_xyz
++                ),
++            )
++            if affinity_metadata is not None
++            else None
++        ),
++        extra_env={"CLOUD_VOLUME_DIR": str(runtime_cloudvolume_root)},
++    )
++
++
++def _sha256_bytes(payload: bytes) -> str:
++    return hashlib.sha256(payload).hexdigest()
++
++
++def _json_sha(payload: Any) -> str:
++    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    return _sha256_bytes(encoded)
++
++
++def _abiss_build_id(abiss_home: Path) -> str:
++    git_marker = abiss_home / ".git"
++    if git_marker.exists():
++        result = subprocess.run(
++            ["git", "-C", str(abiss_home), "rev-parse", "HEAD"],
++            check=True,
++            capture_output=True,
++            text=True,
++        )
++        return f"git:{result.stdout.strip()}"
++
++    ws_binary = abiss_home / "build" / "ws"
++    if ws_binary.is_file():
++        return f"ws-sha256:{_sha256_bytes(ws_binary.read_bytes())}"
++
++    raise RuntimeError(
++        f"Cannot identify ABISS build at {abiss_home}: expected its .git metadata or build/ws."
++    )
++
++
++def _expected_manifest(resolved: ResolvedReplay, *, abiss_build_id: str) -> dict[str, Any]:
++    return {
++        "provenance_sha": _sha256_bytes(resolved.provenance_path.read_bytes()),
++        "whitelisted_param_sha": _json_sha(resolved.param),
++        "abiss_build_id": abiss_build_id,
++        "execution_bbox": list(resolved.execution_bbox),
++    }
++
++
++def _read_manifest(path: Path) -> dict[str, Any]:
++    try:
++        with path.open("r", encoding="utf-8") as handle:
++            manifest = json.load(handle)
++    except FileNotFoundError as exc:
++        raise ValueError(f"Resume requires existing manifest {path}.") from exc
++    if not isinstance(manifest, dict):
++        raise ValueError(f"Manifest {path} must contain a JSON object.")
++    return manifest
++
++
++def _check_manifest_compatibility(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
++    mismatches = {
++        key: {"existing": actual.get(key), "requested": expected[key]}
++        for key in MANIFEST_COMPATIBILITY_KEYS
++        if actual.get(key) != expected[key]
++    }
++    if mismatches:
++        raise ValueError(
++            "Resume manifest is incompatible with this replay: "
++            + json.dumps(mismatches, sort_keys=True)
++        )
++
++
++def _apply_output_mode(resolved: ResolvedReplay, expected_manifest: Mapping[str, Any]) -> None:
++    run_root = resolved.run_root
++    if run_root.is_symlink():
++        raise ValueError(f"Refusing to use symlinked replay output root {run_root}.")
++
++    if resolved.mode == "fresh":
++        if run_root.exists() and (not run_root.is_dir() or any(run_root.iterdir())):
++            raise ValueError(
++                f"Fresh replay requires an empty output namespace: {run_root}. "
++                "Choose a new --name, --mode resume, or explicit --mode overwrite."
++            )
++    elif resolved.mode == "resume":
++        if not run_root.is_dir():
++            raise ValueError(f"Resume requires existing replay directory {run_root}.")
++        _check_manifest_compatibility(_read_manifest(resolved.manifest_path), expected_manifest)
++    elif resolved.mode == "overwrite":
++        if resolved.out_root == Path(resolved.out_root.anchor):
++            raise ValueError(
++                "Refusing destructive overwrite directly below filesystem root "
++                f"{resolved.out_root}."
++            )
++        if run_root.exists():
++            if not run_root.is_dir():
++                raise ValueError(f"Replay output root exists and is not a directory: {run_root}.")
++            shutil.rmtree(run_root)
++    else:  # pragma: no cover - resolve_replay validates this invariant.
++        raise AssertionError(f"Unexpected mode {resolved.mode!r}")
++
++
++def _write_manifest(resolved: ResolvedReplay, expected: Mapping[str, Any]) -> None:
++    resolved.run_root.mkdir(parents=True, exist_ok=True)
++    manifest = dict(expected)
++    manifest.update(
++        {
++            "mode": resolved.mode,
++            "timestamp": datetime.now(timezone.utc).isoformat(),
++        }
++    )
++    temporary = resolved.manifest_path.with_name(".manifest.json.tmp")
++    with temporary.open("w", encoding="utf-8") as handle:
++        json.dump(manifest, handle, indent=2, sort_keys=True)
++        handle.write("\n")
++    os.replace(temporary, resolved.manifest_path)
++
++
++def _has_explicit_gs_credentials(secrets_dir: Path) -> bool:
++    if secrets_dir.is_dir() and any(path.is_file() for path in secrets_dir.iterdir()):
++        return True
++    credentials = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
++    return bool(credentials and Path(credentials).expanduser().is_file())
++
++
++@contextmanager
++def _cloudvolume_root_view(secrets_dir: Path) -> Iterator[Path]:
++    """Expose any configured secrets directory at CloudVolume's canonical path."""
++
++    if secrets_dir.name == "secrets":
++        yield secrets_dir.parent
++        return
++
++    with tempfile.TemporaryDirectory(prefix="pytc-seuron-cloudvolume-") as temporary:
++        root = Path(temporary)
++        canonical_secrets = root / "secrets"
++        if secrets_dir.is_dir():
++            canonical_secrets.symlink_to(secrets_dir.resolve(), target_is_directory=True)
++        else:
++            canonical_secrets.mkdir()
++        yield root
++
++
++def _preflight_abiss(resolved: ResolvedReplay) -> None:
++    missing = [
++        path
++        for path in (
++            resolved.abiss_home / "scripts" / "run_batch.sh",
++            resolved.abiss_home / "scripts" / "remap_batch.sh",
++        )
++        if not path.is_file()
++    ]
++    if missing:
++        raise RuntimeError(
++            "ABISS installation is incomplete; missing " + ", ".join(map(str, missing))
++        )
++
++
++def _preflight_affinity(
++    resolved: ResolvedReplay,
++    *,
++    cloudvolume_root: Path | None = None,
++) -> AffinityMetadata:
++    if cloudvolume_root is None:
++        with _cloudvolume_root_view(resolved.secrets_dir) as root:
++            return _preflight_affinity(resolved, cloudvolume_root=root)
++
++    affinity_path = str(resolved.param["AFF_PATH"])
++    parsed = urlparse(affinity_path)
++    if parsed.scheme == "file":
++        local_path = Path(unquote(parsed.path))
++        if not local_path.exists():
++            raise RuntimeError(f"Local affinity precomputed layer does not exist: {local_path}")
++    elif parsed.scheme == "gs" and not _has_explicit_gs_credentials(resolved.secrets_dir):
++        raise RuntimeError(
++            f"No GCS credentials found in {resolved.secrets_dir}. Provide --secrets-dir "
++            "or use --mirror /path/to/local/precomputed/crop."
++        )
++
++    requested_resolution = tuple(int(value) for value in resolved.param["AFF_RESOLUTION"])
++    if len(requested_resolution) != 3:
++        raise ValueError(
++            "AFF_RESOLUTION must contain three XYZ values, got "
++            f"{resolved.param['AFF_RESOLUTION']!r}."
++        )
++    requested_mip = int(resolved.param["AFF_MIP"])
++
++    old_cloudvolume_root = os.environ.get("CLOUD_VOLUME_DIR")
++    os.environ["CLOUD_VOLUME_DIR"] = str(cloudvolume_root)
++    try:
++        from cloudvolume import CloudVolume
++
++        try:
++            volume = CloudVolume(
++                affinity_path,
++                mip=list(requested_resolution),
++                bounded=True,
++                fill_missing=False,
++                progress=False,
++            )
++            actual_mip = int(volume.mip)
++            actual_resolution = tuple(int(value) for value in volume.resolution[:3])
++            volume_bbox = tuple(int(value) for value in volume.bounds.minpt[:3]) + tuple(
++                int(value) for value in volume.bounds.maxpt[:3]
++            )
++            chunk_size = tuple(int(value) for value in volume.chunk_size[:3])
++        except Exception as exc:
++            raise RuntimeError(
++                f"Affinity preflight failed for {affinity_path}: {exc}. Check credentials "
++                "or use --mirror /path/to/local/precomputed/crop."
++            ) from exc
++
++        if actual_mip != requested_mip:
++            raise ValueError(
++                f"AFF_RESOLUTION {list(requested_resolution)} selects mip {actual_mip}, "
++                f"but provenance declares AFF_MIP {requested_mip}."
++            )
++        if actual_resolution != requested_resolution:
++            raise ValueError(
++                f"Affinity resolution is {actual_resolution}, expected {requested_resolution}."
++            )
++        if not _contains(volume_bbox, resolved.execution_bbox):
++            raise ValueError(
++                f"execution bbox {list(resolved.execution_bbox)} is outside affinity bounds "
++                f"{list(volume_bbox)}."
++            )
++
++        x, y, z, x1, y1, z1 = resolved.execution_bbox
++        # Read one voxel, not just metadata, so inaccessible buckets and incomplete
++        # mirrors fail before output directories or manifests are created. Reading
++        # both corners also catches a locally mirrored crop missing an edge chunk.
++        try:
++            _ = volume[x : x + 1, y : y + 1, z : z + 1]
++            _ = volume[x1 - 1 : x1, y1 - 1 : y1, z1 - 1 : z1]
++        except Exception as exc:
++            raise RuntimeError(
++                f"Affinity preflight failed for {affinity_path}: {exc}. Check credentials "
++                "or use --mirror /path/to/local/precomputed/crop."
++            ) from exc
++        if len(chunk_size) != 3:
++            raise ValueError(f"Affinity chunk size must have three XYZ values, got {chunk_size}.")
++        metadata = AffinityMetadata(
++            resolution_xyz=(
++                actual_resolution[0],
++                actual_resolution[1],
++                actual_resolution[2],
++            ),
++            chunk_size_xyz=(chunk_size[0], chunk_size[1], chunk_size[2]),
++        )
++    finally:
++        if old_cloudvolume_root is None:
++            os.environ.pop("CLOUD_VOLUME_DIR", None)
++        else:
++            os.environ["CLOUD_VOLUME_DIR"] = old_cloudvolume_root
++    return metadata
++
++
++def execute_replay(resolved: ResolvedReplay) -> RunResult:
++    """Preflight, enforce namespace safety, write a manifest, and run ABISS."""
++
++    _preflight_abiss(resolved)
++    with _cloudvolume_root_view(resolved.secrets_dir) as cloudvolume_root:
++        affinity_metadata = _preflight_affinity(
++            resolved,
++            cloudvolume_root=cloudvolume_root,
++        )
++        build_id = _abiss_build_id(resolved.abiss_home)
++        expected_manifest = _expected_manifest(resolved, abiss_build_id=build_id)
++        _apply_output_mode(resolved, expected_manifest)
++        _write_manifest(resolved, expected_manifest)
++        return run_abiss_large(
++            prepare_execution(resolved, affinity_metadata),
++            execute=True,
++        )
++
++
++def _resolution_report(resolved: ResolvedReplay, *, execute: bool) -> dict[str, Any]:
++    output_paths = {
++        key: resolved.param[key] for key in sorted(GENERATED_OUTPUT) if key in resolved.param
++    }
++    input_paths = {
++        key: resolved.param[key] for key in ("AFF_PATH", "IMAGE_PATH") if key in resolved.param
++    }
++    return {
++        "backend": resolved.backend,
++        "chunk_grid_xyz": list(resolved.chunk_grid),
++        "data": resolved.data,
++        "deferred_igneous_tasks": [dict(task) for task in resolved.replay_spec.igneous_blocks],
++        "execute": execute,
++        "execution_bbox_xyz": list(resolved.execution_bbox),
++        "input_paths": input_paths,
++        "mode": resolved.mode,
++        "name": resolved.name,
++        "output_paths": output_paths,
++        "param": resolved.param,
++        "param_path": str(resolved.param_path),
++        "provenance_path": str(resolved.provenance_path),
++        "score_bbox_xyz": list(resolved.score_bbox) if resolved.score_bbox else None,
++        "workdir": str(resolved.workdir),
++    }
++
++
++def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", required=True, help="YAML file with a seuron_replay block")
++    parser.add_argument("--out-root", help="Fresh replay namespace parent")
++    parser.add_argument("--name", help="Replay namespace name")
++    parser.add_argument("--secrets-dir", help="CloudVolume secrets directory")
++    parser.add_argument("--abiss-home", help="ABISS checkout/build root")
++    parser.add_argument(
++        "--exec-bbox", nargs=6, type=int, metavar=("X0", "Y0", "Z0", "X1", "Y1", "Z1")
++    )
++    parser.add_argument(
++        "--score-bbox", nargs=6, type=int, metavar=("X0", "Y0", "Z0", "X1", "Y1", "Z1")
++    )
++    parser.add_argument("--aff-path", help="Highest-precedence affinity CloudVolume path")
++    parser.add_argument(
++        "--mirror",
++        help="Existing local precomputed affinity crop used instead of provenance AFF_PATH",
++    )
++    parser.add_argument(
++        "--mode",
++        choices=("fresh", "resume", "overwrite"),
++        help="Execution output policy (default: fresh)",
++    )
++    parser.add_argument(
++        "--overwrite",
++        action="store_true",
++        help="Alias for the explicit destructive --mode overwrite",
++    )
++    parser.add_argument(
++        "--execute",
++        action="store_true",
++        help="Run ABISS after preflight; omission performs a pure resolve",
++    )
++    return parser.parse_args(argv)
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    args = parse_args(argv)
++    try:
++        resolved = resolve_replay(args)
++        print(
++            json.dumps(_resolution_report(resolved, execute=args.execute), indent=2, sort_keys=True)
++        )
++        if not args.execute:
++            return 0
++        result = execute_replay(resolved)
++    except (OSError, RuntimeError, ValueError) as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 2
++
++    print(f"Manifest: {resolved.manifest_path}")
++    print(f"Final segmentation layer: {result.seg_cloudpath}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/validate_tutorial_configs.py b/scripts/validate_tutorial_configs.py
+index bf4a9ce38..9c5e333eb 100644
+--- a/scripts/validate_tutorial_configs.py
++++ b/scripts/validate_tutorial_configs.py
+@@ -20,8 +20,12 @@
+ 
+ import yaml
+ 
+-from connectomics.config import load_config
+-from connectomics.runtime.preflight import validate_runtime_coherence
++_REPO_ROOT = Path(__file__).resolve().parents[1]
++if str(_REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(_REPO_ROOT))
++
++from connectomics.config import load_config  # noqa: E402
++from connectomics.runtime.preflight import validate_runtime_coherence  # noqa: E402
+ 
+ LEGACY_PATTERNS: List[Tuple[Tuple[str, ...], str]] = [
+     (("inference", "data"), "Use `test.data` instead of `inference.data`."),
+@@ -108,7 +112,7 @@
+      "default.data.train.name has no effect; set under val/test instead."),
+ ]
+ 
+-CUSTOM_WORKFLOW_ROOTS = {"large_decode", "abiss_large"}
++CUSTOM_WORKFLOW_ROOTS = {"large_decode", "abiss_large", "seuron_replay"}
+ 
+ 
+ def _has_path(data: Any, path: Tuple[str, ...]) -> bool:
+diff --git a/tests/unit/fixtures/seuron_provenance.json b/tests/unit/fixtures/seuron_provenance.json
+new file mode 100644
+index 000000000..58e9c1311
+--- /dev/null
++++ b/tests/unit/fixtures/seuron_provenance.json
+@@ -0,0 +1,169 @@
++{
++  "description": "",
++  "owners": [],
++  "processing": [
++    {
++      "by": "ranl",
++      "date": "2026-07-19 06:57 UTC",
++      "method": {
++        "AFF_MIP": 0,
++        "AFF_PATH": "gs://zebrafinch_aff1/affinity_r1_float32/",
++        "AFF_RESOLUTION": [
++          9,
++          9,
++          20
++        ],
++        "AGG_THRESHOLD": "0.3",
++        "BBOX": [
++          0,
++          0,
++          0,
++          10664,
++          10912,
++          5700
++        ],
++        "CHUNKMAP_OUTPUT": "gs://princeton-eric-medial-entorhinal-cortex-scratch/region_graph/seg_20260719054914/agg/chunkmap",
++        "CHUNK_SIZE": [
++          512,
++          512,
++          256
++        ],
++        "IMAGE_PATH": "gs://j0126-nature-methods-data/GgwKmcKgrcoNxJccKuGIzRnQqfit9hnfK1ctZzNbnuU/rawdata_realigned/",
++        "MOUNT_PATH": "/workspace/seg/.cloudvolume/secrets",
++        "NAME": "seg_20260719054914",
++        "NG_PREFIX": "gs://princeton-eric-medial-entorhinal-cortex-scratch/make_cv_happy/",
++        "REDIS_DB": 1,
++        "REDIS_SERVER": "ranl-testing-bootstrap.us-east1-b.c.hi-mc-collab.internal",
++        "SCRATCH_PATH": "gs://princeton-eric-medial-entorhinal-cortex-scratch/region_graph/seg_20260719054914",
++        "SCRATCH_PREFIX": "gs://princeton-eric-medial-entorhinal-cortex-scratch/region_graph/",
++        "SEG_PATH": "gs://princeton-eric-medial-entorhinal-cortex-scratch/make_cv_happy/seg/seg_20260719054914",
++        "SEG_PREFIX": "gs://princeton-eric-medial-entorhinal-cortex-scratch/make_cv_happy/seg/",
++        "SKIP_SKELETON": true,
++        "STATSD_HOST": "ranl-testing-bootstrap.us-east1-b.c.hi-mc-collab.internal",
++        "STATSD_PORT": "9125",
++        "WORKER_IMAGE": "ranlu/abiss:main",
++        "WORKSPACE_PATH": "/workspace/seg",
++        "WS_DUST_THRESHOLD": "200",
++        "WS_HIGH_THRESHOLD": "0.99999",
++        "WS_LOW_THRESHOLD": "0.00001",
++        "WS_PATH": "gs://princeton-eric-medial-entorhinal-cortex-scratch/make_cv_happy/ws/seg_20260719054914",
++        "WS_PREFIX": "gs://princeton-eric-medial-entorhinal-cortex-scratch/make_cv_happy/ws/",
++        "WS_SIZE_THRESHOLD": "200"
++      }
++    },
++    {
++      "by": "",
++      "date": "2026-07-19 08:03 UTC",
++      "method": {
++        "axis": "z",
++        "background_color": 0,
++        "bounds": "Bbox([0, 0, 0],[10664, 10912, 5700], dtype=np.int32, unit='vx')",
++        "chunk_size": null,
++        "compress": null,
++        "delete_black_uploads": false,
++        "dest_path": null,
++        "encoding": null,
++        "encoding_effort": null,
++        "encoding_level": null,
++        "factor": null,
++        "fill_missing": false,
++        "mask": null,
++        "method": 6,
++        "mip": 0,
++        "num_mips": 2,
++        "preserve_chunk_size": true,
++        "shape": [
++          2048,
++          2048,
++          64
++        ],
++        "sparse": false,
++        "task": "DownsampleTask"
++      }
++    },
++    {
++      "by": "",
++      "date": "2026-07-19 08:09 UTC",
++      "method": {
++        "cdn_cache": false,
++        "closed_dataset_edges": true,
++        "compress": "gzip",
++        "dry_run": false,
++        "dust_global": false,
++        "dust_threshold": null,
++        "encoding": "precomputed",
++        "exclude_object_ids": [],
++        "fill_holes": 0,
++        "fill_missing": false,
++        "frag_path": "file:///share/seg_20260719054914_segmentation",
++        "layer_path": "gs://princeton-eric-medial-entorhinal-cortex-scratch/make_cv_happy/seg/seg_20260719054914",
++        "max_simplification_error": 40,
++        "mesh_dir": "mesh_mip_2_err_40",
++        "mip": 2,
++        "object_ids": null,
++        "shape": [
++          256,
++          256,
++          256
++        ],
++        "sharded": true,
++        "simplification": true,
++        "spatial_index": true,
++        "task": "MeshTask"
++      }
++    },
++    {
++      "by": "",
++      "date": "2026-07-19 08:19 UTC",
++      "method": {
++        "cloudpath": "gs://princeton-eric-medial-entorhinal-cortex-scratch/make_cv_happy/seg/seg_20260719054914",
++        "draco_compression_level": 7,
++        "frag_path": "http://ranl-testing-nfs-server.us-east1-b.c.hi-mc-collab.internal/share/seg_20260719054914_segmentation",
++        "mesh_dir": null,
++        "min_chunk_size": [
++          256,
++          256,
++          256
++        ],
++        "minishard_bits": 3,
++        "mip": 2,
++        "num_lod": 8,
++        "preshift_bits": 0,
++        "shard_bits": 12,
++        "task": "MultiResShardedMeshMergeTask",
++        "vertex_quantization_bits": 16
++      }
++    },
++    {
++      "by": "",
++      "date": "2026-07-19 08:35 UTC",
++      "method": {
++        "axis": "z",
++        "background_color": 0,
++        "bounds": "Bbox([0, 0, 0],[10664, 10912, 5700], dtype=np.int32, unit='vx')",
++        "chunk_size": null,
++        "compress": null,
++        "delete_black_uploads": false,
++        "dest_path": null,
++        "encoding": null,
++        "encoding_effort": null,
++        "encoding_level": null,
++        "factor": null,
++        "fill_missing": false,
++        "mask": null,
++        "method": 6,
++        "mip": 0,
++        "num_mips": 2,
++        "preserve_chunk_size": true,
++        "shape": [
++          2048,
++          2048,
++          64
++        ],
++        "sparse": false,
++        "task": "DownsampleTask"
++      }
++    }
++  ],
++  "sources": []
++}
+\ No newline at end of file
+diff --git a/tests/unit/test_abiss_large_executor.py b/tests/unit/test_abiss_large_executor.py
+new file mode 100644
+index 000000000..9f68ca47c
+--- /dev/null
++++ b/tests/unit/test_abiss_large_executor.py
+@@ -0,0 +1,361 @@
++"""Tests for the runtime-owned ABISS-large executor."""
++
++from __future__ import annotations
++
++import json
++import subprocess
++from dataclasses import replace
++from pathlib import Path
++from typing import Any
++
++import h5py
++import numpy as np
++import pytest
++import yaml
++
++from connectomics.runtime import abiss_large
++
++
++def _prepared(
++    tmp_path: Path,
++    *,
++    stages: tuple[str, ...] = ("watershed", "remap_watershed"),
++) -> abiss_large.PreparedConfig:
++    return abiss_large.PreparedConfig(
++        workdir=tmp_path / "run" / "work",
++        secrets_dir=tmp_path / "run" / "secrets",
++        param_path=tmp_path / "run" / "secrets" / "param",
++        abiss_home=tmp_path / "lib" / "abiss",
++        param_payload={
++            "NAME": "fixture",
++            "AFF_PATH": "file:///input/affinity",
++            "SEG_PATH": "file:///output/segmentation",
++            "BBOX": [0, 0, 0, 1024, 1024, 512],
++            "CHUNK_SIZE": [512, 512, 256],
++            "AGG_THRESHOLD": "0.3",
++            "UPLOAD_CMD": "fixture-upload",
++            "DOWNLOAD_CMD": "fixture-download",
++        },
++        root_tag="1_0_0_0",
++        top_mip=1,
++        stage_overlap="0",
++        stage_meta="",
++        stages=stages,
++    )
++
++
++def test_execute_false_returns_plan_without_writes_or_result_read(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    prepared = _prepared(tmp_path)
++
++    def unexpected(*args: Any, **kwargs: Any) -> None:
++        raise AssertionError("dry resolution performed I/O")
++
++    monkeypatch.setattr(abiss_large, "_write_param", unexpected)
++    monkeypatch.setattr(abiss_large, "_execute_stage", unexpected)
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", unexpected)
++
++    result = abiss_large.run_abiss_large(prepared)
++
++    assert result.executed is False
++    assert result.segmentation is None
++    assert result.seg_cloudpath == "file:///output/segmentation"
++    assert [plan.stage for plan in result.stage_plans] == [
++        "watershed",
++        "remap_watershed",
++    ]
++    assert not (tmp_path / "run").exists()
++
++
++def test_execute_writes_param_and_runs_stages_in_order(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    prepared = _prepared(tmp_path)
++    calls: list[tuple[list[str], str, dict[str, str], bool]] = []
++    discovered: list[str] = []
++    output_marker = object()
++
++    def fake_run(argv: list[str], *, cwd: str, env: dict[str, str], check: bool) -> None:
++        calls.append((argv, cwd, env, check))
++
++    def fake_discover(path: str) -> object:
++        discovered.append(path)
++        return output_marker
++
++    monkeypatch.setattr(abiss_large.subprocess, "run", fake_run)
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", fake_discover)
++
++    result = abiss_large.run_abiss_large(prepared, execute=True)
++
++    with prepared.param_path.open("r", encoding="utf-8") as f:
++        assert json.load(f) == dict(prepared.param_payload)
++    assert prepared.param_path.read_text(encoding="utf-8").endswith("\n")
++
++    scripts_dir = prepared.abiss_home / "scripts"
++    assert [call[0] for call in calls] == [
++        [
++            "bash",
++            str(scripts_dir / "run_batch.sh"),
++            "ws",
++            "1",
++            "1_0_0_0",
++        ],
++        [
++            "bash",
++            str(scripts_dir / "remap_batch.sh"),
++            "ws",
++            "1",
++            "1_0_0_0",
++        ],
++    ]
++    assert all(call[1] == str(prepared.workdir) for call in calls)
++    assert all(call[3] is True for call in calls)
++    assert [call[2]["STAGE"] for call in calls] == ["ws", "ws"]
++    for _, _, env, _ in calls:
++        assert env["WORKER_HOME"] == str(prepared.abiss_home)
++        assert env["SECRETS"] == str(prepared.secrets_dir)
++        assert env["AIRFLOW_TMP_DIR"] == str(prepared.workdir / ".airflow")
++
++    assert discovered == ["file:///output/segmentation"]
++    assert result.executed is True
++    assert result.segmentation is output_marker
++
++
++def test_default_stage_order_preserves_four_stage_pipeline(tmp_path: Path) -> None:
++    prepared = _prepared(tmp_path, stages=abiss_large.STAGES_ALL)
++
++    result = abiss_large.run_abiss_large(prepared)
++
++    assert [Path(plan.argv[1]).name for plan in result.stage_plans] == [
++        "run_batch.sh",
++        "remap_batch.sh",
++        "run_batch.sh",
++        "remap_batch.sh",
++    ]
++    assert [plan.argv[2] for plan in result.stage_plans] == ["ws", "ws", "me", "agg"]
++    assert [plan.env["STAGE"] for plan in result.stage_plans] == ["ws", "ws", "agg", "agg"]
++
++
++def test_nonzero_stage_exit_propagates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
++    prepared = _prepared(tmp_path)
++    calls = 0
++
++    def fake_run(argv: list[str], *, cwd: str, env: dict[str, str], check: bool) -> None:
++        nonlocal calls
++        calls += 1
++        if calls == 2:
++            raise subprocess.CalledProcessError(17, argv)
++
++    def unexpected_discovery(path: str) -> None:
++        raise AssertionError(f"discovered result after failed stage: {path}")
++
++    monkeypatch.setattr(abiss_large.subprocess, "run", fake_run)
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", unexpected_discovery)
++
++    with pytest.raises(subprocess.CalledProcessError) as exc_info:
++        abiss_large.run_abiss_large(prepared, execute=True)
++
++    assert exc_info.value.returncode == 17
++    assert calls == 2
++
++
++def test_result_discovery_opens_segmentation_layer(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    prepared = _prepared(tmp_path, stages=())
++    opened: list[tuple[str, bool]] = []
++    marker = object()
++
++    def fake_cloud_volume(path: str, *, progress: bool) -> object:
++        opened.append((path, progress))
++        return marker
++
++    monkeypatch.setattr(abiss_large, "_open_cloudvolume", fake_cloud_volume)
++
++    result = abiss_large.run_abiss_large(prepared, execute=True)
++
++    assert opened == [("file:///output/segmentation", False)]
++    assert result.segmentation is marker
++
++
++def test_runtime_secrets_stages_param_without_touching_credential_source(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    prepared = replace(
++        _prepared(tmp_path, stages=("watershed",)),
++        secrets_dir=tmp_path / "credentials" / "secrets",
++        param_path=tmp_path / "run" / "param",
++        runtime_secrets_dir=tmp_path / "run" / ".abiss_secrets",
++    )
++    prepared.secrets_dir.mkdir(parents=True)
++    credential = prepared.secrets_dir / "s3-secret"
++    credential.write_text("credential source\n", encoding="utf-8")
++    (prepared.secrets_dir / "config.sh").write_text("stale config\n", encoding="utf-8")
++    (prepared.secrets_dir / "param").write_text("historical param\n", encoding="utf-8")
++    monkeypatch.setattr(abiss_large.subprocess, "run", lambda *args, **kwargs: None)
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", lambda path: object())
++
++    result = abiss_large.run_abiss_large(prepared, execute=True)
++
++    assert json.loads(prepared.param_path.read_text()) == dict(prepared.param_payload)
++    runtime_param = prepared.runtime_secrets_dir / "param"
++    assert json.loads(runtime_param.read_text()) == dict(prepared.param_payload)
++    runtime_credential = prepared.runtime_secrets_dir / "s3-secret"
++    assert runtime_credential.is_symlink()
++    assert runtime_credential.resolve() == credential.resolve()
++    assert runtime_credential.read_text(encoding="utf-8") == "credential source\n"
++    assert not (prepared.runtime_secrets_dir / "config.sh").exists()
++    assert (prepared.secrets_dir / "param").read_text(encoding="utf-8") == "historical param\n"
++    assert result.stage_plans[0].env["SECRETS"] == str(prepared.runtime_secrets_dir)
++
++
++def test_custom_param_path_does_not_clobber_shared_secrets_param(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    prepared = replace(
++        _prepared(tmp_path, stages=()),
++        secrets_dir=tmp_path / "shared" / "secrets",
++        param_path=tmp_path / "run" / "param",
++    )
++    prepared.secrets_dir.mkdir(parents=True)
++    shared_param = prepared.secrets_dir / "param"
++    shared_param.write_text("shared historical state\n", encoding="utf-8")
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", lambda path: object())
++
++    abiss_large.run_abiss_large(prepared, execute=True)
++
++    assert json.loads(prepared.param_path.read_text()) == dict(prepared.param_payload)
++    assert shared_param.read_text(encoding="utf-8") == "shared historical state\n"
++
++
++def test_write_param_false_preserves_prepared_param(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    prepared = replace(_prepared(tmp_path, stages=()), write_param=False)
++    prepared.param_path.parent.mkdir(parents=True)
++    prepared.param_path.write_text("already prepared\n", encoding="utf-8")
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", lambda path: object())
++
++    abiss_large.run_abiss_large(prepared, execute=True)
++
++    assert prepared.param_path.read_text(encoding="utf-8") == "already prepared\n"
++
++
++def test_replay_output_initialization_uses_validated_metadata(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    payload = dict(_prepared(tmp_path).param_payload)
++    payload.update(
++        {
++            "WS_PATH": (tmp_path / "run" / "ws").as_uri(),
++            "SCRATCH_PATH": (tmp_path / "run" / "scratch").as_uri(),
++            "CHUNKMAP_OUTPUT": (tmp_path / "run" / "scratch" / "ws" / "chunkmap").as_uri(),
++        }
++    )
++    prepared = replace(
++        _prepared(tmp_path, stages=()),
++        param_payload=payload,
++        output_layer_spec=abiss_large.OutputLayerSpec(
++            resolution_xyz=(9, 9, 20),
++            chunk_size_xyz=(64, 64, 64),
++        ),
++        write_param=False,
++    )
++    calls: list[dict[str, Any]] = []
++    monkeypatch.setattr(
++        abiss_large,
++        "_prepare_segmentation_output_layers",
++        lambda **kwargs: calls.append(kwargs),
++    )
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", lambda path: object())
++
++    abiss_large.run_abiss_large(prepared, execute=True)
++
++    assert calls == [
++        {
++            "ws_cloudpath": payload["WS_PATH"],
++            "seg_cloudpath": payload["SEG_PATH"],
++            "bbox_xyz": payload["BBOX"],
++            "resolution_xyz": (9, 9, 20),
++            "chunk_size_xyz": (64, 64, 64),
++        }
++    ]
++    assert (tmp_path / "run" / "scratch" / "ws" / "chunkmap").is_dir()
++
++
++def test_thin_cli_delegates_to_api_and_yaml_builds_same_execution_config(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    import scripts.run_abiss_large as cli
++
++    source_h5 = tmp_path / "affinity.h5"
++    with h5py.File(source_h5, "w") as f:
++        f.create_dataset("main", data=np.zeros((3, 4, 6, 8), dtype=np.uint8))
++
++    config_path = tmp_path / "abiss.yaml"
++    config_path.write_text(
++        yaml.safe_dump(
++            {
++                "abiss_large": {
++                    "abiss_home": str(tmp_path / "abiss"),
++                    "workdir": str(tmp_path / "outputs" / "work"),
++                    "secrets_dir": str(tmp_path / "outputs" / "secrets"),
++                    "source_affinity_h5": str(source_h5),
++                    "source_dataset": "main",
++                    "root_tag": "0_0_0_0",
++                    "top_mip": 0,
++                    "param": {
++                        "NAME": "equivalence",
++                        "BBOX": [0, 0, 0, 8, 6, 4],
++                        "CHUNK_SIZE": [8, 6, 4],
++                    },
++                }
++            },
++            sort_keys=False,
++        ),
++        encoding="utf-8",
++    )
++
++    workflow = abiss_large.prepare_config(config_path)
++    prepared = workflow.execution_config(stages=("watershed",), write_param=False)
++    prepared_calls: list[abiss_large.PreparedConfig] = []
++
++    def fake_prepare_config(path: Path) -> abiss_large.LargeWorkflowConfig:
++        assert path == config_path.resolve()
++        return workflow
++
++    def fake_run(value: abiss_large.PreparedConfig, *, execute: bool) -> abiss_large.RunResult:
++        assert execute is True
++        prepared_calls.append(value)
++        return abiss_large.RunResult(
++            prepared=value,
++            stage_plans=(),
++            executed=True,
++            segmentation=object(),
++        )
++
++    monkeypatch.setattr(abiss_large, "prepare_config", fake_prepare_config)
++    monkeypatch.setattr(abiss_large, "run_abiss_large", fake_run)
++
++    exit_code = cli.main(
++        [
++            "--config",
++            str(config_path),
++            "--skip-prepare",
++            "--stages",
++            "watershed",
++        ]
++    )
++
++    assert cli.main is abiss_large.main
++    assert exit_code == 0
++    assert prepared_calls == [prepared]
++    assert prepared.workdir == workflow.workdir
++    assert prepared.secrets_dir == workflow.secrets_dir
++    assert prepared.param_path == workflow.param_path
++    assert prepared.abiss_home == workflow.abiss_home
++    assert prepared.param_payload == workflow.param_payload
++    assert prepared.seg_cloudpath == workflow.seg_cloudpath
++    assert prepared.write_param is False
+diff --git a/tests/unit/test_seuron_provenance_replay.py b/tests/unit/test_seuron_provenance_replay.py
+new file mode 100644
+index 000000000..38c45b1b9
+--- /dev/null
++++ b/tests/unit/test_seuron_provenance_replay.py
+@@ -0,0 +1,467 @@
++"""Tests for resolving Seuron provenance into a fail-closed ABISS payload."""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from copy import deepcopy
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from connectomics.runtime.seuron_provenance import (
++    CLASSIFIED_KEYS,
++    GENERATED_OUTPUT,
++    IGNORED_INFRA,
++    OPTIONAL_INPUT,
++    REQUIRED_INPUT,
++    classify_and_map,
++    load_provenance,
++)
++
++FIXTURE = Path(__file__).parent / "fixtures" / "seuron_provenance.json"
++TUTORIAL = Path(__file__).parents[2] / "tutorials" / "seuron_provenance_replay.yaml"
++
++
++def _fixture_payload():
++    return json.loads(FIXTURE.read_text(encoding="utf-8"))
++
++
++def _write_provenance(tmp_path: Path, processing) -> Path:
++    path = tmp_path / "provenance.json"
++    path.write_text(json.dumps({"processing": processing}), encoding="utf-8")
++    return path
++
++
++def test_real_provenance_maps_only_whitelisted_keys(tmp_path):
++    spec = load_provenance(FIXTURE)
++    mapped = classify_and_map(spec.seg_block, name="replay", out_root=tmp_path)
++
++    assert set(spec.seg_block) == CLASSIFIED_KEYS
++    assert set(mapped.param) == REQUIRED_INPUT | OPTIONAL_INPUT | GENERATED_OUTPUT
++    for key in REQUIRED_INPUT | OPTIONAL_INPUT:
++        assert mapped.param[key] == spec.seg_block[key]
++    assert not (set(mapped.param) & IGNORED_INFRA)
++
++
++def test_unknown_segmentation_key_raises(tmp_path):
++    seg_block = deepcopy(load_provenance(FIXTURE).seg_block)
++    seg_block["NEW_SEURON_FIELD"] = "schema drift"
++
++    with pytest.raises(ValueError, match="Unknown.*NEW_SEURON_FIELD"):
++        classify_and_map(seg_block, name="replay", out_root=tmp_path)
++
++
++def test_outputs_are_fresh_and_minted_under_run_root(tmp_path):
++    seg_block = load_provenance(FIXTURE).seg_block
++    mapped = classify_and_map(seg_block, name="bounded-replay", out_root=tmp_path)
++    run_uri = (tmp_path.resolve() / "bounded-replay").as_uri()
++
++    for key in GENERATED_OUTPUT - {"NAME"}:
++        assert mapped.param[key].startswith(run_uri + "/")
++        assert mapped.param[key] != seg_block[key]
++    assert mapped.param["NAME"] == "bounded-replay"
++    assert mapped.param["NAME"] != seg_block["NAME"]
++    assert mapped.param["WS_PATH"].endswith("/precomputed/ws/bounded-replay")
++    assert mapped.param["SEG_PATH"].endswith("/precomputed/seg/bounded-replay")
++    assert mapped.param["CHUNKMAP_OUTPUT"].endswith("/scratch/bounded-replay/ws/chunkmap")
++
++
++def test_load_provenance_rejects_zero_segmentation_blocks(tmp_path):
++    processing = _fixture_payload()["processing"][1:]
++    path = _write_provenance(tmp_path, processing)
++
++    with pytest.raises(ValueError, match="exactly one.*found 0"):
++        load_provenance(path)
++
++
++def test_load_provenance_rejects_two_segmentation_blocks(tmp_path):
++    processing = _fixture_payload()["processing"]
++    processing.append(deepcopy(processing[0]))
++    path = _write_provenance(tmp_path, processing)
++
++    with pytest.raises(ValueError, match="exactly one.*found 2"):
++        load_provenance(path)
++
++
++def test_missing_required_input_raises(tmp_path):
++    seg_block = deepcopy(load_provenance(FIXTURE).seg_block)
++    del seg_block["CHUNK_SIZE"]
++
++    with pytest.raises(ValueError, match="Missing required.*CHUNK_SIZE"):
++        classify_and_map(seg_block, name="replay", out_root=tmp_path)
++
++
++def test_image_path_is_optional_input_and_never_remapped(tmp_path):
++    seg_block = load_provenance(FIXTURE).seg_block
++    mapped = classify_and_map(seg_block, name="replay", out_root=tmp_path)
++
++    assert mapped.param["IMAGE_PATH"] == seg_block["IMAGE_PATH"]
++
++    without_image = dict(seg_block)
++    del without_image["IMAGE_PATH"]
++    mapped_without_image = classify_and_map(
++        without_image, name="replay-no-image", out_root=tmp_path
++    )
++    assert "IMAGE_PATH" not in mapped_without_image.param
++
++
++def test_affinity_override_takes_precedence(tmp_path):
++    seg_block = load_provenance(FIXTURE).seg_block
++    mapped = classify_and_map(
++        seg_block,
++        name="replay",
++        out_root=tmp_path,
++        aff_override="file:///mirror/affinity",
++    )
++
++    assert mapped.param["AFF_PATH"] == "file:///mirror/affinity"
++    assert seg_block["AFF_PATH"].startswith("gs://")
++
++
++def test_cli_overrides_yaml_values_without_writing(tmp_path):
++    from scripts import run_seuron_provenance as cli
++
++    out_root = tmp_path / "cli-output"
++    args = cli.parse_args(
++        [
++            "--config",
++            str(TUTORIAL),
++            "--out-root",
++            str(out_root),
++            "--name",
++            "cli-name",
++            "--secrets-dir",
++            str(tmp_path / "cli-secrets"),
++            "--abiss-home",
++            str(tmp_path / "cli-abiss"),
++            "--exec-bbox",
++            "0",
++            "0",
++            "0",
++            "1024",
++            "1024",
++            "512",
++            "--score-bbox",
++            "256",
++            "256",
++            "128",
++            "768",
++            "768",
++            "384",
++            "--mirror",
++            str(tmp_path / "lower-precedence-mirror"),
++            "--aff-path",
++            "file:///cli-affinity",
++            "--mode",
++            "resume",
++        ]
++    )
++
++    resolved = cli.resolve_replay(args)
++
++    assert resolved.out_root == out_root.resolve()
++    assert resolved.name == "cli-name"
++    assert resolved.secrets_dir == (tmp_path / "cli-secrets").resolve()
++    assert resolved.abiss_home == (tmp_path / "cli-abiss").resolve()
++    assert resolved.execution_bbox == (0, 0, 0, 1024, 1024, 512)
++    assert resolved.score_bbox == (256, 256, 128, 768, 768, 384)
++    assert resolved.param["AFF_PATH"] == "file:///cli-affinity"
++    assert resolved.mode == "resume"
++    assert not out_root.exists()
++
++
++def test_resolve_cli_does_not_import_cloudvolume_or_create_state(tmp_path):
++    home = tmp_path / "home"
++    cloudvolume_root = home / ".cloudvolume"
++    out_root = tmp_path / "outputs"
++    import_guard = tmp_path / "import-guard"
++    import_guard.mkdir()
++    (import_guard / "cloudvolume.py").write_text(
++        "raise AssertionError('cloudvolume imported during pure resolve')\n",
++        encoding="utf-8",
++    )
++    env = os.environ.copy()
++    env.update({"CLOUD_VOLUME_DIR": str(cloudvolume_root), "HOME": str(home)})
++    env["PYTHONPATH"] = os.pathsep.join(
++        value for value in (str(import_guard), env.get("PYTHONPATH")) if value
++    )
++
++    result = subprocess.run(
++        [
++            sys.executable,
++            str(TUTORIAL.parents[1] / "scripts" / "run_seuron_provenance.py"),
++            "--config",
++            str(TUTORIAL),
++            "--out-root",
++            str(out_root),
++            "--secrets-dir",
++            str(cloudvolume_root / "secrets"),
++        ],
++        check=True,
++        capture_output=True,
++        env=env,
++        text=True,
++    )
++
++    report = json.loads(result.stdout)
++    assert report["execute"] is False
++    assert not cloudvolume_root.exists()
++    assert not out_root.exists()
++
++
++def test_output_modes_enforce_fresh_resume_and_explicit_overwrite(tmp_path):
++    from scripts import run_seuron_provenance as cli
++
++    base = cli.resolve_replay(
++        cli.parse_args(
++            [
++                "--config",
++                str(TUTORIAL),
++                "--out-root",
++                str(tmp_path),
++                "--name",
++                "fresh-run",
++            ]
++        )
++    )
++    expected = {
++        "provenance_sha": "provenance",
++        "whitelisted_param_sha": "param",
++        "abiss_build_id": "build",
++        "execution_bbox": list(base.execution_bbox),
++    }
++
++    base.run_root.mkdir()
++    (base.run_root / "artifact").write_text("occupied", encoding="utf-8")
++    with pytest.raises(ValueError, match="empty output namespace"):
++        cli._apply_output_mode(base, expected)
++
++    resume = replace(base, name="resume-run", mode="resume")
++    resume.run_root.mkdir()
++    resume.manifest_path.write_text(json.dumps(expected), encoding="utf-8")
++    cli._apply_output_mode(resume, expected)
++
++    overwrite = replace(base, name="overwrite-run", mode="overwrite")
++    overwrite.run_root.mkdir()
++    (overwrite.run_root / "artifact").write_text("delete me", encoding="utf-8")
++    cli._apply_output_mode(overwrite, expected)
++    assert not overwrite.run_root.exists()
++
++
++@pytest.mark.parametrize(
++    ("field", "replacement"),
++    [
++        ("provenance_sha", "different-provenance"),
++        ("whitelisted_param_sha", "different-param"),
++        ("abiss_build_id", "different-build"),
++        ("execution_bbox", [0, 0, 0, 1, 1, 1]),
++    ],
++)
++def test_resume_rejects_each_manifest_compatibility_field(tmp_path, field, replacement):
++    from scripts import run_seuron_provenance as cli
++
++    resolved = cli.resolve_replay(
++        cli.parse_args(
++            [
++                "--config",
++                str(TUTORIAL),
++                "--out-root",
++                str(tmp_path),
++                "--name",
++                "resume-run",
++                "--mode",
++                "resume",
++            ]
++        )
++    )
++    expected = {
++        "provenance_sha": "provenance",
++        "whitelisted_param_sha": "param",
++        "abiss_build_id": "build",
++        "execution_bbox": list(resolved.execution_bbox),
++    }
++    incompatible_manifest = deepcopy(expected)
++    incompatible_manifest[field] = replacement
++    resolved.run_root.mkdir()
++    resolved.manifest_path.write_text(json.dumps(incompatible_manifest), encoding="utf-8")
++
++    with pytest.raises(ValueError, match=field):
++        cli._apply_output_mode(resolved, expected)
++
++
++def test_affinity_preflight_uses_physical_resolution_and_full_bounds(monkeypatch, tmp_path):
++    from scripts import run_seuron_provenance as cli
++
++    affinity = tmp_path / "affinity"
++    affinity.mkdir()
++    resolved = cli.resolve_replay(
++        cli.parse_args(
++            [
++                "--config",
++                str(TUTORIAL),
++                "--out-root",
++                str(tmp_path / "output"),
++                "--name",
++                "preflight-run",
++                "--aff-path",
++                str(affinity),
++            ]
++        )
++    )
++    opens = []
++    reads = []
++
++    class FakeVolume:
++        mip = 0
++        resolution = (9, 9, 20)
++        chunk_size = (64, 64, 64)
++        bounds = SimpleNamespace(minpt=(0, 0, 0), maxpt=(10664, 10912, 5700))
++
++        def __init__(self, path, **kwargs):
++            opens.append((path, kwargs))
++
++        def __getitem__(self, key):
++            reads.append(key)
++            return object()
++
++    monkeypatch.setattr("cloudvolume.CloudVolume", FakeVolume)
++
++    metadata = cli._preflight_affinity(resolved)
++
++    assert opens[0][1]["mip"] == [9, 9, 20]
++    assert metadata.resolution_xyz == (9, 9, 20)
++    assert metadata.chunk_size_xyz == (64, 64, 64)
++    assert len(reads) == 2
++
++    FakeVolume.bounds = SimpleNamespace(minpt=(0, 0, 0), maxpt=(4000, 4000, 2500))
++    with pytest.raises(ValueError, match="outside affinity bounds") as exc_info:
++        cli._preflight_affinity(resolved)
++    assert "credentials" not in str(exc_info.value)
++
++
++def test_replay_execute_writes_copy_uri_transfer_commands(monkeypatch, tmp_path):
++    from connectomics.runtime import abiss_large
++    from scripts import run_seuron_provenance as cli
++
++    resolved = cli.resolve_replay(
++        cli.parse_args(
++            [
++                "--config",
++                str(TUTORIAL),
++                "--out-root",
++                str(tmp_path / "output"),
++                "--name",
++                "execute-run",
++                "--secrets-dir",
++                str(tmp_path / "credentials"),
++            ]
++        )
++    )
++    prepared = replace(cli.prepare_execution(resolved), stages=("watershed",))
++    calls = []
++
++    def fake_run(argv, *, cwd, env, check):
++        calls.append((argv, cwd, env, check))
++
++    monkeypatch.setattr(abiss_large.subprocess, "run", fake_run)
++    monkeypatch.setattr(abiss_large, "_discover_segmentation", lambda path: object())
++
++    result = abiss_large.run_abiss_large(prepared, execute=True)
++
++    copy_helper = (TUTORIAL.parents[1] / "scripts" / "copy_uri.py").resolve()
++    copy_command = f"{sys.executable} {copy_helper}"
++    assert "UPLOAD_CMD" not in resolved.param
++    assert "DOWNLOAD_CMD" not in resolved.param
++    assert "UPLOAD_CMD" not in prepared.param_payload
++    assert "DOWNLOAD_CMD" not in prepared.param_payload
++    assert result.prepared.param_payload["UPLOAD_CMD"] == copy_command
++    assert result.prepared.param_payload["DOWNLOAD_CMD"] == copy_command
++    assert len(calls) == 1
++
++    param = json.loads(prepared.param_path.read_text(encoding="utf-8"))
++    runtime_param = json.loads((prepared.runtime_secrets_dir / "param").read_text(encoding="utf-8"))
++    assert param["UPLOAD_CMD"] == copy_command
++    assert param["DOWNLOAD_CMD"] == copy_command
++    assert runtime_param == param
++
++
++def test_arbitrary_secrets_dir_gets_canonical_cloudvolume_view(monkeypatch, tmp_path):
++    from scripts import run_seuron_provenance as cli
++
++    affinity = tmp_path / "affinity"
++    affinity.mkdir()
++    secrets_dir = tmp_path / "gcp-credentials"
++    secrets_dir.mkdir()
++    credential = secrets_dir / "google-secret.json"
++    credential.write_text("{}\n", encoding="utf-8")
++    resolved = cli.resolve_replay(
++        cli.parse_args(
++            [
++                "--config",
++                str(TUTORIAL),
++                "--out-root",
++                str(tmp_path / "output"),
++                "--name",
++                "custom-secrets",
++                "--aff-path",
++                str(affinity),
++                "--secrets-dir",
++                str(secrets_dir),
++            ]
++        )
++    )
++    observed = []
++
++    class FakeVolume:
++        mip = 0
++        resolution = (9, 9, 20)
++        chunk_size = (64, 64, 64)
++        bounds = SimpleNamespace(minpt=(0, 0, 0), maxpt=(10664, 10912, 5700))
++
++        def __init__(self, path, **kwargs):
++            cloudvolume_root = Path(os.environ["CLOUD_VOLUME_DIR"])
++            canonical = cloudvolume_root / "secrets" / "google-secret.json"
++            observed.append((canonical.resolve(), canonical.read_text(encoding="utf-8")))
++
++        def __getitem__(self, key):
++            return object()
++
++    monkeypatch.setattr("cloudvolume.CloudVolume", FakeVolume)
++
++    cli._preflight_affinity(resolved)
++    prepared = cli.prepare_execution(resolved)
++
++    assert observed == [(credential.resolve(), "{}\n")]
++    assert prepared.runtime_secrets_dir == resolved.run_root / ".cloudvolume" / "secrets"
++    assert prepared.extra_env == {"CLOUD_VOLUME_DIR": str(resolved.run_root / ".cloudvolume")}
++
++
++def test_igneous_tasks_preserve_provenance_order():
++    spec = load_provenance(FIXTURE)
++
++    assert [block["task"] for block in spec.igneous_blocks] == [
++        "DownsampleTask",
++        "MeshTask",
++        "MultiResShardedMeshMergeTask",
++        "DownsampleTask",
++    ]
++
++
++def test_malformed_processing_method_raises(tmp_path):
++    path = _write_provenance(tmp_path, [{"method": None}])
++
++    with pytest.raises(ValueError, match=r"processing\[0\]\.method"):
++        load_provenance(path)
++
++
++def test_to_dict_returns_detached_payload(tmp_path):
++    mapped = classify_and_map(load_provenance(FIXTURE).seg_block, name="replay", out_root=tmp_path)
++
++    payload = mapped.to_dict()
++    payload["BBOX"][0] = 123
++    assert mapped.param["BBOX"][0] == 0
+diff --git a/tutorials/seuron_provenance_replay.yaml b/tutorials/seuron_provenance_replay.yaml
+new file mode 100644
+index 000000000..b58dff529
+--- /dev/null
++++ b/tutorials/seuron_provenance_replay.yaml
+@@ -0,0 +1,19 @@
++# Phase-1 segmentation-only replay of a Seuron provenance record through local ABISS.
++# Running scripts/run_seuron_provenance.py without --execute only resolves and prints
++# this recipe; it creates no files and does not contact GCS.
++seuron_replay:
++  # The tracked fixture makes this tutorial and its unit tests self-contained. For
++  # the full main-checkout run, dev/zebrafinch/seuron_provenance.json is equivalent.
++  provenance_path: ../tests/unit/fixtures/seuron_provenance.json
++  backend: abiss_local
++  data: local
++
++  out_root: /tmp/pytc-seuron-replay
++  name: seg_20260719054914_phase1
++  secrets_dir: ~/.cloudvolume/secrets
++  abiss_home: /projects/weilab/weidf/lib/pytorch_connectomics/lib/abiss
++
++  # Mip-0 XYZ coordinates. E is S expanded by one [512, 512, 256] ABISS
++  # chunk on every side, so boundaries scored in S are resolved within E.
++  exec_bbox: [3488, 3488, 2244, 5536, 5536, 3268]
++  score_bbox: [4000, 4000, 2500, 5024, 5024, 3012]

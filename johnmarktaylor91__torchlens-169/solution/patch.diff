@@ -1,0 +1,1315 @@
+diff --git a/tests/test_fastlog_postfunc_parity.py b/tests/test_fastlog_postfunc_parity.py
+new file mode 100644
+index 0000000000..bdb1b3098d
+--- /dev/null
++++ b/tests/test_fastlog_postfunc_parity.py
+@@ -0,0 +1,407 @@
++"""Behavioral coverage for fastlog ``activation_postfunc`` parity.
++
++Mirrors the slow-path raw-vs-transformed contract added in PR #166 while
++documenting the intentional fastlog divergence:
++
++* Fastlog stores transformed payloads on parallel ``ActivationRecord``
++  fields (``transformed_ram_payload`` / ``transformed_disk_payload``).
++* The postfunc runs in ``_storage_resolver`` after predicate selection,
++  so predicates continue to see raw metadata.
++* ``dry_run()`` does not invoke the postfunc.
++* No ``gradient_postfunc`` is exposed.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++import torch
++from torch import nn
++
++import torchlens as tl
++from torchlens.fastlog import ActivationRecord, CaptureSpec, RecordContext
++
++
++class _PostfuncModel(nn.Module):
++    """Small model with two operation events (linear + relu)."""
++
++    def __init__(self) -> None:
++        """Initialize the layers."""
++
++        super().__init__()
++        self.linear = nn.Linear(3, 2)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """Run a forward pass."""
++
++        return torch.relu(self.linear(x))
++
++
++def _activation_records(
++    recording: tl.fastlog.Recording,
++) -> list[ActivationRecord]:
++    """Return retained records for activation events."""
++
++    return [
++        record
++        for record in recording.records
++        if record.spec.save_activation
++        and (record.ram_payload is not None or record.transformed_ram_payload is not None)
++    ]
++
++
++def _disk_activation_records(
++    recording: tl.fastlog.Recording,
++) -> list[ActivationRecord]:
++    """Return retained records that wrote a disk activation blob."""
++
++    return [
++        record
++        for record in recording.records
++        if record.metadata.get("blob_id") is not None
++        or record.metadata.get("transformed_activation_blob_id") is not None
++    ]
++
++
++@pytest.mark.smoke
++def test_postfunc_replaces_transformed_payload_with_raw_kept() -> None:
++    """Postfunc populates transformed RAM payload while keeping raw."""
++
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        activation_postfunc=lambda t: t.float() * 2,
++    )
++
++    records = _activation_records(recording)
++    assert records, "expected at least one activation record"
++    for record in records:
++        assert record.ram_payload is not None
++        assert record.transformed_ram_payload is not None
++        # Postfunc output equals raw * 2.
++        torch.testing.assert_close(
++            record.transformed_ram_payload,
++            record.ram_payload.float() * 2,
++        )
++        # Disk payloads remain unset for RAM-only mode.
++        assert record.disk_payload is None
++        assert record.transformed_disk_payload is None
++
++
++def test_save_raw_activation_false_drops_raw_payload() -> None:
++    """Disabling raw save retains only the transformed RAM payload."""
++
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        activation_postfunc=lambda t: t.float() * 0.5,
++        save_raw_activation=False,
++    )
++
++    records = _activation_records(recording)
++    assert records, "expected at least one activation record"
++    for record in records:
++        assert record.ram_payload is None
++        assert record.transformed_ram_payload is not None
++        # Raw metadata still captured on the context.
++        assert record.ctx.tensor_shape is not None
++        assert record.ctx.tensor_dtype is not None
++
++
++def test_no_postfunc_leaves_transformed_payload_unset() -> None:
++    """Without a postfunc transformed fields stay None on every record."""
++
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++    )
++
++    assert recording.activation_postfunc_repr is None
++    for record in recording.records:
++        assert record.transformed_ram_payload is None
++        assert record.transformed_disk_payload is None
++
++
++def test_disk_only_mode_persists_transformed_blob(tmp_path: Path) -> None:
++    """Disk-only mode writes a ``transformed_activation`` blob and roundtrips."""
++
++    bundle_path = tmp_path / "disk.tlfast"
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        activation_postfunc=lambda t: t.float() * 2,
++        streaming=tl.StreamingOptions(bundle_path=bundle_path, retain_in_memory=False),
++    )
++
++    records = _disk_activation_records(recording)
++    assert records, "expected at least one disk-backed record"
++    for record in records:
++        assert record.metadata.get("transformed_activation_blob_id") is not None
++        assert record.metadata.get("transformed_activation_relative_path", "").endswith(
++            ".safetensors"
++        )
++
++    # Manifest counts transformed_activation blobs as auxiliary entries.
++    manifest = json.loads((bundle_path / "manifest.json").read_text(encoding="utf-8"))
++    transformed_entries = [
++        entry for entry in manifest["tensors"] if entry["kind"] == "transformed_activation"
++    ]
++    assert transformed_entries, "manifest is missing transformed_activation kind"
++    assert manifest["n_auxiliary_blobs"] == len(transformed_entries)
++
++    loaded = tl.fastlog.load(bundle_path)
++    loaded_disk = _disk_activation_records(loaded)
++    assert len(loaded_disk) == len(records)
++    for original, restored in zip(records, loaded_disk):
++        assert restored.metadata.get("transformed_activation_blob_id") == original.metadata.get(
++            "transformed_activation_blob_id"
++        )
++        assert restored.metadata.get("transformed_activation_sha256") == original.metadata.get(
++            "transformed_activation_sha256"
++        )
++
++
++def test_ram_disk_mirror_populates_both_transformed_payloads(tmp_path: Path) -> None:
++    """Mirror mode populates both RAM and disk transformed payloads."""
++
++    bundle_path = tmp_path / "mirror.tlfast"
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        activation_postfunc=lambda t: t.float() * 3,
++        streaming=tl.StreamingOptions(bundle_path=bundle_path, retain_in_memory=True),
++    )
++
++    records = _activation_records(recording)
++    assert records, "expected at least one activation record"
++    for record in records:
++        assert record.ram_payload is not None
++        assert record.transformed_ram_payload is not None
++        assert record.disk_payload is not None
++        assert record.transformed_disk_payload is not None
++        torch.testing.assert_close(
++            record.transformed_ram_payload,
++            record.ram_payload.float() * 3,
++        )
++        torch.testing.assert_close(
++            record.transformed_disk_payload,
++            record.disk_payload.float() * 3,
++        )
++
++
++def test_train_mode_well_behaved_postfunc_keeps_graph_connected_payload() -> None:
++    """A graph-preserving postfunc keeps RAM payload differentiable."""
++
++    model = _PostfuncModel()
++    recording = tl.fastlog.record(
++        model,
++        torch.ones(1, 3),
++        default_op=CaptureSpec(keep_grad=True),
++        activation_postfunc=lambda t: t * 2,
++    )
++
++    records = _activation_records(recording)
++    grad_records = [record for record in records if record.spec.keep_grad]
++    assert grad_records, "expected at least one keep_grad record"
++    for record in grad_records:
++        assert record.transformed_ram_payload is not None
++        assert record.transformed_ram_payload.requires_grad is True
++        assert record.transformed_ram_payload.grad_fn is not None
++    grad_records[0].transformed_ram_payload.sum().backward()
++    assert model.linear.weight.grad is not None
++
++
++def test_train_mode_detaching_postfunc_rejected() -> None:
++    """A detaching postfunc fails train-mode validation."""
++
++    with pytest.raises(tl.TrainingModeConfigError, match="grad_fn is None"):
++        tl.fastlog.record(
++            _PostfuncModel(),
++            torch.ones(1, 3),
++            default_op=CaptureSpec(keep_grad=True),
++            activation_postfunc=lambda t: t.detach(),
++        )
++
++
++def test_train_mode_integer_postfunc_rejected() -> None:
++    """A postfunc returning integer dtype fails train-mode validation."""
++
++    with pytest.raises(tl.TrainingModeConfigError, match="non-grad dtype"):
++        tl.fastlog.record(
++            _PostfuncModel(),
++            torch.ones(1, 3),
++            default_op=CaptureSpec(keep_grad=True),
++            activation_postfunc=lambda t: t.to(torch.int64),
++        )
++
++
++def test_source_events_receive_postfunc_outputs() -> None:
++    """``include_source_events`` routes input/buffer events through the postfunc."""
++
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        include_source_events=True,
++        activation_postfunc=lambda t: t.float() * 4,
++    )
++
++    source_records = [record for record in recording.records if record.ctx.kind == "input"]
++    assert source_records, "expected at least one input source event record"
++    for record in source_records:
++        if record.spec.save_activation:
++            assert record.transformed_ram_payload is not None
++            torch.testing.assert_close(
++                record.transformed_ram_payload,
++                record.ram_payload.float() * 4,
++            )
++
++
++def test_predicate_postfunc_invocation_count_matches_kept_events() -> None:
++    """Postfunc runs once per predicate-selected activation event."""
++
++    invocations: list[int] = [0]
++
++    def counting_postfunc(t: torch.Tensor) -> torch.Tensor:
++        """Increment a counter and return the tensor unchanged."""
++
++        invocations[0] += 1
++        return t * 1
++
++    def keep_op(ctx: RecordContext) -> bool:
++        """Keep only the relu operation event (filters linear)."""
++
++        return ctx.kind == "op" and ctx.func_name == "relu"
++
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        keep_op=keep_op,
++        activation_postfunc=counting_postfunc,
++    )
++
++    selected = _activation_records(recording)
++    assert selected, "expected at least one selected event"
++    assert invocations[0] == len(selected)
++
++
++def test_dry_run_does_not_invoke_postfunc() -> None:
++    """``dry_run`` never invokes the postfunc since payloads are suppressed."""
++
++    invocations: list[int] = [0]
++
++    def counting_postfunc(t: torch.Tensor) -> torch.Tensor:
++        """Track invocation count and return the tensor."""
++
++        invocations[0] += 1
++        return t
++
++    # dry_run does not accept activation_postfunc, but it shares the
++    # storage resolver path. We exercise the same callable via a
++    # full Recorder with no_tensor_capture toggled like dry_run does.
++    trace = tl.fastlog.dry_run(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        keep_op=lambda ctx: ctx.kind == "op",
++    )
++
++    assert trace.contexts
++    assert invocations[0] == 0
++
++
++def test_postfunc_error_wrapped_with_event_context() -> None:
++    """Postfunc exceptions surface as TorchLensPostfuncError with event context."""
++
++    def boom(_: torch.Tensor) -> torch.Tensor:
++        """Always raise to validate error wrapping."""
++
++        raise RuntimeError("custom failure")
++
++    with pytest.raises(tl.TorchLensPostfuncError) as exc_info:
++        tl.fastlog.record(
++            _PostfuncModel(),
++            torch.ones(1, 3),
++            default_op=True,
++            activation_postfunc=boom,
++        )
++
++    message = str(exc_info.value)
++    assert "label=" in message
++    assert "func=" in message
++    assert "shape=" in message
++    assert "dtype=" in message
++    assert "storage_target=" in message
++    assert isinstance(exc_info.value.__cause__, RuntimeError)
++    assert "custom failure" in str(exc_info.value.__cause__)
++
++
++def test_activation_postfunc_repr_exposed_and_persisted(tmp_path: Path) -> None:
++    """Recording exposes ``activation_postfunc_repr`` and persists it on disk."""
++
++    def named_postfunc(t: torch.Tensor) -> torch.Tensor:
++        """Doubling postfunc with a stable repr."""
++
++        return t.float() * 2
++
++    recording = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        activation_postfunc=named_postfunc,
++    )
++    assert recording.activation_postfunc_repr is not None
++    assert "named_postfunc" in recording.activation_postfunc_repr
++
++    bundle_path = tmp_path / "metadata.tlfast"
++    persisted = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        activation_postfunc=named_postfunc,
++        streaming=tl.StreamingOptions(bundle_path=bundle_path, retain_in_memory=False),
++    )
++    metadata = json.loads((bundle_path / "metadata.json").read_text(encoding="utf-8"))
++    assert metadata.get("activation_postfunc_repr") is not None
++    assert "named_postfunc" in metadata["activation_postfunc_repr"]
++    loaded = tl.fastlog.load(bundle_path)
++    assert loaded.activation_postfunc_repr == persisted.activation_postfunc_repr
++
++
++def test_postfunc_roundtrips_via_disk_recovery(tmp_path: Path) -> None:
++    """Disk bundles roundtrip transformed blob metadata via load/recover."""
++
++    bundle_path = tmp_path / "roundtrip.tlfast"
++    original = tl.fastlog.record(
++        _PostfuncModel(),
++        torch.ones(1, 3),
++        default_op=True,
++        activation_postfunc=lambda t: t.float() * 2,
++        streaming=tl.StreamingOptions(bundle_path=bundle_path, retain_in_memory=False),
++    )
++
++    loaded = tl.fastlog.load(bundle_path)
++    recovered = tl.fastlog.recover(bundle_path)
++
++    original_records = _disk_activation_records(original)
++    loaded_records = _disk_activation_records(loaded)
++    recovered_records = _disk_activation_records(recovered)
++
++    assert original_records and loaded_records and recovered_records
++    assert len(loaded_records) == len(original_records)
++    assert len(recovered_records) == len(original_records)
++    for original_record, loaded_record, recovered_record in zip(
++        original_records, loaded_records, recovered_records
++    ):
++        original_blob = original_record.metadata.get("transformed_activation_blob_id")
++        loaded_blob = loaded_record.metadata.get("transformed_activation_blob_id")
++        recovered_blob = recovered_record.metadata.get("transformed_activation_blob_id")
++        assert original_blob is not None
++        assert loaded_blob == original_blob
++        assert recovered_blob == original_blob
+diff --git a/torchlens/capture/output_tensors.py b/torchlens/capture/output_tensors.py
+index dc3cab44a6..dc717635f3 100644
+--- a/torchlens/capture/output_tensors.py
++++ b/torchlens/capture/output_tensors.py
+@@ -71,6 +71,8 @@
+     _get_hash_from_args,
+     _update_tensor_containing_modules,
+ )
++from .._errors import TorchLensPostfuncError
++from .._training_validation import TrainingModeConfigError
+ from ..data_classes.internal_types import FuncExecutionContext
+ from ..fastlog._predicate import _evaluate_keep_op
+ from ..fastlog._record_context import _build_record_context
+@@ -150,14 +152,23 @@ def _record_predicate_output(
+     state = get_active_recording_state()
+     ram_payload = None
+     disk_payload = None
++    transformed_ram_payload = None
++    transformed_disk_payload = None
+     if spec.save_activation:
+-        ram_payload, disk_payload = state.resolve_storage(out, spec)
++        (
++            ram_payload,
++            disk_payload,
++            transformed_ram_payload,
++            transformed_disk_payload,
++        ) = state.resolve_storage(out, spec, ctx=ctx)
+     state.add_record(
+         ActivationRecord(
+             ctx=ctx,
+             spec=spec,
+             ram_payload=ram_payload,
+             disk_payload=disk_payload,
++            transformed_ram_payload=transformed_ram_payload,
++            transformed_disk_payload=transformed_disk_payload,
+         )
+     )
+ 
+@@ -221,6 +232,13 @@ def log_function_output_tensors_predicate(
+         try:
+             spec = _evaluate_keep_op(ctx, state.options)
+             _record_predicate_output(ctx, out, spec)
++        except (TorchLensPostfuncError, TrainingModeConfigError):
++            # Postfunc + train-mode validation errors are storage failures and
++            # must surface directly to the caller, not be aggregated through
++            # the predicate-failure pipeline. The orchestrator's outer
++            # exception handler aborts disk storage before the raise reaches
++            # the caller.
++            raise
+         except Exception as exc:
+             state.handle_predicate_exception(ctx, exc)
+         finally:
+diff --git a/torchlens/capture/source_tensors.py b/torchlens/capture/source_tensors.py
+index cc0e7f6a21..f95570087b 100644
+--- a/torchlens/capture/source_tensors.py
++++ b/torchlens/capture/source_tensors.py
+@@ -28,6 +28,8 @@
+ import torch
+ from torch import nn
+ 
++from .._errors import TorchLensPostfuncError
++from .._training_validation import TrainingModeConfigError
+ from ..utils.introspection import _get_func_call_stack, get_attr_values_from_tensor_list
+ from ..utils.tensor_utils import get_tensor_memory_amount
+ from ..utils.rng import log_current_rng_states
+@@ -119,16 +121,32 @@ def log_source_tensor_predicate(
+             if spec.save_activation or spec.save_metadata:
+                 ram_payload = None
+                 disk_payload = None
++                transformed_ram_payload = None
++                transformed_disk_payload = None
+                 if spec.save_activation:
+-                    ram_payload, disk_payload = state.resolve_storage(t, spec)
++                    (
++                        ram_payload,
++                        disk_payload,
++                        transformed_ram_payload,
++                        transformed_disk_payload,
++                    ) = state.resolve_storage(t, spec, ctx=ctx)
+                 state.add_record(
+                     ActivationRecord(
+                         ctx=ctx,
+                         spec=spec,
+                         ram_payload=ram_payload,
+                         disk_payload=disk_payload,
++                        transformed_ram_payload=transformed_ram_payload,
++                        transformed_disk_payload=transformed_disk_payload,
+                     )
+                 )
++    except (TorchLensPostfuncError, TrainingModeConfigError):
++        # Postfunc + train-mode validation errors are storage failures and
++        # must surface directly to the caller, not be aggregated through
++        # the predicate-failure pipeline. The orchestrator's outer
++        # exception handler aborts disk storage before the raise reaches
++        # the caller.
++        raise
+     except Exception as exc:
+         state.handle_predicate_exception(ctx, exc)
+     finally:
+diff --git a/torchlens/fastlog/_orchestrator.py b/torchlens/fastlog/_orchestrator.py
+index 319f06a3d0..c3f6a05cea 100644
+--- a/torchlens/fastlog/_orchestrator.py
++++ b/torchlens/fastlog/_orchestrator.py
+@@ -48,6 +48,9 @@ def _empty_recording(options: RecordingOptions) -> Recording:
+         keep_op_repr=repr(options.keep_op) if options.keep_op is not None else None,
+         keep_module_repr=repr(options.keep_module) if options.keep_module is not None else None,
+         history_size=options.history_size,
++        activation_postfunc_repr=(
++            repr(options.activation_postfunc) if options.activation_postfunc is not None else None
++        ),
+     )
+ 
+ 
+diff --git a/torchlens/fastlog/_record_one_shot.py b/torchlens/fastlog/_record_one_shot.py
+index 042e12e17c..49b9998a91 100644
+--- a/torchlens/fastlog/_record_one_shot.py
++++ b/torchlens/fastlog/_record_one_shot.py
+@@ -9,6 +9,7 @@
+ from .._deprecations import MISSING, MissingType
+ from .._training_validation import reject_compiled_model
+ from ..options import StreamingOptions
++from ..types import ActivationPostfunc
+ from ._recorder import Recorder
+ from ._validation import validate_postprocess
+ from .options import PredicateErrorMode, PredicateFn
+@@ -32,6 +33,8 @@ def record(
+     return_output: bool = False,
+     postprocess: str = "none",
+     random_seed: int | None = None,
++    activation_postfunc: ActivationPostfunc | None = None,
++    save_raw_activation: bool = True,
+     train_mode: bool = False,
+ ) -> Recording | tuple[Any, Recording]:
+     """Record one model forward pass with fastlog predicates.
+@@ -48,6 +51,13 @@ def record(
+     include_source_events, max_predicate_failures, on_predicate_error, streaming,
+     random_seed:
+         Fastlog recording options.
++    activation_postfunc:
++        Optional callable applied to each retained activation copy after
++        dtype/device transforms. Errors propagate as
++        :class:`torchlens.TorchLensPostfuncError`.
++    save_raw_activation:
++        When ``False`` and ``activation_postfunc`` is set, only transformed
++        payloads are retained. Defaults to ``True`` to mirror the slow path.
+     train_mode:
+         If True, omitted defaults are promoted to keep-grad capture specs.
+     return_output:
+@@ -75,6 +85,8 @@ def record(
+         on_predicate_error=on_predicate_error,
+         streaming=streaming,
+         random_seed=random_seed,
++        activation_postfunc=activation_postfunc,
++        save_raw_activation=save_raw_activation,
+         train_mode=train_mode,
+     ) as recorder:
+         output = recorder.log(input_args, input_kwargs)
+diff --git a/torchlens/fastlog/_recorder.py b/torchlens/fastlog/_recorder.py
+index 55b59e5e85..eea6df55b0 100644
+--- a/torchlens/fastlog/_recorder.py
++++ b/torchlens/fastlog/_recorder.py
+@@ -13,6 +13,7 @@
+ from .._training_validation import TrainingModeConfigError, reject_compiled_model
+ from ..decoration.model_prep import _ensure_model_prepared
+ from ..options import StreamingOptions
++from ..types import ActivationPostfunc
+ from ._orchestrator import _empty_recording, _run_predicate_pass
+ from ._state import RecordingState
+ from ._validation import validate_recording_options
+@@ -136,6 +137,8 @@ def __init__(
+         on_predicate_error: PredicateErrorMode | MissingType = MISSING,
+         streaming: StreamingOptions | None | MissingType = MISSING,
+         random_seed: int | None | MissingType = MISSING,
++        activation_postfunc: ActivationPostfunc | None | MissingType = MISSING,
++        save_raw_activation: bool | MissingType = MISSING,
+         train_mode: bool = False,
+     ) -> None:
+         """Initialize a recorder and perform construction-time validation.
+@@ -148,6 +151,15 @@ def __init__(
+         include_source_events, max_predicate_failures, on_predicate_error, streaming,
+         random_seed:
+             Fastlog recording options.
++        activation_postfunc:
++            Optional callable applied to each retained activation copy after
++            dtype/device transforms. The callable runs under ``pause_logging``
++            and must return a ``torch.Tensor``. Errors are wrapped in
++            :class:`torchlens.TorchLensPostfuncError`.
++        save_raw_activation:
++            When ``False`` and ``activation_postfunc`` is set, only the
++            transformed payload is retained on the record. Defaults to
++            ``True`` to mirror the slow path.
+         train_mode:
+             If True, omitted defaults are promoted to ``CaptureSpec(keep_grad=True)``.
+         """
+@@ -177,6 +189,8 @@ def __init__(
+             on_predicate_error=on_predicate_error,
+             streaming=streaming,
+             random_seed=random_seed,
++            activation_postfunc=activation_postfunc,
++            save_raw_activation=save_raw_activation,
+         )
+         validate_recording_options(self.options)
+         _ensure_model_prepared(self.model)
+diff --git a/torchlens/fastlog/_state.py b/torchlens/fastlog/_state.py
+index 5670220bf2..32d7ceded2 100644
+--- a/torchlens/fastlog/_state.py
++++ b/torchlens/fastlog/_state.py
+@@ -36,7 +36,15 @@ def resolve_payloads(
+         tensor: torch.Tensor,
+         spec: CaptureSpec,
+         intent: StorageIntent,
+-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++        *,
++        options: RecordingOptions,
++        ctx: RecordContext | None,
++    ) -> tuple[
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++    ]:
+         """Resolve payloads for one selected tensor."""
+ 
+     def finalize(self) -> None:
+@@ -111,12 +119,32 @@ def resolve_storage(
+         self,
+         tensor: torch.Tensor,
+         spec: CaptureSpec,
+-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+-        """Resolve payloads through the active storage backend."""
++        *,
++        ctx: RecordContext | None = None,
++    ) -> tuple[
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++    ]:
++        """Resolve payloads through the active storage backend.
++
++        Returns
++        -------
++        tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]
++            ``(ram_payload, disk_payload, transformed_ram_payload,
++            transformed_disk_payload)``. Any element may be ``None``.
++        """
+ 
+         if self.no_tensor_capture:
+-            return None, None
+-        return self.storage_backend.resolve_payloads(tensor, spec, self.storage_intent)
++            return None, None, None, None
++        return self.storage_backend.resolve_payloads(
++            tensor,
++            spec,
++            self.storage_intent,
++            options=self.options,
++            ctx=ctx,
++        )
+ 
+     def finalize_storage(self) -> None:
+         """Finalize the active storage backend."""
+diff --git a/torchlens/fastlog/_storage_resolver.py b/torchlens/fastlog/_storage_resolver.py
+index ffbf2dfb15..fe743621fb 100644
+--- a/torchlens/fastlog/_storage_resolver.py
++++ b/torchlens/fastlog/_storage_resolver.py
+@@ -2,12 +2,19 @@
+ 
+ from __future__ import annotations
+ 
++from typing import TYPE_CHECKING, Callable
++
+ import torch
+ 
++from .._errors import TorchLensPostfuncError
+ from .._state import pause_logging
++from .._training_validation import TrainingModeConfigError
+ from ..utils.tensor_utils import safe_copy
+ from .exceptions import PredicateError
+-from .types import CaptureSpec, StorageIntent
++from .types import CaptureSpec, RecordContext, StorageIntent
++
++if TYPE_CHECKING:
++    from ..types import ActivationPostfunc
+ 
+ _INTEGER_DTYPES = {
+     torch.int8,
+@@ -35,18 +42,50 @@ def _resolve_storage(
+     tensor: torch.Tensor,
+     spec: CaptureSpec,
+     intent: StorageIntent,
+-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++    *,
++    activation_postfunc: "ActivationPostfunc | None" = None,
++    save_raw_activation: bool = True,
++    ctx: RecordContext | None = None,
++) -> tuple[
++    torch.Tensor | None,
++    torch.Tensor | None,
++    torch.Tensor | None,
++    torch.Tensor | None,
++]:
+     """Resolve RAM and disk tensor payloads for one capture decision.
+ 
+     Returns
+     -------
+-    tuple[torch.Tensor | None, torch.Tensor | None]
+-        ``(ram_payload, disk_payload)``. Either payload may be None.
++    tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]
++        ``(ram_payload, disk_payload, transformed_ram_payload, transformed_disk_payload)``.
++        Any payload may be ``None``.
++
++    Parameters
++    ----------
++    tensor:
++        Tensor selected for capture.
++    spec:
++        Capture policy for the tensor.
++    intent:
++        Storage intent resolved from streaming options.
++    activation_postfunc:
++        Optional callable applied to RAM/disk payloads after dtype/device
++        transforms. Errors are wrapped in :class:`TorchLensPostfuncError`.
++    save_raw_activation:
++        When False and ``activation_postfunc`` is set, raw payloads are
++        suppressed and only the transformed copy is retained.
++    ctx:
++        Record context used to enrich postfunc error messages.
+ 
+     Raises
+     ------
+     PredicateError
+         If the requested storage policy is invalid for the tensor.
++    TorchLensPostfuncError
++        If the activation postfunc raises while transforming a payload.
++    TrainingModeConfigError
++        If ``keep_grad=True`` and the transformed RAM payload is not a
++        gradient-capable tensor connected to the autograd graph.
+     """
+ 
+     if spec.keep_grad and intent.on_disk and not intent.in_ram:
+@@ -54,12 +93,143 @@ def _resolve_storage(
+     if spec.keep_grad and (tensor.dtype in _INTEGER_DTYPES or spec.dtype in _INTEGER_DTYPES):
+         raise PredicateError("keep_grad=True is not valid for integer or bool tensors")
+ 
+-    ram_payload = None
+-    disk_payload = None
++    ram_payload: torch.Tensor | None = None
++    disk_payload: torch.Tensor | None = None
++    transformed_ram: torch.Tensor | None = None
++    transformed_disk: torch.Tensor | None = None
++    postfunc = activation_postfunc
++    keep_raw = save_raw_activation or postfunc is None
++
++    if intent.in_ram:
++        raw_ram = safe_copy(tensor, detach_tensor=not spec.keep_grad)
++        raw_ram = _apply_payload_transforms(raw_ram, spec)
++        if postfunc is not None:
++            transformed_ram = _invoke_postfunc(
++                raw_ram,
++                postfunc,
++                ctx=ctx,
++                spec=spec,
++                intent=intent,
++                target="ram",
++            )
++            if spec.keep_grad:
++                _validate_train_mode_transformed(
++                    raw_ram,
++                    transformed_ram,
++                    ctx=ctx,
++                    spec=spec,
++                )
++        if keep_raw:
++            ram_payload = raw_ram
++    if intent.on_disk:
++        raw_disk = safe_copy(tensor, detach_tensor=True)
++        raw_disk = _apply_payload_transforms(raw_disk, spec)
++        if postfunc is not None:
++            transformed_disk = _invoke_postfunc(
++                raw_disk,
++                postfunc,
++                ctx=ctx,
++                spec=spec,
++                intent=intent,
++                target="disk",
++            )
++        if keep_raw:
++            disk_payload = raw_disk
++    return ram_payload, disk_payload, transformed_ram, transformed_disk
++
++
++def _invoke_postfunc(
++    tensor: torch.Tensor,
++    postfunc: Callable[[torch.Tensor], torch.Tensor],
++    *,
++    ctx: RecordContext | None,
++    spec: CaptureSpec,
++    intent: StorageIntent,
++    target: str,
++) -> torch.Tensor:
++    """Apply a fastlog activation postfunc with logging paused."""
++
++    try:
++        with pause_logging():
++            return postfunc(tensor)
++    except Exception as exc:
++        raise TorchLensPostfuncError(
++            _postfunc_error_message(
++                ctx=ctx,
++                spec=spec,
++                intent=intent,
++                target=target,
++            )
++        ) from exc
++
++
++def _postfunc_error_message(
++    *,
++    ctx: RecordContext | None,
++    spec: CaptureSpec,
++    intent: StorageIntent,
++    target: str,
++) -> str:
++    """Build context for an activation postfunc failure."""
++
++    storage_target = _describe_storage_target(intent, target)
++    if ctx is None:
++        return (
++            "activation_postfunc raised while resolving a fastlog payload "
++            f"(storage_target={storage_target}, keep_grad={spec.keep_grad})."
++        )
++    return (
++        f"activation_postfunc raised for fastlog event "
++        f"label={ctx.label!r} kind={ctx.kind} func={ctx.func_name} "
++        f"shape={tuple(ctx.tensor_shape) if ctx.tensor_shape is not None else None} "
++        f"dtype={ctx.tensor_dtype} storage_target={storage_target} "
++        f"keep_grad={spec.keep_grad}."
++    )
++
++
++def _describe_storage_target(intent: StorageIntent, target: str) -> str:
++    """Return a human-readable storage-target description."""
++
++    if intent.in_ram and intent.on_disk:
++        return f"mirror:{target}"
+     if intent.in_ram:
+-        ram_payload = safe_copy(tensor, detach_tensor=not spec.keep_grad)
+-        ram_payload = _apply_payload_transforms(ram_payload, spec)
++        return "ram"
+     if intent.on_disk:
+-        disk_payload = safe_copy(tensor, detach_tensor=True)
+-        disk_payload = _apply_payload_transforms(disk_payload, spec)
+-    return ram_payload, disk_payload
++        return "disk"
++    return target
++
++
++def _validate_train_mode_transformed(
++    raw_tensor: torch.Tensor,
++    transformed: torch.Tensor | None,
++    *,
++    ctx: RecordContext | None,
++    spec: CaptureSpec,
++) -> None:
++    """Validate differentiability requirements for a transformed RAM payload.
++
++    The transformed payload must remain a gradient-capable tensor that stays
++    graph-connected when the raw RAM payload retained autograd history.
++    Disk transformed payloads are detached inspection copies and are not
++    validated here.
++    """
++
++    label = ctx.label if ctx is not None else "<unknown>"
++    if not isinstance(transformed, torch.Tensor):
++        raise TrainingModeConfigError(
++            "activation_postfunc must return a torch.Tensor while keep_grad=True "
++            f"for fastlog event {label!r}."
++        )
++    if transformed.dtype in _INTEGER_DTYPES:
++        raise TrainingModeConfigError(
++            f"train_mode=True with non-grad dtype {transformed.dtype} on fastlog "
++            f"event {label!r}. Integer and bool dtypes cannot propagate gradients. "
++            "Adjust activation_postfunc to return a floating dtype."
++        )
++    if raw_tensor.requires_grad and transformed.grad_fn is None:
++        raise TrainingModeConfigError(
++            "activation_postfunc returned a tensor disconnected from the autograd "
++            "graph (grad_fn is None) while keep_grad=True. The transformed activation "
++            f"for fastlog event {label!r} must remain differentiable."
++        )
++    _ = spec
+diff --git a/torchlens/fastlog/options.py b/torchlens/fastlog/options.py
+index e4c7513c39..32fd514c6d 100644
+--- a/torchlens/fastlog/options.py
++++ b/torchlens/fastlog/options.py
+@@ -7,6 +7,7 @@
+ 
+ from .._deprecations import MISSING, MissingType
+ from ..options import StreamingOptions
++from ..types import ActivationPostfunc
+ from .types import CaptureSpec, RecordContext
+ 
+ CaptureDecision = bool | CaptureSpec | None
+@@ -24,6 +25,8 @@
+     "on_predicate_error",
+     "streaming",
+     "random_seed",
++    "activation_postfunc",
++    "save_raw_activation",
+ )
+ 
+ 
+@@ -55,6 +58,8 @@ class RecordingOptions:
+     on_predicate_error: PredicateErrorMode = "auto"
+     streaming: StreamingOptions | None = None
+     random_seed: int | None = None
++    activation_postfunc: ActivationPostfunc | None = None
++    save_raw_activation: bool = True
+     _specified_fields: frozenset[str] = field(
+         default_factory=frozenset,
+         init=False,
+@@ -74,6 +79,8 @@ def __init__(
+         on_predicate_error: PredicateErrorMode | MissingType = MISSING,
+         streaming: StreamingOptions | None | MissingType = MISSING,
+         random_seed: int | None | MissingType = MISSING,
++        activation_postfunc: ActivationPostfunc | None | MissingType = MISSING,
++        save_raw_activation: bool | MissingType = MISSING,
+     ) -> None:
+         """Initialize a frozen recording option bundle."""
+ 
+@@ -105,6 +112,12 @@ def __init__(
+             "random_seed": _resolve_recording_option(
+                 "random_seed", random_seed, None, specified_fields
+             ),
++            "activation_postfunc": _resolve_recording_option(
++                "activation_postfunc", activation_postfunc, None, specified_fields
++            ),
++            "save_raw_activation": _resolve_recording_option(
++                "save_raw_activation", save_raw_activation, True, specified_fields
++            ),
+         }
+         _validate_recording_values(values)
+         for field_name in _RECORDING_FIELDS:
+@@ -143,12 +156,18 @@ def _validate_recording_values(values: Mapping[str, Any]) -> None:
+     history_size = values["history_size"]
+     max_predicate_failures = values["max_predicate_failures"]
+     on_predicate_error = values["on_predicate_error"]
++    activation_postfunc = values["activation_postfunc"]
++    save_raw_activation = values["save_raw_activation"]
+     if not isinstance(history_size, int) or not 0 <= history_size <= 1024:
+         raise ValueError("history_size must be an integer in [0, 1024]")
+     if not isinstance(max_predicate_failures, int) or max_predicate_failures < 0:
+         raise ValueError("max_predicate_failures must be a non-negative integer")
+     if on_predicate_error not in {"auto", "accumulate", "fail-fast"}:
+         raise ValueError("on_predicate_error must be 'auto', 'accumulate', or 'fail-fast'")
++    if activation_postfunc is not None and not callable(activation_postfunc):
++        raise ValueError("activation_postfunc must be callable or None")
++    if not isinstance(save_raw_activation, bool):
++        raise ValueError("save_raw_activation must be a bool")
+ 
+ 
+ def merge_recording_options(
+@@ -164,6 +183,8 @@ def merge_recording_options(
+     on_predicate_error: PredicateErrorMode | MissingType = MISSING,
+     streaming: StreamingOptions | None | MissingType = MISSING,
+     random_seed: int | None | MissingType = MISSING,
++    activation_postfunc: ActivationPostfunc | None | MissingType = MISSING,
++    save_raw_activation: bool | MissingType = MISSING,
+ ) -> RecordingOptions:
+     """Merge flat recording kwargs into a grouped options object."""
+ 
+@@ -182,6 +203,8 @@ def merge_recording_options(
+         "on_predicate_error": on_predicate_error,
+         "streaming": streaming,
+         "random_seed": random_seed,
++        "activation_postfunc": activation_postfunc,
++        "save_raw_activation": save_raw_activation,
+     }
+     for field_name, value in incoming.items():
+         if value is MISSING:
+diff --git a/torchlens/fastlog/recover.py b/torchlens/fastlog/recover.py
+index d4238e3dfd..04ea612394 100644
+--- a/torchlens/fastlog/recover.py
++++ b/torchlens/fastlog/recover.py
+@@ -146,11 +146,41 @@ def _blob_is_recoverable(
+     record: ActivationRecord,
+     recovery_warnings: list[str],
+ ) -> bool:
+-    """Return whether a record's blob is present and hash-valid."""
++    """Return whether a record's blob(s) are present and hash-valid.
++
++    Both the raw activation blob and the transformed activation blob are
++    validated when their metadata is present. A missing or hash-mismatched
++    blob disqualifies the record.
++    """
++
++    raw_recoverable = _validate_blob_metadata(
++        bundle_path,
++        record.metadata.get("blob_id"),
++        record.metadata.get("relative_path"),
++        record.metadata.get("sha256"),
++        recovery_warnings,
++    )
++    if not raw_recoverable:
++        return False
++    transformed_recoverable = _validate_blob_metadata(
++        bundle_path,
++        record.metadata.get("transformed_activation_blob_id"),
++        record.metadata.get("transformed_activation_relative_path"),
++        record.metadata.get("transformed_activation_sha256"),
++        recovery_warnings,
++    )
++    return transformed_recoverable
++
++
++def _validate_blob_metadata(
++    bundle_path: Path,
++    blob_id: Any,
++    relative_path: Any,
++    expected_sha256: Any,
++    recovery_warnings: list[str],
++) -> bool:
++    """Validate a single blob entry from record metadata."""
+ 
+-    blob_id = record.metadata.get("blob_id")
+-    relative_path = record.metadata.get("relative_path")
+-    expected_sha256 = record.metadata.get("sha256")
+     if blob_id is None or relative_path is None or expected_sha256 is None:
+         return True
+     try:
+@@ -192,6 +222,7 @@ def _recording_from_records(
+         keep_op_repr=metadata.get("keep_op_repr"),
+         keep_module_repr=metadata.get("keep_module_repr"),
+         history_size=int(metadata.get("history_size", 0)),
++        activation_postfunc_repr=metadata.get("activation_postfunc_repr"),
+         recovered=recovered,
+         recovery_warnings=recovery_warnings,
+     )
+diff --git a/torchlens/fastlog/storage_disk.py b/torchlens/fastlog/storage_disk.py
+index 24090e115a..3ce06a64f3 100644
+--- a/torchlens/fastlog/storage_disk.py
++++ b/torchlens/fastlog/storage_disk.py
+@@ -22,7 +22,14 @@
+ from .exceptions import PredicateError, RecordingConfigError
+ from .options import RecordingOptions
+ from .storage_ram import RamStorageBackend
+-from .types import ActivationRecord, CaptureSpec, ModuleStackFrame, Recording, StorageIntent
++from .types import (
++    ActivationRecord,
++    CaptureSpec,
++    ModuleStackFrame,
++    RecordContext,
++    Recording,
++    StorageIntent,
++)
+ 
+ _GRAD_DTYPES = {
+     torch.float16,
+@@ -82,6 +89,7 @@ def append(self, record: ActivationRecord) -> None:
+ 
+         self._validate_record_keep_grad(record)
+         stored_record = record
++        wrote_blob = False
+         if record.disk_payload is not None:
+             blob_id = self.writer.next_blob_id()
+             entry = self.writer.write_blob(
+@@ -92,8 +100,20 @@ def append(self, record: ActivationRecord) -> None:
+             )
+             self._tensor_entries.append(entry)
+             stored_record.metadata.update(_entry_to_record_metadata(record, entry))
+-            self._append_index_line(stored_record)
+-        elif record.spec.save_metadata:
++            wrote_blob = True
++        if record.transformed_disk_payload is not None:
++            blob_id = self.writer.next_blob_id()
++            transformed_label = f"{record.ctx.label}::transformed_activation"
++            entry = self.writer.write_blob(
++                blob_id,
++                record.transformed_disk_payload,
++                kind="transformed_activation",
++                label=transformed_label,
++            )
++            self._tensor_entries.append(entry)
++            stored_record.metadata.update(_transformed_entry_to_record_metadata(record, entry))
++            wrote_blob = True
++        if wrote_blob or record.spec.save_metadata:
+             self._append_index_line(stored_record)
+         self._ram_backend.append(stored_record)
+ 
+@@ -102,7 +122,15 @@ def resolve_payloads(
+         tensor: torch.Tensor,
+         spec: CaptureSpec,
+         intent: StorageIntent,
+-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++        *,
++        options: RecordingOptions,
++        ctx: "RecordContext | None" = None,
++    ) -> tuple[
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++    ]:
+         """Resolve tensor payloads for disk-backed capture.
+ 
+         Parameters
+@@ -113,14 +141,27 @@ def resolve_payloads(
+             Capture policy for the selected tensor.
+         intent:
+             Storage intent resolved from streaming options.
++        options:
++            Recording options carrying ``activation_postfunc`` /
++            ``save_raw_activation``.
++        ctx:
++            Record context used to enrich postfunc error messages.
+ 
+         Returns
+         -------
+-        tuple[torch.Tensor | None, torch.Tensor | None]
+-            RAM and disk payloads for the active storage mode.
++        tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]
++            ``(ram_payload, disk_payload, transformed_ram_payload,
++            transformed_disk_payload)``. Any element may be ``None``.
+         """
+ 
+-        return _resolve_storage(tensor, spec, intent)
++        return _resolve_storage(
++            tensor,
++            spec,
++            intent,
++            activation_postfunc=options.activation_postfunc,
++            save_raw_activation=options.save_raw_activation,
++            ctx=ctx,
++        )
+ 
+     def finalize(self) -> None:
+         """Finalize the fastlog directory bundle."""
+@@ -233,7 +274,7 @@ def record_from_json(data: dict[str, Any]) -> ActivationRecord:
+ 
+ 
+ def _entry_to_record_metadata(record: ActivationRecord, entry: TensorEntry) -> dict[str, Any]:
+-    """Return persisted blob metadata for one record."""
++    """Return persisted raw activation blob metadata for one record."""
+ 
+     metadata = entry.to_dict()
+     metadata["shape"] = (
+@@ -242,6 +283,30 @@ def _entry_to_record_metadata(record: ActivationRecord, entry: TensorEntry) -> d
+     return metadata
+ 
+ 
++def _transformed_entry_to_record_metadata(
++    record: ActivationRecord,
++    entry: TensorEntry,
++) -> dict[str, Any]:
++    """Return persisted transformed activation blob metadata for one record.
++
++    Stored under a ``transformed_activation_*`` key namespace so it can be
++    rehydrated independently from the raw activation blob.
++    """
++
++    return {
++        "transformed_activation_blob_id": entry.blob_id,
++        "transformed_activation_kind": entry.kind,
++        "transformed_activation_relative_path": entry.relative_path,
++        "transformed_activation_shape": list(entry.shape),
++        "transformed_activation_dtype": entry.dtype,
++        "transformed_activation_backend": entry.backend,
++        "transformed_activation_bytes": entry.bytes,
++        "transformed_activation_sha256": entry.sha256,
++        "transformed_activation_layout": entry.layout,
++        "transformed_activation_device_at_save": entry.device_at_save,
++    }
++
++
+ def _ctx_to_json(ctx: Any) -> dict[str, Any]:
+     """Convert a RecordContext into JSON data without recursive history."""
+ 
+@@ -325,6 +390,8 @@ def _write_metadata(path: Path, recording: Recording, options: RecordingOptions)
+         "predicate_failure_overflow_count": recording.predicate_failure_overflow_count,
+         "keep_op_repr": recording.keep_op_repr,
+         "keep_module_repr": recording.keep_module_repr,
++        "activation_postfunc_repr": recording.activation_postfunc_repr,
++        "save_raw_activation": options.save_raw_activation,
+         "history_size": options.history_size,
+     }
+     with path.open("w", encoding="utf-8") as handle:
+diff --git a/torchlens/fastlog/storage_ram.py b/torchlens/fastlog/storage_ram.py
+index 2c8c87dbc6..d2d610301b 100644
+--- a/torchlens/fastlog/storage_ram.py
++++ b/torchlens/fastlog/storage_ram.py
+@@ -5,7 +5,8 @@
+ import torch
+ 
+ from ._storage_resolver import _resolve_storage
+-from .types import ActivationRecord, CaptureSpec, Recording, StorageIntent
++from .options import RecordingOptions
++from .types import ActivationRecord, CaptureSpec, RecordContext, Recording, StorageIntent
+ 
+ 
+ class RamStorageBackend:
+@@ -27,7 +28,15 @@ def resolve_payloads(
+         tensor: torch.Tensor,
+         spec: CaptureSpec,
+         intent: StorageIntent,
+-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++        *,
++        options: RecordingOptions,
++        ctx: RecordContext | None,
++    ) -> tuple[
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++        torch.Tensor | None,
++    ]:
+         """Resolve tensor payloads for in-memory capture.
+ 
+         Parameters
+@@ -38,14 +47,27 @@ def resolve_payloads(
+             Capture policy for the selected tensor.
+         intent:
+             Storage intent resolved from streaming options.
++        options:
++            Active recording options carrying the activation postfunc and
++            ``save_raw_activation`` flag.
++        ctx:
++            Record context used to enrich postfunc error messages.
+ 
+         Returns
+         -------
+-        tuple[torch.Tensor | None, torch.Tensor | None]
+-            RAM and disk payloads. RAM-only mode returns no disk payload.
++        tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]
++            Raw RAM payload, raw disk payload (always ``None`` for the RAM
++            backend), transformed RAM payload, and transformed disk payload.
+         """
+ 
+-        return _resolve_storage(tensor, spec, intent)
++        return _resolve_storage(
++            tensor,
++            spec,
++            intent,
++            activation_postfunc=options.activation_postfunc,
++            save_raw_activation=options.save_raw_activation,
++            ctx=ctx,
++        )
+ 
+     def append(self, record: ActivationRecord) -> None:
+         """Append one retained record and update recording indexes.
+diff --git a/torchlens/fastlog/types.py b/torchlens/fastlog/types.py
+index 3a4bfc3c1f..02a73b2bc1 100644
+--- a/torchlens/fastlog/types.py
++++ b/torchlens/fastlog/types.py
+@@ -111,12 +111,40 @@ def __getattr__(self, name: str) -> Any:
+ 
+ @dataclass(frozen=True, slots=True)
+ class ActivationRecord:
+-    """One retained fastlog event."""
++    """One retained fastlog event.
++
++    Parameters
++    ----------
++    ctx:
++        Frozen record context produced for the underlying event.
++    spec:
++        Resolved capture policy for this record.
++    ram_payload:
++        Raw activation copy retained in memory, or ``None`` when not stored
++        either because the record is metadata-only or the caller opted out
++        via ``save_raw_activation=False``.
++    disk_payload:
++        Raw activation copy persisted to disk, or ``None`` when no disk
++        target is active or the caller opted out via
++        ``save_raw_activation=False``.
++    transformed_ram_payload:
++        Output of ``activation_postfunc`` retained in memory. ``None`` when
++        no postfunc is configured for the recording.
++    transformed_disk_payload:
++        Output of ``activation_postfunc`` persisted to disk. ``None`` when
++        no postfunc is configured for the recording.
++    metadata:
++        Auxiliary record metadata, including disk blob entries when present.
++    recorded_at:
++        Wall-clock time the record was created.
++    """
+ 
+     ctx: RecordContext
+     spec: CaptureSpec
+     ram_payload: torch.Tensor | None = None
+     disk_payload: torch.Tensor | None = None
++    transformed_ram_payload: torch.Tensor | None = None
++    transformed_disk_payload: torch.Tensor | None = None
+     metadata: dict[str, Any] = field(default_factory=dict)
+     recorded_at: float = field(default_factory=time.time)
+ 
+@@ -235,6 +263,7 @@ class Recording:
+     keep_op_repr: str | None
+     keep_module_repr: str | None
+     history_size: int
++    activation_postfunc_repr: str | None = None
+     recovered: bool = False
+     recovery_warnings: list[str] = field(default_factory=list)
+ 

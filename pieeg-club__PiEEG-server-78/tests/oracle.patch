@@ -1,0 +1,438 @@
+diff --git a/README.md b/README.md
+index c29179fa..7a043ec4 100644
+--- a/README.md
++++ b/README.md
+@@ -264,6 +264,7 @@ That's it. Every frame is plain JSON — no SDK, no binary protocol, works in an
+ | **[VRChat OSC](#vrchat-osc)** | Band powers via UDP OSC; chatbox + avatar parameters; per-region streaming; rolling normalization |
+ | **[LSL](#lab-streaming-layer)** | Push raw samples to LSL network; discoverable by OpenViBE, MNE, LabRecorder |
+ | **[Webhooks](#webhooks)** | HTTP callbacks on EEG events; IFTTT & Zapier presets; per-rule cooldown |
++| **[HTTP API](#http-api)** | `GET /api/spectrum` — band-power snapshot at ~4 Hz; no SDK, no WebSocket |
+ | **[ADS1299 registers](#ads1299-register-configuration)** | Live ADS1299 register config via WebSocket & dashboard; presets, noise test |
+ | **Self-diagnostics** | `pieeg-server doctor` checks Pi model, SPI/GPIO, ports, deps, systemd |
+ | **Self-update** | Detects pip/git install; checks PyPI or remote; one-click upgrade from dashboard |
+@@ -494,6 +495,57 @@ The dashboard **Register panel** provides a visual interface — click to switch
+ 
+ ---
+ 
++<a id="http-api"></a>
++
++## HTTP API
++
++The dashboard server (`:1617`) exposes a small REST API alongside the dashboard UI. All endpoints return JSON. No authentication required — only derived/aggregate data is exposed, no raw EEG samples.
++
++### `GET /api/info`
++
++Server health and version. Used by the PiEEG Chrome extension to detect the server.
++
++```json
++{ "version": "0.42.0", "branch": "main" }
++```
++
++### `GET /api/spectrum`
++
++Latest per-band, per-channel power spectral density (µV²/Hz), updated at ~4 Hz. Returns `warming_up: true` for the first ~2 s while the ring buffers fill.
++
++```json
++{
++  "bands": {
++    "Delta": [12.3, 11.8, 10.2, ...],
++    "Theta": [4.1, 3.9, 4.4, ...],
++    "Alpha": [22.7, 21.0, 23.5, ...],
++    "Beta":  [6.3, 5.8, 6.1, ...],
++    "Gamma": [1.2, 1.0, 1.3, ...]
++  }
++}
++```
++
++Each array has one element per channel. Frequency bands: δ 0.5–4 Hz · θ 4–8 Hz · α 8–13 Hz · β 13–30 Hz · γ 30–100 Hz.
++
++Used by the **PiEEG Chrome extension** to show a live band-power strip in the popup — no WebSocket required.
++
++```bash
++curl http://raspberrypi.local:1617/api/spectrum
++```
++
++```javascript
++// Poll at 1 Hz — cheap, no persistent connection
++const data = await fetch("http://raspberrypi.local:1617/api/spectrum").then(r => r.json());
++if (!data.warming_up) {
++  const avgAlpha = data.bands.Alpha.reduce((s, v) => s + v, 0) / data.bands.Alpha.length;
++  console.log("mean alpha power:", avgAlpha, "µV²/Hz");
++}
++```
++
++<sup>[↑ Navigation](#nav)</sup>
++
++---
++
+ <a id="websocket-api"></a>
+ 
+ ## WebSocket API
+diff --git a/pieeg_server/__main__.py b/pieeg_server/__main__.py
+index aad44863..5494a3e0 100644
+--- a/pieeg_server/__main__.py
++++ b/pieeg_server/__main__.py
+@@ -715,6 +715,7 @@ def _mon_shutdown(*_):
+             host=args.host,
+             port=args.dashboard_port,
+             auth=auth,
++            get_spectrum=server.spectrum_cache,
+         )
+         dashboard.start()
+ 
+diff --git a/pieeg_server/dashboard.py b/pieeg_server/dashboard.py
+index d0d28b82..fc77e8df 100644
+--- a/pieeg_server/dashboard.py
++++ b/pieeg_server/dashboard.py
+@@ -88,7 +88,7 @@
+ """
+ 
+ 
+-def _make_handler(static_dir: Path, auth: AuthManager):
++def _make_handler(static_dir: Path, auth: AuthManager, get_spectrum=None):
+     """Create a handler class bound to a specific static directory."""
+ 
+     class _DashboardHandler(SimpleHTTPRequestHandler):
+@@ -172,6 +172,16 @@ def do_GET(self):
+                     ws_token = auth.create_ws_token()
+                     return self._send_json({"token": ws_token})
+ 
++                # Band-power spectrum cache (public — no auth needed)
++                # This mirrors /api/info which is also public. Only derived
++                # aggregate values are exposed; no raw EEG samples.
++                if self.path == "/api/spectrum":
++                    if get_spectrum is not None:
++                        cache = get_spectrum()
++                        if cache is not None:
++                            return self._send_json(cache)
++                    return self._send_json({"warming_up": True})
++
+                 # Server info (public — no auth needed)
+                 if self.path == "/api/info":
+                     branch = None
+@@ -458,17 +468,19 @@ def __init__(
+         host: str = "0.0.0.0",
+         port: int = DEFAULT_DASHBOARD_PORT,
+         auth: AuthManager | None = None,
++        get_spectrum=None,
+     ):
+         self._host = host
+         self._port = port
+         self._auth = auth
++        self._get_spectrum = get_spectrum
+         self._httpd = None
+         self._thread = None
+ 
+     def start(self):
+         static_dir = STATIC_DIR
+ 
+-        handler = _make_handler(static_dir, self._auth)
++        handler = _make_handler(static_dir, self._auth, self._get_spectrum)
+         self._httpd = _ReusableTCPServer(
+             (self._host, self._port), handler
+         )
+diff --git a/pieeg_server/osc_vrchat.py b/pieeg_server/osc_vrchat.py
+index cb7f1a0e..322e9da0 100644
+--- a/pieeg_server/osc_vrchat.py
++++ b/pieeg_server/osc_vrchat.py
+@@ -26,26 +26,19 @@
+ from collections import deque
+ from dataclasses import asdict, dataclass, field
+ 
+-import numpy as np
+-
+ from .acquisition import AcquisitionLoop
++from .spectral import (
++    FFT_SIZE,
++    BANDS,
++    SAMPLE_RATE,
++    make_ring_buffers,
++    compute_band_powers_avg,
++)
+ 
+ logger = logging.getLogger("pieeg.osc")
+ 
+ # ── constants ─────────────────────────────────────────────────────────────
+-
+-SAMPLE_RATE = 250  # Hz (from acquisition.py)
+-FFT_SIZE = 512
+-_HANNING: np.ndarray = np.hanning(FFT_SIZE)
+-_FREQS: np.ndarray = np.fft.rfftfreq(FFT_SIZE, d=1.0 / SAMPLE_RATE)
+-
+-BANDS: dict[str, tuple[float, float]] = {
+-    "Delta": (0.5, 4.0),
+-    "Theta": (4.0, 8.0),
+-    "Alpha": (8.0, 13.0),
+-    "Beta": (13.0, 30.0),
+-    "Gamma": (30.0, 100.0),
+-}
++# FFT_SIZE, SAMPLE_RATE, BANDS are imported from spectral.py
+ 
+ DEFAULT_CHATBOX_TEMPLATE = (
+     "\U0001f9e0 α{alpha:.0f}|θ{theta:.0f}|β{beta:.0f}|γ{gamma:.0f} µV²/Hz"
+@@ -181,6 +174,8 @@ def __init__(
+         self._sock: socket.socket | None = None
+         self._running = False
+         self._normaliser = _RollingMax()
++        # Cache hardware sample rate so FFT frequency axis is correct
++        self._sample_rate: int = self._resolve_sample_rate()
+         # Telemetry (read by status())
+         self._send_count: int = 0
+         self._last_send: float = 0.0
+@@ -197,6 +192,19 @@ def __init__(
+ 
+     # ── Config ────────────────────────────────────────────────────────────
+ 
++    @staticmethod
++    def _resolve_sample_rate_from(acq) -> int:
++        """Read hardware sample rate from AcquisitionLoop (defaults to 250 Hz)."""
++        hw = getattr(acq, "_hw", None)
++        rate = getattr(hw, "sample_rate", None)
++        try:
++            return int(rate) if rate else SAMPLE_RATE
++        except (TypeError, ValueError):
++            return SAMPLE_RATE
++
++    def _resolve_sample_rate(self) -> int:
++        return self._resolve_sample_rate_from(self._acq)
++
+     def update_config(self, patch: dict) -> None:
+         cfg = self._config
+         for k, v in patch.items():
+@@ -220,8 +228,7 @@ def status(self) -> dict:
+     # ── Internal helpers ──────────────────────────────────────────────────
+ 
+     def _init_buffers(self) -> None:
+-        n = self._acq.num_channels
+-        self._buffers = [deque(maxlen=FFT_SIZE) for _ in range(n)]
++        self._buffers = make_ring_buffers(self._acq.num_channels)
+ 
+     def _open_socket(self) -> None:
+         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+@@ -244,25 +251,10 @@ def _send(self, pkt: bytes) -> None:
+ 
+     def _band_powers_for(self, targets: list[int]) -> dict[str, float] | None:
+         """
+-        FFT the given channel ring buffers, average their PSDs, and return
+-        µV²/Hz per band. Returns None if any target buffer is not yet full.
++        Average band powers for the given channel indices.
++        Returns None if any target buffer is not yet full.
+         """
+-        if not targets:
+-            return None
+-        if any(len(self._buffers[c]) < FFT_SIZE for c in targets):
+-            return None
+-
+-        psds: list[np.ndarray] = []
+-        for c in targets:
+-            samples = np.array(self._buffers[c], dtype=np.float64)
+-            psds.append(np.abs(np.fft.rfft(samples * _HANNING)) ** 2)
+-
+-        psd = np.mean(psds, axis=0) if len(psds) > 1 else psds[0]
+-
+-        return {
+-            band: float(np.mean(psd[(_FREQS >= lo) & (_FREQS < hi)]) or 0.0)
+-            for band, (lo, hi) in BANDS.items()
+-        }
++        return compute_band_powers_avg(self._buffers, targets, self._sample_rate)
+ 
+     def _compute_band_powers(self) -> dict[str, float] | None:
+         """
+diff --git a/pieeg_server/server.py b/pieeg_server/server.py
+index 04004bcc..8816d851 100644
+--- a/pieeg_server/server.py
++++ b/pieeg_server/server.py
+@@ -35,6 +35,7 @@
+ from .webhooks import WebhookStore
+ from .osc_vrchat import VRChatOSCBridge, OSCConfig
+ from .lsl import LSLBridge, LSLConfig  # LSLBridge defers pylsl import to run()
++from .spectral import make_ring_buffers, compute_band_powers
+ from . import profiles
+ from . import __version__
+ from . import _native
+@@ -79,6 +80,14 @@ def __init__(self, acquisition: AcquisitionLoop,
+         self._cloud_relay_timeout_task: asyncio.Task | None = None
+         self._cloud_relay_meta: dict | None = None  # {relay_id, share_url}
+         self._noise_test_running = False
++        # Spectral cache — updated at ~4 Hz, served by GET /api/spectrum
++        self._spec_buffers: list = []   # populated lazily on first frame
++        self._spec_frame: int = 0
++        self._spec_cache: dict | None = None   # last computed band powers
++
++    def spectrum_cache(self) -> dict | None:
++        """Return the latest band-power snapshot, or None during warm-up."""
++        return self._spec_cache
+ 
+     def enable_filter(self, lowcut: float = 1.0, highcut: float = 40.0):
+         # Pass the *actual* hardware sample rate so SOS coefficients are
+@@ -183,6 +192,15 @@ async def _health_check(self, connection, request):
+             else:
+                 body = json.dumps({"token": self._auth.create_ws_token()}).encode()
+             return HTTPResponse(200, "OK", hdrs, body)
++        if request.path == "/api/spectrum":
++            hdrs = self._cors_headers(request)
++            hdrs["Content-Type"] = "application/json"
++            hdrs["Cache-Control"] = "no-store"
++            if self._spec_cache is not None:
++                body = json.dumps(self._spec_cache).encode()
++            else:
++                body = b'{"warming_up": true}'
++            return HTTPResponse(200, "OK", hdrs, body)
+ 
+         # For any other non-upgrade request, reject cleanly instead of
+         # letting websockets fail with a confusing 426.
+@@ -439,6 +457,27 @@ async def _broadcast_loop(self):
+                     channels = self._notch_filter.apply_sample(channels)
+                 frame["channels"] = channels
+ 
++            # Feed spectral ring buffers (always, regardless of WS clients)
++            channels = frame["channels"]
++            if not self._spec_buffers:
++                self._spec_buffers = make_ring_buffers(len(channels))
++            for i, v in enumerate(channels):
++                if i < len(self._spec_buffers):
++                    self._spec_buffers[i].append(v)
++
++            # Recompute band powers at ~4 Hz using the actual hardware sample rate
++            sr = self._sample_rate()
++            spec_stride = max(sr // 4, 1)
++            self._spec_frame += 1
++            if self._spec_frame >= spec_stride:
++                self._spec_frame = 0
++                powers = compute_band_powers(self._spec_buffers, sample_rate=sr)
++                if powers is not None:
++                    self._spec_cache = {"bands": {
++                        b: [round(v, 4) for v in vals]
++                        for b, vals in powers.items()
++                    }}
++
+             if not self._clients:
+                 continue
+ 
+diff --git a/pieeg_server/spectral.py b/pieeg_server/spectral.py
+new file mode 100644
+index 00000000..917a88e7
+--- /dev/null
++++ b/pieeg_server/spectral.py
+@@ -0,0 +1,121 @@
++"""
++Shared spectral (FFT / band-power) utilities.
++
++Used by:
++  - VRChatOSCBridge  (osc_vrchat.py)
++  - PiEEGServer      (server.py)  — caches latest result for GET /api/spectrum
++
++All computation happens on demand; callers feed ring buffers.
++"""
++
++from collections import deque
++
++import numpy as np
++
++# ── Constants ─────────────────────────────────────────────────────────────
++
++SAMPLE_RATE: int = 250          # Hz  (PiEEG / IronBCI SPI default)
++FFT_SIZE: int = 512             # ~2 s of data at 250 Hz
++
++BANDS: dict[str, tuple[float, float]] = {
++    "Delta": (0.5,  4.0),
++    "Theta": (4.0,  8.0),
++    "Alpha": (8.0,  13.0),
++    "Beta":  (13.0, 30.0),
++    "Gamma": (30.0, 100.0),
++}
++
++# ── Window / frequency cache (keyed by sample_rate) ──────────────────────
++# Avoids recomputing on every call for the common case (single device rate).
++
++_window_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
++
++
++def _get_window(sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
++    """Return (hanning_window, rfft_freqs) for the given sample rate."""
++    if sample_rate not in _window_cache:
++        _window_cache[sample_rate] = (
++            np.hanning(FFT_SIZE),
++            np.fft.rfftfreq(FFT_SIZE, d=1.0 / sample_rate),
++        )
++    return _window_cache[sample_rate]
++
++
++# ── Ring-buffer factory ───────────────────────────────────────────────────
++
++def make_ring_buffers(n_channels: int) -> list[deque]:
++    """Return one deque(maxlen=FFT_SIZE) per channel."""
++    return [deque(maxlen=FFT_SIZE) for _ in range(n_channels)]
++
++
++# ── Core computation ──────────────────────────────────────────────────────
++
++def compute_band_powers(
++    buffers: list[deque],
++    targets: list[int] | None = None,
++    sample_rate: int = SAMPLE_RATE,
++) -> dict[str, list[float]] | None:
++    """
++    Compute per-band, per-channel µV²/Hz powers.
++
++    Parameters
++    ----------
++    buffers     : one deque per channel (filled from the raw sample stream)
++    targets     : channel indices to include; None → all channels;
++                  out-of-range indices are silently dropped
++    sample_rate : hardware sample rate in Hz (default: 250)
++                  must match the rate at which buffers were filled so that
++                  the FFT frequency axis is correct
++
++    Returns
++    -------
++    dict  {"Delta": [ch0, ch1, ...], "Theta": [...], ...}
++    None  while any target buffer has fewer than FFT_SIZE samples
++    """
++    if not buffers:
++        return None
++
++    n = len(buffers)
++    if targets is None:
++        targets = list(range(n))
++    else:
++        targets = [c for c in targets if 0 <= c < n]
++
++    if not targets:
++        return None
++
++    # Wait until all target buffers are full
++    if any(len(buffers[c]) < FFT_SIZE for c in targets):
++        return None
++
++    hanning, freqs = _get_window(sample_rate)
++    # Normalise to single-sided PSD in signal-units²/Hz (Welch periodogram).
++    # norm = fs * Σ(w²) converts magnitude² to power per Hz.
++    norm_factor = float(sample_rate) * float(np.sum(hanning ** 2))
++    result: dict[str, list[float]] = {b: [] for b in BANDS}
++
++    for c in targets:
++        samples = np.array(buffers[c], dtype=np.float64)
++        raw = np.abs(np.fft.rfft(samples * hanning)) ** 2 / norm_factor
++        # One-sided correction: double interior bins (skip DC and Nyquist)
++        raw[1:-1] *= 2
++        for band, (lo, hi) in BANDS.items():
++            mask = (freqs >= lo) & (freqs < hi)
++            result[band].append(float(np.mean(raw[mask]) if mask.any() else 0.0))
++
++    return result
++
++
++def compute_band_powers_avg(
++    buffers: list[deque],
++    targets: list[int] | None = None,
++    sample_rate: int = SAMPLE_RATE,
++) -> dict[str, float] | None:
++    """
++    Like compute_band_powers but averages across channels.
++    Convenience wrapper used by the OSC bridge.
++    """
++    per_ch = compute_band_powers(buffers, targets, sample_rate)
++    if per_ch is None:
++        return None
++    return {band: float(np.mean(vals)) for band, vals in per_ch.items()}

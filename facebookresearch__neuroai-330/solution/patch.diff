@@ -1,0 +1,354 @@
+diff --git a/neuralbench-repo/neuralbench/callbacks.py b/neuralbench-repo/neuralbench/callbacks.py
+index d8fc2ff7f..a775fad7c 100644
+--- a/neuralbench-repo/neuralbench/callbacks.py
++++ b/neuralbench-repo/neuralbench/callbacks.py
+@@ -27,6 +27,7 @@
+ from torch.utils.data import DataLoader
+ from tqdm import tqdm
+ 
++from neuralset.events import etypes
+ from neuraltrain.metrics.utils import agg_per_group, agg_retrieval_preds
+ 
+ from .modules import DownstreamWrapperModel
+@@ -157,12 +158,29 @@ class TestFullRetrievalMetrics(Callback):
+ 
+     Requires the pl.LightningModule object this callback is attached to to define a
+     torch.ModuleDict named `retrieval_metrics` containing the metrics to evaluate.
++
++    ``retrieval_item`` names what one candidate of the retrieval set is:
++
++    - ``"trigger"``: whatever the trigger is labelled with, its text or its
++      filepath. Repeats of a label collapse into one candidate carrying the
++      mean of their targets, which is what a word-level or image-level
++      retrieval score is built on.
++    - ``"window"``: the file a continuous trigger (``Audio``, ``Video``)
++      plays, paired with the window's time within that file (the trigger's
++      ``offset`` plus the window's delay from the trigger), rounded to
++      ``window_decimals`` decimals of a second. Only windows that saw the
++      same moment of the same stimulus collapse, e.g. two subjects watching
++      one scene. For a single event spanning the whole recording,
++      ``"trigger"`` averages targets that differ, and the candidate it yields
++      is a centroid rather than anything the model could have decoded.
+     """
+ 
+     def __init__(
+         self,
+         event_type: tp.Literal["Word", "Image"] = "Word",
+         event_field: tp.Literal["text", "category"] = "text",
++        retrieval_item: tp.Literal["trigger", "window"] = "trigger",
++        window_decimals: int = 0,
+         retrieval_set_sizes: tuple = (None, 250),
+         save_outputs: bool = False,
+         logger: tp.Any = None,
+@@ -170,6 +188,8 @@ def __init__(
+     ):
+         self.event_type = event_type
+         self.event_field = event_field
++        self.retrieval_item = retrieval_item
++        self.window_decimals = window_decimals
+         self.retrieval_set_sizes = retrieval_set_sizes
+         self.save_outputs = save_outputs
+         self.logger = logger
+@@ -301,6 +321,21 @@ def _collate_outputs(self, outputs, batch, dataloader_idx):
+                 full["filepath"].append(trigger.filepath)
+             else:
+                 pass
++            if self.retrieval_item == "window":
++                full["window"].append(self._window_key(segment))
++
++    def _window_key(self, segment: tp.Any) -> str:
++        """Return the window's ``"<filepath>@<seconds within file>s"``."""
++        trigger = segment.trigger
++        if not isinstance(trigger, etypes.BaseSplittableEvent):
++            raise ValueError(
++                f"retrieval_item='window' needs a continuous trigger (Audio, Video) "
++                f"to place a window within its file, got a {type(trigger).__name__} "
++                f"at {trigger.start:.3f} s; use retrieval_item='trigger'"
++            )
++        time = round(trigger.offset + segment.start - trigger.start, self.window_decimals)
++        time += 0.0  # -0.0 -> 0.0
++        return f"{trigger.filepath}@{time:.{max(self.window_decimals, 0)}f}s"
+ 
+     def _compute_metrics(
+         self,
+@@ -320,10 +355,20 @@ def _compute_metrics(
+             y_true = torch.cat(full["y_true"], dim=0)
+ 
+             subjects_pred = full["subject"]
+-            if "text" in full.keys():
++            if self.retrieval_item == "window":
++                groups_pred = full["window"]
++            elif "text" in full.keys():
+                 groups_pred = full["text"]
+             else:
+                 groups_pred = full["filepath"]
++            if len(set(groups_pred)) < 2:
++                raise ValueError(
++                    f"{step_name}: the retrieval set holds "
++                    f"{len(set(groups_pred))} candidate(s) over {len(groups_pred)} "
++                    f"windows, so there is nothing to rank against and every "
++                    f"metric comes out NaN; for an Audio or Video trigger, set "
++                    f"retrieval_item='window' to rank the windows themselves"
++                )
+ 
+             for retrieval_set_size in self.retrieval_set_sizes:
+                 out = self._get_test_full_metrics(
+diff --git a/neuralbench-repo/neuralbench/main.py b/neuralbench-repo/neuralbench/main.py
+index c089bd7df..f892a3490 100644
+--- a/neuralbench-repo/neuralbench/main.py
++++ b/neuralbench-repo/neuralbench/main.py
+@@ -98,6 +98,8 @@ class Experiment(BaseExperiment):
+     validate_before_training: bool = True
+     test_full_metrics: list[BaseMetric] = []
+     test_full_retrieval_metrics: list[BaseMetric] = []
++    retrieval_item: tp.Literal["trigger", "window"] = "trigger"
++    retrieval_window_decimals: int = 0
+     # When True, raw per-window test predictions/targets are folded into the
+     # cached ``run`` result (see ``WindowPredictionCollector``).
+     save_test_predictions: bool = False
+@@ -319,6 +321,8 @@ def setup_trainer(
+                 callbacks.append(
+                     TestFullRetrievalMetrics(
+                         event_type=self.data.target.event_types,  # type: ignore[arg-type]
++                        retrieval_item=self.retrieval_item,
++                        window_decimals=self.retrieval_window_decimals,
+                         retrieval_set_sizes=(None, 250),
+                         logger=LOGGER,
+                         eval_val=False,
+diff --git a/neuralbench-repo/neuralbench/test_callbacks.py b/neuralbench-repo/neuralbench/test_callbacks.py
+index c55a34c96..8e1ed0ff2 100644
+--- a/neuralbench-repo/neuralbench/test_callbacks.py
++++ b/neuralbench-repo/neuralbench/test_callbacks.py
+@@ -4,6 +4,7 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++from collections import defaultdict
+ from types import SimpleNamespace
+ 
+ import lightning.pytorch as pl
+@@ -516,6 +517,78 @@ def test_edge_case_all_same_prediction(mock_trainer, mock_pl_module):
+     mock_pl_module.test_full_metrics["test/acc"].update.assert_called_once()
+ 
+ 
++# ---------------------------------------------------------------------------
++# TestFullRetrievalMetrics tests
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "window_decimals, times", [(0, ["50", "50", "52"]), (1, ["50.0", "49.8", "52.0"])]
++)
++def test_window_items_pool_the_subjects_that_saw_the_same_moment(
++    tmp_path, window_decimals, times
++):
++    """Two subjects enter one film at different recording times and offsets."""
++    from neuralset.events.etypes import Video
++
++    from .callbacks import TestFullRetrievalMetrics
++
++    film = tmp_path / "cars-2.mp4"
++    film.touch()
++
++    def segment(subject: str, trigger_start: float, offset: float, start: float):
++        trigger = Video(
++            start=trigger_start,
++            timeline=subject,
++            offset=offset,
++            duration=30.0,
++            frequency=25.0,
++            filepath=film,
++            extra={"subject": subject},
++        )
++        return SimpleNamespace(start=start, trigger=trigger)
++
++    batch = SimpleNamespace(
++        segments=[
++            # film time 50.0 s and 49.8 s
++            segment("sub_3", trigger_start=100.0, offset=40.0, start=110.0),
++            segment("sub_7", trigger_start=7.5, offset=48.0, start=9.3),
++            segment("sub_3", trigger_start=100.0, offset=40.0, start=112.0),
++        ]
++    )
++    callback = TestFullRetrievalMetrics(
++        retrieval_item="window", window_decimals=window_decimals
++    )
++    callback.full_outputs = {0: defaultdict(list)}
++    outputs = (torch.randn(3, 4), torch.randn(3, 4))
++
++    callback._collate_outputs(outputs, batch, dataloader_idx=0)
++
++    assert callback.full_outputs[0]["window"] == [f"{film}@{t}s" for t in times]
++
++
++def test_a_retrieval_set_of_one_candidate_raises_rather_than_logging_nan():
++    """One ``Audio`` event over the whole podcast leaves a single candidate."""
++    from .callbacks import TestFullRetrievalMetrics
++
++    callback = TestFullRetrievalMetrics()
++    callback.full_outputs = {
++        0: {
++            "y_pred": [torch.randn(4, 8)],
++            "y_true": [torch.randn(4, 8)],
++            "subject": ["sub0"] * 4,
++            "text": ["the podcast"] * 4,
++        }
++    }
++    pl_module = SimpleNamespace(
++        test_full_retrieval_metrics={"test/full_retrieval/inv_norm_rank_mean": None}
++    )
++    trainer = SimpleNamespace(test_dataloaders=[None])
++
++    with pytest.raises(ValueError, match="1 candidate"):
++        callback._compute_metrics(trainer, pl_module, step_name="test")
++
++
+ # ---------------------------------------------------------------------------
+ # PlotRegressionScatter tests
+ # ---------------------------------------------------------------------------
+diff --git a/neuralfetch-repo/neuralfetch/download.py b/neuralfetch-repo/neuralfetch/download.py
+index 086271287..cc7041312 100644
+--- a/neuralfetch-repo/neuralfetch/download.py
++++ b/neuralfetch-repo/neuralfetch/download.py
+@@ -1009,9 +1009,13 @@ def _latest_version_files(self) -> list[dict[str, tp.Any]]:
+         if not all_versions:
+             raise RuntimeError(f"No versions found for DOI {self.doi}")
+         latest = all_versions[-1]
+-        files_href = latest["_links"]["stash:files"]["href"]
+-        files_resp = self._api_get(files_href)
+-        return files_resp.get("_embedded", {}).get("stash:files", [])
++        files: list[dict[str, tp.Any]] = []
++        href: str | None = latest["_links"]["stash:files"]["href"]
++        while href is not None:  # paginated, 20 files per page
++            page = self._api_get(href)
++            files += page.get("_embedded", {}).get("stash:files", [])
++            href = page.get("_links", {}).get("next", {}).get("href")
++        return files
+ 
+     def _download(self, overwrite: bool = False) -> None:
+         from urllib.parse import quote
+diff --git a/neuralfetch-repo/neuralfetch/test_download.py b/neuralfetch-repo/neuralfetch/test_download.py
+index cc2b87722..381e3da35 100644
+--- a/neuralfetch-repo/neuralfetch/test_download.py
++++ b/neuralfetch-repo/neuralfetch/test_download.py
+@@ -216,6 +216,23 @@ def test_dryad_missing_token_raises(tmp_path: Path) -> None:
+         )
+ 
+ 
++def test_dryad_files_follow_pagination(tmp_path: Path) -> None:
++    dryad = download.Dryad(
++        study="test", doi="12.3456/dryad.abc", token="t", dset_dir=tmp_path / "dryad"
++    )
++    version = {"_links": {"stash:files": {"href": "/api/v2/versions/1/files"}}}
++    pages = [
++        {"_embedded": {"stash:versions": [version]}},
++        {
++            "_embedded": {"stash:files": [{"path": "a"}]},
++            "_links": {"next": {"href": "/api/v2/versions/1/files?page=2"}},
++        },
++        {"_embedded": {"stash:files": [{"path": "b"}]}, "_links": {}},
++    ]
++    with patch.object(download.Dryad, "_api_get", side_effect=pages):
++        assert [f["path"] for f in dryad._latest_version_files()] == ["a", "b"]
++
++
+ def _make_gin(tmp_path: Path, **kwargs: tp.Any) -> download.Gin:
+     """Factory that builds a Gin instance rooted at *tmp_path*."""
+     defaults: dict[str, tp.Any] = {
+diff --git a/neuralset-repo/neuralset/events/etypes.py b/neuralset-repo/neuralset/events/etypes.py
+index 52d6956c2..a3ca69d30 100644
+--- a/neuralset-repo/neuralset/events/etypes.py
++++ b/neuralset-repo/neuralset/events/etypes.py
+@@ -975,7 +975,7 @@ class Ecg(MneRaw):
+     """Electrocardiography (ECG) recording event.
+ 
+     For a dedicated cardiac recording. When the lead is an auxiliary channel of
+-    an EEG/PSG recording, the study emits its usual event instead, and
++    an EEG/PSG or iEEG recording, the study emits its usual event instead, and
+     :class:`~neuralset.extractors.EcgExtractor` reads the lead out of that.
+     """
+ 
+diff --git a/neuralset-repo/neuralset/extractors/neuro.py b/neuralset-repo/neuralset/extractors/neuro.py
+index 4c8cc8f84..99b7df04a 100644
+--- a/neuralset-repo/neuralset/extractors/neuro.py
++++ b/neuralset-repo/neuralset/extractors/neuro.py
+@@ -681,16 +681,16 @@ class EcgExtractor(MneRaw):
+     Parameters
+     ----------
+     event_types: default = "Ecg"
+-        set ``"Eeg"`` when the cardiac lead is an auxiliary channel of an EEG
+-        or PSG recording, which is how most studies carry it -- the study then
+-        emits no event of its own for the lead.
++        set ``"Eeg"`` or ``"Ieeg"`` when the cardiac lead is an auxiliary
++        channel of an EEG/PSG or iEEG recording, which is how most studies carry
++        it -- the study then emits no event of its own for the lead.
+     picks: default = ("ecg",)
+         pick "ecg" channels by default. A study that leaves its cardiac
+         channel typed as ``eeg`` will not be picked up -- fix the channel type
+         in the study rather than naming the channel here.
+     """
+ 
+-    event_types: tp.Literal["Ecg", "Eeg"] = "Ecg"
++    event_types: tp.Literal["Ecg", "Eeg", "Ieeg"] = "Ecg"
+     picks: tuple[str, ...] = pydantic.Field(("ecg",), min_length=1)
+ 
+ 
+@@ -700,8 +700,8 @@ class IeegExtractor(MneRaw):
+ 
+     Parameters
+     ----------
+-    picks: default = ("seeg", "ecog", )
+-        pick "seeg" and "ecog" channels by default.
++    picks: default = ("seeg", "ecog", "dbs")
++        pick "seeg", "ecog" and "dbs" (DBS-lead LFP) channels by default.
+     reference: "bipolar" or None, default=None
+         If "bipolar", applies a bipolar reference to the data, i.e., uses neighboring electrode as reference.
+         Uses mne.set_bipolar_reference under the hood. [ieeg1]_
+@@ -728,13 +728,7 @@ class IeegExtractor(MneRaw):
+     """
+ 
+     event_types: tp.Literal["Ieeg"] = "Ieeg"
+-    picks: tuple[str, ...] = pydantic.Field(
+-        (
+-            "seeg",
+-            "ecog",
+-        ),
+-        min_length=1,
+-    )
++    picks: tuple[str, ...] = pydantic.Field(("seeg", "ecog", "dbs"), min_length=1)
+     reference: tp.Literal["bipolar"] | None = None
+ 
+     def model_post_init(self, log__):
+diff --git a/neuralset-repo/neuralset/extractors/test_neuro.py b/neuralset-repo/neuralset/extractors/test_neuro.py
+index b5858eb2e..514c526a5 100644
+--- a/neuralset-repo/neuralset/extractors/test_neuro.py
++++ b/neuralset-repo/neuralset/extractors/test_neuro.py
+@@ -1720,6 +1720,28 @@ def test_ieeg(test_data_path: Path) -> None:
+     assert preproc_data.shape == (24, sfreq * duration)
+ 
+ 
++def test_ieeg_default_picks_dbs(tmp_path: Path) -> None:
++    info = mne.create_info(["L1-L2", "R1-R2", "ACC"], 100.0, ["dbs", "dbs", "misc"])
++    fif = tmp_path / "dbs_raw.fif"
++    mne.io.RawArray(np.zeros((3, 500)), info).save(fif)
++    event = dict(
++        type="Ieeg", start=0.0, duration=5.0, timeline="t", filepath=str(fif), subject="s"
++    )
++    data = ns.extractors.IeegExtractor(frequency=100.0, baseline=None)(event, 0.0, 5.0)
++    assert data.shape == (2, 500), "DBS-lead LFP must be picked by default"
++
++
++def test_ecg_from_ieeg_event(tmp_path: Path) -> None:
++    info = mne.create_info(["A1", "A2", "EKG"], 100.0, ["seeg", "seeg", "ecg"])
++    fif = tmp_path / "ieeg_raw.fif"
++    mne.io.RawArray(np.zeros((3, 500)), info).save(fif)
++    event = dict(
++        type="Ieeg", start=0.0, duration=5.0, timeline="t", filepath=str(fif), subject="s"
++    )
++    ecg = ns.extractors.EcgExtractor(event_types="Ieeg", frequency=100.0, baseline=None)
++    assert ecg(event, 0.0, 5.0).shape == (1, 500), "ECG lead of an iEEG recording"
++
++
+ def test_bipolar_ieeg(tmp_path: Path) -> None:
+     expected = "Bipolar reference can only be applied on seeg signals"
+     with pytest.raises(ValueError, match=expected):

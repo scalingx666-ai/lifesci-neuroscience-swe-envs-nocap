@@ -1,0 +1,711 @@
+diff --git a/ngclearn/components/synapses/__init__.py b/ngclearn/components/synapses/__init__.py
+index 6021d95b..69fc6dc8 100644
+--- a/ngclearn/components/synapses/__init__.py
++++ b/ngclearn/components/synapses/__init__.py
+@@ -20,3 +20,7 @@
+ from .convolution.traceSTDPDeconvSynapse import TraceSTDPDeconvSynapse
+ ## modulated synaptic components
+ from .modulated.MSTDPETSynapse import MSTDPETSynapse
++## patched synaptic components
++from .patched.patchedSynapse import PatchedSynapse
++from .patched.staticPatchedSynapse import StaticPatchedSynapse
++from .patched.hebbianPatchedSynapse import HebbianPatchedSynapse
+diff --git a/ngclearn/components/synapses/patched/hebbianPatchedSynapse.py b/ngclearn/components/synapses/patched/hebbianPatchedSynapse.py
+new file mode 100644
+index 00000000..935c1db9
+--- /dev/null
++++ b/ngclearn/components/synapses/patched/hebbianPatchedSynapse.py
+@@ -0,0 +1,316 @@
++import matplotlib.pyplot as plt
++from jax import random, numpy as jnp, jit
++from functools import partial
++from ngclearn.utils.optim import get_opt_init_fn, get_opt_step_fn
++from ngclearn import resolver, Component, Compartment
++from ngclearn.components.synapses import PatchedSynapse
++from ngclearn.utils import tensorstats
++
++@partial(jit, static_argnums=[3, 4, 5, 6, 7, 8, 9])
++def _calc_update(pre, post, W, w_mask, w_bound, is_nonnegative=True, signVal=1., w_decay=0.,
++                 pre_wght=1., post_wght=1.):
++    """
++    Compute a tensor of adjustments to be applied to a synaptic value matrix.
++
++    Args:
++        pre: pre-synaptic statistic to drive Hebbian update
++
++        post: post-synaptic statistic to drive Hebbian update
++
++        W: synaptic weight values (at time t)
++
++        w_bound: maximum value to enforce over newly computed efficacies
++
++        is_nonnegative: (Unused)
++
++        signVal: multiplicative factor to modulate final update by (good for
++            flipping the signs of a computed synaptic change matrix)
++
++        w_decay: synaptic decay factor to apply to this update
++
++        pre_wght: pre-synaptic weighting term (Default: 1.)
++
++        post_wght: post-synaptic weighting term (Default: 1.)
++
++    Returns:
++        an update/adjustment matrix, an update adjustment vector (for biases)
++    """
++    _pre = pre * pre_wght
++    _post = post * post_wght
++    dW = jnp.matmul(_pre.T, _post)
++    db = jnp.sum(_post, axis=0, keepdims=True)
++    if w_bound > 0.:
++        dW = dW * (w_bound - jnp.abs(W))
++    if w_decay > 0.:
++        dW = dW - W * w_decay
++
++    if w_mask!=None:
++        dW = dW * w_mask
++
++    return dW * signVal, db * signVal
++
++@partial(jit, static_argnums=[1,2, 3])
++def _enforce_constraints(W, w_mask, w_bound, is_nonnegative=True):
++    """
++    Enforces constraints that the (synaptic) efficacies/values within matrix
++    `W` must adhere to.
++
++    Args:
++        W: synaptic weight values (at time t)
++
++        w_bound: maximum value to enforce over newly computed efficacies
++
++        is_nonnegative: ensure updated value matrix is strictly non-negative
++
++    Returns:
++        the newly evolved synaptic weight value matrix
++    """
++    _W = W
++    if w_bound > 0.:
++        if is_nonnegative == True:
++            _W = jnp.clip(_W, 0., w_bound)
++        else:
++            _W = jnp.clip(_W, -w_bound, w_bound)
++
++    if w_mask!=None:
++        _W = _W * w_mask
++
++    return _W
++
++class HebbianPatchedSynapse(PatchedSynapse):
++    """
++    A synaptic cable that adjusts its efficacies via a two-factor Hebbian
++    adjustment rule.
++
++    | --- Synapse Compartments: ---
++    | inputs - input (takes in external signals)
++    | outputs - output signals (transformation induced by synapses)
++    | weights - current value matrix of synaptic efficacies
++    | biases - current value vector of synaptic bias values
++    | key - JAX PRNG key
++    | --- Synaptic Plasticity Compartments: ---
++    | pre - pre-synaptic signal to drive first term of Hebbian update (takes in external signals)
++    | post - post-synaptic signal to drive 2nd term of Hebbian update (takes in external signals)
++    | dWweights - current delta matrix containing changes to be applied to synaptic efficacies
++    | dBiases - current delta vector containing changes to be applied to bias values
++    | opt_params - locally-embedded optimizer statisticis (e.g., Adam 1st/2nd moments if adam is used)
++
++    Args:
++        name: the string name of this cell
++
++        shape: tuple specifying shape of this synaptic cable (usually a 2-tuple
++            with number of inputs by number of outputs)
++
++        eta: global learning rate
++
++        weight_init: a kernel to drive initialization of this synaptic cable's values;
++            typically a tuple with 1st element as a string calling the name of
++            initialization to use
++
++        bias_init: a kernel to drive initialization of biases for this synaptic cable
++            (Default: None, which turns off/disables biases)
++
++        w_bound: maximum weight to softly bound this cable's value matrix to; if
++            set to 0, then no synaptic value bounding will be applied
++
++        is_nonnegative: enforce that synaptic efficacies are always non-negative
++            after each synaptic update (if False, no constraint will be applied)
++
++        w_decay: degree to which (L2) synaptic weight decay is applied to the
++            computed Hebbian adjustment (Default: 0); note that decay is not
++            applied to any configured biases
++
++        sign_value: multiplicative factor to apply to final synaptic update before
++            it is applied to synapses; this is useful if gradient descent style
++            optimization is required (as Hebbian rules typically yield
++            adjustments for ascent)
++
++        optim_type: optimization scheme to physically alter synaptic values
++            once an update is computed (Default: "sgd"); supported schemes
++            include "sgd" and "adam"
++
++            :Note: technically, if "sgd" or "adam" is used but `signVal = 1`,
++                then the ascent form of each rule is employed (signVal = -1) or
++                a negative learning rate will mean a descent form of the
++                `optim_scheme` is being employed
++
++        pre_wght: pre-synaptic weighting factor (Default: 1.)
++
++        post_wght: post-synaptic weighting factor (Default: 1.)
++
++        resist_scale: a fixed scaling factor to apply to synaptic transform
++            (Default: 1.), i.e., yields: out = ((W * Rscale) * in) + b
++
++        p_conn: probability of a connection existing (default: 1.); setting
++            this to < 1. will result in a sparser synaptic structure
++    """
++
++    def __init__(self, name, shape, n_sub_models, stride_shape=(0,0), eta=0., weight_init=None, bias_init=None,
++                 w_mask=None, w_bound=1., is_nonnegative=False, w_decay=0., sign_value=1.,
++                 optim_type="sgd", pre_wght=1., post_wght=1., p_conn=1.,
++                 resist_scale=1., batch_size=1, **kwargs):
++        super().__init__(name, shape, n_sub_models, stride_shape, w_mask, weight_init, bias_init, resist_scale,
++                         p_conn, batch_size=batch_size, **kwargs)
++
++        self.n_sub_models = n_sub_models
++        self.sub_stride = stride_shape
++
++        self.shape = (shape[0] + (2 * stride_shape[0]),
++                      shape[1] + (2 * stride_shape[1]))
++        self.sub_shape = (shape[0]//n_sub_models + (2 * stride_shape[0]),
++                          shape[1]//n_sub_models + (2*  stride_shape[1]))
++
++        ## synaptic plasticity properties and characteristics
++        self.Rscale = resist_scale
++        self.w_bound = w_bound
++        self.w_decay = w_decay ## synaptic decay
++        self.pre_wght = pre_wght
++        self.post_wght = post_wght
++        self.eta = eta
++        self.is_nonnegative = is_nonnegative
++        self.sign_value = sign_value
++
++        ## optimization / adjustment properties (given learning dynamics above)
++        self.opt = get_opt_step_fn(optim_type, eta=self.eta)
++
++        # compartments (state of the cell, parameters, will be updated through stateless calls)
++        self.preVals = jnp.zeros((self.batch_size, self.shape[0]))
++        self.postVals = jnp.zeros((self.batch_size, self.shape[1]))
++        self.pre = Compartment(self.preVals)
++        self.post = Compartment(self.postVals)
++        self.w_mask = w_mask
++        self.dWeights = Compartment(jnp.zeros(self.shape))
++        self.dBiases = Compartment(jnp.zeros(self.shape[1]))
++
++        #key, subkey = random.split(self.key.value)
++        self.opt_params = Compartment(get_opt_init_fn(optim_type)(
++            [self.weights.value, self.biases.value]
++            if bias_init else [self.weights.value]))
++
++    @staticmethod
++    def _compute_update(w_mask, w_bound, is_nonnegative, sign_value, w_decay, pre_wght,
++                        post_wght, pre, post, weights):
++        ## calculate synaptic update values
++        dW, db = _calc_update(
++            pre, post, weights, w_mask, w_bound, is_nonnegative=is_nonnegative,
++            signVal=sign_value, w_decay=w_decay, pre_wght=pre_wght,
++            post_wght=post_wght)
++
++        return dW  * jnp.where(0 != jnp.abs(weights), 1, 0) , db
++
++    @staticmethod
++    def _evolve(w_mask, opt, w_bound, is_nonnegative, sign_value, w_decay, pre_wght,
++                post_wght, bias_init, pre, post, weights, biases, opt_params):
++        ## calculate synaptic update values
++        dWeights, dBiases = HebbianPatchedSynapse._compute_update(
++            w_mask, w_bound, is_nonnegative, sign_value, w_decay,
++            pre_wght, post_wght, pre, post, weights
++        )
++        ## conduct a step of optimization - get newly evolved synaptic weight value matrix
++        if bias_init != None:
++            opt_params, [weights, biases] = opt(opt_params, [weights, biases], [dWeights, dBiases])
++        else:
++            # ignore db since no biases configured
++            opt_params, [weights] = opt(opt_params, [weights], [dWeights])
++        ## ensure synaptic efficacies adhere to constraints
++        weights = _enforce_constraints(weights, w_mask, w_bound, is_nonnegative=is_nonnegative)
++        return opt_params, weights, biases, dWeights, dBiases
++
++    @resolver(_evolve)
++    def evolve(self, opt_params, weights, biases, dWeights, dBiases):
++        self.opt_params.set(opt_params)
++        self.weights.set(weights)
++        self.biases.set(biases)
++        self.dWeights.set(dWeights)
++        self.dBiases.set(dBiases)
++
++    @staticmethod
++    def _reset(batch_size, shape):
++        preVals = jnp.zeros((batch_size, shape[0]))
++        postVals = jnp.zeros((batch_size, shape[1]))
++        return (
++            preVals, # inputs
++            postVals, # outputs
++            preVals, # pre
++            postVals, # post
++            jnp.zeros(shape), # dW
++            jnp.zeros(shape[1]), # db
++        )
++
++    @classmethod
++    def help(cls): ## component help function
++        properties = {
++            "synapse_type": "HebbianSynapse - performs an adaptable synaptic "
++                            "transformation of inputs to produce output signals; "
++                            "synapses are adjusted via two-term/factor Hebbian adjustment"
++        }
++        compartment_props = {
++            "inputs":
++                {"inputs": "Takes in external input signal values",
++                 "pre": "Pre-synaptic statistic for Hebb rule (z_j)",
++                 "post": "Post-synaptic statistic for Hebb rule (z_i)"},
++            "states":
++                {"weights": "Synapse efficacy/strength parameter values",
++                 "biases": "Base-rate/bias parameter values",
++                 "key": "JAX PRNG key"},
++            "analytics":
++                {"dWeights": "Synaptic weight value adjustment matrix produced at time t",
++                 "dBiases": "Synaptic bias/base-rate value adjustment vector produced at time t"},
++            "outputs":
++                {"outputs": "Output of synaptic transformation"},
++        }
++        hyperparams = {
++            "shape": "Overall shape of synaptic weight value matrix; number inputs x number outputs",
++            "n_sub_models": "The number of submodels in each layer",
++            "stride_shape": "Stride shape of overlapping synaptic weight value matrix",
++            "batch_size": "Batch size dimension of this component",
++            "weight_init": "Initialization conditions for synaptic weight (W) values",
++            "bias_init": "Initialization conditions for bias/base-rate (b) values",
++            "resist_scale": "Resistance level scaling factor (applied to output of transformation)",
++            "p_conn": "Probability of a connection existing (otherwise, it is masked to zero)",
++            "is_nonnegative": "Should synapses be constrained to be non-negative post-updates?",
++            "sign_value": "Scalar `flipping` constant -- changes direction to Hebbian descent if < 0",
++            "eta": "Global (fixed) learning rate",
++            "pre_wght": "Pre-synaptic weighting coefficient (q_pre)",
++            "post_wght": "Post-synaptic weighting coefficient (q_post)",
++            "w_bound": "Soft synaptic bound applied to synapses post-update",
++            "w_decay": "Synaptic decay term",
++            "optim_type": "Choice of optimizer to adjust synaptic weights"
++        }
++        info = {cls.__name__: properties,
++                "compartments": compartment_props,
++                "dynamics": "outputs = [(W * Rscale) * inputs] + b ;"
++                            "dW_{ij}/dt = eta * [(z_j * q_pre) * (z_i * q_post)] - W_{ij} * w_decay",
++                "hyperparameters": hyperparams}
++        return info
++
++    @resolver(_reset)
++    def reset(self, inputs, outputs, pre, post, dWeights, dBiases):
++        self.inputs.set(inputs)
++        self.outputs.set(outputs)
++        self.pre.set(pre)
++        self.post.set(post)
++        self.dWeights.set(dWeights)
++        self.dBiases.set(dBiases)
++
++    def __repr__(self):
++        comps = [varname for varname in dir(self) if Compartment.is_compartment(getattr(self, varname))]
++        maxlen = max(len(c) for c in comps) + 5
++        lines = f"[{self.__class__.__name__}] PATH: {self.name}\n"
++        for c in comps:
++            stats = tensorstats(getattr(self, c).value)
++            if stats is not None:
++                line = [f"{k}: {v}" for k, v in stats.items()]
++                line = ", ".join(line)
++            else:
++                line = "None"
++            lines += f"  {f'({c})'.ljust(maxlen)}{line}\n"
++        return lines
++
++if __name__ == '__main__':
++    from ngcsimlib.context import Context
++    with Context("Bar") as bar:
++        Wab = HebbianPatchedSynapse("Wab", (9, 30), 3)
++    print(Wab)
++    plt.imshow(Wab.weights.value, cmap='gray')
++    plt.show()
+diff --git a/ngclearn/components/synapses/patched/patchedSynapse.py b/ngclearn/components/synapses/patched/patchedSynapse.py
+new file mode 100644
+index 00000000..ef22e06e
+--- /dev/null
++++ b/ngclearn/components/synapses/patched/patchedSynapse.py
+@@ -0,0 +1,192 @@
++import matplotlib.pyplot as plt
++from jax import random, numpy as jnp, jit
++from ngclearn import resolver, Component, Compartment
++from ngclearn.components.jaxComponent import JaxComponent
++from ngclearn.utils import tensorstats
++from ngclearn.utils.weight_distribution import initialize_params
++from ngcsimlib.logger import info
++import math
++
++
++"""
++       𝑳𝒾                     𝑳𝑗       
++       ⬇︎                     ⬇︎          
++    𝒏𝒾 = 3, 𝑫𝒾                  𝑫𝑗    
++    𝒅𝒾 = 𝑫𝒾 / 𝒏𝒾            𝒅𝑗 = 𝑫𝑗 / 𝒏𝒾
++
++        ⎯[𝑤𝒾𝑗¹      𝟘       𝟘 ]⎯      
++  Z𝒾    ⎯[ 𝟘      𝑤𝒾𝑗²      𝟘 ]⎯  Z𝑗
++        ⎯[ 𝟘       𝟘      𝑤𝒾𝑗³]⎯ 
++
++"""
++
++
++def create_multi_patch_synapses(key, shape, n_sub_models, sub_stride, weight_init):
++    sub_shape = (shape[0] // n_sub_models, shape[1] // n_sub_models)
++    di, dj = sub_shape
++    si, sj = sub_stride
++
++    weight_shape = ((n_sub_models * di) + 2 * si, (n_sub_models * dj) + 2 * sj)
++    weights = initialize_params(key[2], {"dist": "constant", "value": 0.}, weight_shape, use_numpy=True)
++
++    for i in range(n_sub_models):
++        start_i = i * di
++        end_i = (i + 1) * di + 2 * si
++        start_j = i * dj
++        end_j = (i + 1) * dj + 2 * sj
++
++        shape_ = (end_i - start_i, end_j - start_j) # (di + 2 * si, dj + 2 * sj)
++
++        weights[start_i : end_i,
++                start_j : end_j] = initialize_params(key[2],
++                                                     init_kernel=weight_init,
++                                                     shape=shape_,
++                                                     use_numpy=True)
++    if si!=0:
++        weights[:si,:] = 0.
++        weights[-si:,:] = 0.
++    if sj!=0:
++        weights[:,:sj] = 0.
++        weights[:, -sj:] = 0.
++
++    return weights
++
++
++
++class PatchedSynapse(JaxComponent): ## base patched synaptic cable
++    # Define Functions
++    def __init__(self, name, shape, n_sub_models, stride_shape=(0,0), w_mask=None, weight_init=None, bias_init=None,
++                 resist_scale=1., p_conn=1., batch_size=1, **kwargs):
++        super().__init__(name, **kwargs)
++
++        self.Rscale = resist_scale
++        self.batch_size = batch_size
++        self.weight_init = weight_init
++        self.bias_init = bias_init
++
++        self.n_sub_models = n_sub_models
++        self.sub_stride = stride_shape
++
++        tmp_key, *subkeys = random.split(self.key.value, 4)
++        if self.weight_init is None:
++            info(self.name, "is using default weight initializer!")
++            self.weight_init = {"dist": "fan_in_gaussian"}
++
++        weights = create_multi_patch_synapses(key=subkeys, shape=shape, n_sub_models=self.n_sub_models, sub_stride=self.sub_stride,
++                                              weight_init=self.weight_init)
++
++        self.w_mask = jnp.where(weights!=0, 1, 0)
++        self.sub_shape = (shape[0]//n_sub_models, shape[1]//n_sub_models)
++
++        self.shape = weights.shape
++        self.sub_shape = self.sub_shape[0]+(2*self.sub_stride[0]), self.sub_shape[1]+(2*self.sub_stride[1])
++
++        if 0. < p_conn < 1.: ## only non-zero and <1 probs allowed
++            mask = random.bernoulli(subkeys[1], p=p_conn, shape=self.shape)
++            weights = weights * mask ## sparsify matrix
++
++        ## Compartment setup
++        preVals = jnp.zeros((self.batch_size, self.shape[0]))
++        postVals = jnp.zeros((self.batch_size, self.shape[1]))
++        self.inputs = Compartment(preVals)
++        self.outputs = Compartment(postVals)
++        self.weights = Compartment(weights)
++
++        ## Set up (optional) bias values
++        if self.bias_init is None:
++            info(self.name, "is using default bias value of zero (no bias "
++                            "kernel provided)!")
++        self.biases = Compartment(initialize_params(subkeys[2], bias_init,
++                                                    (1, self.shape[1]))
++                                  if bias_init else 0.0)
++    @staticmethod
++    def _advance_state(Rscale, inputs, weights, biases):
++        outputs = (jnp.matmul(inputs, weights) * Rscale) + biases
++        return outputs
++
++    @resolver(_advance_state)
++    def advance_state(self, outputs):
++        self.outputs.set(outputs)
++
++    @staticmethod
++    def _reset(batch_size, shape):
++        preVals = jnp.zeros((batch_size, shape[0]))
++        postVals = jnp.zeros((batch_size, shape[1]))
++        inputs = preVals
++        outputs = postVals
++        return inputs, outputs
++
++    @resolver(_reset)
++    def reset(self, inputs, outputs):
++        self.inputs.set(inputs)
++        self.outputs.set(outputs)
++
++    def save(self, directory, **kwargs):
++        file_name = directory + "/" + self.name + ".npz"
++        if self.bias_init != None:
++            jnp.savez(file_name, weights=self.weights.value,
++                      biases=self.biases.value)
++        else:
++            jnp.savez(file_name, weights=self.weights.value)
++
++    def load(self, directory, **kwargs):
++        file_name = directory + "/" + self.name + ".npz"
++        data = jnp.load(file_name)
++        self.weights.set(data['weights'])
++        if "biases" in data.keys():
++            self.biases.set(data['biases'])
++
++    @classmethod
++    def help(cls): ## component help function
++        properties = {
++            "synapse_type": "PatchedSynapse - performs a synaptic transformation "
++                            "of inputs to produce  output signals (e.g., a "
++                            "scaled linear multivariate transformation)"
++        }
++        compartment_props = {
++            "inputs":
++                {"inputs": "Takes in external input signal values"},
++            "states":
++                {"weights": "Synapse efficacy/strength parameter values",
++                 "biases": "Base-rate/bias parameter values",
++                 "key": "JAX PRNG key"},
++            "outputs":
++                {"outputs": "Output of synaptic transformation"},
++        }
++        hyperparams = {
++            "shape": "Overall shape of synaptic weight value matrix; number inputs x number outputs",
++            "n_sub_models": "The number of submodels in each layer",
++            "stride_shape": "Stride shape of overlapping synaptic weight value matrix",
++            "batch_size": "Batch size dimension of this component",
++            "weight_init": "Initialization conditions for synaptic weight (W) values",
++            "bias_init": "Initialization conditions for bias/base-rate (b) values",
++            "resist_scale": "Resistance level scaling factor (Rscale); applied to output of transformation",
++            "p_conn": "Probability of a connection existing (otherwise, it is masked to zero)"
++        }
++        info = {cls.__name__: properties,
++                "compartments": compartment_props,
++                "dynamics": "outputs = [W * inputs] * Rscale + b",
++                "hyperparameters": hyperparams}
++        return info
++
++    def __repr__(self):
++        comps = [varname for varname in dir(self) if Compartment.is_compartment(getattr(self, varname))]
++        maxlen = max(len(c) for c in comps) + 5
++        lines = f"[{self.__class__.__name__}] PATH: {self.name}\n"
++        for c in comps:
++            stats = tensorstats(getattr(self, c).value)
++            if stats is not None:
++                line = [f"{k}: {v}" for k, v in stats.items()]
++                line = ", ".join(line)
++            else:
++                line = "None"
++            lines += f"  {f'({c})'.ljust(maxlen)}{line}\n"
++        return lines
++
++if __name__ == '__main__':
++    from ngcsimlib.context import Context
++    with Context("Bar") as bar:
++        Wab = PatchedSynapse("Wab", (9, 30), 3)
++    print(Wab)
++    plt.imshow(Wab.weights.value, cmap='gray')
++    plt.show()
+diff --git a/ngclearn/components/synapses/patched/staticPatchedSynapse.py b/ngclearn/components/synapses/patched/staticPatchedSynapse.py
+new file mode 100644
+index 00000000..6cbcf988
+--- /dev/null
++++ b/ngclearn/components/synapses/patched/staticPatchedSynapse.py
+@@ -0,0 +1,4 @@
++from .patchedSynapse import PatchedSynapse
++
++class StaticPatchedSynapse(PatchedSynapse):
++    pass
+\ No newline at end of file
+diff --git a/ngclearn/utils/patch_utils.py b/ngclearn/utils/patch_utils.py
+index 6d307197..06c70eb8 100755
+--- a/ngclearn/utils/patch_utils.py
++++ b/ngclearn/utils/patch_utils.py
+@@ -5,6 +5,119 @@
+ from jax import numpy as jnp
+ from sklearn.feature_extraction.image import extract_patches_2d
+ 
++
++def patch_with_stride(X, patch, stride):
++    n_x, n_y = X.shape[0] // patch[0], X.shape[1] // patch[1]
++    result = []
++    for x_idx in range(n_x):
++        for y_idx in range(n_y):
++
++            x_start = stride[0] * x_idx
++            x_end = x_start + patch[0]
++            y_start = stride[1] * y_idx
++            y_end = y_start + patch[1]
++
++            img_ = X[x_start: x_end, y_start: y_end]
++
++            if img_.shape == (patch[0], patch[1]):
++                result.append(img_)
++
++    return jnp.array(result)
++
++
++def patch_with_overlap(X, patch, overlap):
++    
++    stride = (X.shape[0] - overlap[0],
++              X.shape[1] - overlap[1])
++    
++    return patch_with_stride(X, patch, stride)
++  
++
++class Create_Patches:
++    """
++    This function will create small patches out of the image based on the provided attributes.
++
++    Args:
++        img: jax array of size (H, W)
++        patched: (height_patch, width_patch)
++        overlap: (height_overlap, width_overlap)
++
++        add_frame: increases the img size by (height_patch - height_overlap, width_patch - width_overlap)
++        create_patches: creates small patches out of the image based on the provided attributes.
++
++    Returns:
++        jnp.array: Array containing the patches
++        shape: (num_patches, patch_height, patch_width)
++
++    """
++
++    def __init__(self, img, patch_shape, overlap_shape):
++        self.img = img
++        self.height_patch, self.width_patch = patch_shape
++        self.height_over, self.width_over = overlap_shape
++
++        self.height, self.width = self.img.shape
++
++        self.nw_patches = self.width // self.width_patch #(self.width + self.width_over) // (self.width_patch - self.width_over) - 2
++        self.nh_patches = self.height // self.height_patch #(self.height + self.height_over) // (self.height_patch - self.height_over) - 2
++
++    def _add_frame(self):
++        """
++        This function will add zero frames (increase the dimension) to the image
++
++        Returns:
++            image with increased size (x.shape[0], x.shape[1]) -> (x.shape[0] + (height_patch - height_overlap),
++                                                                   x.shape[1] + (width_patch - width_overlap))
++        """
++        self.img = np.hstack((jnp.zeros((self.img.shape[0], (self.height_patch - self.height_over))),
++                              self.img,
++                              jnp.zeros((self.img.shape[0], (self.height_patch - self.height_over)))))
++        self.img = np.vstack((jnp.zeros(((self.width_patch - self.width_over), self.img.shape[1])),
++                              self.img,
++                              jnp.zeros(((self.width_patch - self.width_over), self.img.shape[1]))))
++
++        self.height, self.width = self.img.shape
++
++        self.nw_patches = (self.width + self.width_over) // (self.width_patch - self.width_over) - 2
++        self.nh_patches = (self.height + self.height_over) // (self.height_patch - self.height_over) - 2
++
++
++
++    def create_patches(self, add_frame=False, center=True):
++        """
++        This function will create small patches out of the image based on the provided attributes.
++
++        Keyword Args:
++            add_frame: If true the function will add zero frames (increase the dimension) to the image
++
++        Returns:
++            jnp.array: Array containing the patches
++            shape: (num_patches, patch_height, patch_width)
++        """
++
++        if add_frame == True:
++            self._add_frame()
++
++        if center == True:
++            mu = np.mean(self.img, axis=0, keepdims=True)
++            self.img  = self.img - mu
++
++        result = []
++        for nh_ in range(self.nh_patches):
++            for nw_ in range(self.nw_patches):
++                img_ = self.img[(self.height_patch - self.height_over) * nh_: nh_ * (
++                            self.height_patch - self.height_over) + self.height_patch
++                , (self.width_patch - self.width_over) * nw_: nw_ * (
++                            self.width_patch - self.width_over) + self.width_patch]
++
++                if img_.shape == (self.height_patch, self.width_patch):
++                    result.append(img_)
++        return jnp.array(result)
++
++
++
++
++
+ def generate_patch_set(x_batch, patch_size=(8, 8), max_patches=50, center=True): ## scikit
+     """
+     Generates a set of patches from an array/list of image arrays (via
+diff --git a/ngclearn/utils/viz/synapse_plot.py b/ngclearn/utils/viz/synapse_plot.py
+index 9c4a0e49..fcc851a6 100644
+--- a/ngclearn/utils/viz/synapse_plot.py
++++ b/ngclearn/utils/viz/synapse_plot.py
+@@ -8,7 +8,9 @@
+ import imageio.v3 as iio
+ import jax.numpy as jnp
+ 
+-def visualize(thetas, sizes, prefix, suffix='.jpg'):
++
++
++def visualize(thetas, sizes, prefix, order=None, suffix='.jpg'):
+     """
+ 
+     Args:
+@@ -20,6 +22,11 @@ def visualize(thetas, sizes, prefix, suffix='.jpg'):
+ 
+         suffix:
+     """
++
++
++    if order is None:
++        order = ['C' for _ in range(len(thetas))]
++
+     Ts = [t.T for t in thetas] # [tf.transpose(t) for t in thetas]
+     num_filters = [T.shape[0] for T in Ts]
+     n_cols = [math.ceil(math.sqrt(nf)) for nf in num_filters]
+@@ -46,7 +53,7 @@ def visualize(thetas, sizes, prefix, suffix='.jpg'):
+             point = start + 1 + i + (r * extra)
+             plt.subplot(n_rows_total, n_cols_total, point)
+             filter = T[i, :]
+-            plt.imshow(np.reshape(filter, (sizes[idx][0], sizes[idx][1])), cmap=plt.cm.bone, interpolation='nearest')
++            plt.imshow(np.reshape(filter, (sizes[idx][0], sizes[idx][1]), order=order[idx]), cmap=plt.cm.bone, interpolation='nearest')
+             plt.axis("off")
+ 
+     plt.subplots_adjust(top=0.9)
+@@ -54,6 +61,7 @@ def visualize(thetas, sizes, prefix, suffix='.jpg'):
+     plt.clf()
+     plt.close()
+ 
++
+ def visualize_labels(thetas, sizes, prefix, space_width=None, widths=None, suffix='.jpg'):
+     """
+ 

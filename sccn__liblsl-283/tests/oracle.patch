@@ -1,0 +1,139 @@
+diff --git a/src/resolve_attempt_udp.cpp b/src/resolve_attempt_udp.cpp
+index 08e5a9ba..adde2290 100644
+--- a/src/resolve_attempt_udp.cpp
++++ b/src/resolve_attempt_udp.cpp
+@@ -160,9 +160,25 @@ void resolve_attempt_udp::send_next_query(
+ 		// Mismatching protocols? Skip this round
+ 		if (mcit->addr.is_v4() != (proto == asio::ip::udp::v4()))
+ 			next = targets_.end();
+-		else
+-			recv_socket_.set_option(mcit->addr.is_v4() ? outbound_interface(mcit->addr.to_v4())
+-													   : outbound_interface(mcit->ifindex));
++		else {
++			// Select the outbound interface for multicast sends. Use the error_code overload: a
++			// bad/stale interface (VPN utun, AWDL, Hyper-V/VirtualBox adapter, or an address that
++			// changed since enumeration) must NOT throw here. This runs inside an asio completion
++			// handler, so a throw would propagate out of io_->run() — aborting the whole resolve
++			// wave (oneshot) or terminating the process from the background thread (continuous).
++			// On failure just log and carry on: the multicast sends on this pass fall back to the
++			// socket's default interface (and individually no-op on error), while the unicast and
++			// broadcast targets — which don't depend on the outbound interface — still go out.
++			asio::error_code ec;
++			recv_socket_.set_option(mcit->addr.is_v4()
++					? outbound_interface(mcit->addr.to_v4())
++					: outbound_interface(mcit->ifindex),
++				ec);
++			if (ec) {
++				LOG_F(1, "Could not select multicast interface %s for outbound queries: %s",
++					mcit->addr.to_string().c_str(), ec.message().c_str());
++			}
++		}
+ 	}
+ 	if (next != targets_.end()) {
+ 		udp::endpoint ep(*next++);
+diff --git a/src/resolver_impl.cpp b/src/resolver_impl.cpp
+index a521a20f..eda9e16c 100644
+--- a/src/resolver_impl.cpp
++++ b/src/resolver_impl.cpp
+@@ -190,8 +190,20 @@ void resolver_impl::resolve_continuous(const std::string &query, double forget_a
+ 	expired_ = false;
+ 	// start a wave of resolve packets
+ 	next_resolve_wave();
+-	// spawn a thread that runs the IO operations
+-	background_io_ = std::make_shared<std::thread>([shared_io = io_]() { shared_io->run(); });
++	// spawn a thread that runs the IO operations. Mirror the outlet's IO threads: an exception
++	// escaping an asio completion handler (e.g. a bad multicast interface) must not propagate out
++	// of this background thread and call std::terminate() — log it and keep serving.
++	background_io_ = std::make_shared<std::thread>([shared_io = io_]() {
++		loguru::set_thread_name("resolver_io");
++		while (!shared_io->stopped()) {
++			try {
++				shared_io->run();
++				return;
++			} catch (std::exception &e) {
++				LOG_F(ERROR, "Error during resolver IO processing: %s", e.what());
++			}
++		}
++	});
+ 	status = resolver_status::running_continuous;
+ }
+ 
+diff --git a/testing/CMakeLists.txt b/testing/CMakeLists.txt
+index a1d8ca55..a24a2b89 100644
+--- a/testing/CMakeLists.txt
++++ b/testing/CMakeLists.txt
+@@ -109,6 +109,17 @@ add_executable(lsl_test_runtime_config int/runtime_config.cpp)
+ target_link_libraries(lsl_test_runtime_config PRIVATE lslobj lslboost common catch_main)
+ target_compile_definitions(lsl_test_runtime_config PRIVATE LIBLSL_EXPORTS)
+ 
++# resolve_bad_interface test sets the api_config singleton, so it lives in its own executable.
++add_executable(lsl_test_resolve_bad_interface int/resolve_bad_interface.cpp)
++target_link_libraries(lsl_test_resolve_bad_interface PRIVATE lslobj lslboost common catch_main)
++target_compile_definitions(lsl_test_resolve_bad_interface PRIVATE LIBLSL_EXPORTS)
++# Needs pugixml headers (resolver_impl.h -> stream_info_impl.h includes pugixml)
++if(LSL_PUGIXML_IS_FETCHED)
++    target_include_directories(lsl_test_resolve_bad_interface PRIVATE ${pugixml_SOURCE_DIR}/src)
++else()
++    target_link_libraries(lsl_test_resolve_bad_interface PRIVATE pugixml::pugixml)
++endif()
++
+ # resolve_machine test sets the api_config singleton, so it lives in its own executable.
+ add_executable(lsl_test_resolve_machine int/resolve_machine.cpp)
+ target_link_libraries(lsl_test_resolve_machine PRIVATE lslobj lslboost common catch_main)
+@@ -157,7 +168,7 @@ if(LSL_BENCHMARKS)
+ 	)
+ endif()
+ 
+-set(LSL_TESTS lsl_test_exported lsl_test_internal lsl_test_runtime_config lsl_test_resolve_machine lsl_test_resolve_over_tcp lsl_test_resolve_query_port)
++set(LSL_TESTS lsl_test_exported lsl_test_internal lsl_test_runtime_config lsl_test_resolve_bad_interface lsl_test_resolve_machine lsl_test_resolve_over_tcp lsl_test_resolve_query_port)
+ foreach(lsltest ${LSL_TESTS})
+ 	add_test(NAME ${lsltest} COMMAND ${lsltest} --wait-for-keypress never)
+ 	if(LSL_INSTALL)
+diff --git a/testing/int/resolve_bad_interface.cpp b/testing/int/resolve_bad_interface.cpp
+new file mode 100644
+index 00000000..47df80d8
+--- /dev/null
++++ b/testing/int/resolve_bad_interface.cpp
+@@ -0,0 +1,42 @@
++#include "api_config.h"
++#include <catch2/catch_test_macros.hpp>
++#include <lsl_cpp.h>
++#include <vector>
++
++// Regression test for a bad multicast interface aborting / terminating stream resolution.
++//
++// The resolver selects the outbound interface for each multicast send via set_option(
++// outbound_interface(...)). An interface address that cannot be used for IP_MULTICAST_IF (a stale
++// or removed adapter, a VPN utun, AWDL, a Hyper-V/VirtualBox adapter, or simply an address that is
++// not local) makes that call fail. Pre-fix it used the throwing overload, and because the call runs
++// inside an asio completion handler the exception propagated out of io_->run() — aborting the whole
++// resolve wave (oneshot) or calling std::terminate() from the continuous resolver's background
++// thread. Here 203.0.113.1 is a TEST-NET-3 address (RFC 5737) that is never assignable locally.
++//
++// The fix uses the error_code overload and carries on, so the stream is still resolved and the
++// process does not crash.
++//
++// Sets the api_config singleton, so (like runtime_config) it lives in its own executable.
++
++TEST_CASE("a bad multicast interface does not abort resolution", "[resolver][interfaces]") {
++	lsl::api_config::set_api_config_content(
++		"[ports]\n"
++		"IPv6 = disable\n"
++		"[multicast]\n"
++		"ResolveScope = machine\n"
++		"MachineAddresses = {127.0.0.1}\n"
++		"Interfaces = {127.0.0.1, 203.0.113.1}\n" // 203.0.113.1 is unusable for IP_MULTICAST_IF
++		"[lab]\n"
++		"SessionID = resolve_bad_interface_test\n"
++		"KnownPeers = {}\n");
++
++	lsl::stream_info info("ifacetest", "test", 1, lsl::IRREGULAR_RATE, lsl::cf_float32, "ifacesrc");
++	lsl::stream_outlet outlet(info);
++
++	// Pre-fix this either finds nothing (wave aborted) or crashes; post-fix the bad interface is
++	// skipped and the stream is resolved normally.
++	std::vector<lsl::stream_info> found = lsl::resolve_stream("name", "ifacetest", 1, 5.0);
++
++	REQUIRE(found.size() == 1);
++	CHECK(found[0].name() == "ifacetest");
++}

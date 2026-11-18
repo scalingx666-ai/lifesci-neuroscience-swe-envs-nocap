@@ -1,0 +1,161 @@
+diff --git a/doc/whats_new.rst b/doc/whats_new.rst
+index 32bc90aec..1f22ba646 100644
+--- a/doc/whats_new.rst
++++ b/doc/whats_new.rst
+@@ -59,6 +59,7 @@ Detailed list of changes
+ - Fix :func:`read_raw_bids` ignoring ``electrodes.tsv`` when ``EEGCoordinateUnits`` is ``"n/a"`` by inferring the unit from coordinate magnitudes, and synthesize approximate fiducials for ``ctf_head`` montages to enable the coordinate transform to ``head`` frame, by `Bruno Aristimunha`_ (:gh:`1506`)
+ - Improve :func:`mne_bids.read_raw_bids` handling when ``electrodes.tsv`` exists without ``coordsystem.json``: keep strict failure for iEEG, and for EEG/MEG emit a warning and continue without applying a montage, by `Bruno Aristimunha`_
+ - Allow ``task=None`` in :func:`mne_bids.read_raw_bids` for BIDS paths without a task entity (e.g. datasets that omit task in the path), by `Aman Jaiswal`_
++- Fix :func:`mne_bids.read_raw_bids` and related read paths failing with ``PermissionError`` on datalad/git-annex datasets by keeping the file lock next to the symlink instead of its (read-only) target, and gracefully continuing without a lock when one cannot be created, by `Bruno Aristimunha`_ (:gh:`1569`)
+ 
+ ⚕️ Code health
+ ^^^^^^^^^^^^^^
+diff --git a/mne_bids/_fileio.py b/mne_bids/_fileio.py
+index 18b145d1a..f7f8d3833 100644
+--- a/mne_bids/_fileio.py
++++ b/mne_bids/_fileio.py
+@@ -30,8 +30,15 @@
+ 
+ 
+ def _canonical_lock_path(path: str | os.PathLike[str]) -> Path:
+-    """Return an absolute, normalised path without requiring it to exist."""
+-    return Path(path).expanduser().resolve(strict=False)
++    """Return an absolute, normalised path without following symlinks.
++
++    Symlinks are preserved so that the ``.lock`` companion file is written
++    next to the symlink itself rather than its target. This matters for
++    datalad/git-annex datasets, where the symlink target lives in a
++    read-only ``.git/annex/objects/`` directory (see issue #1569).
++    """
++    path = Path(path)
++    return Path(os.path.abspath(path.expanduser()))
+ 
+ 
+ @contextmanager
+@@ -90,10 +97,13 @@ def _get_lock_context(path, timeout=None):
+                 str(lock_path),
+                 timeout=timeout,
+             )
+-        except (OSError, TypeError):
++        except (OSError, TypeError) as exp:
+             # OSError: permission issues creating lock file
+             # TypeError: invalid timeout parameter
+-            warn("Could not create lock. Proceeding without a lock.")
++            warn(
++                f"Could not create lock at {lock_path} ({exp}); "
++                "proceeding without a lock."
++            )
+     try:
+         yield lock_context
+     except Exception:
+@@ -158,10 +168,17 @@ def _open_lock(path, *args, lock_timeout=None, **kwargs):
+             canonical_path,
+             timeout=lock_timeout,
+         ) as lock_context:
+-            with lock_context:
++            with contextlib.ExitStack() as stack:
++                try:
++                    stack.enter_context(lock_context)
++                except OSError as exp:
++                    warn(
++                        f"Could not acquire lock for {canonical_path} "
++                        f"({exp}); proceeding without a lock."
++                    )
+                 if args or kwargs:
+-                    with open(canonical_path, *args, **kwargs) as fid:
+-                        yield fid
++                    fid = stack.enter_context(open(canonical_path, *args, **kwargs))
++                    yield fid
+                 else:
+                     yield None
+     finally:
+diff --git a/mne_bids/tests/test_fileio.py b/mne_bids/tests/test_fileio.py
+index 1aefecab1..e6519e78d 100644
+--- a/mne_bids/tests/test_fileio.py
++++ b/mne_bids/tests/test_fileio.py
+@@ -4,9 +4,12 @@
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+ import importlib
++import os
++import sys
+ import threading
+ import time
+ from concurrent.futures import ProcessPoolExecutor
++from contextlib import contextmanager
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+@@ -23,6 +26,17 @@
+ )
+ 
+ 
++@contextmanager
++def _readonly(directory):
++    """Temporarily strip write bit from ``directory``."""
++    original = directory.stat().st_mode
++    os.chmod(directory, 0o555)
++    try:
++        yield directory
++    finally:
++        os.chmod(directory, original)
++
++
+ def _worker_increment_file(file_path, iterations):
+     """Worker function for multiprocess test - must be at module level for pickling."""
+     file_path = Path(file_path)
+@@ -262,6 +276,54 @@ def test_open_lock_without_filelock(tmp_path):
+             assert content == "test"
+ 
+ 
++def test_open_lock_symlink_to_readonly_target(tmp_path):
++    """Regression test for issue #1569 (datalad/git-annex symlinks).
++
++    When the symlink target lives in a read-only directory, the lock must
++    be placed next to the symlink itself rather than resolved through it.
++    Previously this raised ``PermissionError``.
++    """
++    pytest.importorskip("filelock")
++
++    annex_dir = tmp_path / "annex"
++    annex_dir.mkdir()
++    target = annex_dir / "blob.json"
++    target.write_text('{"k": 2}')
++
++    work_dir = tmp_path / "work"
++    work_dir.mkdir()
++    link = work_dir / "sidecar.json"
++    try:
++        link.symlink_to(target)
++    except (OSError, NotImplementedError):
++        pytest.skip("symlinks not supported on this platform")
++
++    with _readonly(annex_dir):
++        with _open_lock(link, encoding="utf-8") as fin:
++            assert fin.read() == '{"k": 2}'
++        assert not (annex_dir / "blob.json.lock").exists()
++        assert not (work_dir / "sidecar.json.lock").exists()
++
++
++@pytest.mark.skipif(
++    sys.platform == "win32",
++    reason="POSIX chmod 0o555 does not restrict directory writes on Windows",
++)
++def test_open_lock_readonly_parent_falls_back(tmp_path):
++    """If the lock file cannot be created, warn and fall back gracefully."""
++    pytest.importorskip("filelock")
++
++    ro_dir = tmp_path / "ro"
++    ro_dir.mkdir()
++    test_file = ro_dir / "file.json"
++    test_file.write_text("payload")
++
++    with _readonly(ro_dir):
++        with pytest.warns(RuntimeWarning, match="without a lock"):
++            with _open_lock(test_file, "r", encoding="utf-8") as fid:
++                assert fid.read() == "payload"
++
++
+ def test_open_lock_custom_timeout(tmp_path):
+     """Test custom timeout parameter."""
+     pytest.importorskip("filelock")

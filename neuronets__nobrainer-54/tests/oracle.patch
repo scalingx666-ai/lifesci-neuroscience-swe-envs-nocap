@@ -1,0 +1,1610 @@
+diff --git a/.travis.yml b/.travis.yml
+index a41033f1..eda6b849 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -2,7 +2,10 @@ dist: xenial
+ language: python
+ python:
+   - "3.6"
++branches:
++  only:
++    - master
+ install:
+   - pip install --no-cache-dir --editable=".[dev]" tf-nightly
+ script:
+-  - pytest --cov=nobrainer nobrainer
++  - pytest --verbose --cov=nobrainer nobrainer
+diff --git a/nobrainer/__init__.py b/nobrainer/__init__.py
+index 42a9ccb6..2e841516 100644
+--- a/nobrainer/__init__.py
++++ b/nobrainer/__init__.py
+@@ -3,14 +3,13 @@
+ import tensorflow as tf
+ 
+ # For tensorflow<2.0
+-# tf.enable_eager_execution()
+-tf.enable_v2_tensorshape()
++tf.enable_v2_behavior()
+ 
+ if LooseVersion(tf.__version__) < LooseVersion("1.13.1"):
+     raise ValueError(
+         "tensorflow>=1.13.1 must be installed but found version {}"
+         .format(tf.__version__))
+-del LooseVersion
++del LooseVersion, tf
+ 
+ from nobrainer._version import get_versions
+ __version__ = get_versions()['version']
+@@ -21,6 +20,7 @@
+ import nobrainer.losses
+ import nobrainer.metrics
+ import nobrainer.models
++import nobrainer.prediction
+ import nobrainer.training
+ import nobrainer.transform
+ import nobrainer.utils
+diff --git a/nobrainer/cli/main.py b/nobrainer/cli/main.py
+index a406298f..41c683bf 100644
+--- a/nobrainer/cli/main.py
++++ b/nobrainer/cli/main.py
+@@ -2,22 +2,31 @@
+ 
+ import inspect
+ import json
++import logging
+ import os
+ import pprint
+ import sys
+ 
+ import click
++import nibabel as nib
++import numpy as np
++import skimage
+ import tensorflow as tf
+ 
+ from nobrainer import __version__
+ from nobrainer.io import convert as _convert
+ from nobrainer.io import verify_features_labels as _verify_features_labels
+ from nobrainer.io import read_csv as _read_csv
++from nobrainer.io import read_volume as _read_volume
+ from nobrainer.losses import get as _get_loss
++from nobrainer.prediction import _transform_and_predict
+ from nobrainer.training import train as _train
+ from nobrainer.utils import _get_all_cpus
++from nobrainer.volume import from_blocks_numpy as _from_blocks_numpy
+ from nobrainer.volume import get_dataset as _get_dataset
+ from nobrainer.volume import get_steps_per_epoch as _get_steps_per_epoch
++from nobrainer.volume import standardize_numpy as _standardize_numpy
++from nobrainer.volume import to_blocks_numpy as _to_blocks_numpy
+ 
+ 
+ _option_kwds = {
+@@ -111,10 +120,126 @@ def merge():
+ 
+ 
+ @cli.command()
+-def predict():
+-    """Predict labels from features using a trained model."""
+-    click.echo("Not implemented yet. In the future, this command will be used for prediction.")
+-    sys.exit(-2)
++@click.argument('infile')
++@click.argument('outfile')
++@click.option('-m', '--model', type=click.Path(exists=True), required=True, help='Path to model HDF5 file.', **_option_kwds)
++@click.option('-b', '--block-shape', default=(128, 128, 128), type=int, nargs=3, help='Shape of sub-volumes on which to predict.', **_option_kwds)
++@click.option('-r', '--resize-features-to', default=(256, 256, 256), type=int, nargs=3, help='Resize features to this size before taking blocks and predicting.', **_option_kwds)
++@click.option('-t', '--threshold', type=float, default=0.3, help='Threshold used to binarize model output. Only used in binary prediction and must be in (0, 1).', **_option_kwds)
++@click.option('-l', '--largest-label', is_flag=True, help='Zero out all values not connected to the largest contiguous label (not including 0 values). This remove false positives in binary prediction.', **_option_kwds)
++@click.option('--rotate-and-predict', is_flag=True, help='Average the prediction with a prediction on a rotated (and subsequently un-rotated) volume. This can produce a better overall prediction.', **_option_kwds)
++@click.option('-v', '--verbose', is_flag=True, help='Print progress bar.', **_option_kwds)
++def predict(*, infile, outfile, model, block_shape, resize_features_to, threshold, largest_label, rotate_and_predict, verbose):
++    """Predict labels from features using a trained model.
++
++    The predictions are saved to OUTFILE.
++    """
++
++    if not verbose:
++        # Supress most logging messages.
++        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
++        tf.get_logger().setLevel(logging.ERROR)
++
++    if os.path.exists(outfile):
++        raise FileExistsError(
++            "Output file already exists. Will not overwrite {}".format(outfile))
++
++    x, affine = _read_volume(infile, dtype=np.float32, return_affine=True)
++    if x.ndim != 3:
++        raise ValueError("Input volume must be rank 3, got rank {}".format(x.ndim))
++    original_shape = x.shape
++    required_shape = resize_features_to
++    must_resize = False
++    if x.shape != required_shape:
++        must_resize = True
++        if verbose:
++            click.echo("Resizing volume from shape {} to shape {}".format(x.shape, required_shape))
++        x = skimage.transform.resize(
++            x,
++            output_shape=required_shape,
++            order=1,  # linear
++            mode='constant',
++            preserve_range=True,
++            anti_aliasing=False)
++
++    x = _standardize_numpy(x)
++    x_blocks = _to_blocks_numpy(x, block_shape=block_shape)
++    x_blocks = x_blocks[..., None]  # Add grayscale channel.
++
++    model = tf.keras.models.load_model(model, compile=False)
++    if verbose:
++        click.echo("Predicting ...")
++    try:
++        y_blocks = model.predict(x_blocks, batch_size=1, verbose=verbose)
++    except Exception:
++        click.echo(
++            click.style("ERROR: prediction failed. See error trace.", fg='red'))
++        raise
++
++    # Collapse the last dimension, depending on number of output classes.
++    is_binary_prediction = y_blocks.shape[-1] == 1
++    if is_binary_prediction:
++        y_blocks = y_blocks.squeeze(-1)
++    else:
++        y_blocks = y_blocks.argmax(-1)
++
++    y = _from_blocks_numpy(y_blocks, x.shape)
++
++    # Rotate the volume, predict, undo the rotation, and average with original
++    # prediction.
++    if rotate_and_predict:
++        if not is_binary_prediction:
++            raise ValueError(
++                "Cannot transform and predict on multi-class output.")
++        if verbose:
++            click.echo("Predicting on rotated volume ...")
++        y_other = _transform_and_predict(
++            model=model,
++            x=x,
++            block_shape=block_shape,
++            rotation=[np.pi/4, np.pi/4, 0],
++            translation=[0, 0, 0],
++            verbose=verbose)
++        if verbose:
++            click.echo("Averaging predictions ...")
++        y = np.mean([y, y_other], axis=0)
++
++    if is_binary_prediction:
++        if threshold <= 0 or threshold >= 1:
++            raise ValueError("Threshold must be in (0, 1).")
++        y = y > threshold
++
++    if must_resize:
++        if verbose:
++            click.echo("Resizing volume from shape {} to shape {}".format(y.shape, original_shape))
++        y = skimage.transform.resize(
++            y,
++            output_shape=original_shape,
++            order=0,  # nearest neighbor
++            mode='constant',
++            preserve_range=True,
++            anti_aliasing=False)
++
++    if largest_label:
++        if not is_binary_prediction:
++            raise ValueError(
++                "Removing all labels except the largest is only allowed with binary prediction.")
++        if verbose:
++            click.echo("Removing all labels except largest ...")
++        labels, n_labels = skimage.measure.label(y, return_num=True)
++        # Do not consider 0 values.
++        d = {(labels == label).sum(): label for label in range(1, n_labels+1)}
++        largest_label = d[max(d.keys())]
++        if verbose:
++            click.echo(
++                "Zeroed {} region(s) not contiguous with largest label."
++                .format(n_labels - 2))
++        y = (labels == largest_label).astype(np.int32)
++
++    img = nib.spatialimages.SpatialImage(y.astype(np.int32), affine=affine)
++    nib.save(img, outfile)
++    if verbose:
++        click.echo("Output saved to {}".format(outfile))
+ 
+ 
+ @cli.command()
+@@ -162,6 +287,9 @@ def train(*,
+           num_parallel_calls):
+     """Train a model."""
+ 
++    if num_parallel_calls == -1:
++        num_parallel_calls = _get_all_cpus()
++
+     dataset = _get_dataset(
+         file_pattern=tfrecords_pattern,
+         n_classes=n_classes,
+@@ -245,6 +373,6 @@ def evaluate():
+     sys.exit(-2)
+ 
+ 
+-# TODO: For debugging only.
++# For debugging only.
+ if __name__ == '__main__':
+     cli()
+diff --git a/nobrainer/cli/tests/main_test.py b/nobrainer/cli/tests/main_test.py
+new file mode 100644
+index 00000000..1d941851
+--- /dev/null
++++ b/nobrainer/cli/tests/main_test.py
+@@ -0,0 +1,96 @@
++"""Tests for `nobrainer.cli.main`."""
++
++from pathlib import Path
++
++import click
++from click.testing import CliRunner
++import nibabel as nib
++import numpy as np
++import pytest
++
++from nobrainer.cli import main as climain
++from nobrainer.io import convert
++from nobrainer.io import read_csv
++from nobrainer.io import read_volume
++from nobrainer.models.meshnet import meshnet
++from nobrainer.utils import get_data
++
++
++def test_convert(tmp_path):
++    runner = CliRunner()
++    with runner.isolated_filesystem():
++        csvpath = get_data(str(tmp_path))
++        tfrecords_template = Path('data/shard-{shard:03d}.tfrecords')
++        tfrecords_template.parent.mkdir(exist_ok=True)
++        args = """\
++    convert --csv={} --tfrecords-template={} --volume-shape 256 256 256
++        --volumes-per-shard=2 --to-ras --no-verify-volumes
++    """.format(csvpath, tfrecords_template)
++        result = runner.invoke(climain.cli, args.split())
++        assert result.exit_code == 0
++        assert Path('data/shard-000.tfrecords').is_file()
++        assert Path('data/shard-001.tfrecords').is_file()
++        assert Path('data/shard-002.tfrecords').is_file()
++        assert Path('data/shard-003.tfrecords').is_file()
++        assert Path('data/shard-004.tfrecords').is_file()
++        assert not Path('data/shard-005.tfrecords').is_file()
++
++
++@pytest.mark.xfail
++def test_merge():
++    assert False
++
++
++def test_predict():
++    runner = CliRunner()
++    with runner.isolated_filesystem():
++        model = meshnet(1, (10, 10, 10, 1))
++        model_path = 'model.h5'
++        model.save(model_path)
++
++        img_path = 'features.nii.gz'
++        nib.Nifti1Image(np.random.randn(20, 20, 20), np.eye(4)).to_filename(img_path)
++        out_path = 'predictions.nii.gz'
++
++        args = """\
++    predict --model={} --block-shape 10 10 10 --resize-features-to 20 20 20
++        --largest-label --rotate-and-predict {} {}
++    """.format(model_path, img_path, out_path)
++
++        result = runner.invoke(climain.cli, args.split())
++        assert result.exit_code == 0
++        assert Path('predictions.nii.gz').is_file()
++        assert nib.load(out_path).shape == (20, 20, 20)
++
++
++@pytest.mark.xfail
++def test_save():
++    assert False
++
++
++def test_train():
++    runner = CliRunner()
++    with runner.isolated_filesystem():
++        xpath = 'features.nii.gz'
++        ypath = 'labels.nii.gz'
++        nib.Nifti1Image(np.ones((20, 20, 20)), np.eye(4)).to_filename(str(xpath))
++        nib.Nifti1Image(np.ones((20, 20, 20)), np.eye(4)).to_filename(str(ypath))
++        files = [(str(xpath), str(ypath))]
++        convert(files, tfrecords_template='data-{shard:03d}.tf')
++
++        args = """\
++    train --model=meshnet --tfrecords-pattern={} --n-classes=1 --batch-size=1
++        --volume-shape 20 20 20 --block-shape 10 10 10 --n-epochs=1 --n-volumes=1
++        --loss=dice --learning-rate=1e-05
++    """.format('data-*.tf')
++
++        result = runner.invoke(climain.cli, args.split())
++        print(result.output)
++        assert result.exit_code == 0
++        assert Path('logs').is_dir()
++        assert Path('checkpoints').is_dir()
++
++
++@pytest.mark.xfail
++def test_evaluate():
++    assert False
+diff --git a/nobrainer/io.py b/nobrainer/io.py
+index 5a2bf7ac..bfe0075f 100644
+--- a/nobrainer/io.py
++++ b/nobrainer/io.py
+@@ -96,6 +96,7 @@ def convert(volume_filepaths, tfrecords_template="tfrecords/data_shard-{shard:03
+     except Exception:
+         raise ValueError("invalid 'tfrecords_template'. This template must contain the key 'shard'.")
+ 
++    tfrecords_template = os.path.abspath(tfrecords_template)
+     _dirname = os.path.dirname(tfrecords_template)
+     if not os.path.exists(_dirname):
+         raise ValueError("directory does not exist: {}".format(_dirname))
+@@ -114,9 +115,15 @@ def convert(volume_filepaths, tfrecords_template="tfrecords/data_shard-{shard:03
+     progbar.update(0)
+     if num_parallel_calls is None:
+         num_parallel_calls = _get_all_cpus()
+-    with multiprocessing.Pool(num_parallel_calls) as p:
+-        for _ in p.imap(map_fn, volume_filepaths_shards, chunksize=2):
++
++    if num_parallel_calls == 1:
++        for vf in volume_filepaths_shards:
++            map_fn(vf)
+             progbar.add(1)
++    else:
++        with multiprocessing.Pool(num_parallel_calls) as p:
++            for _ in p.imap(map_fn, volume_filepaths_shards, chunksize=2):
++                progbar.add(1)
+ 
+ 
+ def _convert(tfrecords_path_volume_filepaths, to_ras=True, gzip_compressed=True):
+@@ -267,11 +274,18 @@ def verify_features_labels(volume_filepaths, volume_shape=(256, 256, 256), check
+     map_fn = functools.partial(_verify_features_labels_pair, volume_shape=volume_shape, check_shape=check_shape, check_labels_int=check_labels_int, check_labels_gte_zero=check_labels_gte_zero)
+     if num_parallel_calls is None:
+         num_parallel_calls = _get_all_cpus()
+-    with multiprocessing.Pool(num_parallel_calls) as p:
+-        outputs = []
+-        for valid in p.imap(map_fn, volume_filepaths, chunksize=2):
++
++    outputs = []
++    if num_parallel_calls == 1:
++        for vf in volume_filepaths:
++            valid = map_fn(vf)
+             outputs.append(valid)
+             progbar.add(1)
++    else:
++        with multiprocessing.Pool(num_parallel_calls) as p:
++            for valid in p.imap(map_fn, volume_filepaths, chunksize=2):
++                outputs.append(valid)
++                progbar.add(1)
+     invalid_files = [pair for valid, pair in zip(outputs, volume_filepaths) if not valid]
+     return invalid_files
+ 
+diff --git a/nobrainer/layers/tests/layers_test.py b/nobrainer/layers/tests/layers_test.py
+index f093a5f9..6a43498a 100644
+--- a/nobrainer/layers/tests/layers_test.py
++++ b/nobrainer/layers/tests/layers_test.py
+@@ -3,8 +3,6 @@
+ 
+ from nobrainer.layers import ZeroPadding3DChannels
+ 
+-tf.enable_eager_execution()
+-
+ 
+ def test_zeropadding3dchannels():
+     # This test function is a much shorter version of
+diff --git a/nobrainer/losses.py b/nobrainer/losses.py
+index 84a9dc65..17550b65 100644
+--- a/nobrainer/losses.py
++++ b/nobrainer/losses.py
+@@ -195,8 +195,7 @@ def variational(y_true, y_pred, model, n_examples=1, prior_model=None):
+     """"""
+ 
+     def _maybe_get_layer_attr(model, layer_attribute):
+-        """Get a list of values for a particular attribute for each layer in a
+-        model.
++        """Get the value for a particular attribute for each layer in a model.
+         """
+         attr_values = []
+         for layer in model.layers:
+diff --git a/nobrainer/prediction.py b/nobrainer/prediction.py
+index a65dab6b..7de292ba 100644
+--- a/nobrainer/prediction.py
++++ b/nobrainer/prediction.py
+@@ -1,208 +1,212 @@
+-# -*- coding: utf-8 -*-
+ """Methods to predict using trained models."""
+ 
+ import math
+ from pathlib import Path
++
++import h5py
+ import nibabel as nib
+ import numpy as np
+ import tensorflow as tf
+-import time
++
++from nobrainer.transform import get_affine
++from nobrainer.transform import warp
+ from nobrainer.volume import from_blocks
+-from nobrainer.volume import zscore, normalize_zero_one
++from nobrainer.volume import from_blocks_numpy
++from nobrainer.volume import standardize_numpy
+ from nobrainer.volume import to_blocks
+-
+-DT_X = "float32"
+-_INFERENCE_CLASSES_KEY = "class_ids"
++from nobrainer.volume import to_blocks_numpy
+ 
+ 
+ def predict(inputs,
+-            predictor,
+-            block_shape,
+-            return_variance=False,
+-            return_entropy=False,
+-            return_array_from_images=False,
+-            n_samples=1,
+-            normalizer=None,
+-            batch_size=4,
+-            dtype=DT_X,
+-            ):
++             model,
++             block_shape,
++             batch_size=1,
++             normalizer=None,
++             n_samples=1,
++             return_variance=False,
++             return_entropy=False):
+     """Return predictions from `inputs`.
+ 
+     This is a general prediction method that can accept various types of
+-    `inputs` and `predictor`.
+-
+-    Args:
+-        inputs: 3D array or Nibabel image or filepath or list of filepaths.
+-        predictor: path-like or TensorFlow Predictor object, if path, must be
+-            path to SavedModel.
+-        return_variance: Boolean. If set True, it returns the running population
+-            variance along with mean. Note, if the n_samples is smaller or equal to 1,
+-            the variance will not be returned; instead it will return None
+-        return_entropy: Boolean. If set True, it returns the running entropy.
+-            along with mean.
+-        return_array_from_images: Boolean. If set True and the given input is either image,
+-            filepath, or filepaths, it will return arrays of [mean, variance, entropy]
+-            instead of images of them. Also, if the input is array, it will
+-            simply return array, whether or not this flag is True or False.
+-        n_samples: The number of sampling. If set as 1, it will just return the
+-            single prediction value. The default value is 1
+-        block_shape: tuple of length 3, shape of sub-volumes on which to
+-            predict.
+-        normalizer: callable, function that accepts two arguments
+-            `(features, labels)` and returns a tuple of modified
+-            `(features, labels)`.
+-        batch_size: int, number of sub-volumes per batch for predictions.
+-        dtype: str or dtype object, datatype of features array.
+-
+-    Returns:
+-        If `inputs` is a:
+-            -3D numpy array, return an iterable of maximum 3 elements;
+-                3D array of mean, variance(optional),and entropy(optional) of prediction.
+-                if the flags for variance or entropy is set False, it won't be returned at all
+-                The specific order of the elements are:
+-                mean, variance(default=None) , entropy(default=None)
+-                Note, variance is only defined when n_sample  > 1
+-            - Nibabel image or filepath, return a set of Nibabel images of mean, variance,
+-                entropy of predictions or just the pure arrays of them,
+-                if return_array_from_images is True.
+-            - list of filepaths, return generator that yields one set of Nibabel images
+-                or arrays(if return_array_from_images is set True) of means, variance, and
+-                entropy predictions per iteration.
++    `inputs`.
++
++    Parameters
++    ----------
++    inputs: 3D array or Nibabel image or filepath or list of filepaths.
++    model: str: path to saved model, either HDF5 or SavedModel.
++    block_shape: tuple of length 3, shape of sub-volumes on which to
++        predict.
++    batch_size: int, number of sub-volumes per batch for predictions.
++    normalizer: callable, function that accepts an ndarray and returns an
++        ndarray. Called before separating volume into blocks.
++    n_samples: The number of sampling. If set as 1, it will just return the
++        single prediction value. The default value is 1
++    return_variance: Boolean. If set True, it returns the running population
++        variance along with mean. Note, if the n_samples is smaller or equal to 1,
++        the variance will not be returned; instead it will return None
++    return_entropy: Boolean. If set True, it returns the running entropy.
++        along with mean.
++
++    Returns
++    -------
++    If `inputs` is a:
++        - 3D numpy array, return an iterable of maximum 3 elements;
++            3D array of mean, variance(optional),and entropy(optional) of prediction.
++            if the flags for variance or entropy is set False, it won't be returned at all
++            The specific order of the elements are:
++            mean, variance(default=None) , entropy(default=None)
++            Note, variance is only defined when n_sample  > 1
++        - Nibabel image or filepath, return a set of Nibabel images of mean, variance,
++            entropy of predictions or just the pure arrays of them,
++            if return_array_from_images is True.
++        - list of filepaths, return generator that yields one set of Nibabel images
++            or arrays(if return_array_from_images is set True) of means, variance, and
++            entropy predictions per iteration.
+     """
+     if n_samples < 1:
+         raise Exception('n_samples cannot be lower than 1.')
+ 
+-
+-    predictor = _get_predictor(predictor)
++    model = _get_model(model)
+ 
+     if isinstance(inputs, np.ndarray):
+         out = predict_from_array(
+             inputs=inputs,
+-            predictor=predictor,
++            model=model,
+             block_shape=block_shape,
+-            return_variance=return_variance,
+-            return_entropy=return_entropy,
+-            return_array_from_images=return_array_from_images,
+-            n_samples=n_samples,
++            batch_size=batch_size,
+             normalizer=normalizer,
+-            batch_size=batch_size)
++            n_samples=n_samples,
++            return_variance=return_variance,
++            return_entropy=return_entropy)
+     elif isinstance(inputs, nib.spatialimages.SpatialImage):
+         out = predict_from_img(
+             img=inputs,
+-            predictor=predictor,
++            model=model,
+             block_shape=block_shape,
+-            return_variance=return_variance,
+-            return_entropy=return_entropy,
+-            return_array_from_images=return_array_from_images,
+-            n_samples=n_samples,
+-            normalizer=normalizer,
+             batch_size=batch_size,
+-            dtype=dtype)
++            normalizer=normalizer,
++            n_samples=n_samples,
++            return_variance=return_variance,
++            return_entropy=return_entropy)
+     elif isinstance(inputs, str):
+         out = predict_from_filepath(
+             filepath=inputs,
+-            predictor=predictor,
++            model=model,
+             block_shape=block_shape,
+-            return_variance=return_variance,
+-            return_entropy=return_entropy,
+-            return_array_from_images=return_array_from_images,
+-            n_samples=n_samples,
+-            normalizer=normalizer,
+             batch_size=batch_size,
+-            dtype=dtype)
++            normalizer=normalizer,
++            n_samples=n_samples,
++            return_variance=return_variance,
++            return_entropy=return_entropy)
+     elif isinstance(inputs, (list, tuple)):
+         out = predict_from_filepaths(
+             filepaths=inputs,
+-            predictor=predictor,
++            model=model,
+             block_shape=block_shape,
+-            nreturn_variance=return_variance,
+-            return_entropy=return_entropy,
+-            return_array_from_images=return_array_from_images,
+-            n_samples=n_samples,
+-            normalizer=normalizer,
+             batch_size=batch_size,
+-            dtype=dtype)
++            normalizer=normalizer,
++            n_samples=n_samples,
++            return_variance=return_variance,
++            return_entropy=return_entropy)
+     else:
+         raise TypeError("Input to predict is not a valid type")
+     return out
+ 
+ 
+ def predict_from_array(inputs,
+-                       predictor,
+-                       block_shape,
+-                       return_variance=False,
+-                       return_entropy=False,
+-                       return_array_from_images=False,
+-                       n_samples=1,
+-                       normalizer=None,
+-                       batch_size=4):
++                     model,
++                     block_shape,
++                     batch_size=1,
++                     normalizer=None,
++                     n_samples=1,
++                     return_variance=False,
++                     return_entropy=False):
+     """Return a prediction given a filepath and an ndarray of features.
+ 
+-    Args:
+-        inputs: ndarray, array of features.
+-        predictor: TensorFlow Predictor object, predictor from previously
+-            trained model.
+-        block_shape: tuple of len 3, shape of blocks on which to predict.
+-        return_variance: 'y' or 'n'. If set True, it returns the running population
+-            variance along with mean. Note, if the n_samples is smaller or equal to 1,
+-            the variance will not be returned; instead it will return None
+-        return_entropy: Boolean. If set True, it returns the running entropy.
+-            along with mean.
+-        return_array_from_images: Boolean. If set True and the given input is either image,
+-            filepath, or filepaths, it will return arrays of [mean, variance, entropy]
+-            instead of images of them. Also, if the input is array, it will
+-            simply return array, whether or not this flag is True or False.
+-        n_samples: The number of sampling. If set as 1, it will just return the
+-            single prediction value.
+-        normalizer: callable, function that accepts an ndarray and returns an
+-            ndarray. Called before separating volume into blocks.
+-        batch_size: int, number of sub-volumes per batch for prediction.
+-
+-    Returns:
+-        ndarray of predictions.
++    Parameters
++    ----------
++    inputs: ndarray, array of features.
++    model: `tf.keras.Model`, trained model.
++    block_shape: tuple of length 3, shape of sub-volumes on which to
++        predict.
++    batch_size: int, number of sub-volumes per batch for predictions.
++    normalizer: callable, function that accepts an ndarray and returns an
++        ndarray. Called before separating volume into blocks.
++    n_samples: The number of sampling. If set as 1, it will just return the
++        single prediction value. The default value is 1
++    return_variance: Boolean. If set True, it returns the running population
++        variance along with mean. Note, if the n_samples is smaller or equal to 1,
++        the variance will not be returned; instead it will return None
++    return_entropy: Boolean. If set True, it returns the running entropy.
++        along with mean.
++
++    Returns
++    -------
++    ndarray of predictions.
+     """
+-
+-    print("Normalizer being used {n}".format(n = normalizer))
+     if normalizer:
+         features = normalizer(inputs)
+-        print(features.mean())
+-        print(features.std())
+     else:
+         features = inputs
+-    features = to_blocks(features, block_shape=block_shape)
+-    means = np.zeros_like(features)
+-    variances = np.zeros_like(features)
+-    entropies = np.zeros_like(features)
++    if block_shape is not None:
++        features = to_blocks_numpy(features, block_shape=block_shape)
++    else:
++        features = features[None]  # Add batch dimension.
+ 
+-    features = features[..., None]  # Add a dimension for single channel.
++    # Add a dimension for single channel.
++    features = features[..., None]
+ 
+     # Predict per block to reduce memory consumption.
+     n_blocks = features.shape[0]
+     n_batches = math.ceil(n_blocks / batch_size)
++
++    if not return_variance and not return_entropy and n_samples == 1:
++        outputs = model.predict(features, batch_size=1, verbose=0)
++        if outputs.shape[-1] == 1:
++            # Binarize according to threshold.
++            outputs = outputs > 0.3
++            outputs = outputs.squeeze(-1)
++            # Nibabel doesn't like saving boolean arrays as Nifti.
++            outputs = outputs.astype(np.uint8)
++        else:
++            # Hard classes for multi-class segmentation.
++            outputs = np.argmax(outputs, -1)
++        outputs = from_blocks_numpy(outputs, output_shape=inputs.shape)
++        return outputs
++
++    raise NotImplementedError(
++        "Predicting from Bayesian nets is not implemented yet.")
++
++    means = np.zeros_like(features)
++    variances = np.zeros_like(features)
++    entropies = np.zeros_like(features)
+     progbar = tf.keras.utils.Progbar(n_batches)
+     progbar.update(0)
+     for j in range(0, n_blocks, batch_size):
+ 
+-        new_prediction = predictor( {'volume': features[j:j + batch_size]})
++        this_x = features[j:j + batch_size]
++
++        new_prediction = model.predict(this_x, batch_size=1, verbose=0)
+ 
+         prev_mean = np.zeros_like(new_prediction['probabilities'])
+         curr_mean = new_prediction['probabilities']
+-        
++
+         M = np.zeros_like(new_prediction['probabilities'])
+         for n in range(1, n_samples):
+ 
+-            new_prediction = predictor( {'volume': features[j:j + batch_size]})
++            new_prediction = model.predict(this_x)
+             prev_mean = curr_mean
+             curr_mean = prev_mean + (new_prediction['probabilities'] - prev_mean)/float(n+1)
+             M = M + np.multiply(prev_mean - new_prediction['probabilities'], curr_mean - new_prediction['probabilities'])
+ 
+-        progbar.add(1)
+         means[j:j + batch_size] = np.argmax(curr_mean, axis = -1 ) # max mean
+         variances[j:j + batch_size] = np.sum(M/n_samples, axis = -1)
+         entropies[j:j + batch_size] = -np.sum(np.multiply(np.log(curr_mean+0.001),curr_mean), axis = -1) # entropy
+-    total_means =from_blocks(means, output_shape=inputs.shape)
+-    total_variance = from_blocks(variances, output_shape=inputs.shape)
+-    total_entropy = from_blocks(entropies, output_shape=inputs.shape)
++        progbar.add(1)
++
++    total_means = from_blocks_numpy(means, output_shape=inputs.shape)
++    total_variance = from_blocks_numpy(variances, output_shape=inputs.shape)
++    total_entropy = from_blocks_numpy(entropies, output_shape=inputs.shape)
+ 
+     mean_var_voxels = np.mean(total_variance)
+     std_var_voxels = np.std(total_variance)
+@@ -221,72 +225,63 @@ def predict_from_array(inputs,
+ 
+ 
+ def predict_from_img(img,
+-                     predictor,
++                     model,
+                      block_shape,
+-                     return_variance=False,
+-                     return_entropy=False,
+-                     return_array_from_images=False,
+-                     n_samples=1,
++                     batch_size=1,
+                      normalizer=None,
+-                     batch_size=4,
+-                     dtype=DT_X):
++                     n_samples=1,
++                     return_variance=False,
++                     return_entropy=False):
+     """Return a prediction given a Nibabel image instance and a predictor.
+ 
+-    Args:
+-        img: nibabel image, image on which to predict.
+-        predictor: TensorFlow Predictor object, predictor from previously
+-            trained model.
+-        block_shape: tuple of len 3, shape of blocks on which to predict.
+-        return_variance: Boolean. If set True, it returns the running population
+-            variance along with mean. Note, if the n_samples is smaller or equal to 1,
+-            the variance will not be returned; instead it will return None
+-        return_entropy: Boolean. If set True, it returns the running entropy.
+-            along with mean.
+-        return_array_from_images: Boolean. If set True and the given input is either image,
+-            filepath, or filepaths, it will return arrays of [mean, variance, entropy]
+-            instead of images of them. Also, if the input is array, it will
+-            simply return array, whether or not this flag is True or False.
+-        n_samples: The number of sampling. If set as 1, it will just return the
+-            single prediction value.
+-        normalizer: callable, function that accepts an ndarray and returns an
+-            ndarray. Called before separating volume into blocks.
+-        batch_size: int, number of sub-volumes per batch for prediction.
+-        dtype: str or dtype object, dtype of features.
+-
+-    Returns:
+-        `nibabel.spatialimages.SpatialImage` or arrays of prediction of mean,
+-            variance(optional) or entropy (optional).
++    Parameters
++    ----------
++    img: nibabel image, image on which to predict.
++    model: `tf.keras.Model`, trained model.
++    block_shape: tuple of length 3, shape of sub-volumes on which to
++        predict.
++    batch_size: int, number of sub-volumes per batch for predictions.
++    normalizer: callable, function that accepts an ndarray and returns an
++        ndarray. Called before separating volume into blocks.
++    n_samples: The number of sampling. If set as 1, it will just return the
++        single prediction value. The default value is 1
++    return_variance: Boolean. If set True, it returns the running population
++        variance along with mean. Note, if the n_samples is smaller or equal to 1,
++        the variance will not be returned; instead it will return None
++    return_entropy: Boolean. If set True, it returns the running entropy.
++        along with mean.
++
++    Returns
++    -------
++    `nibabel.spatialimages.SpatialImage` or arrays of prediction of mean,
++    variance(optional) or entropy (optional).
+     """
+     if not isinstance(img, nib.spatialimages.SpatialImage):
+         raise ValueError("image is not a nibabel image type")
+     inputs = np.asarray(img.dataobj)
+-    if dtype is not None:
+-        inputs = inputs.astype(dtype)
+     img.uncache()
++    inputs = inputs.astype(np.float32)
++
+     y = predict_from_array(
+         inputs=inputs,
+-        predictor=predictor,
++        model=model,
+         block_shape=block_shape,
+-        return_variance=return_variance,
+-        return_entropy=return_entropy,
+-        return_array_from_images=return_array_from_images,
+-        n_samples=n_samples,
++        batch_size=batch_size,
+         normalizer=normalizer,
+-        batch_size=batch_size)
++        n_samples=n_samples,
++        return_variance=return_variance,
++        return_entropy=return_entropy)
+ 
+-    if return_array_from_images:
+-        return y
++    if isinstance(y, np.ndarray):
++        return nib.spatialimages.SpatialImage(
++            dataobj=y, affine=img.affine, header=img.header, extra=img.extra)
+     else:
+-        if len(y) == 1:
+-            return nib.spatialimages.SpatialImage(
+-                dataobj=y[0], affine=img.affine, header=img.header, extra=img.extra),
+-
+-        elif len(y) == 2:
++        if len(y) == 2:
+             return nib.spatialimages.SpatialImage(
+                 dataobj=y[0], affine=img.affine, header=img.header, extra=img.extra),\
+                 nib.spatialimages.SpatialImage(
+                 dataobj=y[1], affine=img.affine, header=img.header, extra=img.extra)
+-        else:           # 3 inputs
++        elif len(y) == 3:
+             return nib.spatialimages.SpatialImage(
+                 dataobj=y[0], affine=img.affine, header=img.header, extra=img.extra),\
+                 nib.spatialimages.SpatialImage(
+@@ -295,42 +290,37 @@ def predict_from_img(img,
+                 dataobj=y[2], affine=img.affine, header=img.header, extra=img.extra)
+ 
+ 
+-
+-
+-
+ def predict_from_filepath(filepath,
+-                          predictor,
+-                          block_shape,
+-                          return_variance=False,
+-                          return_entropy=False,
+-                          return_array_from_images=False,
+-                          n_samples=1,
+-                          normalizer=None,
+-                          batch_size=4,
+-                          dtype=DT_X):
+-    """Return a prediction given a filepath and Predictor object.
+-
+-    Args:
+-        filepath: path-like, path to existing neuroimaging volume on which
+-            to predict.
+-        predictor: TensorFlow Predictor object, predictor from previously
+-            trained model.
+-        block_shape: tuple of len 3, shape of blocks on which to predict.
+-        return_variance: Boolean. If set True, it returns the running population
+-            variance along with mean. Note, if the n_samples is smaller or equal to 1,
+-            the variance will not be returned; instead it will return None
+-            along with mean.
+-        return_array_from_images: Boolean. If set True and the given input is either image,
+-            filepath, or filepaths, it will return arrays of [mean, variance, entropy]
+-            instead of images of them. Also, if the input is array, it will
+-            simply return array, whether or not this flag is True or False.
+-        n_samples: The number of sampling. If set as 1, it will just return the
+-            single prediction value.
+-        normalizer: callable, function that accepts an ndarray and returns an
+-            ndarray. Called before separating volume into blocks.
+-
+-    Returns:
+-        `nibabel.spatialimages.SpatialImage` or arrays of predictions of
++                           model,
++                           block_shape,
++                           batch_size=1,
++                           normalizer=None,
++                           n_samples=1,
++                           return_variance=False,
++                           return_entropy=False):
++    """Predict on a volume given a filepath and a trained model.
++
++    Parameters
++    ----------
++    filepath: path-like, path to existing neuroimaging volume on which
++        to predict.
++    model: `tf.keras.Model`, trained model.
++    block_shape: tuple of length 3, shape of sub-volumes on which to
++        predict.
++    batch_size: int, number of sub-volumes per batch for predictions.
++    normalizer: callable, function that accepts an ndarray and returns an
++        ndarray. Called before separating volume into blocks.
++    n_samples: The number of sampling. If set as 1, it will just return the
++        single prediction value. The default value is 1
++    return_variance: Boolean. If set True, it returns the running population
++        variance along with mean. Note, if the n_samples is smaller or equal to 1,
++        the variance will not be returned; instead it will return None
++    return_entropy: Boolean. If set True, it returns the running entropy.
++        along with mean.
++
++    Returns
++    -------
++    `nibabel.spatialimages.SpatialImage` or arrays of predictions of
+         mean, variance(optional), and entropy (optional).
+     """
+     if not Path(filepath).is_file():
+@@ -338,74 +328,140 @@ def predict_from_filepath(filepath,
+     img = nib.load(filepath)
+     return predict_from_img(
+         img=img,
+-        predictor=predictor,
++        model=model,
+         block_shape=block_shape,
+-        return_variance=return_variance,
+-        return_entropy=return_entropy,
+-        return_array_from_images=return_array_from_images,
+-        n_samples=n_samples,
++        batch_size=batch_size,
+         normalizer=normalizer,
+-        batch_size=batch_size)
++        n_samples=n_samples,
++        return_variance=return_variance,
++        return_entropy=return_entropy)
+ 
+ 
+ def predict_from_filepaths(filepaths,
+-                           predictor,
+-                           block_shape,
+-                           return_variance=False,
+-                           return_entropy=False,
+-                           return_array_from_images=False,
+-                           n_samples=1,
+-                           normalizer=None,
+-                           batch_size=4,
+-                           dtype=DT_X):
+-    """Yield predictions from filepaths using a SavedModel.
+-
+-    Args:
+-        filepaths: list, neuroimaging volume filepaths on which to predict.
+-        predictor: TensorFlow Predictor object, predictor from previously
+-            trained model.
+-        block_shape: tuple of len 3, shape of blocks on which to predict.
+-        normalizer: callable, function that accepts an ndarray and returns
+-            an ndarray. Called before separating volume into blocks.
+-        batch_size: int, number of sub-volumes per batch for prediction.
+-        dtype: str or dtype object, dtype of features.
+-
+-    Returns:
+-        Generator object that yields a `nibabel.spatialimages.SpatialImage` or
+-        arrays of predictions per filepath in list of input filepaths.
++                            model,
++                            block_shape,
++                            batch_size=1,
++                            normalizer=None,
++                            n_samples=1,
++                            return_variance=False,
++                            return_entropy=False):
++    """Yield a model's predictions on a list of filepaths.
++
++    Parameters
++    ----------
++    filepaths: list, volume filepaths on which to predict.
++    model: `tf.keras.Model`, trained model.
++    block_shape: tuple of length 3, shape of sub-volumes on which to
++        predict.
++    batch_size: int, number of sub-volumes per batch for predictions.
++    normalizer: callable, function that accepts an ndarray and returns an
++        ndarray. Called before separating volume into blocks.
++    n_samples: The number of sampling. If set as 1, it will just return the
++        single prediction value. The default value is 1
++    return_variance: Boolean. If set True, it returns the running population
++        variance along with mean. Note, if the n_samples is smaller or equal to 1,
++        the variance will not be returned; instead it will return None
++    return_entropy: Boolean. If set True, it returns the running entropy.
++        along with mean.
++
++    Returns
++    -------
++    Generator object that yields a `nibabel.spatialimages.SpatialImage` or
++    arrays of predictions per filepath in list of input filepaths.
+     """
+     for filepath in filepaths:
+         yield predict_from_filepath(
+             filepath=filepath,
+-            predictor=predictor,
++            model=model,
+             block_shape=block_shape,
+-            return_variance=return_variance,
+-            return_entropy=return_entropy,
+-            return_array_from_images=return_array_from_images,
+-            n_samples=n_samples,
+-            normalizer=normalizer,
+             batch_size=batch_size,
+-            dtype=dtype)
++            normalizer=normalizer,
++            n_samples=n_samples,
++            return_variance=return_variance,
++            return_entropy=return_entropy)
+ 
+ 
+-def _get_predictor(predictor):
+-    """Return `tf.contrib.predictor.predictor.Predictor` object from a filepath
+-    or a `Predictor` object.
++def _get_model(path):
++    """Return `tf.keras.Model` object from a filepath.
++
++    Parameters
++    ----------
++    path: str, path to HDF5 or SavedModel file.
++
++    Returns
++    -------
++    Instance of `tf.keras.Model`.
++
++    Raises
++    ------
++    `ValueError` if cannot load model.
+     """
+-    from tensorflow.contrib.predictor.predictor import Predictor
++    if isinstance(path, tf.keras.Model):
++        return path
++    try:
++        return tf.keras.models.load_model(path, compile=False)
++    except OSError:
++        # Not an HDF5 file.
++        pass
+ 
+-    if isinstance(predictor, Predictor):
++    try:
++        path = Path(path)
++        if path.suffix == '.json':
++            path = path.parent.parent
++        return tf.keras.experimental.load_from_saved_model(str(path))
++    except Exception:
+         pass
++
++    raise ValueError(
++        "Failed to load model. Is the model in HDF5 format or SavedModel"
++        " format?")
++
++
++def _transform_and_predict(model, x, block_shape, rotation, translation=[0, 0, 0], verbose=False):
++    """Predict on rigidly transformed features.
++
++    The rigid transformation is applied to the volumes prior to prediction, and
++    the prediced labels are transformed with the inverse warp, so that they are
++    in the same space.
++
++    Parameters
++    ----------
++    model: `tf.keras.Model`, model used for prediction.
++    x: 3D array, volume of features.
++    block_shape: tuple of length 3, shape of non-overlapping blocks to take
++        from the features. This also corresponds to the input of the model, not
++        including the batch or channel dimensions.
++    rotation: tuple of length 3, rotation angle in radians in each dimension.
++    translation: tuple of length 3, units of translation in each dimension.
++    verbose: bool, whether to print progress bar.
++
++    Returns
++    -------
++    Array of predictions with the same shape and in the same space as the
++    original input features.
++    """
++
++    x = np.asarray(x).astype(np.float32)
++    affine = get_affine(x.shape, rotation=rotation, translation=translation)
++    inverse_affine = tf.linalg.inv(affine)
++    x_warped = warp(x, affine, order=1)
++
++    x_warped_blocks = to_blocks_numpy(x_warped, block_shape)
++    x_warped_blocks = x_warped_blocks[..., np.newaxis]  # add grayscale channel
++    x_warped_blocks = standardize_numpy(x_warped_blocks)
++    y = model.predict(x_warped_blocks, batch_size=1, verbose=verbose)
++
++    n_classes = y.shape[-1]
++    if n_classes == 1:
++        y = y.squeeze(-1)
+     else:
+-        try:
+-            path = Path(predictor)
+-            # User might provide path to saved_model.pb but predictor expects
+-            # parent directory.
+-            if path.suffix == '.pb':
+-                path = path.parent
+-            predictor = tf.contrib.predictor.from_saved_model(str(path))
+-        except Exception:
+-            raise ValueError(
+-                "Failed to load predictor. Is `predictor` a path to a saved"
+-                " model?")
+-    return predictor
++        # Usually, the argmax would be taken to get the class membership of
++        # each voxel, but if we get hard values, then we cannot average
++        # multiple predictions.
++        raise ValueError(
++            "This function is not compatible with multi-class predictions.")
++
++    y = from_blocks_numpy(y, x.shape)
++    y = warp(y, inverse_affine, order=0).numpy()
++
++    return y
+diff --git a/nobrainer/tests/io_test.py b/nobrainer/tests/io_test.py
+index 007b3fc7..9ffd66b7 100644
+--- a/nobrainer/tests/io_test.py
++++ b/nobrainer/tests/io_test.py
+@@ -76,7 +76,11 @@ def test_convert(csv_of_volumes, tmp_path):
+     files = io.read_csv(csv_of_volumes, skip_header=False)
+     tfrecords_template = str(tmp_path / 'data-{shard:03d}.tfrecords')
+     volumes_per_shard = 12
+-    io.convert(files, tfrecords_template=tfrecords_template, volumes_per_shard=volumes_per_shard)
++    io.convert(
++        files,
++        tfrecords_template=tfrecords_template,
++        volumes_per_shard=volumes_per_shard,
++        num_parallel_calls=1)
+ 
+     paths = list(tmp_path.glob('data-*.tfrecords'))
+     paths = sorted(paths)
+@@ -101,7 +105,8 @@ def test_convert(csv_of_volumes, tmp_path):
+ 
+ def test_verify_features_labels(csv_of_volumes):
+     files = io.read_csv(csv_of_volumes, skip_header=False)
+-    io.verify_features_labels(files, volume_shape=(8, 8, 8))
++    io.verify_features_labels(
++        files, volume_shape=(8, 8, 8), num_parallel_calls=1)
+ 
+ 
+ def test_is_gzipped(tmp_path):
+diff --git a/nobrainer/tests/prediction_test.py b/nobrainer/tests/prediction_test.py
+new file mode 100644
+index 00000000..54e149aa
+--- /dev/null
++++ b/nobrainer/tests/prediction_test.py
+@@ -0,0 +1,95 @@
++"""Tests for `nobrainer.prediction`."""
++
++import nibabel as nib
++import numpy as np
++from numpy.testing import assert_array_equal
++import pytest
++import tensorflow as tf
++
++from nobrainer import prediction
++from nobrainer.models.meshnet import meshnet
++
++
++def test_predict(tmp_path):
++
++    x = np.ones((4, 4, 4))
++    img = nib.Nifti1Image(x, affine=np.eye(4))
++    path = str(tmp_path / 'features.nii.gz')
++    img.to_filename(path)
++
++    x2 = x * -50
++    img2 = nib.Nifti1Image(x2, affine=np.eye(4))
++    path2 = str(tmp_path / 'features2.nii.gz')
++    img2.to_filename(path2)
++
++    model = meshnet(1, (*x.shape, 1), receptive_field=37)
++
++    # From array.
++    y_ = prediction.predict_from_array(
++        x, model=model, block_shape=None)
++    y_blocks = prediction.predict_from_array(
++        x, model=model, block_shape=x.shape)
++    y_other = prediction.predict(
++        x, model=model, block_shape=None)
++    assert isinstance(y_, np.ndarray)
++    assert_array_equal(y_.shape, *x.shape)
++    assert_array_equal(y_, y_other)
++    assert_array_equal(y_, y_blocks)
++
++    # From image.
++    y_img = prediction.predict_from_img(img, model=model, block_shape=None)
++    y_img_other = prediction.predict(img, model=model, block_shape=None)
++    assert isinstance(y_img, nib.spatialimages.SpatialImage)
++    assert_array_equal(y_img.shape, x.shape)
++    assert_array_equal(y_img.get_fdata(caching='unchanged'), y_)
++    assert_array_equal(
++        y_img.get_fdata(caching='unchanged'),
++        y_img_other.get_fdata(caching='unchanged'))
++
++    # From filepath
++    y_img2 = prediction.predict_from_filepath(
++        path, model=model, block_shape=None)
++    y_img2_other = prediction.predict(
++        path, model=model, block_shape=None)
++    assert isinstance(y_img, nib.spatialimages.SpatialImage)
++    assert_array_equal(y_img.shape, x.shape)
++    assert_array_equal(y_img.get_fdata(caching='unchanged'), y_)
++    assert_array_equal(
++        y_img2.get_fdata(caching='unchanged'),
++        y_img2_other.get_fdata(caching='unchanged'))
++
++    # From filepaths
++    gen = prediction.predict_from_filepaths(
++        [path, path2], model=model, block_shape=None)
++    y_img3 = next(gen)
++    y_img4 = next(gen)
++    gen_other = prediction.predict(
++        [path, path2], model=model, block_shape=None)
++    y_img3_other = next(gen_other)
++    y_img4_other = next(gen_other)
++
++    assert_array_equal(
++        y_img2.get_fdata(caching='unchanged'),
++        y_img3.get_fdata(caching='unchanged'))
++    assert_array_equal(
++        y_img3.get_fdata(caching='unchanged'),
++        y_img3_other.get_fdata(caching='unchanged'))
++    assert_array_equal(
++        y_img4.get_fdata(caching='unchanged'),
++        y_img4_other.get_fdata(caching='unchanged'))
++    assert_array_equal(y_img3.shape, x.shape)
++
++
++def test_get_model(tmp_path):
++    model = meshnet(3, (10, 10, 10, 1), receptive_field=37)
++    path = str(tmp_path / 'model.h5')
++    model.save(path)
++    assert isinstance(prediction._get_model(path), tf.keras.Model)
++    assert model is prediction._get_model(model)
++    with pytest.raises(ValueError):
++        prediction._get_model("not a model")
++
++
++@pytest.mark.xfail
++def test_transform_and_predict(tmp_path):
++    assert False
+diff --git a/nobrainer/tests/volume_test.py b/nobrainer/tests/volume_test.py
+index 7b14be62..ec310751 100644
+--- a/nobrainer/tests/volume_test.py
++++ b/nobrainer/tests/volume_test.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++from numpy.testing import assert_allclose
+ from numpy.testing import assert_array_equal
+ import pytest
+ import tensorflow as tf
+@@ -43,6 +44,28 @@ def test_apply_random_transform():
+     assert not np.array_equal(x0, x1)
+     assert not np.array_equal(y0, y1)
+ 
++    # Test that new iterations yield different augmentations.
++    x = np.arange(64).reshape(1, 4, 4, 4).astype(np.float32)
++    y = np.random.randint(0, 2, size=(1, 4, 4, 4)).astype(np.float32)
++    dataset = tf.data.Dataset.from_tensor_slices((x, y))
++    # sanity check
++    x0, y0 = next(iter(dataset))
++    x1, y1 = next(iter(dataset))
++    assert_array_equal(x[0], x0)
++    assert_array_equal(x0, x1)
++    assert_array_equal(y[0], y0)
++    assert_array_equal(y0, y1)
++    dataset = dataset.map(volume.apply_random_transform)
++    x0, y0 = next(iter(dataset))
++    x1, y1 = next(iter(dataset))
++    assert not np.array_equal(x0, x1)
++    assert not np.array_equal(y0, y1)
++    assert_array_equal(np.unique(y0), [0, 1])
++    assert_array_equal(np.unique(y1), [0, 1])
++    # Naive test that features were interpolated without nearest neighbor.
++    assert np.any(x0 % 1)
++    assert np.any(x1 % 1)
++
+ 
+ def test_binarize():
+     x = [ 0.49671415, -0.1382643 ,  0.64768854,  1.52302986, -0.23415337,
+@@ -144,14 +167,93 @@ def test_get_preprocess_fn():
+     assert False
+ 
+ 
+-@pytest.mark.xfail
+ def test_preprocess_binary():
+-    assert False
++    shape = (10, 10, 10)
++    x = np.random.randn(*shape).astype(np.float32)
++    y = np.random.randint(0, 256, size=shape).astype(np.float32)
++    x0, y0 = volume._preprocess_binary(x, y, n_classes=1, block_shape=None)
++    assert_array_equal(x0.shape, [1, *shape, 1])
++    assert_array_equal(x0.shape, y0.shape)
++    assert_array_equal(np.unique(y0), [0, 1])
++    assert_allclose(np.mean(x0), 0, atol=1e-07)
++    assert_allclose(np.std(x0), 1, atol=1e-07)
++
++    x0, y0 = volume._preprocess_binary(x, y, n_classes=2)
++    assert_array_equal(x0.shape, [1, *shape, 1])
++    assert_array_equal(y0.shape, [1, *shape, 2])
++    assert_allclose(np.mean(x0), 0, atol=1e-07)
++    assert_allclose(np.std(x0), 1, atol=1e-07)
++    # All one-hot encoded items sum to 1.
++    assert (np.sum(y0, -1) == 1).all()
++
++    block_shape=(5, 5, 5)
++    x0, y0 = volume._preprocess_binary(
++        x, y, n_classes=1, block_shape=block_shape)
++    assert_array_equal(x0.shape, [8, *block_shape, 1])
++    assert_array_equal(y0.shape, [8, *block_shape, 1])
++    assert_allclose(np.mean(x0), 0, atol=1e-07)
++    assert_allclose(np.std(x0), 1, atol=1e-07)
++
++    block_shape=(5, 5, 5)
++    x0, y0 = volume._preprocess_binary(
++        x, y, n_classes=2, block_shape=block_shape)
++    assert_array_equal(x0.shape, [8, *block_shape, 1])
++    assert_array_equal(y0.shape, [8, *block_shape, 2])
++    assert_allclose(np.mean(x0), 0, atol=1e-07)
++    assert_allclose(np.std(x0), 1, atol=1e-07)
++    # All one-hot encoded items sum to 1.
++    assert (np.sum(y0, -1) == 1).all()
++
++    with pytest.raises(ValueError):
++        volume._preprocess_binary(x, y, n_classes=3)
++    with pytest.raises(ValueError):
++        volume._preprocess_binary(x, y, n_classes=0)
+ 
+ 
+ @pytest.mark.xfail
+ def test_preprocess_multiclass():
+-    assert False
++    shape = (10, 10, 10)
++    x = np.random.randn(*shape).astype(np.float32)
++    y = np.random.randint(0, 21, size=shape).astype(np.float32)
++    x0, y0 = volume._preprocess_multiclass(x, y, n_classes=3, block_shape=None)
++    assert_array_equal(x0.shape, [1, *shape, 1])
++    assert_array_equal(y0.shape, [1, *shape, 3])
++    assert_array_equal(np.unique(y0), [0, 1])
++    assert_allclose(np.mean(x0), 0, atol=1e-07)
++    assert_allclose(np.std(x0), 1, atol=1e-07)
++
++    block_shape=(5, 5, 5)
++    x0, y0 = volume._preprocess_multiclass(
++        x, y, n_classes=20, block_shape=block_shape)
++    assert_array_equal(x0.shape, [8, *block_shape, 1])
++    assert_array_equal(y0.shape, [8, *block_shape, 20])
++    assert_allclose(np.mean(x0), 0, atol=1e-07)
++    assert_allclose(np.std(x0), 1, atol=1e-07)
++
++    y = np.array([0, 1, 2, 3]).reshape(1, 2, 2).astype(np.float32)
++    x = y.copy()
++    x0, y0 = volume._preprocess_multiclass(x, y, n_classes=4)
++    assert (np.sum(y0, -1) == 1).all()
++    assert_array_equal(x0.shape, [1, 1, 2, 2, 1])
++    assert_array_equal(y0.shape, [1, 1, 2, 2, 4])
++
++    y = np.array([0, 1, 2, 3]).reshape(1, 2, 2).astype(np.float32)
++    x = y.copy()
++    mapping = {3: 2, 2: 1}
++    x0, y0 = volume._preprocess_multiclass(x, y, n_classes=4, mapping=mapping)
++    assert_array_equal(y0.numpy().argmax(-1).flatten(), [0, 1, 1, 2])
++
++    # Test that label values not in mapping values are zeroed.
++    mapping = {3: 2}
++    x0, y0 = volume._preprocess_multiclass(x, y, n_classes=4, mapping=mapping)
++    assert_array_equal(y0.numpy().argmax(-1).flatten(), [0, 0, 2, 2])
++
++    with pytest.raises(ValueError):
++        volume._preprocess_binary(x, y, n_classes=2)
++    with pytest.raises(ValueError):
++        volume._preprocess_binary(x, y, n_classes=1)
++    with pytest.raises(ValueError):
++        volume._preprocess_binary(x, y, n_classes=0)
+ 
+ 
+ def test_get_steps_per_epoch():
+diff --git a/nobrainer/training.py b/nobrainer/training.py
+index b35c5e23..8ee59e99 100644
+--- a/nobrainer/training.py
++++ b/nobrainer/training.py
+@@ -14,7 +14,7 @@ def train(model, dataset, optimizer, loss, steps_per_epoch, model_kwds={}, n_epo
+     """
+ 
+     # TODO: add checks.
+-    n_classes = dataset.output_shapes[1][-1].value  # last dimension of labels
++    n_classes = dataset.output_shapes[1][-1]  # last dimension of labels
+     input_shape = dataset.output_shapes[0][1:]  # remove batch dimension
+ 
+     if metrics is None:
+diff --git a/nobrainer/volume.py b/nobrainer/volume.py
+index a2f17da7..5f15eb31 100644
+--- a/nobrainer/volume.py
++++ b/nobrainer/volume.py
+@@ -173,7 +173,7 @@ def replace(x, mapping, zero=True):
+     -------
+     Modified tensor.
+     """
+-    x = tf.convert_to_tensor(x, dtype=tf.int32)
++    x = tf.cast(x, dtype=tf.int32)
+     keys = tf.convert_to_tensor(list(mapping.keys()))
+     vals = tf.convert_to_tensor(list(mapping.values()))
+ 
+@@ -186,7 +186,7 @@ def replace(x, mapping, zero=True):
+     idx = tf.reshape(idx, x.shape)
+ 
+     # Zero values that are equal to len(vs).
+-    idx = tf.multiply(idx, tf.cast(tf.not_equal(idx, len(vs)), tf.int32))
++    idx = tf.multiply(idx, tf.cast(tf.not_equal(idx, vs.shape[0]), tf.int32))
+     mask = tf.equal(tf.gather(ks, idx), x)
+     out = tf.where(mask, tf.gather(vs, idx), x)
+ 
+@@ -341,8 +341,7 @@ def preprocess(features, labels):
+ 
+ 
+ def _preprocess_binary(features, labels, n_classes=1, block_shape=None):
+-    """Creates a `Dataset` of `features` and `labels` preprocessed for binary
+-    segmentation.
++    """Preprocesses `features` and `labels` for binary segmentation.
+ 
+     Features are standard-scored (mean 0 and standard deviation of 1). Labels
+     are binarized (i.e., values above 0 are set to 1). Then, non-overlapping
+@@ -370,7 +369,7 @@ def _preprocess_binary(features, labels, n_classes=1, block_shape=None):
+     x = tf.convert_to_tensor(x)
+     x = standardize(x)
+     if block_shape is not None:
+-        x = to_blocks(x, volume_shape=x.shape, block_shape=block_shape)
++        x = to_blocks(x, block_shape=block_shape)
+     else:
+         x = tf.expand_dims(x, axis=0)
+     x = tf.expand_dims(x, axis=-1)  # Add grayscale channel.
+@@ -378,13 +377,13 @@ def _preprocess_binary(features, labels, n_classes=1, block_shape=None):
+     y = tf.convert_to_tensor(y)
+     y = binarize(y)
+     if block_shape is not None:
+-        y = to_blocks(y, volume_shape=y.shape, block_shape=block_shape)
++        y = to_blocks(y, block_shape=block_shape)
+     else:
+         y = tf.expand_dims(y, axis=0)
+     if n_classes == 1:
+         y = tf.expand_dims(y, axis=-1)
+     elif n_classes == 2:
+-        y = tf.one_hot(tf.to_int32(y), n_classes, dtype=tf.float32)
++        y = tf.one_hot(tf.cast(y, tf.int32), n_classes, dtype=tf.float32)
+     else:
+         raise ValueError("`n_classes` must be 1 or 2 for binary segmentation.")
+ 
+@@ -392,8 +391,7 @@ def _preprocess_binary(features, labels, n_classes=1, block_shape=None):
+ 
+ 
+ def _preprocess_multiclass(features, labels, n_classes, block_shape=None, mapping=None):
+-    """Creates a `Dataset` of `features` and `labels` preprocessed for
+-    multiclass segmentation.
++    """Preprocesses `features` and `labels` for multiclass segmentation.
+ 
+     Features are standard-scored (mean 0 and standard deviation of 1). If a
+     mapping is provided, values in labels are replaced according to the mapping.
+@@ -429,7 +427,7 @@ def _preprocess_multiclass(features, labels, n_classes, block_shape=None, mappin
+     x = tf.convert_to_tensor(x)
+     x = standardize(x)
+     if block_shape is not None:
+-        x = to_blocks(x, volume_shape=x.shape, block_shape=block_shape)
++        x = to_blocks(x, block_shape=block_shape)
+     else:
+         x = tf.expand_dims(x, axis=0)
+     x = tf.expand_dims(x, axis=-1)  # Add grayscale channel.
+@@ -438,11 +436,11 @@ def _preprocess_multiclass(features, labels, n_classes, block_shape=None, mappin
+     if mapping is not None:
+         y = replace(y, mapping=mapping)
+     if block_shape is not None:
+-        y = to_blocks(y, volume_shape=y.shape, block_shape=block_shape)
++        y = to_blocks(y, block_shape=block_shape)
+     else:
+         y = tf.expand_dims(y, axis=0)
+ 
+-    y = tf.one_hot(tf.to_int32(y), n_classes, dtype=tf.float32)
++    y = tf.one_hot(tf.cast(y, tf.int32), n_classes, dtype=tf.float32)
+     return x, y
+ 
+ 
+@@ -462,3 +460,93 @@ def get_n(a, k):
+     steps = n_blocks_per_volume * n_volumes / batch_size
+     steps = math.ceil(steps)
+     return steps
++
++
++# Below this line, we implement methods similar to those above but using Numpy.
++# This is particularly useful when we use models to predict, because it is
++# usually more pleasant to predict on Numpy arrays.
++
++
++def standardize_numpy(a):
++    """Standard score array.
++
++    Implements `(x - mean(x)) / stdev(x)`.
++
++    Parameters
++    ----------
++    x: array, values to standardize.
++
++    Returns
++    -------
++    Array of standardized values. Output has mean 0 and standard deviation 1.
++    """
++    a = np.asarray(a)
++    return (a - a.mean()) / a.std()
++
++
++def from_blocks_numpy(a, output_shape):
++    """Combine 4D array of non-overlapping blocks `a` into 3D array of shape
++    `output_shape`.
++
++    For the reverse of this function, see `to_blocks_numpy`.
++
++    Parameters
++    ----------
++    a: array-like, 4D array of blocks with shape (N, *block_shape), where N is
++        the number of blocks.
++    output_shape: tuple of len 3, shape of the combined array.
++
++    Returns
++    -------
++    Rank 3 array with shape `output_shape`.
++    """
++    a = np.asarray(a)
++
++    if a.ndim != 4:
++        raise ValueError("This function only works for 4D arrays.")
++    if len(output_shape) != 3:
++        raise ValueError("output_shape must have three values.")
++
++    n_blocks = a.shape[0]
++    block_shape = a.shape[1:]
++    ncbrt = np.cbrt(n_blocks).round(6)
++    if not ncbrt.is_integer():
++        raise ValueError("Cubed root of number of blocks is not an integer")
++    ncbrt = int(ncbrt)
++    intershape = (ncbrt, ncbrt, ncbrt, *block_shape)
++
++    return (
++        a.reshape(intershape)
++        .transpose((0, 3, 1, 4, 2, 5))
++        .reshape(output_shape))
++
++
++def to_blocks_numpy(a, block_shape):
++    """Return new array of non-overlapping blocks of shape `block_shape` from
++    array `a`.
++
++    For the reverse of this function (blocks to array), see `from_blocks_numpy`.
++
++    Parameters
++    ----------
++    a: array-like, 3D array to block
++    block_shape: tuple of len 3, shape of non-overlapping blocks.
++
++    Returns
++    -------
++    Rank 4 array with shape `(N, *block_shape)`, where N is the number of
++    blocks.
++    """
++    a = np.asarray(a)
++    orig_shape = np.asarray(a.shape)
++
++    if a.ndim != 3:
++        raise ValueError("This function only supports 3D arrays.")
++    if len(block_shape) != 3:
++        raise ValueError("block_shape must have three values.")
++
++    blocks = orig_shape // block_shape
++    inter_shape = tuple(e for tup in zip(blocks, block_shape) for e in tup)
++    new_shape = (-1,) + block_shape
++    perm = (0, 2, 4, 1, 3, 5)
++    return a.reshape(inter_shape).transpose(perm).reshape(new_shape)
+diff --git a/setup.cfg b/setup.cfg
+index df0daf8e..6d9a1e52 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -29,6 +29,7 @@ install_requires =
+     click
+     nibabel
+     numpy
++    scikit-image
+ python_requires = >=3.5
+ 
+ [options.entry_points]

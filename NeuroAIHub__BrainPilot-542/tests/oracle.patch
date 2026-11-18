@@ -1,0 +1,830 @@
+diff --git a/KnowledgeBase/README.md b/KnowledgeBase/README.md
+index b00203c2..f30d6fda 100644
+--- a/KnowledgeBase/README.md
++++ b/KnowledgeBase/README.md
+@@ -175,14 +175,17 @@ All failure modes (KB not built yet, sidecar can't start, model weights missing,
+ 
+ #### `search_papers_local(title?, authors?, journal?, published_year?, keywords?, topk=5, mode=meta-data, segment=1) -> str`
+ 
+-Filter the `KB_source.json` library by exact title / author overlap / exact journal / year prefix, rank by whole-word keyword hits across `title + abstract` (and the full `.mmd` body in `full-paper` mode).
++Filter the `KB_source.json` library by normalized title or title phrase / author overlap / exact journal / year, then rank by whole-word keyword hits. Title normalization ignores case, Unicode presentation variants, punctuation, and repeated whitespace while preserving semantic symbols.
+ 
+-- `mode="meta-data"` → metadata + `keyword_hits`.
+-- `mode="full-paper"` → adds a `~20k-char` segment of the `.mmd` and `segment_info` so long papers can be paged.
++- `mode="meta-data"` searches `title + abstract` without reading `.mmd` bodies.
++- `mode="full-paper"` also searches full text and returns a `~20k-char` segment, `full_text_status`, and `segment_info`.
++- Keyword-only searches return no zero-hit papers. With explicit metadata filters, keywords rank rather than discard the filtered set.
++- Every response includes `status`, `results`, `corpus_size`, and `matched_count`; `topk` is limited to 20.
++- Missing/unreadable full text and unavailable page numbers are reported explicitly rather than mapped to empty or repeated content.
+ 
+ Internal fields (`mmd_path`, `extraction_status`) are stripped from every returned record.
+ 
+-⚠️ All filters are **exact-match**: `journal="Nat Commun"` will miss "Nature Communications"; `published_year=2020` excludes any paper with an empty `published_date`. When unsure, lean on `keywords` and drop the filter.
++⚠️ Author and journal filters remain **exact-match**: `journal="Nat Commun"` will miss "Nature Communications"; `published_year=2020` excludes any paper with an empty `published_date`. When unsure, lean on `keywords` and drop the filter.
+ 
+ ### 7. How the local model deployment works
+ 
+@@ -427,14 +430,17 @@ python KnowledgeBase/scripts/build_kb.py --only chunk vectorize   # 只重切+
+ 
+ #### `search_papers_local(title?, authors?, journal?, published_year?, keywords?, topk=5, mode=meta-data, segment=1) -> str`
+ 
+-按元数据过滤 + 关键词排序检索 `KB_source.json`：
++按元数据过滤 + 关键词排序检索 `KB_source.json`：标题支持标准化后的完整标题或连续标题短语匹配，忽略大小写、Unicode 表现差异、标点和重复空白，同时保留有语义的符号。
+ 
+-- `mode="meta-data"` 返回 JSON 元数据列表（附 `keyword_hits`）。
+-- `mode="full-paper"` 额外返回一段 mmd 全文片段（默认每段 ~20k 字符）+ `segment_info`，可用 `segment` 翻页。
++- `mode="meta-data"` 只搜索 `title + abstract`，不会读取 mmd 全文。
++- `mode="full-paper"` 同时搜索全文，并返回一段 mmd 全文、`full_text_status` 与 `segment_info`。
++- 仅使用关键词时不会返回零命中论文；存在明确元数据过滤时，关键词只对过滤结果排序。
++- 每次响应都包含 `status`、`results`、`corpus_size` 与 `matched_count`；`topk` 最大为 20。
++- 全文缺失、不可读或请求页不存在时会显式报告，不会伪装为空正文或重复最后一页。
+ 
+ 所有内部字段（`mmd_path`、`extraction_status`）都从返回结果中剥离，不会泄漏给 agent。
+ 
+-⚠️ 注意所有过滤参数都是**完全匹配**：`journal="Nat Commun"` 不会命中 `"Nature Communications"`；`published_year=2020` 会排除掉 `published_date` 为空的条目。不确定时优先用 `keywords` 排序、把过滤参数留空。
++⚠️ 作者与期刊过滤仍是**完全匹配**：`journal="Nat Commun"` 不会命中 `"Nature Communications"`；`published_year=2020` 会排除掉 `published_date` 为空的条目。不确定时优先用 `keywords` 排序、把过滤参数留空。
+ 
+ ### 7. 模型本地化部署细节
+ 
+diff --git a/packages/runtime/src/__tests__/search-papers.test.ts b/packages/runtime/src/__tests__/search-papers.test.ts
+new file mode 100644
+index 00000000..954366f4
+--- /dev/null
++++ b/packages/runtime/src/__tests__/search-papers.test.ts
+@@ -0,0 +1,273 @@
++import { afterEach, describe, expect, it } from "vitest";
++import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import {
++  normalizeTitle,
++  searchPapers,
++  type FullPaperResult,
++  type MetaResult,
++  type PaperMetadata,
++} from "../tools/kb/search-papers.js";
++import { createSearchPapersLocalTool } from "../tools/kb/tools.js";
++
++const roots: string[] = [];
++
++afterEach(async () => {
++  delete process.env.BP_KB_ROOT;
++  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
++});
++
++async function makeKb(
++  papers: Array<PaperMetadata & {
++    mmd_content?: string;
++    mmd_missing?: boolean;
++    mmd_unreadable?: boolean;
++  }>,
++): Promise<string> {
++  const root = await mkdtemp(join(tmpdir(), "brainpilot-paper-search-"));
++  roots.push(root);
++  const source = join(root, "source");
++  const mmdDir = join(source, "mmd");
++  await mkdir(mmdDir, { recursive: true });
++
++  const stored = [];
++  for (const [index, paper] of papers.entries()) {
++    const path = join(mmdDir, `paper-${index}.mmd`);
++    if (paper.mmd_unreadable) await mkdir(path);
++    else if (!paper.mmd_missing) await writeFile(path, paper.mmd_content ?? "", "utf8");
++    const {
++      mmd_content: _content,
++      mmd_missing: _missing,
++      mmd_unreadable: _unreadable,
++      ...metadata
++    } = paper;
++    stored.push({ ...metadata, mmd_path: path });
++  }
++  await writeFile(join(source, "KB_source.json"), JSON.stringify({ papers: stored }), "utf8");
++  return root;
++}
++
++const eegnet: PaperMetadata & { mmd_content: string } = {
++  title: "EEGNet: A Compact Convolutional Neural Network for EEG-based BCIs",
++  authors: ["Vernon J. Lawhern"],
++  journal: "Journal of Neural Engineering",
++  published_date: "2018-10-12",
++  abstract: "EEGNet uses depthwise and separable convolutions for EEG classification.",
++  mmd_content: "Full EEGNet paper body with architecture and evaluation details.",
++};
++
++describe("searchPapers", () => {
++  it("returns a structured no_match result instead of unrelated zero-hit papers", async () => {
++    const root = await makeKb([
++      eegnet,
++      {
++        title: "A Recent Epilepsy Brain-Age Study",
++        published_date: "2026-01-01",
++        abstract: "Brain age estimation in epilepsy.",
++      },
++    ]);
++
++    const response = await searchPapers({
++      kbRoot: root,
++      keywords: "nonexistent motor imagery transformer",
++    });
++
++    expect(response).toEqual(expect.objectContaining({
++      status: "no_match",
++      results: [],
++      corpus_size: 2,
++      matched_count: 0,
++    }));
++  });
++
++  it("matches normalized exact titles and contiguous title phrases", async () => {
++    const root = await makeKb([eegnet]);
++
++    expect(normalizeTitle(" EEGNet—A  Compact: Network! ")).toBe("eegnet a compact network");
++    const exact = await searchPapers({
++      kbRoot: root,
++      title: "eegnet — a compact convolutional neural network for eeg based bcis",
++    });
++    const phrase = await searchPapers({
++      kbRoot: root,
++      title: "compact convolutional neural network",
++    });
++
++    expect(exact.status).toBe("ok");
++    expect((exact.results[0] as MetaResult).title_match).toBe("exact");
++    expect(phrase.status).toBe("ok");
++    expect((phrase.results[0] as MetaResult).title_match).toBe("phrase");
++  });
++
++  it("preserves semantic symbols and matches phrases only at token boundaries", async () => {
++    const root = await makeKb([{
++      title: "C++ Methods for Scientific Computing",
++      abstract: "Modern C++ implementation techniques.",
++    }]);
++
++    expect(normalizeTitle("C++ Methods")).toBe("c++ methods");
++    expect((await searchPapers({ kbRoot: root, title: "C++ Methods" })).status).toBe("ok");
++    expect((await searchPapers({ kbRoot: root, title: "C" })).status).toBe("not_in_corpus");
++  });
++
++  it("ranks an exact title before phrase matches even without keywords", async () => {
++    const root = await makeKb([
++      { title: "EEGNet Extended Analysis", published_date: "2026-01-01" },
++      { title: "EEGNet", published_date: "2018-01-01" },
++    ]);
++
++    const response = await searchPapers({ kbRoot: root, title: "EEGNet" });
++
++    expect((response.results[0] as MetaResult).title).toBe("EEGNet");
++    expect((response.results[0] as MetaResult).title_match).toBe("exact");
++  });
++
++  it("keeps metadata search cheap while preserving full-text recall in full-paper mode", async () => {
++    const root = await makeKb([{
++      title: "Generic EEG Methods",
++      abstract: "A general methods overview.",
++      mmd_content: "The body alone mentions hidden-body-keyword and its validation.",
++    }]);
++
++    const metadata = await searchPapers({
++      kbRoot: root,
++      mode: "meta-data",
++      keywords: "hidden-body-keyword",
++    });
++    const fullPaper = await searchPapers({
++      kbRoot: root,
++      mode: "full-paper",
++      keywords: "hidden-body-keyword",
++    });
++
++    expect(metadata.status).toBe("no_match");
++    expect(fullPaper.status).toBe("ok");
++    expect(fullPaper.results[0]).toEqual(expect.objectContaining({
++      mmd_content: expect.stringContaining("hidden-body-keyword"),
++    }));
++  });
++
++  it("uses keywords as ranking evidence rather than overriding explicit metadata filters", async () => {
++    const root = await makeKb([eegnet]);
++
++    const response = await searchPapers({
++      kbRoot: root,
++      title: "EEGNet",
++      keywords: "term-not-present",
++    });
++
++    expect(response.status).toBe("ok");
++    expect((response.results[0] as MetaResult).keyword_hits).toBe(0);
++  });
++
++  it("rejects invalid mode, result limits, and segment numbers consistently", async () => {
++    const root = await makeKb([eegnet]);
++
++    for (const args of [
++      { kbRoot: root, keywords: "EEGNet", mode: "invalid" as "meta-data" },
++      { kbRoot: root, keywords: "EEGNet", topk: 21 },
++      { kbRoot: root, keywords: "EEGNet", segment: 0 },
++    ]) {
++      await expect(searchPapers(args)).resolves.toEqual(expect.objectContaining({
++        status: "invalid_query",
++        results: [],
++      }));
++    }
++  });
++
++  it("requires a meaningful criterion and a valid publication year", async () => {
++    const root = await makeKb([eegnet]);
++
++    for (const args of [
++      { kbRoot: root },
++      { kbRoot: root, title: "   " },
++      { kbRoot: root, journal: "   " },
++      { kbRoot: root, published_year: 20 },
++    ]) {
++      const response = await searchPapers(args);
++      expect(response.status).toBe("invalid_query");
++    }
++  });
++
++  it("reports missing and unreadable full-text artifacts without losing metadata", async () => {
++    const root = await makeKb([
++      {
++        title: "Metadata-Only Paper",
++        abstract: "A discoverable abstract.",
++        mmd_missing: true,
++      },
++      {
++        title: "Unreadable Full Text",
++        abstract: "Another discoverable abstract.",
++        mmd_unreadable: true,
++      },
++    ]);
++
++    const response = await searchPapers({
++      kbRoot: root,
++      mode: "full-paper",
++      title: "Metadata-Only Paper",
++    });
++    const result = response.results[0] as FullPaperResult;
++
++    expect(response.status).toBe("ok");
++    expect(result.metadata.title).toBe("Metadata-Only Paper");
++    expect(result.full_text_status).toBe("missing");
++    expect(result.mmd_content).toBe("");
++    expect(result.segment_info).toEqual(expect.objectContaining({ available: false }));
++
++    const unreadable = await searchPapers({
++      kbRoot: root,
++      mode: "full-paper",
++      title: "Unreadable Full Text",
++    });
++    expect((unreadable.results[0] as FullPaperResult).full_text_status).toBe("unreadable");
++  });
++
++  it("reports an unavailable requested page instead of repeating the last page", async () => {
++    const root = await makeKb([eegnet]);
++
++    const response = await searchPapers({
++      kbRoot: root,
++      mode: "full-paper",
++      title: "EEGNet",
++      segment: 2,
++    });
++    const result = response.results[0] as FullPaperResult;
++
++    expect(result.full_text_status).toBe("available");
++    expect(result.mmd_content).toBe("");
++    expect(result.segment_info).toEqual(expect.objectContaining({
++      segment: 2,
++      total_segments: 1,
++      available: false,
++      has_more: false,
++    }));
++  });
++});
++
++describe("search_papers_local tool", () => {
++  it("keeps query errors recoverable and marks only infrastructure failures as tool errors", async () => {
++    const root = await makeKb([eegnet]);
++    process.env.BP_KB_ROOT = root;
++    const tool = createSearchPapersLocalTool();
++
++    const invalid = await tool.execute({ mode: "invalid", keywords: "EEGNet" });
++    expect(invalid.isError).not.toBe(true);
++    expect(JSON.parse(invalid.content[0]!.text)).toEqual(expect.objectContaining({
++      status: "invalid_query",
++      results: [],
++    }));
++
++    const missingRoot = await mkdtemp(join(tmpdir(), "brainpilot-paper-search-missing-"));
++    roots.push(missingRoot);
++    process.env.BP_KB_ROOT = missingRoot;
++    const infrastructure = await tool.execute({ keywords: "EEGNet" });
++    expect(infrastructure.isError).toBe(true);
++    expect(JSON.parse(infrastructure.content[0]!.text)).toEqual(expect.objectContaining({
++      status: "infrastructure_error",
++      results: [],
++    }));
++  });
++});
+diff --git a/packages/runtime/src/tools/kb/search-papers.ts b/packages/runtime/src/tools/kb/search-papers.ts
+index 237d8993..d5e6ac5b 100644
+--- a/packages/runtime/src/tools/kb/search-papers.ts
++++ b/packages/runtime/src/tools/kb/search-papers.ts
+@@ -2,17 +2,11 @@
+  * Multi-criteria paper search over the local ``source/KB_source.json``
+  * library written by ``scripts/extract_meta.py``.
+  *
+- * Mirrors `tools.py:search_papers` (the function that powers the v3 KB on
+- * the legacy MCP server):
+- *
+- *   - Filters: title (exact), authors (any-overlap exact), journal (exact),
+- *     published_year (year prefix). Each filter is OPTIONAL.
+- *   - Ranking: count whole-word keyword matches against title + abstract,
+- *     and optionally the full .mmd body in full-paper mode. Ties break by
+- *     publication date desc.
+- *   - Output: "meta-data" returns metadata + keyword_hits. "full-paper"
+- *     additionally returns a `mmd_content` segment + `segment_info` so
+- *     long papers can be paged through.
++ *   - Filters: normalized title/phrase, exact author or journal, and year.
++ *   - Ranking: whole-word keyword hits in metadata, plus full text only in
++ *     full-paper mode. Keyword-only queries never return zero-hit papers.
++ *   - Output: a structured status envelope. Full-paper results expose content
++ *     and page availability without hiding missing or unreadable artifacts.
+  *
+  * Internal-only fields (``mmd_path``, ``extraction_status``) are stripped
+  * from every returned record so they never leak to an agent.
+@@ -21,6 +15,12 @@ import { readFile } from "node:fs/promises";
+ import { resolveKbPaths } from "./paths.js";
+ 
+ export type SearchMode = "meta-data" | "full-paper";
++export type PaperSearchStatus =
++  | "ok"
++  | "no_match"
++  | "not_in_corpus"
++  | "invalid_query"
++  | "infrastructure_error";
+ 
+ export interface SearchArgs {
+   title?: string;
+@@ -51,22 +51,49 @@ interface RawPaper extends PaperMetadata {
+   [key: string]: unknown;
+ }
+ 
+-export type MetaResult = PaperMetadata & { keyword_hits: number };
++export type TitleMatch = "exact" | "phrase";
++export type FullTextStatus = "available" | "missing" | "unreadable";
++
++export type MetaResult = PaperMetadata & {
++  keyword_hits: number;
++  title_match?: TitleMatch;
++};
+ 
+ export interface FullPaperResult {
+   metadata: MetaResult;
+   mmd_content: string;
++  full_text_status: FullTextStatus;
+   segment_info: {
+     segment: number;
+     total_segments: number;
+     total_chars: number;
++    available: boolean;
+     has_more: boolean;
+   };
+ }
+ 
++export interface PaperSearchResponse {
++  status: PaperSearchStatus;
++  results: Array<MetaResult | FullPaperResult>;
++  corpus_size: number;
++  matched_count: number;
++  message?: string;
++}
++
+ const SEGMENT_CHARS = 20_000;
++const MAX_TOPK = 20;
+ const INTERNAL_FIELDS = new Set(["mmd_path", "extraction_status"]);
+ 
++function invalidQuery(message: string): PaperSearchResponse {
++  return {
++    status: "invalid_query",
++    results: [],
++    corpus_size: 0,
++    matched_count: 0,
++    message,
++  };
++}
++
+ function stripInternal<T extends Record<string, unknown>>(d: T): Omit<T, "mmd_path" | "extraction_status"> {
+   const out: Record<string, unknown> = {};
+   for (const [k, v] of Object.entries(d)) {
+@@ -87,6 +114,23 @@ function normalizeStrList(value: string[] | string | undefined): string[] | null
+   return items.length ? items : null;
+ }
+ 
++/** Normalize presentation differences while preserving semantic symbols such as `+`. */
++export function normalizeTitle(value: string): string {
++  return value
++    .normalize("NFKC")
++    .toLocaleLowerCase("en-US")
++    .replace(/\p{P}+/gu, " ")
++    .replace(/\s+/g, " ")
++    .trim();
++}
++
++function hasTitlePhrase(title: string, phrase: string): boolean {
++  return title === phrase
++    || title.startsWith(`${phrase} `)
++    || title.endsWith(` ${phrase}`)
++    || title.includes(` ${phrase} `);
++}
++
+ function escapeRegex(s: string): string {
+   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+ }
+@@ -101,12 +145,18 @@ function countKeywordHits(text: string, patterns: RegExp[]): number {
+   return n;
+ }
+ 
+-async function readMmd(path: string | undefined): Promise<string> {
+-  if (!path) return "";
++interface FullTextRead {
++  content: string;
++  status: FullTextStatus;
++}
++
++async function readMmd(path: string | undefined): Promise<FullTextRead> {
++  if (!path) return { content: "", status: "missing" };
+   try {
+-    return await readFile(path, "utf8");
+-  } catch {
+-    return "";
++    return { content: await readFile(path, "utf8"), status: "available" };
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException).code;
++    return { content: "", status: code === "ENOENT" ? "missing" : "unreadable" };
+   }
+ }
+ 
+@@ -139,39 +189,94 @@ async function loadSource(kbSourceJson: string): Promise<RawPaper[]> {
+ 
+ export async function searchPapers(
+   args: SearchArgs,
+-): Promise<MetaResult[] | FullPaperResult[]> {
++): Promise<PaperSearchResponse> {
+   const mode: SearchMode = args.mode ?? "meta-data";
+   if (mode !== "meta-data" && mode !== "full-paper") {
+-    throw new Error(`mode must be 'meta-data' or 'full-paper', got '${mode}'`);
++    return invalidQuery(`mode must be 'meta-data' or 'full-paper', got '${mode}'`);
++  }
++  const topk = args.topk ?? 5;
++  if (!Number.isInteger(topk) || topk < 1 || topk > MAX_TOPK) {
++    return invalidQuery(`topk must be an integer between 1 and ${MAX_TOPK}`);
++  }
++  const segment = args.segment ?? 1;
++  if (!Number.isInteger(segment) || segment < 1) {
++    return invalidQuery("segment must be a positive integer");
+   }
+-  const topk = Math.max(1, Math.floor(args.topk ?? 5));
+-  const segment = Math.max(1, Math.floor(args.segment ?? 1));
+ 
+   const authors = normalizeStrList(args.authors);
+   const keywords = normalizeStrList(args.keywords);
++  const titleQuery = typeof args.title === "string" ? normalizeTitle(args.title) : null;
++  const journal = typeof args.journal === "string" ? args.journal.trim() : undefined;
++  const validYear = args.published_year === undefined || (
++    Number.isInteger(args.published_year)
++    && args.published_year >= 1000
++    && args.published_year <= 9999
++  );
++  if (!validYear) return invalidQuery("published_year must be a four-digit integer");
++  if (args.title !== undefined && !titleQuery) return invalidQuery("title must be non-empty");
++  if (args.journal !== undefined && !journal) return invalidQuery("journal must be non-empty");
++  if (args.authors !== undefined && !authors) return invalidQuery("authors must be non-empty");
++  if (args.keywords !== undefined && !keywords) return invalidQuery("keywords must be non-empty");
++  if (!titleQuery && !authors && !journal && args.published_year === undefined && !keywords) {
++    return invalidQuery("provide at least one title, author, journal, year, or keyword criterion");
++  }
++  const hasStructuralFilter = Boolean(
++    titleQuery || authors || journal || args.published_year !== undefined,
++  );
+ 
+   const kb = resolveKbPaths(args.kbRoot);
+   const papers = await loadSource(kb.kbSourceJson);
++  if (papers.length === 0) {
++    return {
++      status: "not_in_corpus",
++      results: [],
++      corpus_size: 0,
++      matched_count: 0,
++      message: "the local paper corpus is empty",
++    };
++  }
+ 
+   // Filter
+-  const filtered: RawPaper[] = [];
++  const filtered: Array<{ paper: RawPaper; titleMatch?: TitleMatch }> = [];
++  let titleMatchesInCorpus = 0;
+   for (const paper of papers) {
+     if (typeof paper !== "object" || paper === null) continue;
+-    if (args.title !== undefined && paper.title !== args.title) continue;
++    let titleMatch: TitleMatch | undefined;
++    if (titleQuery) {
++      const candidate = normalizeTitle(typeof paper.title === "string" ? paper.title : "");
++      if (candidate === titleQuery) titleMatch = "exact";
++      else if (hasTitlePhrase(candidate, titleQuery)) titleMatch = "phrase";
++      else continue;
++      titleMatchesInCorpus++;
++    }
+     if (authors !== null) {
+       const pa = Array.isArray(paper.authors) ? paper.authors : [];
+       if (!authors.some((a) => pa.includes(a))) continue;
+     }
+-    if (args.journal !== undefined && paper.journal !== args.journal) continue;
++    if (journal !== undefined && paper.journal !== journal) continue;
+     if (args.published_year !== undefined) {
+       const pd = typeof paper.published_date === "string" ? paper.published_date : "";
+       if (!pd.startsWith(String(args.published_year))) continue;
+     }
+-    filtered.push(paper);
++    filtered.push({ paper, ...(titleMatch ? { titleMatch } : {}) });
++  }
++  if (titleQuery && titleMatchesInCorpus === 0) {
++    return {
++      status: "not_in_corpus",
++      results: [],
++      corpus_size: papers.length,
++      matched_count: 0,
++      message: "no paper in the local corpus has the requested title or title phrase",
++    };
+   }
+ 
+   // Rank
+-  let ranked: Array<{ paper: RawPaper; hits: number; mmd: string }> = [];
++  let ranked: Array<{
++    paper: RawPaper;
++    hits: number;
++    fullText?: FullTextRead;
++    titleMatch?: TitleMatch;
++  }> = [];
+   if (keywords) {
+     const patterns: RegExp[] = [];
+     for (const kw of keywords) {
+@@ -181,51 +286,94 @@ export async function searchPapers(
+         /* skip un-compilable */
+       }
+     }
+-    for (const p of filtered) {
+-      const mmd = await readMmd(p.mmd_path);
+-      const blob = `${p.title ?? ""} ${p.abstract ?? ""} ${mmd}`;
++    for (const candidate of filtered) {
++      const p = candidate.paper;
++      const fullText = mode === "full-paper" ? await readMmd(p.mmd_path) : undefined;
++      const blob = `${p.title ?? ""} ${p.abstract ?? ""} ${fullText?.content ?? ""}`;
+       const hits = countKeywordHits(blob, patterns);
+-      ranked.push({ paper: p, hits, mmd });
++      if (hits === 0 && !hasStructuralFilter) continue;
++      ranked.push({
++        paper: p,
++        hits,
++        ...(fullText ? { fullText } : {}),
++        ...(candidate.titleMatch ? { titleMatch: candidate.titleMatch } : {}),
++      });
+     }
+-    ranked.sort((a, b) => {
+-      if (b.hits !== a.hits) return b.hits - a.hits;
+-      const yearA = Number((a.paper.published_date ?? "").slice(0, 4)) || 0;
+-      const yearB = Number((b.paper.published_date ?? "").slice(0, 4)) || 0;
+-      return yearB - yearA;
+-    });
+   } else {
+-    ranked = filtered.map((p) => ({ paper: p, hits: 0, mmd: "" }));
++    ranked = filtered.map(({ paper, titleMatch }) => ({
++      paper,
++      hits: 0,
++      ...(titleMatch ? { titleMatch } : {}),
++    }));
++  }
++  ranked.sort((a, b) => {
++    if (b.hits !== a.hits) return b.hits - a.hits;
++    const titleRank = (match?: TitleMatch) => match === "exact" ? 2 : match === "phrase" ? 1 : 0;
++    if (titleRank(b.titleMatch) !== titleRank(a.titleMatch)) {
++      return titleRank(b.titleMatch) - titleRank(a.titleMatch);
++    }
++    const yearA = Number((a.paper.published_date ?? "").slice(0, 4)) || 0;
++    const yearB = Number((b.paper.published_date ?? "").slice(0, 4)) || 0;
++    return yearB - yearA;
++  });
++  if (ranked.length === 0) {
++    return {
++      status: "no_match",
++      results: [],
++      corpus_size: papers.length,
++      matched_count: 0,
++      message: "no paper matches the requested criteria",
++    };
+   }
+   const top = ranked.slice(0, topk);
+ 
+   if (mode === "meta-data") {
+-    return top.map(({ paper, hits }) => ({
++    const results = top.map(({ paper, hits, titleMatch }) => ({
+       ...stripInternal(paper),
+       keyword_hits: hits,
++      ...(titleMatch ? { title_match: titleMatch } : {}),
+     })) as MetaResult[];
++    return {
++      status: "ok",
++      results,
++      corpus_size: papers.length,
++      matched_count: ranked.length,
++    };
+   }
+ 
+   // full-paper
+   const out: FullPaperResult[] = [];
+-  for (const { paper, hits, mmd } of top) {
+-    const content = mmd || (await readMmd(paper.mmd_path));
++  for (const { paper, hits, fullText: rankedFullText, titleMatch } of top) {
++    const fullText = rankedFullText ?? await readMmd(paper.mmd_path);
++    const content = fullText.content;
+     const totalChars = content.length;
+-    const totalSegments = totalChars > 0
+-      ? Math.ceil(totalChars / SEGMENT_CHARS)
+-      : 1;
+-    const seg = Math.max(1, Math.min(segment, totalSegments));
+-    const start = (seg - 1) * SEGMENT_CHARS;
++    const totalSegments = fullText.status === "available"
++      ? Math.max(1, Math.ceil(totalChars / SEGMENT_CHARS))
++      : 0;
++    const available = fullText.status === "available" && segment <= totalSegments;
++    const start = (segment - 1) * SEGMENT_CHARS;
+     const end = Math.min(start + SEGMENT_CHARS, totalChars);
+     out.push({
+-      metadata: { ...stripInternal(paper), keyword_hits: hits },
+-      mmd_content: content.slice(start, end),
++      metadata: {
++        ...stripInternal(paper),
++        keyword_hits: hits,
++        ...(titleMatch ? { title_match: titleMatch } : {}),
++      },
++      mmd_content: available ? content.slice(start, end) : "",
++      full_text_status: fullText.status,
+       segment_info: {
+-        segment: seg,
++        segment,
+         total_segments: totalSegments,
+         total_chars: totalChars,
+-        has_more: seg < totalSegments,
++        available,
++        has_more: available && segment < totalSegments,
+       },
+     });
+   }
+-  return out;
++  return {
++    status: "ok",
++    results: out,
++    corpus_size: papers.length,
++    matched_count: ranked.length,
++  };
+ }
+diff --git a/packages/runtime/src/tools/kb/tools.ts b/packages/runtime/src/tools/kb/tools.ts
+index bd886b2e..23935de2 100644
+--- a/packages/runtime/src/tools/kb/tools.ts
++++ b/packages/runtime/src/tools/kb/tools.ts
+@@ -9,21 +9,17 @@
+  *     loopback.
+  *
+  *   search_papers_local
+- *     Multi-criteria search over ``source/KB_source.json``. Same surface as
+- *     ``tools.py:search_papers``.
++ *     Structured multi-criteria search over ``source/KB_source.json``.
+  *
+- * Both tools return STRINGS. Errors are returned as ``"ERROR: ..."`` strings
+- * (with the tool result also marked ``isError: true`` so Pi surfaces it as
+- * a failed call) — never thrown. This matches the legacy contract and lets
+- * agents react to a missing KB or an unreachable sidecar by simply reading
+- * the result.
++ * Both tools return strings. Domain retrieval retains the legacy
++ * ``ERROR: ...`` failure contract. Paper search returns a JSON object with an
++ * explicit status; only infrastructure failures are marked ``isError: true``.
+  */
+ import type { SystemTool } from "../../types.js";
+ import { retrieve, type RetrievalResult } from "./retrieve.js";
+ import {
+   searchPapers,
+-  type FullPaperResult,
+-  type MetaResult,
++  type PaperSearchResponse,
+   type SearchMode,
+ } from "./search-papers.js";
+ import { isKbReady, resolveKbPaths } from "./paths.js";
+@@ -39,6 +35,13 @@ function fail(text: string): {
+   return { ...ok(`ERROR: ${text}`), isError: true as const };
+ }
+ 
++function paperSearchFailure(payload: PaperSearchResponse): {
++  content: [{ type: "text"; text: string }];
++  isError: true;
++} {
++  return { ...ok(JSON.stringify(payload, null, 2)), isError: true as const };
++}
++
+ function formatResults(results: RetrievalResult[], reloadNote?: string): string {
+   const blocks: string[] = [];
+   if (reloadNote) blocks.push(reloadNote);
+@@ -165,18 +168,18 @@ export function createSearchPapersLocalTool(): SystemTool {
+     name: "search_papers_local",
+     description:
+       "Multi-criteria search over the LOCAL paper library (source/KB_source.json " +
+-      "produced by KnowledgeBase/scripts/extract_meta.py). Filter by exact title, " +
++      "produced by KnowledgeBase/scripts/extract_meta.py). Filter by normalized exact/phrase title, " +
+       "author overlap, exact journal, or publication year; rank by keyword hit " +
+-      "count against title+abstract (+full mmd content in full-paper mode). " +
+-      "mode='meta-data' returns metadata only; mode='full-paper' returns metadata " +
+-      "+ a paged segment of the full text. Internal fields (mmd_path, " +
+-      "extraction_status) are stripped. ⚠️ All filters are EXACT-MATCH and " +
+-      "papers with empty year/journal/authors will silently miss the filter — " +
+-      "lean on keyword ranking when unsure.",
++      "count against title+abstract, plus full text in full-paper mode. " +
++      "Responses include status, results, corpus_size, and matched_count. " +
++      "Internal fields (mmd_path, extraction_status) are stripped.",
+     parameters: {
+       type: "object",
+       properties: {
+-        title: { type: "string", description: "Exact title to match (case-sensitive)." },
++        title: {
++          type: "string",
++          description: "Title or contiguous title phrase; matching normalizes case, Unicode, punctuation, and whitespace.",
++        },
+         authors: {
+           oneOf: [
+             { type: "array", items: { type: "string" } },
+@@ -187,17 +190,23 @@ export function createSearchPapersLocalTool(): SystemTool {
+             "or a comma-separated string.",
+         },
+         journal: { type: "string", description: "Exact journal/venue name." },
+-        published_year: { type: "integer", description: "Four-digit year." },
++        published_year: {
++          type: "integer",
++          minimum: 1000,
++          maximum: 9999,
++          description: "Four-digit year.",
++        },
+         keywords: {
+           oneOf: [
+             { type: "array", items: { type: "string" } },
+             { type: "string" },
+           ],
+           description:
+-            "Whole-word keyword matching for ranking (case-insensitive). " +
++            "Whole-word keyword matching (case-insensitive). Keyword-only searches drop zero-hit papers; " +
++            "with explicit metadata filters, keywords rank the filtered set. " +
+             "Accepts a list or comma-separated string.",
+         },
+-        topk: { type: "integer", description: "Max results (default 5)." },
++        topk: { type: "integer", minimum: 1, maximum: 20, description: "Max results (default 5, maximum 20)." },
+         mode: {
+           type: "string",
+           enum: ["meta-data", "full-paper"],
+@@ -207,6 +216,7 @@ export function createSearchPapersLocalTool(): SystemTool {
+         },
+         segment: {
+           type: "integer",
++          minimum: 1,
+           description:
+             "(full-paper mode) 1-indexed segment number; each segment is ~20000 chars. " +
+             "Check segment_info.has_more to page through.",
+@@ -216,10 +226,7 @@ export function createSearchPapersLocalTool(): SystemTool {
+     execute: async (params: Record<string, unknown>) => {
+       try {
+         const mode = (params.mode as SearchMode | undefined) ?? "meta-data";
+-        if (mode !== "meta-data" && mode !== "full-paper") {
+-          return fail(`mode must be 'meta-data' or 'full-paper', got '${String(mode)}'`);
+-        }
+-        const results = (await searchPapers({
++        const response = await searchPapers({
+           title: typeof params.title === "string" ? params.title : undefined,
+           authors: params.authors as string | string[] | undefined,
+           journal: typeof params.journal === "string" ? params.journal : undefined,
+@@ -229,12 +236,16 @@ export function createSearchPapersLocalTool(): SystemTool {
+           topk: typeof params.topk === "number" ? params.topk : undefined,
+           mode,
+           segment: typeof params.segment === "number" ? params.segment : undefined,
+-        })) as MetaResult[] | FullPaperResult[];
+-        // The legacy Python tool returns str(list[dict]); we serialize as
+-        // JSON instead — it's the same shape but cleaner for the model.
+-        return ok(JSON.stringify(results, null, 2));
++        });
++        return ok(JSON.stringify(response, null, 2));
+       } catch (err) {
+-        return fail(`search_papers_local failed: ${(err as Error).message}`);
++        return paperSearchFailure({
++          status: "infrastructure_error",
++          results: [],
++          corpus_size: 0,
++          matched_count: 0,
++          message: `search_papers_local failed: ${(err as Error).message}`,
++        });
+       }
+     },
+   };

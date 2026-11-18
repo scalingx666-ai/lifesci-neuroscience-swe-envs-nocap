@@ -1,0 +1,13 @@
+# Issue
+
+**Title:** Add copy_sorting option to SortingAnalyzer.create_memory
+
+## Description
+
+`create_memory` always materializes the sorting into an in-memory `NumpySorting` via `from_sorting(..., copy_spike_vector=True)`, which requests the whole spike vector up front and discards any laziness the sorting provides. This adds a `copy_sorting` parameter (default `True`, so existing behavior is unchanged); with `copy_sorting=False` the given sorting is kept as-is, so it stays lazy through analyzer construction and its spike times are read only on demand. This pairs directly with #4662, which keeps the `NwbSortingExtractor` spike vector lazy (nothing read until first requested): without this option `create_memory` immediately re-materializes exactly what #4662 made lazy, so the two are needed together for a streamed sorting to reach an analyzer without a full spike read. The immediate consumer is the streaming `read_nwb_sorting_analyzer` reader (#4645).
+
+The payoff is building analyzers over large or streamed sortings where the spike vector is often never touched (template-and-metric analysis, batch surveys, memory-constrained builds). Materializing costs roughly three times the on-disk size in RAM and grows with the recording. Querying IBL processed files from dandiset [000409](https://dandiarchive.org/dandiset/000409) (Brain Wide Map) by metadata only (via lindi), a single probe insertion runs 16-37M spikes: session [`6713a4a7-faed-4df2-acab-ee4e63326f8d`](https://neurosift.app/?p=/nwb&dandisetId=000409&dandisetVersion=draft&url=https://api.dandiarchive.org/api/dandisets/000409/versions/draft/assets/388c82a6-94fe-4055-af61-4dfc05035633/download/) has 898 units and 20.7M spikes (~0.50 GB materialized), and session [`4364a246-f8d7-4ce7-ba23-a098104b96e4`](https://neurosift.app/?p=/nwb&dandisetId=000409&dandisetVersion=draft&url=https://api.dandiarchive.org/api/dandisets/000409/versions/draft/assets/b0af11bd-4c9b-4c0e-94de-7f4110bd18f0/download/) has 1202 units and 36.6M spikes (~0.88 GB), against only 18-25 MB of templates that template-and-metric workflows actually use. A survey across the hundreds of Brain Wide Map sessions would otherwise pay gigabytes of RAM and hundreds of gigabytes of reads for spikes it immediately discards. The default preserves today's behavior.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `6e558a536898`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,334 @@
+diff --git a/docs/cli.md b/docs/cli.md
+index 6a859136..9918a987 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -564,6 +564,7 @@ Available for automation, scripting, and debugging. Skills call some of these in
+ | `graph-analyse <vault> --path A B` / `--around PAGE --depth N [--direction in\|out\|both]` | Query modes: shortest link path between two pages; N-hop neighbourhood of a page (`--direction in` = blast radius) |
+ | `batch-plan <vault> <source_dir>` | Split a source directory into parallel-ingest batches, skipping unchanged files |
+ | `cache-check <vault> <sources...>` | Which sources are new / modified / unchanged vs. `.manifest.json`. Vault-local sources no longer on disk are reported as `missing`; machine-local sources absent on this host (e.g. synced from another machine) are reported separately as `unavailable`. Covers hashed **file** sources only — a git repo is tracked under `projects` by commit, not by hash, so use `projects-check` for those |
++| `ingest-guard <vault> <sources...>` | Read-only preflight before an ingest write. Each source name is reduced to an identity (document extensions such as `.pdf`, `.docx`, `.md` stripped, then slugged), so `report.pdf`, `_raw/report.md` and a page named `report.pdf.md` are recognised as one document. Each source is reported as `create` (no page claims the identity), `update` (exactly one page, the source's primary page, matched by stem or `title:`), or `blocked` (two or more pages; merge them with `wiki-dedup` first). `prior_sources` lists manifest keys with the same identity, and `siblings` lists other sources in the same call that share it (one document, one page). Redirect stubs are ignored. Directories are expanded like `batch-plan`. Exits 2 when any source is `blocked` |
+ | `cache-update <vault> <source> [--key <pseudo-key>] [--pages <page>...]` | Record a source's SHA-256 in `.manifest.json` after ingest. The stored key is normalised to a portable form; `--key` sets it explicitly (`repo:`/`url:`/`agent:`) for sources outside the vault and `$HOME`. If `_raw/_archived/<basename>` exists, that is the stored key and the file that is hashed — even when you pass a staging `_raw/<name>.md` path |
+ | `projects-check <vault> [--pretty]` | How far each `.manifest.json` `projects` entry has drifted from its checkout: `behind` (with a commit count), `current`, `unreachable` (the recorded sha no longer resolves or is no longer an ancestor — history was rewritten), `unsynced` (no `last_commit_synced` yet), `unavailable` (no usable checkout on this machine). Exits **2** when anything is `behind` or `unreachable`, so a scheduled run can branch on it; `unavailable`/`unsynced` exit 0, because an absent checkout is an absence of evidence, not a finding |
+ | `cache-hash <path>` | Compute a file or directory hash (no manifest I/O) |
+diff --git a/obsidian_wiki/cli.py b/obsidian_wiki/cli.py
+index 40c42f21..ec5ced47 100644
+--- a/obsidian_wiki/cli.py
++++ b/obsidian_wiki/cli.py
+@@ -1585,6 +1585,23 @@ def cmd_cache_check(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def cmd_ingest_guard(args: argparse.Namespace) -> int:
++    from obsidian_wiki.batch import discover_sources
++    from obsidian_wiki.ingest_guard import guard_sources
++    vault = Path(args.vault).expanduser().resolve()
++    sources: list[Path] = []
++    for raw in args.sources:
++        source = _resolve_source_arg(vault, raw)
++        if source.is_dir():
++            sources.extend(Path(item["path"]) for item in discover_sources(source, vault=vault))
++        else:
++            sources.append(source)
++    result = guard_sources(vault, sources)
++    print(json.dumps(result, indent=2) if args.pretty else json.dumps(result))
++    # Exit 2 when any source is blocked, so the ingest skill can stop on it.
++    return 2 if result["blocked"] else 0
++
++
+ def cmd_projects_check(args: argparse.Namespace) -> int:
+     from obsidian_wiki.cache import check_projects
+     vault = Path(args.vault).expanduser().resolve()
+@@ -3161,6 +3178,15 @@ def build_parser() -> argparse.ArgumentParser:
+     cc.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
+     cc.set_defaults(func=cmd_cache_check)
+ 
++    ig = sub.add_parser(
++        "ingest-guard",
++        help="before an ingest write: the one page each source should create or update",
++    )
++    ig.add_argument("vault", help="path to the Obsidian vault")
++    ig.add_argument("sources", nargs="+", help="source file or directory paths about to be ingested")
++    ig.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
++    ig.set_defaults(func=cmd_ingest_guard)
++
+     pc = sub.add_parser(
+         "projects-check",
+         help="check how far each project's checkout has moved past last_commit_synced",
+diff --git a/obsidian_wiki/ingest_guard.py b/obsidian_wiki/ingest_guard.py
+new file mode 100644
+index 00000000..f93d3a88
+--- /dev/null
++++ b/obsidian_wiki/ingest_guard.py
+@@ -0,0 +1,102 @@
++"""Ingest preflight: one source file gets exactly one primary page (#315).
++
++`report.pdf`, its conversion `report.md`, and the pages `report.md` /
++`report.pdf.md` all name the same document, but their stems, titles, and
++hashes differ, so `cache-check` and `lint`'s duplicate checks see four
++unrelated things. Here each name is reduced to one *identity* (document
++extensions stripped, slugged) and every source is matched against the pages
++and manifest entries that share it. Read-only: nothing is written.
++"""
++
++from __future__ import annotations
++
++import re
++from pathlib import Path
++from typing import Any
++
++from obsidian_wiki.cache import _iter_entries, _load_manifest, _is_file_key, stored_key
++from obsidian_wiki.graph_analysis import iter_pages
++from obsidian_wiki.memory import parse_frontmatter
++from obsidian_wiki.vault import split_frontmatter
++
++# Formats a source arrives in or is converted through. Only these are
++# stripped, so `notes.v2.md` keeps its `.v2`.
++DOC_EXTENSIONS = frozenset({
++    ".md", ".markdown", ".txt", ".pdf", ".doc", ".docx", ".odt", ".rtf",
++    ".xls", ".xlsx", ".ods", ".csv", ".ppt", ".pptx", ".odp",
++    ".html", ".htm", ".epub",
++})
++
++
++def source_identity(name: str) -> str:
++    """`Report.pdf.md` -> `report`: the name with document extensions stripped, slugged."""
++    stem = re.split(r"[\\/]", name.strip())[-1]
++    while True:
++        base, dot, ext = stem.rpartition(".")
++        if not dot or not base or f".{ext.lower()}" not in DOC_EXTENSIONS:
++            break
++        stem = base
++    return re.sub(r"[\s_]+", "-", stem.strip().lower())
++
++
++def _page_identities(vault: Path) -> dict[str, list[str]]:
++    """identity -> pages whose stem or title reduces to it. Redirect stubs are skipped."""
++    index: dict[str, set[str]] = {}
++    for page in iter_pages(vault):
++        try:
++            text = page.read_text(encoding="utf-8", errors="replace")
++        except OSError:
++            continue
++        values = parse_frontmatter(split_frontmatter(text)[0])
++        if str(values.get("redirects_to") or "").strip():
++            continue
++        rel = page.relative_to(vault).as_posix()
++        names = {page.name, str(values.get("title") or "")}
++        for identity in {source_identity(name) for name in names if name.strip()}:
++            if identity:
++                index.setdefault(identity, set()).add(rel)
++    return {identity: sorted(pages) for identity, pages in index.items()}
++
++
++def guard_sources(vault: Path, sources: list[Path]) -> dict[str, Any]:
++    """Classify each source as `create`, `update` (one primary page) or `blocked`.
++
++    `blocked` means two or more pages already claim the source's identity:
++    writing would add to the duplication, so the caller must resolve it first
++    (merge with `wiki-dedup`). `prior_sources` lists manifest keys with the
++    same identity, e.g. the `_raw/` conversion an original PDF was ingested
++    through, so the caller can see the document was ingested before.
++    `siblings` lists the other sources in this call with the same identity
++    (`report.pdf` beside `report.docx`): together they make one page.
++    """
++    pages = _page_identities(vault)
++    prior: dict[str, list[str]] = {}
++    for key, _entry in _iter_entries(_load_manifest(vault)):
++        if key and _is_file_key(key):
++            prior.setdefault(source_identity(key), []).append(key)
++
++    own_keys = [stored_key(source, vault) for source in sources]
++    keys = [own or str(source) for own, source in zip(own_keys, sources)]
++    by_identity: dict[str, list[str]] = {}
++    for source, key in zip(sources, keys):
++        by_identity.setdefault(source_identity(source.name), []).append(key)
++
++    results = []
++    for source, key, own_key in zip(sources, keys, own_keys):
++        identity = source_identity(source.name)
++        # A source kept in the vault outside `_raw/` is itself a page; it is
++        # not a second claim on its own identity.
++        candidates = [page for page in pages.get(identity, []) if page != own_key]
++        status = "blocked" if len(candidates) > 1 else "update" if candidates else "create"
++        results.append({
++            "source": key,
++            "identity": identity,
++            "status": status,
++            "pages": candidates,
++            "prior_sources": sorted(k for k in prior.get(identity, []) if k != own_key),
++            "siblings": sorted(k for k in by_identity[identity] if k != key),
++        })
++    return {
++        "sources": results,
++        "blocked": [item["source"] for item in results if item["status"] == "blocked"],
++    }
+diff --git a/skills/wiki-ingest/SKILL.md b/skills/wiki-ingest/SKILL.md
+index c4f63c21..4f0d806c 100644
+--- a/skills/wiki-ingest/SKILL.md
++++ b/skills/wiki-ingest/SKILL.md
+@@ -117,7 +117,8 @@ This outputs a JSON plan with `batches` (each a list of files + total_bytes + ki
+ 1. **Check `stats.skipped_unchanged`** — report to the user how many files are being skipped (already ingested, hash unchanged).
+ 2. **If `batch_count == 0`** — all files are unchanged. Tell the user and stop.
+ 3. **If `batch_count == 1`** — proceed with the single batch as a normal Step 1 ingest.
+-4. **If `batch_count > 1`** — dispatch each batch as a **parallel subagent** (multiple Agent tool calls in a single message). Each subagent receives a message like:
++4. **Before dispatching anything**, run `obsidian-wiki ingest-guard` on the source directory (see Step 4). Resolve every `blocked` source first. Move any `siblings` into one batch, because subagents running in parallel can't see each other's writes.
++5. **If `batch_count > 1`** — dispatch each batch as a **parallel subagent** (multiple Agent tool calls in a single message). Each subagent receives a message like:
+    ```
+    Ingest these files into the wiki at $OBSIDIAN_VAULT_PATH using wiki-ingest Step 1 onward:
+    <list of file paths from this batch>
+@@ -360,6 +361,21 @@ Before writing anything, plan which pages to update or create. Cap the plan at `
+ - If it's new, which category does it belong in?
+ - What `[[wikilinks]]` should connect it to existing pages?
+ 
++**One source file, one primary page.** A source's primary page is the `references/` (or equivalent) page that stands for the document itself. Derived concept and entity pages don't count. The same document often arrives twice: once as a conversion (`_raw/import/report.md`), later as the original (`report.pdf`). Stems, titles and hashes all differ between the two, so nothing else notices. Run the guard before writing:
++
++```bash
++obsidian-wiki ingest-guard "$OBSIDIAN_VAULT_PATH" <source1> [source2 ...]
++```
++
++It reduces each source name to an identity: document extensions (`.pdf`, `.docx`, `.pptx`, `.md`, …) are stripped and the rest slugged, so `Report.pdf.md` becomes `report`. It then reports which pages already claim that identity, by stem or by `title:`:
++
++- `create` — no page claims it. Name the new page after the identity: `references/report.md`, never `report.pdf.md`.
++- `update` — exactly one page claims it. That page is the primary page; update it instead of creating a new one. `prior_sources` shows the earlier ingest, for example the `_raw/` conversion.
++- `siblings` — other sources in this run with the same identity, such as `report.pdf` beside `report.docx`. They're one document, so write one page from them, not one page per file.
++- `blocked` (exit code 2) — two or more pages already claim it. Don't write a page for that source. List the candidates for the user and suggest `wiki-dedup` to merge them first.
++
++Run it again after the batch: a clean run reports no `blocked` sources.
++
+ **Apply tier-aware filtering to existing pages** (see `llm-wiki/SKILL.md`, Importance Tiering section):
+ 
+ | Tier | Update decision |
+@@ -490,6 +506,8 @@ Also update `stats.total_sources_ingested` and `stats.total_pages`.
+ 
+ **In parallel runs** (batch fan-out, or while the Docker server is writing the same vault), record sources with `obsidian-wiki cache-update` rather than hand-editing `.manifest.json`. That command takes an advisory lock, writes atomically, and normalises the key to the portable form; concurrent hand edits are a plain read-modify-write and silently drop whichever entry lands second. For a source with no portable path form, pass its pseudo-key explicitly: `obsidian-wiki cache-update <vault> <path> --key repo:github.com/owner/name`.
+ 
++When you ingest an original whose conversion was ingested earlier (`prior_sources` from `ingest-guard`), record the original too: `cache-update` it with `--pages` naming the same primary page. Then the next ingest of either file finds the other.
++
+ If the manifest doesn't exist yet, create it with `version: 1`.
+ 
+ **`index.md`, `log.md`, `hot.md`** — one command, not three hand edits:
+@@ -567,6 +585,7 @@ After ingesting, verify:
+ - [ ] Every new/updated page has a bottom **Sources** section with Obsidian wikilinks to `_raw/_archived/…` snapshots (or a live URL only if ingest was `/ingest-url` with no local file)
+ - [ ] YAML `sources:` is origin keys (`url:`, `agent:`, …), not archive paths; after a `_raw/_archived/` move, `snapshots set` then `cache-update` ran on the archived path (YAML `snapshots:` is `"[[_raw/_archived/stem|stem]]"`, not Markdown links); clipping `source:`/`url` frontmatter is not copied in as the clickable source
+ - [ ] Inferred and ambiguous claims are marked with `^[inferred]` / `^[ambiguous]`; `provenance:` frontmatter block is present on new and updated pages
++- [ ] `obsidian-wiki ingest-guard` reports no `blocked` source, and each source has a single primary page, named without its file extension
+ - [ ] No page you wrote is anywhere near 1 MB (`oversized_pages` in `obsidian-wiki lint` is empty); large sources were split into focused pages
+ - [ ] Every new/updated page has a `summary:` frontmatter field (1–2 sentences, ≤200 chars)
+ - [ ] `relationships:` block is present on pages where source text made typed connections clear; all entries use an allowed type from `llm-wiki/SKILL.md`
+diff --git a/tests/test_ingest_guard.py b/tests/test_ingest_guard.py
+new file mode 100644
+index 00000000..68b3efe9
+--- /dev/null
++++ b/tests/test_ingest_guard.py
+@@ -0,0 +1,111 @@
++"""Tests for the ingest preflight (one source file, one primary page)."""
++
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from obsidian_wiki.ingest_guard import guard_sources, source_identity
++
++
++def _page(vault: Path, rel: str, *, title: str, extra: str = "") -> None:
++    path = vault / rel
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(f"---\ntitle: {title}\ncategory: references\n{extra}---\n# {title}\n", encoding="utf-8")
++
++
++@pytest.mark.parametrize(
++    ("name", "identity"),
++    [
++        ("report.pdf", "report"),
++        ("report.pdf.md", "report"),
++        ("_raw/import/Report.md", "report"),
++        ("C:\\docs\\Q3 Plan.docx", "q3-plan"),
++        ("notes.v2.md", "notes.v2"),
++        ("deck_final.pptx.md", "deck-final"),
++    ],
++)
++def test_source_identity_strips_document_extensions(name: str, identity: str) -> None:
++    assert source_identity(name) == identity
++
++
++def test_existing_converted_page_is_updated_not_duplicated(tmp_path: Path) -> None:
++    _page(tmp_path, "references/report.md", title="report")
++    (tmp_path / ".manifest.json").write_text(
++        json.dumps({"sources": {"_raw/_archived/report.md": {"pages_produced": ["references/report.md"]}}}),
++        encoding="utf-8",
++    )
++    pdf = tmp_path / "inbox" / "report.pdf"
++    pdf.parent.mkdir()
++    pdf.write_bytes(b"%PDF-1.7")
++
++    result = guard_sources(tmp_path, [pdf])
++
++    assert result == {
++        "sources": [
++            {
++                "source": "inbox/report.pdf",
++                "identity": "report",
++                "status": "update",
++                "pages": ["references/report.md"],
++                "prior_sources": ["_raw/_archived/report.md"],
++                "siblings": [],
++            }
++        ],
++        "blocked": [],
++    }
++
++
++def test_two_pages_for_one_source_block_the_write(tmp_path: Path) -> None:
++    _page(tmp_path, "references/report.md", title="report")
++    _page(tmp_path, "references/report.pdf.md", title="report.pdf")
++
++    result = guard_sources(tmp_path, [tmp_path / "report.pdf"])
++
++    assert result["sources"][0]["status"] == "blocked"
++    assert result["sources"][0]["pages"] == ["references/report.md", "references/report.pdf.md"]
++    assert result["blocked"] == ["report.pdf"]
++
++
++def test_title_match_and_redirect_stub(tmp_path: Path) -> None:
++    _page(tmp_path, "references/q3-planning.md", title="Q3 Plan.docx")
++    _page(tmp_path, "references/q3-plan.md", title="Q3 Plan", extra='redirects_to: "[[q3-planning]]"\n')
++
++    result = guard_sources(tmp_path, [tmp_path / "Q3 Plan.docx", tmp_path / "fresh.pdf"])
++
++    assert [(r["status"], r["pages"]) for r in result["sources"]] == [
++        ("update", ["references/q3-planning.md"]),
++        ("create", []),
++    ]
++
++
++def test_same_document_in_two_formats_are_siblings(tmp_path: Path) -> None:
++    result = guard_sources(tmp_path, [tmp_path / "report.pdf", tmp_path / "Report.docx"])
++
++    assert [(r["status"], r["siblings"]) for r in result["sources"]] == [
++        ("create", ["Report.docx"]),
++        ("create", ["report.pdf"]),
++    ]
++
++
++def test_cli_exits_2_when_blocked(tmp_path: Path) -> None:
++    _page(tmp_path, "references/report.md", title="report")
++    _page(tmp_path, "concepts/report.pdf.md", title="report.pdf")
++    src = tmp_path / "src"
++    src.mkdir()
++    (src / "report.pdf").write_bytes(b"%PDF-1.7")
++    (src / "other.md").write_text("# other\n", encoding="utf-8")
++
++    proc = subprocess.run(
++        [sys.executable, "-m", "obsidian_wiki.cli", "ingest-guard", str(tmp_path), str(src)],
++        capture_output=True, text=True,
++    )
++
++    assert proc.returncode == 2, proc.stderr
++    data = json.loads(proc.stdout)
++    assert {r["identity"]: r["status"] for r in data["sources"]} == {"other": "create", "report": "blocked"}
++    assert data["blocked"] == ["src/report.pdf"]

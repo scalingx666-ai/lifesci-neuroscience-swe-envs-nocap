@@ -1,0 +1,202 @@
+diff --git a/src/minisweagent/run/mini.py b/src/minisweagent/run/mini.py
+index 9d4aa29ee..818fe72fe 100644
+--- a/src/minisweagent/run/mini.py
++++ b/src/minisweagent/run/mini.py
+@@ -196,6 +196,18 @@ def main(
+         "--total-budget-s",
+         help="Override the mode's total wall-clock budget (seconds). Escape hatch for testing.",
+     ),
++    scoring_target: str = typer.Option(
++        "wall",
++        "--target",
++        help=(
++            "Which signal the harness reports as GEAK_RESULT_LATENCY_MS (the scoring metric "
++            "the agent optimizes against). 'wall' = end-to-end host latency via "
++            "triton.testing.do_bench (includes Python/dispatch overhead). 'kernel' = GPU-only "
++            "kernel time via torch.profiler CUDA events (excludes dispatch). The dual-signal "
++            "harness always reports BOTH (GEAK_RESULT_WALL_MS + GEAK_RESULT_KERNEL_MS) for "
++            "agent visibility; --target only chooses which becomes the scoring signal."
++        ),
++    ),
+ ):
+     # fmt: on
+     del visual
+@@ -521,6 +533,14 @@ def main(
+             logger.info("[bold cyan]Promoted test command to validated harness: %s[/bold cyan]", promoted)
+ 
+     _target_language = "flydsl" if kernel_type in {"pytorch2flydsl", "flydsl"} else None
++    scoring_target_norm = (scoring_target or "wall").strip().lower()
++    if scoring_target_norm not in {"wall", "kernel"}:
++        logger.warning(
++            "Unknown --target=%s, falling back to 'wall'. Valid: wall|kernel.",
++            scoring_target,
++        )
++        scoring_target_norm = "wall"
++    logger.info("Scoring target: %s (GEAK_RESULT_LATENCY_MS = %s_ms)", scoring_target_norm, scoring_target_norm)
+ 
+     # ── Build RunBudget from mode + CLI overrides ────────────────────
+     _budget_cfg = (config.get("run") or {}).get("budgets", {}).get(resolved_mode) or {}
+@@ -554,12 +574,6 @@ def _sigint_handler(_signum, _frame):  # noqa: ANN001
+             budget.soft_stop.set()
+         else:
+             logger.error("Second SIGINT received -- terminating tracked subprocesses and exiting.")
+-            # Restore the original SIGINT handler *before* calling
+-            # ``terminate_all`` so a third Ctrl-C lands on the default handler
+-            # (KeyboardInterrupt) instead of recursing back into this handler
+-            # mid-escalation. ``terminate_all`` waits up to ``escalate_after_s``
+-            # seconds for SIGTERM->SIGKILL escalation; without this swap the
+-            # third SIGINT would re-enter and recurse.
+             signal.signal(signal.SIGINT, _orig_sigint or signal.SIG_DFL)
+             try:
+                 state.registry.terminate_all()
+@@ -579,9 +593,8 @@ def _sigint_handler(_signum, _frame):  # noqa: ANN001
+         target_language=_target_language,
+         budget=budget,
+         state=state,
+-        # Forward the user's -t task to the preprocess sub-agents (UTA + ShapeFixer)
+-        # so a USER TASK CONTEXT block can override op-test default shapes.
+         user_task=task_content,
++        scoring_target=scoring_target_norm,
+     )
+     logger.debug("Preprocess kwargs: %s", _preprocess_kwargs)
+ 
+diff --git a/src/minisweagent/run/preprocess/config/mini_unit_test_agent.yaml b/src/minisweagent/run/preprocess/config/mini_unit_test_agent.yaml
+index 2049efe98..32b5db9d4 100644
+--- a/src/minisweagent/run/preprocess/config/mini_unit_test_agent.yaml
++++ b/src/minisweagent/run/preprocess/config/mini_unit_test_agent.yaml
+@@ -187,11 +187,41 @@ agent:
+        - ITERATIONS resolved from `--iterations` then `GEAK_BENCHMARK_ITERATIONS`
+          (default 200), per the rule above.
+ 
+-    Timing:
+-       - GPU event-based ONLY: `torch.cuda.Event(enable_timing=True)`
+-         or `triton.testing.do_bench` or `hipEventElapsedTime`.
+-         NEVER `time.time()` or wall-clock.
+-       - Run WARMUP, then ITERATIONS, report MEDIAN per shape.
++    Timing (DUAL-SIGNAL — required for Triton/CUDA/HIP kernels):
++       NEVER use `time.time()`, `time.perf_counter`, or any host wall-clock for the
++       benchmark loop itself. Use the dual-signal pattern below so the agent sees
++       BOTH wall-clock (dispatch + GPU) and kernel-only (GPU) latencies, and the
++       optimizer scores against the one selected by the SCORING TARGET in the task.
++
++       Pass 1 — wall-clock (end-to-end, includes dispatch):
++         `triton.testing.do_bench(fn, warmup=WARMUP, rep=ITERATIONS)` for Triton.
++         For HIP/CUDA: `torch.cuda.Event(enable_timing=True)` paired with synchronize.
++         IMPORTANT: do NOT call `perf_counter` inside a `torch.profiler` context —
++         the profiler instrumentation inflates host-measured latency ~3x on
++         dispatch-bound kernels (verified empirically). Use do_bench for wall.
++
++       Pass 2 — kernel-only (GPU work only, excludes dispatch):
++         For each iter, wrap the call in
++         `with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:`
++         then sum `evt.device_time_total` over `prof.key_averages()` and divide by 1000
++         to get ms. Take the MEDIAN across ITERATIONS.
++
++       Cache flush between iters (both passes) so timings are cold-L2:
++         `cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()`
++         then `triton.runtime.driver.active.clear_cache(cache)` per iter.
++
++       Output (REQUIRED markers — emit ALL THREE in --benchmark and --full-benchmark):
++         GEAK_RESULT_WALL_MS=<wall_geomean_ms>          # do_bench / cuda.Event
++         GEAK_RESULT_KERNEL_MS=<kernel_geomean_ms>      # torch.profiler CUDA events
++         GEAK_RESULT_DISPATCH_MS=<wall - kernel>        # informational
++         GEAK_RESULT_DISPATCH_FRACTION=<dispatch/wall>  # informational
++         GEAK_RESULT_LATENCY_MS=<wall_geomean OR kernel_geomean per scoring target>
++       The task prompt declares which value (wall_ms or kernel_ms) GEAK_RESULT_LATENCY_MS
++       must equal — that is the signal the optimizer scores against. The other signals
++       are still printed so the agent can see the full latency decomposition.
++
++       Run WARMUP, then ITERATIONS, report MEDIAN per shape; aggregate per-shape medians
++       via geometric mean for the GEAK_RESULT_*_MS lines.
+ 
+     GEAK_SHAPES_USED (for determinism validation):
+        - In ALL modes, after the loop, print:
+diff --git a/src/minisweagent/run/preprocess/harness_utils.py b/src/minisweagent/run/preprocess/harness_utils.py
+index daa279f04..4a2cc6d21 100644
+--- a/src/minisweagent/run/preprocess/harness_utils.py
++++ b/src/minisweagent/run/preprocess/harness_utils.py
+@@ -1413,6 +1413,7 @@ def create_validated_harness(
+     max_retries: int = MAX_HARNESS_RETRIES,
+     gpu_id: int = 0,
+     user_task: str | None = None,
++    scoring_target: str = "wall",
+ ) -> tuple[str, list[dict]]:
+     """Run UnitTestAgent with static + runtime validation and retry loop.
+ 
+@@ -1459,6 +1460,7 @@ def create_validated_harness(
+             kernel_path=kernel_path,
+             discovery_context=ctx,
+             user_task=user_task,
++            scoring_target=scoring_target,
+         )
+         logger.info("UnitTestAgent test_command (attempt %d): %s", attempt, test_command)
+ 
+diff --git a/src/minisweagent/run/preprocess/preprocessor.py b/src/minisweagent/run/preprocess/preprocessor.py
+index cb6f7317e..403391187 100755
+--- a/src/minisweagent/run/preprocess/preprocessor.py
++++ b/src/minisweagent/run/preprocess/preprocessor.py
+@@ -477,6 +477,7 @@ def run_preprocessor(
+     budget=None,
+     state=None,
+     user_task: str | None = None,
++    scoring_target: str = "wall",
+ ) -> dict[str, Any]:
+     """Run all preprocessing steps and return a context dict.
+ 
+@@ -924,6 +925,7 @@ def _print(msg: str) -> None:
+                     discovery_context=discovery_context,
+                     gpu_id=gpu_id,
+                     user_task=user_task,
++                    scoring_target=scoring_target,
+                 )
+                 _uta_harness = extract_harness_path(test_command)
+                 _uta_harness = _ensure_harness_has_no_kernel_defs(_uta_harness, output_dir, ctx)
+diff --git a/src/minisweagent/run/preprocess/unit_test_agent.py b/src/minisweagent/run/preprocess/unit_test_agent.py
+index 437e2d988..8f4a07634 100644
+--- a/src/minisweagent/run/preprocess/unit_test_agent.py
++++ b/src/minisweagent/run/preprocess/unit_test_agent.py
+@@ -47,7 +47,14 @@ def _extract_test_command(text: str) -> str:
+         "This is a Triton kernel (JIT-compiled Python). No build step needed.\n"
+         "- Import the kernel via its Python package path (do NOT use importlib.util).\n"
+         "- Use `torch.testing.assert_close` for correctness validation.\n"
+-        "- Use `triton.testing.do_bench` or `torch.cuda.Event` for benchmarking.\n"
++        "- Dual-signal timing (REQUIRED for --benchmark / --full-benchmark):\n"
++        "    * Wall-clock: `triton.testing.do_bench(fn, warmup=WARMUP, rep=ITERATIONS)`\n"
++        "      (do NOT use perf_counter inside a torch.profiler context — inflates ~3x).\n"
++        "    * Kernel-only: per-iter `torch.profiler.profile(activities=[ProfilerActivity.CUDA])`,\n"
++        "      sum `device_time_total` per call, take the median across ITERATIONS.\n"
++        "    * Run the two passes back-to-back with L2 cache flush between iters.\n"
++        "    * Print BOTH GEAK_RESULT_WALL_MS=<wall_geomean> and GEAK_RESULT_KERNEL_MS=<kernel_geomean>;\n"
++        "      set GEAK_RESULT_LATENCY_MS to whichever the SCORING TARGET in the task asks for.\n"
+         "- Set `PYTHONPATH` before the process starts if the package is not installed.\n"
+         "- Use fixed random seed (`torch.manual_seed(42)`) and fixed tensor sizes."
+     ),
+@@ -211,6 +218,7 @@ def run_unit_test_agent(
+     kernel_path: Path | None = None,
+     discovery_context: str = "",
+     user_task: str | None = None,
++    scoring_target: str = "wall",
+ ) -> str:
+     """Run UnitTestAgent in ``repo`` and return the extracted test command string.
+ 
+@@ -261,6 +269,20 @@ def run_unit_test_agent(
+         )
+         if rel_kernel_dir is not None:
+             task += f"\nKernel repo-relative directory: {rel_kernel_dir.as_posix()}"
++    target = (scoring_target or "wall").strip().lower()
++    if target not in {"wall", "kernel"}:
++        target = "wall"
++    task += (
++        "\n\nSCORING TARGET (chosen by --target CLI flag): "
++        f"GEAK_RESULT_LATENCY_MS = {target}_ms\n"
++        "The harness MUST emit dual timing signals from --benchmark and --full-benchmark "
++        "(see the 'Dual-signal timing' section in the system prompt):\n"
++        "  - GEAK_RESULT_WALL_MS    : end-to-end host latency (triton.testing.do_bench)\n"
++        "  - GEAK_RESULT_KERNEL_MS  : GPU kernel-only time (torch.profiler CUDA events)\n"
++        "  - GEAK_RESULT_DISPATCH_MS, GEAK_RESULT_DISPATCH_FRACTION (informational)\n"
++        f"Set GEAK_RESULT_LATENCY_MS = {target}_ms (this is the value the optimizer scores against). "
++        "Always print all three GEAK_RESULT_* lines so the agent can see both signals in its output."
++    )
+     if discovery_context:
+         task += f"\n\n{discovery_context}"
+ 

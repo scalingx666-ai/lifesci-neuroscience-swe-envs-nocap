@@ -1,0 +1,351 @@
+diff --git a/app/apps/server/migrations/088_oauth_grant_carry.sql b/app/apps/server/migrations/088_oauth_grant_carry.sql
+new file mode 100644
+index 00000000..d98468f3
+--- /dev/null
++++ b/app/apps/server/migrations/088_oauth_grant_carry.sql
+@@ -0,0 +1,26 @@
++SET LOCAL lock_timeout = '10s';
++-- SPDX-License-Identifier: Apache-2.0
++--
++-- An allow-listed OAuth grant keeps its claim to the vault key across refreshes
++-- made while no member's key is held. Additive only: one new table.
++--
++-- The connector refreshes about hourly. Without this, a refresh while nobody
++-- had Baalda open gave the new row neither a key nor an allow-list entry (the
++-- allow MAC is per grant and only a VK holder can make one), and the
++-- connection needed a reconnect. A carry row copies the ROOT grant's allow
++-- entry (id, refresh-token hash, VK-keyed MAC — useless without the key) and
++-- holds the root's refresh token sealed under THIS row's refresh token. Only
++-- the client that held the root token can have produced it, so a row inserted
++-- into the database still never gets a key. Sealed under the refresh token
++-- only, never the access token: an hour-long access token must not yield a
++-- refresh token that lasts a week.
++CREATE TABLE oauth_grant_carry (
++  grant_id             TEXT NOT NULL REFERENCES "oauthAccessToken" (id) ON DELETE CASCADE,
++  vault_id             TEXT NOT NULL REFERENCES vaults (id) ON DELETE CASCADE,
++  root_grant_id        TEXT NOT NULL,
++  root_refresh_hash    TEXT NOT NULL,
++  root_mac             BYTEA NOT NULL,
++  wrapped_root_refresh BYTEA NOT NULL,
++  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
++  PRIMARY KEY (grant_id, vault_id)
++);
+diff --git a/app/apps/server/src/crypto/token-wrap.ts b/app/apps/server/src/crypto/token-wrap.ts
+index aaadd9f3..62eb6d15 100644
+--- a/app/apps/server/src/crypto/token-wrap.ts
++++ b/app/apps/server/src/crypto/token-wrap.ts
+@@ -14,7 +14,7 @@
+ import { createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
+ import { KEY_BYTES, aadFor, open, seal } from "./envelope.js";
+ 
+-export type WrapPurpose = "mcp-vk" | "link" | "oauth-access" | "oauth-refresh" | "oauth-consent";
++export type WrapPurpose = "mcp-vk" | "link" | "oauth-access" | "oauth-refresh" | "oauth-consent" | "oauth-carry";
+ 
+ const SALT = Buffer.from("baalda-token-wrap-v1", "ascii");
+ 
+@@ -61,6 +61,45 @@ export function unwrapVk(
+   }
+ }
+ 
++/** Any small secret sealed under a token-derived key (the OAuth carry's root
++ *  refresh token). Same envelope as {@link wrapVk}, its own column in the AAD. */
++export function wrapSecret(
++  secret: string,
++  purpose: WrapPurpose,
++  table: string,
++  column: string,
++  vaultId: string,
++  rowKey: string,
++  plaintext: Buffer,
++): Buffer {
++  const kek = deriveTokenKek(secret, purpose, vaultId);
++  try {
++    return seal(kek, aadFor(table, column, vaultId, rowKey), plaintext, 1);
++  } finally {
++    kek.fill(0);
++  }
++}
++
++/** The sealed secret, or null on any failure (wrong token, moved row, tampering). */
++export function unwrapSecret(
++  secret: string,
++  purpose: WrapPurpose,
++  table: string,
++  column: string,
++  vaultId: string,
++  rowKey: string,
++  wrapped: Buffer,
++): Buffer | null {
++  const kek = deriveTokenKek(secret, purpose, vaultId);
++  try {
++    return open(kek, aadFor(table, column, vaultId, rowKey), wrapped);
++  } catch {
++    return null;
++  } finally {
++    kek.fill(0);
++  }
++}
++
+ export function allowMac(vk: Buffer, tokenId: string, tokenHash: string): Buffer {
+   // utf8(id) || utf8(hash), no separator (desktop contract). Unambiguous: the
+   // hash is always 64 lowercase hex chars.
+diff --git a/app/apps/server/src/mcp/oauth-grant-keys.ts b/app/apps/server/src/mcp/oauth-grant-keys.ts
+index c8145e18..76a33dd8 100644
+--- a/app/apps/server/src/mcp/oauth-grant-keys.ts
++++ b/app/apps/server/src/mcp/oauth-grant-keys.ts
+@@ -17,13 +17,20 @@
+ //   token))). On its next refresh or call, while a VK is held in memory, the
+ //   MAC is checked and the wraps are stored. A row inserted into the database
+ //   has no valid MAC and never gets a key.
++// - An allow-listed grant REFRESHED while no key is held: the new row gets a
++//   carry (`oauth_grant_carry`): the root grant's allow entry plus the root's
++//   refresh token sealed under the new refresh token. A later refresh with a
++//   key held opens it, checks the token against the root hash and the root MAC
++//   with the key, and stores the wraps. Without this, one unattended hourly
++//   refresh cost the connection its claim (2026-11-02).
+ // VKs unwrapped for a call are handed to that call only, never cached.
++import { createHash } from "node:crypto";
+ import type pg from "pg";
+ import { pool as defaultPool } from "../db/pool.js";
+ import { vaultKeysEnabled } from "../crypto/config.js";
+ import { vaultKeyCache } from "../crypto/key-cache.js";
+ import { heldKey } from "../crypto/conversion.js";
+-import { unwrapVk, verifyAllowMac, wrapVk } from "../crypto/token-wrap.js";
++import { unwrapSecret, unwrapVk, verifyAllowMac, wrapSecret, wrapVk } from "../crypto/token-wrap.js";
+ import { verifyVk } from "../crypto/vk-check.js";
+ import { orgVaultChecks, type HeldKey } from "./token-keys.js";
+ import type { IssuedGrant } from "./oauth-token-endpoint.js";
+@@ -104,6 +111,78 @@ async function allowListedKey(
+   return vk;
+ }
+ 
++const CARRY = "oauth_grant_carry";
++const CARRY_COLUMN = "wrapped_root_refresh";
++
++/** An allow-listed root grant, as carried across refreshes (see {@link CARRY}). */
++interface CarriedClaim {
++  rootGrantId: string;
++  rootRefreshHash: string;
++  rootMac: Buffer;
++  /** The root's refresh token: the possession proof. Zeroed by the caller. */
++  rootRefresh: Buffer;
++}
++
++/** The claim `grantId` holds on `vaultId`: its own allow entry (root = itself,
++ *  proved by the refresh token just presented) or a carry it can open with that
++ *  token. Null when it holds neither. */
++async function claimOf(
++  grantId: string,
++  refreshToken: string,
++  refreshHashHex: string,
++  vaultId: string,
++  db: Queryable,
++): Promise<CarriedClaim | null> {
++  const { rows: allow } = await db.query<{ mac: Buffer }>(
++    "SELECT mac FROM oauth_grant_allow WHERE grant_id = $1 AND vault_id = $2",
++    [grantId, vaultId],
++  );
++  if (allow[0]) {
++    return { rootGrantId: grantId, rootRefreshHash: refreshHashHex, rootMac: allow[0].mac, rootRefresh: Buffer.from(refreshToken, "utf8") };
++  }
++  const { rows } = await db.query<{ root_grant_id: string; root_refresh_hash: string; root_mac: Buffer; wrapped_root_refresh: Buffer }>(
++    `SELECT root_grant_id, root_refresh_hash, root_mac, wrapped_root_refresh FROM ${CARRY} WHERE grant_id = $1 AND vault_id = $2`,
++    [grantId, vaultId],
++  );
++  const c = rows[0];
++  if (!c) return null;
++  const rootRefresh = unwrapSecret(refreshToken, "oauth-carry", CARRY, CARRY_COLUMN, vaultId, `${grantId}:carry`, c.wrapped_root_refresh);
++  if (!rootRefresh) return null;
++  return { rootGrantId: c.root_grant_id, rootRefreshHash: c.root_refresh_hash, rootMac: c.root_mac, rootRefresh };
++}
++
++/** The key, when `claim` is genuine: the sealed token hashes to the root's
++ *  hash and the root MAC verifies under the held key. Null otherwise. */
++function keyForClaim(
++  claim: CarriedClaim,
++  v: { vaultId: string; check: Buffer; generation: number; pending: boolean },
++): Buffer | null {
++  if (createHash("sha256").update(claim.rootRefresh).digest("hex") !== claim.rootRefreshHash) return null;
++  const vk = heldKey(v.vaultId, { check: v.check, generation: v.generation, pending: v.pending }, vaultKeyCache);
++  if (!vk) return null;
++  if (!verifyAllowMac(vk, claim.rootGrantId, claim.rootRefreshHash, claim.rootMac)) {
++    vk.fill(0);
++    return null;
++  }
++  return vk;
++}
++
++/** Hand the claim to the new grant, sealed under its refresh token. */
++async function storeCarry(grantId: string, refreshToken: string, vaultId: string, claim: CarriedClaim, db: Queryable): Promise<void> {
++  await db.query(
++    `INSERT INTO ${CARRY} (grant_id, vault_id, root_grant_id, root_refresh_hash, root_mac, wrapped_root_refresh)
++     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (grant_id, vault_id) DO NOTHING`,
++    [
++      grantId,
++      vaultId,
++      claim.rootGrantId,
++      claim.rootRefreshHash,
++      claim.rootMac,
++      wrapSecret(refreshToken, "oauth-carry", CARRY, CARRY_COLUMN, vaultId, `${grantId}:carry`, claim.rootRefresh),
++    ],
++  );
++}
++
+ /**
+  * Per-call keys for a resolved OAuth access token. Vaults without a usable key
+  * are absent: an unkeyed vault needs none (today's path), and a keyed vault
+@@ -209,11 +288,31 @@ export async function rewrapOnIssue(grant: IssuedGrant, db: Queryable = defaultP
+     for (const v of checks) {
+       let vk: Buffer | null = null;
+       if (grant.previous) {
++        const prev = grant.previous;
+         vk =
+-          (await openWrap(grant.previous.refreshToken, grant.previous.grantId, "refresh", v, db)) ??
+-          (await allowListedKey(grant.previous.grantId, grant.previous.refreshHashHex, v, db));
++          (await openWrap(prev.refreshToken, prev.grantId, "refresh", v, db)) ??
++          (await allowListedKey(prev.grantId, prev.refreshHashHex, v, db));
++        if (!vk) {
++          // An allow entry or carry with no key held: verify it now if a key is
++          // held, else pass it on to the new row. A claim that fails while a key
++          // IS held is never passed on.
++          const claim = await claimOf(prev.grantId, prev.refreshToken, prev.refreshHashHex, v.vaultId, db);
++          if (claim) {
++            try {
++              const held = heldKey(v.vaultId, { check: v.check, generation: v.generation, pending: v.pending }, vaultKeyCache);
++              if (held) {
++                held.fill(0);
++                vk = keyForClaim(claim, v);
++              } else if (grant.refreshToken) {
++                await storeCarry(grant.grantId, grant.refreshToken, v.vaultId, claim, db);
++              }
++            } finally {
++              claim.rootRefresh.fill(0);
++            }
++          }
++        }
+         // The consumed row is covered too (its refresh token stays valid).
+-        if (vk) await storeWrap(grant.previous.refreshToken, grant.previous.grantId, "refresh", v.vaultId, vk, v.generation, db);
++        if (vk) await storeWrap(prev.refreshToken, prev.grantId, "refresh", v.vaultId, vk, v.generation, db);
+       } else {
+         const c = fromConsent.find((k) => k.vaultId === v.vaultId && k.generation === v.generation);
+         if (c && verifyVk(c.key, v.vaultId, v.check)) vk = Buffer.from(c.key);
+diff --git a/app/apps/server/tests/helpers/db.ts b/app/apps/server/tests/helpers/db.ts
+index 0087e5fe..58c5bdda 100644
+--- a/app/apps/server/tests/helpers/db.ts
++++ b/app/apps/server/tests/helpers/db.ts
+@@ -76,6 +76,7 @@ const TABLES = [
+   "server_secrets",
+   "vault_pending_key_shares",
+   "oauth_grant_consumed",
++  "oauth_grant_carry",
+   "server_secret_fingerprints",
+   '"user"',
+ ];
+diff --git a/app/apps/server/tests/oauth-grant-keys.test.ts b/app/apps/server/tests/oauth-grant-keys.test.ts
+index 5df15e10..6b7ee9bc 100644
+--- a/app/apps/server/tests/oauth-grant-keys.test.ts
++++ b/app/apps/server/tests/oauth-grant-keys.test.ts
+@@ -14,7 +14,7 @@ import type { SyncContext } from "../src/sync/hocuspocus.js";
+ import { makeVkCheck } from "../src/crypto/vk-check.js";
+ import { vaultKeyCache } from "../src/crypto/key-cache.js";
+ import { pendingKeyCache } from "../src/crypto/conversion.js";
+-import { allowMac } from "../src/crypto/token-wrap.js";
++import { allowMac, wrapSecret } from "../src/crypto/token-wrap.js";
+ import { hashOAuthToken } from "../src/mcp/oauth-token-hash.js";
+ import { resetMcpBadTokens } from "../src/http/routes/mcp.js";
+ import { testAppDeps } from "./helpers/app.js";
+@@ -358,6 +358,94 @@ describe("OAuth connector tokens: hashed storage + vault keys", () => {
+     expect((await tool(r.body.access_token!, "read_note", { docId: s.docId })).data.content).toBe("hello");
+   });
+ 
++  /** Allow-list g1, key the vault, then no desktop anywhere. */
++  async function keyedWithAllowListedGrant() {
++    const s = await setup();
++    await api(s.owner, "POST", `/vaults/${s.vaultId}/keys/pending`, { vkCheck: b64(s.vkCheck), generation: 1 }, s.vk);
++    await api(s.owner, "POST", `/vaults/${s.vaultId}/keys/allowlist`, {
++      entries: [{ kind: "oauth_grant", id: "g1", mac: b64(allowMac(s.vk, "g1", sha(s.refreshToken))) }],
++    }, s.vk);
++    const init = await api(s.owner, "POST", `/vaults/${s.vaultId}/keys/init`, {
++      vkCheck: b64(s.vkCheck),
++      generation: 1,
++      sealedVkForSelf: b64(randomBytes(80)),
++    }, s.vk);
++    expect(init.status).toBe(201);
++    noDesktops();
++    return s;
++  }
++  const newestGrant = async () =>
++    (await pool.query<{ id: string }>(`SELECT id FROM "oauthAccessToken" ORDER BY "createdAt" DESC, id DESC LIMIT 1`)).rows[0].id;
++  const keysOf = async (id: string) =>
++    (await pool.query("SELECT 1 FROM oauth_grant_keys WHERE grant_id = $1", [id])).rowCount;
++
++  it("an allow-listed grant refreshed twice with no desktop online still upgrades on a later refresh", async () => {
++    vi.stubEnv("BAALDA_VAULT_KEYS", "on");
++    const s = await keyedWithAllowListedGrant();
++    const r1 = await refresh(s.refreshToken);
++    expect(r1.status).toBe(200);
++    const g2 = await newestGrant();
++    expect(await keysOf(g2)).toBe(0);
++    expect((await pool.query("SELECT root_grant_id FROM oauth_grant_carry WHERE grant_id = $1", [g2])).rows).toEqual([
++      { root_grant_id: "g1" },
++    ]);
++    expect((await tool(r1.body.access_token!, "read_note", { docId: s.docId })).isError).toBe(true);
++
++    const r2 = await refresh(r1.body.refresh_token!);
++    const g3 = await newestGrant();
++    expect((await pool.query("SELECT root_grant_id FROM oauth_grant_carry WHERE grant_id = $1", [g3])).rows).toEqual([
++      { root_grant_id: "g1" },
++    ]);
++
++    // Someone opens Baalda; the next refresh upgrades.
++    vaultKeyCache.holdForRequest(s.vaultId, s.vk, 1); // a member's app connects
++    const r3 = await refresh(r2.body.refresh_token!);
++    expect(r3.status).toBe(200);
++    const g4 = await newestGrant();
++    expect(await keysOf(g4)).toBe(2);
++    expect(await keysOf(g3)).toBe(1); // the consumed row's refresh wrap
++    noDesktops();
++    const read = await tool(r3.body.access_token!, "read_note", { docId: s.docId });
++    expect(read.isError, read.text).toBe(false);
++  });
++
++  it("a refresh while a key is held upgrades directly, with no carry", async () => {
++    vi.stubEnv("BAALDA_VAULT_KEYS", "on");
++    const s = await keyedWithAllowListedGrant();
++    vaultKeyCache.holdForRequest(s.vaultId, s.vk, 1); // a member's app connects
++    expect((await refresh(s.refreshToken)).status).toBe(200);
++    expect(await keysOf(await newestGrant())).toBe(2);
++    expect((await pool.query("SELECT 1 FROM oauth_grant_carry")).rowCount).toBe(0);
++  });
++
++  it("a carry inserted into the database never yields a key, even with real root values", async () => {
++    vi.stubEnv("BAALDA_VAULT_KEYS", "on");
++    const s = await keyedWithAllowListedGrant();
++    const { rows } = await pool.query<{ mac: Buffer }>("SELECT mac FROM oauth_grant_allow WHERE grant_id = 'g1'");
++    const fakeRefresh = "RefreshForgedByDatabaseWriterAbcde";
++    await pool.query(
++      `INSERT INTO "oauthAccessToken" (id, "accessToken", "refreshToken", "accessTokenExpiresAt", "refreshTokenExpiresAt", "clientId", "userId", scopes)
++       VALUES ('gx', 'AccessForgedByDatabaseWriterAbcdef', $1, now() + interval '1 hour', now() + interval '7 days', $2, $3, 'openid offline_access')`,
++      [fakeRefresh, CLIENT, s.owner.userId],
++    );
++    // The attacker copies g1's root entry but cannot seal g1's refresh token,
++    // which the database never held: a guess (and a tampered MAC) both fail.
++    for (const [sealed, mac] of [
++      [Buffer.from("a guess at the root token"), rows[0].mac],
++      [Buffer.from(s.refreshToken), randomBytes(32)],
++    ] as const) {
++      await pool.query("DELETE FROM oauth_grant_carry");
++      await pool.query(
++        `INSERT INTO oauth_grant_carry (grant_id, vault_id, root_grant_id, root_refresh_hash, root_mac, wrapped_root_refresh)
++         VALUES ('gx', $1, 'g1', $2, $3, $4)`,
++        [s.vaultId, sha(s.refreshToken), mac, wrapSecret(fakeRefresh, "oauth-carry", "oauth_grant_carry", "wrapped_root_refresh", s.vaultId, "gx:carry", sealed)],
++      );
++      vaultKeyCache.holdForRequest(s.vaultId, s.vk, 1); // a member's app connects
++      await refresh(fakeRefresh);
++      expect((await pool.query("SELECT 1 FROM oauth_grant_keys")).rowCount).toBe(0);
++    }
++  });
++
+   it("a grant inserted into the database never gets a key", async () => {
+     vi.stubEnv("BAALDA_VAULT_KEYS", "on");
+     const s = await setup();

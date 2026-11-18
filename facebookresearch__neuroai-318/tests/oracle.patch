@@ -1,0 +1,242 @@
+diff --git a/neuralset-repo/neuralset/extractors/neuro.py b/neuralset-repo/neuralset/extractors/neuro.py
+index b320e15f1..5403500f0 100644
+--- a/neuralset-repo/neuralset/extractors/neuro.py
++++ b/neuralset-repo/neuralset/extractors/neuro.py
+@@ -4,10 +4,15 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++import contextlib
+ import functools
+ import hashlib
+ import inspect
+ import logging
++import os
++import secrets
++import socket
++import time
+ import typing as tp
+ import warnings
+ from collections import defaultdict
+@@ -1252,6 +1257,94 @@ def clean(self, data: np.ndarray, t_r: float) -> np.ndarray:
+         return data
+ 
+ 
++# nilearn dataset-fetch serialization ----------------------------------------
++# How long to wait for the lock before giving up and fetching anyway, how old a
++# lock must be to be treated as stale (left by a crashed holder), and the retry
++# poll interval -- all in seconds.
++_DOWNLOAD_LOCK_TIMEOUT_S = 600.0
++_DOWNLOAD_LOCK_STALE_S = 600.0
++_DOWNLOAD_LOCK_POLL_S = 1.0
++
++
++def _nilearn_data_dir() -> Path:
++    """Writable directory where nilearn fetches land (usually ``~/nilearn_data``)."""
++    from nilearn.datasets.utils import get_data_dirs
++
++    return Path(get_data_dirs()[0])
++
++
++@contextlib.contextmanager
++def _nilearn_download_lock() -> tp.Iterator[None]:
++    """Serialize concurrent nilearn dataset fetches across processes.
++
++    nilearn's ``fetch_files`` downloads into a temp dir named by the md5 of the
++    requested file list and ``shutil.rmtree``s it once done. Two processes
++    fetching the *same* dataset into a shared ``~/nilearn_data`` therefore share
++    one temp dir: when the first finishes and removes it, the second's
++    ``*.part`` download vanishes mid-write and raises ``FileNotFoundError``.
++    This happens routinely when exca/submitit fans :class:`FmriExtractor` out
++    over an array of tasks against a cold cache.
++
++    We take a best-effort cross-process lock (a portable ``O_CREAT | O_EXCL``
++    lock file -- no ``flock``, so it also works on NFS/SMB) so only one process
++    fetches at a time; the others wait and then find the dataset already cached.
++    The lock degrades to a no-op on any error, after
++    :data:`_DOWNLOAD_LOCK_TIMEOUT_S`, or when an existing lock looks stale, so a
++    crashed holder can never wedge fetching permanently -- worst case we simply
++    fall back to today's unserialized behavior.
++    """
++    try:
++        data_dir = _nilearn_data_dir()
++        data_dir.mkdir(parents=True, exist_ok=True)
++        lock = data_dir / ".neuralset_fetch.lock"
++    except Exception as exc:  # cannot resolve/create the data dir: skip locking
++        logger.debug("nilearn download lock disabled: %s", exc)
++        yield
++        return
++
++    token = (
++        f"{socket.gethostname()} {os.getpid()} {time.time():.3f} {secrets.token_hex(8)}"
++    ).encode("utf-8")
++    held = False
++    deadline = time.monotonic() + _DOWNLOAD_LOCK_TIMEOUT_S
++    while True:
++        try:
++            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
++            try:
++                os.write(fd, token)
++            finally:
++                os.close(fd)
++            held = True
++            break
++        except FileExistsError:
++            # Reclaim a lock left behind by a crashed holder.
++            try:
++                if time.time() - lock.stat().st_mtime > _DOWNLOAD_LOCK_STALE_S:
++                    lock.unlink()
++                    continue
++            except OSError:
++                pass
++        except OSError as exc:  # share refuses the file: proceed without a lock
++            logger.debug("nilearn download lock disabled: %s", exc)
++            break
++        if time.monotonic() >= deadline:
++            logger.warning(
++                "Timed out waiting for nilearn download lock %s; fetching anyway",
++                lock,
++            )
++            break
++        time.sleep(_DOWNLOAD_LOCK_POLL_S)
++    try:
++        yield
++    finally:
++        if held:
++            try:
++                if lock.read_bytes() == token:
++                    lock.unlink()
++            except OSError:
++                pass
++
++
+ class BaseFmriProjector(DiscriminatedModel, discriminator_key="name"):
+     """Base class for spatial projection sub-configs.
+ 
+@@ -1327,7 +1420,8 @@ def get_mesh(self) -> tp.Any:
+         if self._mesh is None:
+             from nilearn import datasets
+ 
+-            fsaverage = datasets.fetch_surf_fsaverage(self.mesh)
++            with _nilearn_download_lock():
++                fsaverage = datasets.fetch_surf_fsaverage(self.mesh)
+             self._mesh = fsaverage
+         return self._mesh
+ 
+@@ -1400,9 +1494,10 @@ def get_mask(self) -> tp.Any:
+ 
+         if self._mask is None:
+             if self.mask == "subcortical":
+-                atlas = datasets.fetch_atlas_harvard_oxford(
+-                    f"sub-maxprob-thr50-{self.resolution}mm"
+-                )
++                with _nilearn_download_lock():
++                    atlas = datasets.fetch_atlas_harvard_oxford(
++                        f"sub-maxprob-thr50-{self.resolution}mm"
++                    )
+                 excluded = ["Cortex", "White", "Stem", "Background"]
+                 selected_indices = [
+                     i
+@@ -1414,7 +1509,8 @@ def get_mask(self) -> tp.Any:
+                 mask = nib.Nifti1Image(mask_data, atlas.maps.affine, atlas.maps.header)
+             else:
+                 mask_func = getattr(datasets, f"load_{self.mask}_mask")
+-                mask = mask_func(resolution=self.resolution)
++                with _nilearn_download_lock():
++                    mask = mask_func(resolution=self.resolution)
+             self._mask = mask
+         return self._mask
+ 
+@@ -1478,7 +1574,8 @@ def get_atlas(self) -> tp.Any:
+         from nilearn import datasets
+ 
+         atlas_func = getattr(datasets, f"fetch_atlas_{self.atlas}")
+-        atlas = atlas_func(**(self.atlas_kwargs or {}))
++        with _nilearn_download_lock():
++            atlas = atlas_func(**(self.atlas_kwargs or {}))
+         return atlas
+ 
+     def _get_masker(
+diff --git a/neuralset-repo/neuralset/extractors/test_neuro.py b/neuralset-repo/neuralset/extractors/test_neuro.py
+index f1fdd0eb6..0bd2ca3d6 100644
+--- a/neuralset-repo/neuralset/extractors/test_neuro.py
++++ b/neuralset-repo/neuralset/extractors/test_neuro.py
+@@ -6,6 +6,7 @@
+ 
+ import json
+ import pickle
++import threading
+ import time
+ import typing as tp
+ from pathlib import Path
+@@ -28,6 +29,7 @@
+ from neuralset.base import TimedArray
+ from neuralset.events import etypes, test_etypes
+ from neuralset.events.utils import extract_events
++from neuralset.extractors import neuro
+ from neuralset.extractors.neuro import FmriTimedArray, MneTimedArray, _overlap
+ 
+ 
+@@ -196,6 +198,62 @@ def test_fmri(test_data_path: Path, tmp_path: Path) -> None:
+     assert nifti.shape == cached_val.data.shape
+ 
+ 
++def test_nilearn_download_lock_serializes(tmp_path: Path, monkeypatch) -> None:
++    """Concurrent fetches must not overlap: the lock serializes downloads so
++    nilearn's shared temp dir can't be removed out from under another fetch."""
++    monkeypatch.setattr(neuro, "_nilearn_data_dir", lambda: tmp_path)
++    inside = 0
++    max_concurrent = 0
++    lock = threading.Lock()
++    barrier = threading.Barrier(5)
++
++    def worker() -> None:
++        nonlocal inside, max_concurrent
++        barrier.wait()
++        with neuro._nilearn_download_lock():
++            with lock:
++                inside += 1
++                max_concurrent = max(max_concurrent, inside)
++            time.sleep(0.05)  # emulate a download
++            with lock:
++                inside -= 1
++
++    threads = [threading.Thread(target=worker) for _ in range(5)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++
++    assert max_concurrent == 1
++    # the lock file is released on exit
++    assert not (tmp_path / ".neuralset_fetch.lock").exists()
++
++
++def test_nilearn_download_lock_reclaims_stale(tmp_path: Path, monkeypatch) -> None:
++    """A stale lock from a crashed holder is reclaimed, not waited on forever."""
++    monkeypatch.setattr(neuro, "_nilearn_data_dir", lambda: tmp_path)
++    monkeypatch.setattr(neuro, "_DOWNLOAD_LOCK_STALE_S", 0.0)
++    stale = tmp_path / ".neuralset_fetch.lock"
++    stale.write_bytes(b"dead holder")
++
++    start = time.monotonic()
++    with neuro._nilearn_download_lock():
++        pass
++    # reclaimed immediately rather than blocking for the full timeout
++    assert time.monotonic() - start < 5.0
++
++
++def test_nilearn_download_lock_degrades_without_data_dir(monkeypatch) -> None:
++    """If the data dir cannot be resolved, fetching still proceeds (no-op lock)."""
++
++    def boom() -> Path:
++        raise RuntimeError("no nilearn")
++
++    monkeypatch.setattr(neuro, "_nilearn_data_dir", boom)
++    with neuro._nilearn_download_lock():
++        pass  # must not raise
++
++
+ @pytest.mark.parametrize("kind", ["Fmri", "Meg"])
+ def test_extractor_cached_start(test_data_path: Path, tmp_path: Path, kind: str) -> None:
+     infra: tp.Any = {"folder": tmp_path / "cache", "cluster": None}

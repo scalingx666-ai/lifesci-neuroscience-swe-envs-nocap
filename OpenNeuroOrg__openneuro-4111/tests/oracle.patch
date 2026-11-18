@@ -1,0 +1,343 @@
+diff --git a/services/datalad/datalad_service/tasks/maintenance.py b/services/datalad/datalad_service/tasks/maintenance.py
+index 8ed7e0c53..99544b56c 100644
+--- a/services/datalad/datalad_service/tasks/maintenance.py
++++ b/services/datalad/datalad_service/tasks/maintenance.py
+@@ -7,6 +7,7 @@
+ 
+ from datalad_service.config import DATALAD_DATASET_PATH
+ from datalad_service.broker import broker
++from datalad_service.tasks.publish import set_s3_access_tag
+ 
+ 
+ def dataset_factory():
+@@ -40,6 +41,7 @@ def dataset_factory():
+ 
+ gc_dataset_generator = dataset_factory()
+ fsck_dataset_generator = dataset_factory()
++s3_tags_dataset_generator = dataset_factory()
+ 
+ 
+ @broker.task(schedule=[{'cron': '*/15 * * * *'}])
+@@ -80,3 +82,17 @@ def git_fsck_dataset(dataset_path=None):
+         logging.error(
+             f'`git fsck --full` failed for `{dataset_path}`: {git_fsck.stderr}'
+         )
++
++
++@broker.task(schedule=[{'cron': '*/20 * * * *'}])
++async def reconcile_s3_tags_dataset(dataset_path=None):
++    """Routinely verify and reconcile S3 access tags for a dataset to match expected public/private status."""
++    try:
++        if not dataset_path:
++            dataset_path = next(s3_tags_dataset_generator)
++    except StopIteration:
++        logging.info('No datasets available for S3 tag reconciliation.')
++        return
++    dataset_id = os.path.basename(dataset_path)
++    logging.info(f'Running S3 access tag reconciliation on dataset: {dataset_id}')
++    return await set_s3_access_tag(dataset_id)
+diff --git a/services/datalad/datalad_service/tasks/publish.py b/services/datalad/datalad_service/tasks/publish.py
+index dc2aa16ff..872f91d5b 100644
+--- a/services/datalad/datalad_service/tasks/publish.py
++++ b/services/datalad/datalad_service/tasks/publish.py
+@@ -335,17 +335,40 @@ def update_object_tag(client, s3_bucket, key, version_id, value):
+     except client.exceptions.ClientError as e:
+         if e.response['Error']['Code'] == 'NoSuchTagSet':
+             tag_set = []
++        elif e.response['Error']['Code'] in ('NoSuchKey', 'NoSuchVersion'):
++            logger.warning(
++                f'Object {key} (version {version_id}) not found while getting tags: {e}'
++            )
++            return False
+         else:
+             raise
++
++    # Check if access tag already matches desired value (declarative drift check)
++    current_access = next(
++        (tag['Value'] for tag in tag_set if tag['Key'] == 'access'), None
++    )
++    if current_access == value:
++        return False
++
+     # Remove any existing access tag and add the new one
+     new_tags = [tag for tag in tag_set if tag['Key'] != 'access']
+     new_tags.append({'Key': 'access', 'Value': value})
+-    client.put_object_tagging(
+-        Bucket=s3_bucket,
+-        Key=key,
+-        VersionId=version_id,
+-        Tagging={'TagSet': new_tags},
+-    )
++    try:
++        client.put_object_tagging(
++            Bucket=s3_bucket,
++            Key=key,
++            VersionId=version_id,
++            Tagging={'TagSet': new_tags},
++        )
++    except client.exceptions.ClientError as e:
++        if e.response['Error']['Code'] in ('NoSuchKey', 'NoSuchVersion'):
++            logger.warning(
++                f'Object {key} (version {version_id}) not found while putting tags: {e}'
++            )
++            return False
++        else:
++            raise
++    return True
+ 
+ 
+ def set_s3_access_tag_worker(dataset, value):
+@@ -356,19 +379,41 @@ def set_s3_access_tag_worker(dataset, value):
+     )
+     s3_bucket = get_s3_bucket()
+     paginator = client.get_paginator('list_object_versions')
+-    futures = []
+-    for page in paginator.paginate(Bucket=s3_bucket, Prefix=f'{dataset}/'):
+-        for version in page.get('Versions', []):
+-            key = version['Key']
+-            version_id = version['VersionId']
+-            futures.append(
+-                tags_executor.submit(
+-                    update_object_tag, client, s3_bucket, key, version_id, value
+-                )
++    prefix = f'{dataset.rstrip("/")}/'
++    total_scanned = 0
++    total_updated = 0
++
++    for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
++        versions = page.get('Versions', [])
++        if not versions:
++            continue
++        futures = [
++            tags_executor.submit(
++                update_object_tag,
++                client,
++                s3_bucket,
++                version['Key'],
++                version['VersionId'],
++                value,
+             )
+-    # Make sure exceptions from the tag updates are raised
+-    for future in futures:
+-        future.result()
++            for version in versions
++        ]
++        # Evaluate futures page-by-page to stream progress
++        for future in futures:
++            if future.result():
++                total_updated += 1
++            total_scanned += 1
++
++    total_in_sync = total_scanned - total_updated
++    logger.info(
++        f'S3 access tag reconciliation complete for {dataset} (target={value}): '
++        f'{total_scanned} scanned, {total_updated} updated, {total_in_sync} already in sync'
++    )
++    return {
++        'scanned': total_scanned,
++        'updated': total_updated,
++        'in_sync': total_in_sync,
++    }
+ 
+ 
+ @broker.task
+@@ -378,4 +423,4 @@ async def set_s3_access_tag(dataset):
+     loop = asyncio.get_running_loop()
+     # Use the default executor for the orchestration task to avoid deadlocking
+     # the tags_executor which is used for the sub-tasks.
+-    await loop.run_in_executor(None, set_s3_access_tag_worker, dataset, value)
++    return await loop.run_in_executor(None, set_s3_access_tag_worker, dataset, value)
+diff --git a/services/datalad/tests/test_maintenance.py b/services/datalad/tests/test_maintenance.py
+index 06ad9b375..68838f250 100644
+--- a/services/datalad/tests/test_maintenance.py
++++ b/services/datalad/tests/test_maintenance.py
+@@ -1,4 +1,10 @@
+-from datalad_service.tasks.maintenance import gc_dataset, git_fsck_dataset
++from unittest.mock import AsyncMock, patch
++
++from datalad_service.tasks.maintenance import (
++    gc_dataset,
++    git_fsck_dataset,
++    reconcile_s3_tags_dataset,
++)
+ 
+ 
+ def test_gc_dataset(new_dataset):
+@@ -7,3 +13,29 @@ def test_gc_dataset(new_dataset):
+ 
+ def test_git_fsck_dataset(new_dataset):
+     git_fsck_dataset(new_dataset.path)
++
++
++@patch('datalad_service.tasks.maintenance.set_s3_access_tag', new_callable=AsyncMock)
++async def test_reconcile_s3_tags_dataset_explicit(mock_set_s3_access_tag):
++    await reconcile_s3_tags_dataset('/srv/datasets/ds000123')
++    mock_set_s3_access_tag.assert_awaited_once_with('ds000123')
++
++
++@patch('datalad_service.tasks.maintenance.s3_tags_dataset_generator')
++@patch('datalad_service.tasks.maintenance.set_s3_access_tag', new_callable=AsyncMock)
++async def test_reconcile_s3_tags_dataset_generator(
++    mock_set_s3_access_tag, mock_generator
++):
++    mock_generator.__next__.return_value = '/srv/datasets/ds000456'
++    await reconcile_s3_tags_dataset()
++    mock_set_s3_access_tag.assert_awaited_once_with('ds000456')
++
++
++@patch('datalad_service.tasks.maintenance.s3_tags_dataset_generator')
++@patch('datalad_service.tasks.maintenance.set_s3_access_tag', new_callable=AsyncMock)
++async def test_reconcile_s3_tags_dataset_empty_generator(
++    mock_set_s3_access_tag, mock_generator
++):
++    mock_generator.__next__.side_effect = StopIteration
++    await reconcile_s3_tags_dataset()
++    mock_set_s3_access_tag.assert_not_called()
+diff --git a/services/datalad/tests/test_publish.py b/services/datalad/tests/test_publish.py
+index c5b54f6d3..368254486 100644
+--- a/services/datalad/tests/test_publish.py
++++ b/services/datalad/tests/test_publish.py
+@@ -1,6 +1,7 @@
+ import json
+ import os
+ from unittest.mock import AsyncMock, Mock, call, patch
++from botocore.exceptions import ClientError
+ 
+ import falcon
+ 
+@@ -8,6 +9,8 @@
+     export_dataset,
+     create_remotes,
+     set_remote_public,
++    update_object_tag,
++    set_s3_access_tag_worker,
+ )
+ from datalad_service.common.annex import is_git_annex_remote
+ 
+@@ -86,3 +89,126 @@ async def test_set_remote_public(mock_set_s3_access_tag, mock_run_check, new_dat
+     mock_set_s3_access_tag.assert_called_once_with(
+         os.path.basename(new_dataset.path), 'public'
+     )
++
++
++def test_update_object_tag_skips_when_already_matching():
++    client = Mock()
++    client.get_object_tagging.return_value = {
++        'TagSet': [{'Key': 'access', 'Value': 'public'}]
++    }
++    updated = update_object_tag(
++        client, 'my-bucket', 'ds000001/file.txt', 'v1', 'public'
++    )
++    assert updated is False
++    client.put_object_tagging.assert_not_called()
++
++
++def test_update_object_tag_updates_when_mismatched():
++    client = Mock()
++    client.get_object_tagging.return_value = {
++        'TagSet': [{'Key': 'access', 'Value': 'private'}]
++    }
++    updated = update_object_tag(
++        client, 'my-bucket', 'ds000001/file.txt', 'v1', 'public'
++    )
++    assert updated is True
++    client.put_object_tagging.assert_called_once_with(
++        Bucket='my-bucket',
++        Key='ds000001/file.txt',
++        VersionId='v1',
++        Tagging={'TagSet': [{'Key': 'access', 'Value': 'public'}]},
++    )
++
++
++def test_update_object_tag_preserves_other_tags():
++    client = Mock()
++    client.get_object_tagging.return_value = {
++        'TagSet': [
++            {'Key': 'custom', 'Value': 'val'},
++            {'Key': 'access', 'Value': 'private'},
++        ]
++    }
++    updated = update_object_tag(
++        client, 'my-bucket', 'ds000001/file.txt', 'v1', 'public'
++    )
++    assert updated is True
++    client.put_object_tagging.assert_called_once_with(
++        Bucket='my-bucket',
++        Key='ds000001/file.txt',
++        VersionId='v1',
++        Tagging={
++            'TagSet': [
++                {'Key': 'custom', 'Value': 'val'},
++                {'Key': 'access', 'Value': 'public'},
++            ]
++        },
++    )
++
++
++def test_update_object_tag_handles_no_such_tag_set():
++    client = Mock()
++    client.exceptions.ClientError = ClientError
++    client.get_object_tagging.side_effect = ClientError(
++        {'Error': {'Code': 'NoSuchTagSet', 'Message': 'No tags'}},
++        'GetObjectTagging',
++    )
++    updated = update_object_tag(
++        client, 'my-bucket', 'ds000001/file.txt', 'v1', 'public'
++    )
++    assert updated is True
++    client.put_object_tagging.assert_called_once_with(
++        Bucket='my-bucket',
++        Key='ds000001/file.txt',
++        VersionId='v1',
++        Tagging={'TagSet': [{'Key': 'access', 'Value': 'public'}]},
++    )
++
++
++def test_update_object_tag_handles_missing_object():
++    client = Mock()
++    client.exceptions.ClientError = ClientError
++    client.get_object_tagging.side_effect = ClientError(
++        {'Error': {'Code': 'NoSuchKey', 'Message': 'Key does not exist'}},
++        'GetObjectTagging',
++    )
++    updated = update_object_tag(
++        client, 'my-bucket', 'ds000001/file.txt', 'v1', 'public'
++    )
++    assert updated is False
++    client.put_object_tagging.assert_not_called()
++
++
++@patch('datalad_service.tasks.publish.boto3.client')
++@patch('datalad_service.tasks.publish.get_s3_bucket', return_value='test-bucket')
++def test_set_s3_access_tag_worker(mock_get_bucket, mock_boto_client):
++    mock_s3 = Mock()
++    mock_boto_client.return_value = mock_s3
++
++    paginator = Mock()
++    # 2 pages: page 1 has 2 versions (1 in sync, 1 needs update), page 2 has 1 version (needs update)
++    paginator.paginate.return_value = [
++        {
++            'Versions': [
++                {'Key': 'ds000001/f1', 'VersionId': 'v1'},
++                {'Key': 'ds000001/f2', 'VersionId': 'v2'},
++            ]
++        },
++        {
++            'Versions': [
++                {'Key': 'ds000001/f3', 'VersionId': 'v3'},
++            ]
++        },
++    ]
++    mock_s3.get_paginator.return_value = paginator
++
++    def mock_get_tagging(Bucket, Key, VersionId):
++        if Key == 'ds000001/f1':
++            return {'TagSet': [{'Key': 'access', 'Value': 'public'}]}
++        return {'TagSet': [{'Key': 'access', 'Value': 'private'}]}
++
++    mock_s3.get_object_tagging.side_effect = mock_get_tagging
++
++    stats = set_s3_access_tag_worker('ds000001', 'public')
++
++    assert stats == {'scanned': 3, 'updated': 2, 'in_sync': 1}
++    assert mock_s3.put_object_tagging.call_count == 2

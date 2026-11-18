@@ -1,0 +1,1632 @@
+diff --git a/development/inference-internals.md b/development/inference-internals.md
+index 65881a45..4f93ffd2 100644
+--- a/development/inference-internals.md
++++ b/development/inference-internals.md
+@@ -144,11 +144,16 @@ Memory is planned in `nltools/algorithms/backends.py` and nowhere else.
+ run holds at once — the two bounded tails, the replicates buffered before the
+ next flush and the two temporaries that flush builds, one dispatch window, every
+ replicate when `return_samples=True`, and the two Welford accumulators plus the
+-four summary payloads — and raises *before* resampling if that exceeds the
+-budget, naming the requirement, the measured budget, and the `memory_budget_gb`
++four summary payloads — plus the `(n_samples, n_obs)` int64 resampling index
++matrix, charged twice because building it holds the per-draw vectors alongside
++the stacked result. It raises *before* resampling if that exceeds the budget,
++naming the requirement, the measured budget, and the `memory_budget_gb`
+ override. It never weakens the interval, reduces `n_samples`, or disables
+ `return_samples`. `_bootstrap_n_jobs_cpu` treats `n_jobs` as a ceiling and lowers
+-it when a worker's copy of the data would not fit;
++it when a worker's copy of the data would not fit — each engine supplies what
++its closure actually pickles, which for the ridge engines is every feature
++space, the targets, the test matrix where there is one, and the whole index
++matrix, never the targets alone;
+ `_bootstrap_replicate_window` turns that worker count into the dispatch window.
+ `BOOTSTRAP_TAIL_FLUSH_BLOCK` lives there too rather than in the engine, so the
+ one budget owner sees every constant it has to charge for.
+@@ -191,11 +196,27 @@ where `count` = number of null statistics ≥ |observed|. This prevents `p = 0`
+ standard practice (scipy, FSL, AFNI). Two-tailed uses `|null| ≥ |observed|`; one-tailed
+ `'upper'`/`'lower'` are also supported.
+ 
++The ISC tests summarize through `isc._summarize_isc_resamples`, which applies the
++same correction over the draws that are *defined*. A bootstrap draw is undefined
++when every pair it contains is a duplicated subject — unavoidable with few
++subjects — and a flat feature has no correlation at all. Those draws are dropped
++per feature rather than counted as non-exceedances, so the denominator is the
++feature's valid-draw count plus one and the interval is a `np.nanpercentile` over
++the same draws. A feature with no defined draw reports NaN for the p-value and for
++both bounds, and so does a feature whose *observed* statistic is undefined — no null
++value exceeds NaN, so the correction would otherwise report `1 / (n + 1)`, the
++smallest p it can produce, for every flat or masked-out voxel.
++`return_null=True` still hands back the draws as drawn, NaNs included.
++
+ ## Deterministic RNG (worker-count consistency)
+ 
+ The load-bearing pattern (matching MNE-Python): pre-generate an independent seed per
+ permutation, then give each permutation its own `RandomState`. This makes results
+-identical regardless of joblib worker count.
++identical regardless of joblib worker count. The surrogate ISC methods
++(`circle_shift`, `phase_randomize`) follow it through `isc._surrogate_isc_null`,
++which plans workers the way the bootstrap paths do and drives one shared per-replicate
++worker for both surrogates, so `n_jobs` and `progress_bar` behave the same on every
++`method`.
+ 
+ ```python
+ MAX_INT = 2**31 - 1
+diff --git a/docs/migration-guide.md b/docs/migration-guide.md
+index 8c184148..6c3ec59a 100644
+--- a/docs/migration-guide.md
++++ b/docs/migration-guide.md
+@@ -102,6 +102,9 @@ apply `BrainData` methods per subject and stack the results with
+ | Statistics | The social relations model paired each cell with the wrong reciprocal cell | Each dyad is paired with its own transpose | Variance components, reciprocity, reliabilities and the total variance all move |
+ | Statistics | The SRM summary printed two-sided p-values above one when `t` was negative | `2 * sf(abs(t), df)` | Printed covariance rows only; no returned value changes |
+ | Statistics | `brain.bootstrap('mean')` on a single image resampled its voxels as observations | Raises `ValueError` | The old result was one scalar wrapped in the source's full mask, which could not be written or plotted |
++| Statistics | `exclude_self_corr` masked every resampled pair whose correlation reached 1 | Only the pairs a resampled subject forms with itself are masked | Two distinct subjects that genuinely correlate at +1 or -1 now count, and identity is the only correct reading for `metric='euclidean'` or `'cosine'` |
++| Statistics | An ISC bootstrap counted undefined draws in the p-value denominator and let one of them make the whole interval `NaN` | Undefined draws are dropped per feature: the denominator is that feature's valid-draw count and the interval is a NaN-aware percentile | The same data gave p = 1/6 as 2-D input and p = 1/21 once a singleton voxel axis was added; `return_null=True` now hands back every draw, `NaN` where a draw was undefined, rather than a shortened array |
++| Statistics | A feature whose ISC was undefined reported `p = 1 / (n + 1)`, the smallest p the correction can produce, with an interval taken over the resamples that survived | `p` and both bounds are `NaN` for that feature | Every flat or masked-out voxel used to surface as the most significant hit in a whole-brain map |
+ | Plotting | `brain.plot(view=…, threshold_upper=…, axes=…)` | `brain.plot(method=…, upper=…, ax=…)` | `ax` is the matplotlib spelling on every class |
+ | Plotting | `adjacency.plot(limit, axes, *args)` | `adjacency.plot(*, limit=3, ax=None)` | Keyword-only; no positional passthrough |
+ | Plotting | `plot_brain`, `plot_t_brain`, `plot_interactive_brain` | Removed | `BrainData.plot(method='glass'\|'mni'\|'full')` and `BrainData.iplot` |
+diff --git a/nltools/algorithms/backends.py b/nltools/algorithms/backends.py
+index 330b560b..ee9d2c8e 100644
+--- a/nltools/algorithms/backends.py
++++ b/nltools/algorithms/backends.py
+@@ -654,6 +654,10 @@ def _ridge_bootstrap_batch_size(
+ #: every summary payload is converted to CPU float64 before it is retained.
+ _BOOTSTRAP_OUTPUT_ITEMSIZE = 8
+ 
++#: Bytes per resampling index. `_generate_bootstrap_indices` returns an int64
++#: matrix, and every CPU worker's closure captures it.
++_BOOTSTRAP_INDEX_ITEMSIZE = 8
++
+ #: Output-sized arrays a bootstrap run always holds beyond its retained
+ #: replicates: the two Welford accumulators (running mean and running sum of
+ #: squared deviations) and the four `BootstrapResult` summary payloads.
+@@ -734,15 +738,19 @@ def _bootstrap_output_bytes(
+     *,
+     confidence_level: float,
+     return_samples: bool,
++    n_obs: int,
+     n_workers: int = 1,
+ ) -> int:
+-    """Bytes a bootstrap run must hold for its retained output.
++    """Bytes a bootstrap run must hold for its retained output and its indices.
+ 
+     Charges eight bytes for every output-sized array a run holds at once: the
+     two bounded tails, the replicates buffered before the next flush and the
+     two temporaries that flush builds, one dispatch window of in-flight
+     replicates, every replicate when `return_samples=True`, and the two Welford
+-    accumulators plus the four summary payloads.
++    accumulators plus the four summary payloads. On top of that it charges the
++    resampling index matrix twice: the run retains one `(n_samples, n_obs)`
++    int64 array, and building it holds the per-draw vectors alongside the
++    stacked result.
+ 
+     Args:
+         output_shape (tuple[int, ...]): Shape of one replicate's output.
+@@ -750,6 +758,8 @@ def _bootstrap_output_bytes(
+         confidence_level (float): Interval confidence level, which sets the
+             retained tail size.
+         return_samples (bool): Whether the complete distribution is retained.
++        n_obs (int): Observations resampled per replicate, which sizes the
++            index matrix.
+         n_workers (int): Planned CPU worker count, which sets the dispatch
+             window. Defaults to 1 (the GPU driver budgets its own batch through
+             `_ridge_bootstrap_batch_size` instead).
+@@ -770,7 +780,8 @@ def _bootstrap_output_bytes(
+         + (int(n_samples) if return_samples else 0)
+         + _BOOTSTRAP_FIXED_OUTPUT_ARRAYS
+     )
+-    return output_size * arrays * _BOOTSTRAP_OUTPUT_ITEMSIZE
++    index_bytes = 2 * int(n_obs) * int(n_samples) * _BOOTSTRAP_INDEX_ITEMSIZE
++    return output_size * arrays * _BOOTSTRAP_OUTPUT_ITEMSIZE + index_bytes
+ 
+ 
+ def _bootstrap_memory_preflight(
+@@ -779,6 +790,7 @@ def _bootstrap_memory_preflight(
+     *,
+     confidence_level: float,
+     return_samples: bool,
++    n_obs: int,
+     n_workers: int = 1,
+     memory_budget_gb: float | None = None,
+     backend: "_Backend | None" = None,
+@@ -795,6 +807,8 @@ def _bootstrap_memory_preflight(
+         n_samples (int): Number of bootstrap replicates.
+         confidence_level (float): Interval confidence level.
+         return_samples (bool): Whether the complete distribution is retained.
++        n_obs (int): Observations resampled per replicate, which sizes the
++            index matrix.
+         n_workers (int): Planned CPU worker count, which sets the dispatch
+             window. Defaults to 1.
+         memory_budget_gb (float | None): Explicit budget in GB, or None to
+@@ -813,6 +827,7 @@ def _bootstrap_memory_preflight(
+         n_samples,
+         confidence_level=confidence_level,
+         return_samples=return_samples,
++        n_obs=n_obs,
+         n_workers=n_workers,
+     )
+     required_gb = required_bytes / 1e9
+diff --git a/nltools/algorithms/inference/bootstrap.py b/nltools/algorithms/inference/bootstrap.py
+index 16718a98..78ddc727 100644
+--- a/nltools/algorithms/inference/bootstrap.py
++++ b/nltools/algorithms/inference/bootstrap.py
+@@ -259,7 +259,8 @@ def merge(
+             _BootstrapAccumulator: A new accumulator holding both blocks.
+ 
+         Raises:
+-            ValueError: If the two accumulators describe different runs.
++            ValueError: If the two accumulators describe different runs, or
++                together hold more replicates than the run was sized for.
+         """
+         if first.shape != second.shape:
+             raise ValueError(
+@@ -293,6 +294,12 @@ def merge(
+         second._flush()
+ 
+         total = first.n + second.n
++        if total > merged.n_replicates:
++            raise ValueError(
++                f"Cannot merge {first.n} and {second.n} replicates into an "
++                f"accumulator sized for {merged.n_replicates}: both blocks must "
++                f"be sized with the run's total replicate count."
++            )
+         merged.n = total
+         if total:
+             delta = second.mean - first.mean
+@@ -304,9 +311,11 @@ def merge(
+         merged._low = merged._keep_smallest(np.concatenate([first._low, second._low]))
+         merged._high = merged._keep_largest(np.concatenate([first._high, second._high]))
+         if merged.retain_samples:
+-            merged._samples = np.concatenate(
+-                [first._samples[: first.n], second._samples[: second.n]]
+-            )
++            # Copy into the full-capacity buffer `_empty_like` allocated: a
++            # concatenation of the two prefixes would leave the merged
++            # accumulator unable to take the rest of the run.
++            merged._samples[: first.n] = first._samples[: first.n]
++            merged._samples[first.n : total] = second._samples[: second.n]
+         return merged
+ 
+     def results(self) -> dict:
+@@ -510,6 +519,26 @@ def _bootstrap_simple_method_worker(
+     raise ValueError(f"Unsupported method: {method}")
+ 
+ 
++def _bootstrap_index_size_mb(n_obs: int, n_samples: int) -> float:
++    """Megabytes of the resampling index matrix every CPU worker pickles.
++
++    `_generate_bootstrap_indices` materializes one `(n_samples, n_obs)` int64
++    array and each worker's closure captures the whole of it, so the worker
++    planner has to count it alongside the data.
++
++    Args:
++        n_obs (int): Observations resampled per replicate.
++        n_samples (int): Number of bootstrap replicates.
++
++    Returns:
++        float: Size in MB, on the same mebibyte scale as
++            `_estimate_data_size_mb`.
++    """
++    from nltools.algorithms.backends import _BOOTSTRAP_INDEX_ITEMSIZE
++
++    return int(n_obs) * int(n_samples) * _BOOTSTRAP_INDEX_ITEMSIZE / 1024**2
++
++
+ def _bootstrap_simple_cpu_parallel(
+     data: np.ndarray,
+     method: str,
+@@ -579,7 +608,7 @@ def _bootstrap_simple_cpu_parallel(
+     output_shape = (1,) if single_feature else (n_features,)
+ 
+     workers = _bootstrap_n_jobs_cpu(
+-        _estimate_data_size_mb(data),
++        _estimate_data_size_mb(data) + _bootstrap_index_size_mb(n_obs, n_samples),
+         n_samples,
+         memory_budget_gb=memory_budget_gb,
+         n_jobs=n_jobs,
+@@ -589,6 +618,7 @@ def _bootstrap_simple_cpu_parallel(
+         n_samples,
+         confidence_level=confidence_level,
+         return_samples=return_samples,
++        n_obs=n_obs,
+         n_workers=workers,
+         memory_budget_gb=memory_budget_gb,
+     )
+@@ -796,8 +826,15 @@ def _bootstrap_ridge_weights_cpu_parallel(
+     n_features = sum(space.shape[1] for space in spaces)
+     output_shape = (n_features, y.shape[1])
+ 
++    # Each worker pickles the resident design — every feature space and the
++    # targets — plus the whole index matrix, not `y` alone.
++    worker_size_mb = (
++        sum(_estimate_data_size_mb(space) for space in spaces)
++        + _estimate_data_size_mb(y)
++        + _bootstrap_index_size_mb(n_obs, n_samples)
++    )
+     workers = _bootstrap_n_jobs_cpu(
+-        _estimate_data_size_mb(y),
++        worker_size_mb,
+         n_samples,
+         memory_budget_gb=memory_budget_gb,
+         n_jobs=n_jobs,
+@@ -807,6 +844,7 @@ def _bootstrap_ridge_weights_cpu_parallel(
+         n_samples,
+         confidence_level=confidence_level,
+         return_samples=return_samples,
++        n_obs=n_obs,
+         n_workers=workers,
+         memory_budget_gb=memory_budget_gb,
+     )
+@@ -940,8 +978,16 @@ def _bootstrap_ridge_predict_cpu_parallel(
+     n_obs = spaces[0].shape[0]
+     output_shape = (X_pred.shape[0], y.shape[1])
+ 
++    # The closure pickles the resident design, the test matrix and the whole
++    # index matrix.
++    worker_size_mb = (
++        sum(_estimate_data_size_mb(space) for space in spaces)
++        + _estimate_data_size_mb(y)
++        + _estimate_data_size_mb(X_pred)
++        + _bootstrap_index_size_mb(n_obs, n_samples)
++    )
+     workers = _bootstrap_n_jobs_cpu(
+-        _estimate_data_size_mb(y),
++        worker_size_mb,
+         n_samples,
+         memory_budget_gb=memory_budget_gb,
+         n_jobs=n_jobs,
+@@ -951,6 +997,7 @@ def _bootstrap_ridge_predict_cpu_parallel(
+         n_samples,
+         confidence_level=confidence_level,
+         return_samples=return_samples,
++        n_obs=n_obs,
+         n_workers=workers,
+         memory_budget_gb=memory_budget_gb,
+     )
+@@ -1142,6 +1189,7 @@ def _bootstrap_ridge_gpu_batched(
+         n_samples,
+         confidence_level=confidence_level,
+         return_samples=return_samples,
++        n_obs=n_obs,
+         memory_budget_gb=memory_budget_gb,
+         backend=backend,
+     )
+diff --git a/nltools/algorithms/inference/intersubject.py b/nltools/algorithms/inference/intersubject.py
+index fd71abac..270e5d7d 100644
+--- a/nltools/algorithms/inference/intersubject.py
++++ b/nltools/algorithms/inference/intersubject.py
+@@ -103,7 +103,8 @@ def isc(
+         dict: Keys `'isc'` (observed ISC), `'p'`, and `'ci'` (tuple
+             `(lower, upper)`) — floats for 2D data, arrays of length
+             `n_voxels` for 3D — and, when `return_null=True`, `'null_dist'`
+-            (np.ndarray).
++            (np.ndarray), holding every draw with `NaN` where a draw was
++            undefined.
+ 
+     Note:
+         `exclude_self_corr=True` (the default) sets a subject's correlation
+@@ -211,7 +212,8 @@ def isc_group(
+     Returns:
+         dict: Keys `'isc_group_difference'` (float, observed difference), `'p'`
+             (float), `'ci'` (tuple `(lower, upper)`), and — when
+-            `return_null=True` — `'null_dist'` (np.ndarray).
++            `return_null=True` — `'null_dist'` (np.ndarray), holding every draw
++            with `NaN` where a draw was undefined.
+ 
+     References:
+         Chen, G., Shin, Y. W., Taylor, P. A., Glen, D. R., Reynolds, R. C.,
+@@ -312,35 +314,33 @@ def isfc(data, *, method="average", n_jobs=-1, random_state=None, progress_bar=F
+         "unit": "subject",
+     }
+ 
++    def _compute_one_subject_isfc(target_idx):
++        """Correlate one subject against the mean of the others.
++
++        The running total is float64 whatever the input dtype: accumulating in
++        an integer dtype wraps, which would make the answer depend on the
++        worker count.
++        """
++        m1 = data_arrays[target_idx]
++        sub_mean = np.zeros(m1.shape)
++        for y in (y for y in subjects if y != target_idx):
++            sub_mean += data_arrays[y]
++        return _compute_cross_correlation(m1, sub_mean / (n_subjects - 1))
++
+     if n_jobs == 1:
+         # Serial execution (for explicit serial control)
+-        sub_isfc = []
+-        for target in _maybe_tqdm(subjects, **progress_kwargs):
+-            m1 = data_arrays[target]
+-            sub_mean = np.zeros(m1.shape)
+-            for y in (y for y in subjects if y != target):
+-                sub_mean += data_arrays[y]
+-            # Use inference module function for cross-correlation computation
+-            sub_isfc.append(_compute_cross_correlation(m1, sub_mean / (n_subjects - 1)))
+-    else:
+-        # Parallel execution using joblib (default: n_jobs=-1 uses all cores)
+-        from joblib import Parallel, delayed
+-
+-        def _compute_one_subject_isfc(target_idx):
+-            """Compute ISFC for one subject (worker function)."""
+-            m1 = data_arrays[target_idx]
+-            sub_mean = np.zeros(m1.shape, dtype=m1.dtype)
+-            for y in (y for y in subjects if y != target_idx):
+-                sub_mean += data_arrays[y]
+-            return _compute_cross_correlation(m1, sub_mean / (n_subjects - 1))
+-
+-        # Parallelize across subjects
+-        sub_isfc = Parallel(n_jobs=n_jobs)(
+-            delayed(_compute_one_subject_isfc)(target)
++        return [
++            _compute_one_subject_isfc(target)
+             for target in _maybe_tqdm(subjects, **progress_kwargs)
+-        )
++        ]
+ 
+-    return sub_isfc
++    # Parallel execution using joblib (default: n_jobs=-1 uses all cores)
++    from joblib import Parallel, delayed
++
++    return Parallel(n_jobs=n_jobs)(
++        delayed(_compute_one_subject_isfc)(target)
++        for target in _maybe_tqdm(subjects, **progress_kwargs)
++    )
+ 
+ 
+ def isps(
+diff --git a/nltools/algorithms/inference/isc.py b/nltools/algorithms/inference/isc.py
+index 8328f67a..9fdc3311 100644
+--- a/nltools/algorithms/inference/isc.py
++++ b/nltools/algorithms/inference/isc.py
+@@ -27,7 +27,7 @@
+ from sklearn.metrics import pairwise_distances
+ 
+ from .utils import EPSILON, _maybe_tqdm
+-from ..validation import _compute_pvalue, _validate_tail_parameter
++from ..validation import _normalize_tail_internal, _validate_tail_parameter
+ 
+ 
+ # ============================================================================
+@@ -201,11 +201,15 @@ def _compute_pairwise_isc(data, metric="correlation"):
+         # Then: distance = sqrt(squared_distance), similarity = 1 - distance
+         if data.ndim == 2:
+             # Single feature: (n_observations, n_subjects)
++            # Promote first: squaring in an integer dtype can overflow before
++            # the sum, which the other fast paths avoid by construction.
++            values = np.asarray(data, dtype=np.float64)
++
+             # Compute squared norms for each subject
+-            norms_sq = np.sum(data**2, axis=0)  # (n_subjects,)
++            norms_sq = np.sum(values**2, axis=0)  # (n_subjects,)
+ 
+-            # Compute dot products: data.T @ data
+-            dot_products = data.T @ data  # (n_subjects, n_subjects)
++            # Compute dot products: values.T @ values
++            dot_products = values.T @ values  # (n_subjects, n_subjects)
+ 
+             # Compute squared distances: norms_sq[i] + norms_sq[j] - 2*dot_products[i, j]
+             # Broadcasting: (n_subjects, 1) + (1, n_subjects) - 2*dot_products
+@@ -225,13 +229,15 @@ def _compute_pairwise_isc(data, metric="correlation"):
+ 
+             # Compute euclidean similarity per voxel
+             for v in range(n_voxels):
++                # Promote first: squaring in an integer dtype can overflow
++                # before the sum.
++                values = np.asarray(data[:, :, v], dtype=np.float64)
++
+                 # Compute squared norms for each subject
+-                norms_sq = np.sum(data[:, :, v] ** 2, axis=0)  # (n_subjects,)
++                norms_sq = np.sum(values**2, axis=0)  # (n_subjects,)
+ 
+                 # Compute dot products
+-                dot_products = (
+-                    data[:, :, v].T @ data[:, :, v]
+-                )  # (n_subjects, n_subjects)
++                dot_products = values.T @ values  # (n_subjects, n_subjects)
+ 
+                 # Compute squared distances
+                 distances_sq = norms_sq[:, None] + norms_sq[None, :] - 2 * dot_products
+@@ -264,6 +270,145 @@ def _compute_pairwise_isc(data, metric="correlation"):
+     raise ValueError(f"data must be 2D or 3D, got shape {data.shape}")
+ 
+ 
++def _summarize_isc_resamples(observed, null_dist, interval_source, tail, ci_percentile):
++    """P-value and percentile interval over the resamples that are defined.
++
++    A resample can be undefined: with few subjects a bootstrap draw may contain
++    nothing but duplicated-subject pairs, and a flat feature has no correlation
++    at all. Such a draw is dropped per feature instead of being counted as a
++    non-exceedance, so the Phipson-Smyth denominator is the number of draws
++    that exist — `(exceedances + 1) / (n_valid + 1)`. A feature with no defined
++    draw gets NaN for the p-value and for both bounds, and so does a feature
++    whose observed statistic is itself undefined.
++
++    Args:
++        observed (np.ndarray): Observed statistic, shape `()` or
++            `(n_features,)`.
++        null_dist (np.ndarray): Draws the p-value counts against, shape
++            `(n_resamples,)` or `(n_resamples, n_features)`.
++        interval_source (np.ndarray): Draws the interval is taken over, shaped
++            like `null_dist`. The bootstrap paths pass the uncentered draws.
++        tail (int | str): Tail vocabulary, as `_compute_pvalue` accepts it.
++        ci_percentile (float): Interval width in percent.
++
++    Returns:
++        tuple[np.ndarray, np.ndarray, np.ndarray]: P-values, lower bounds and
++            upper bounds, each shape `(n_features,)`.
++    """
++    observed = np.atleast_1d(np.asarray(observed, dtype=np.float64))
++    n_features = observed.shape[0]
++    # Reshape against the resample count rather than -1, so a null that does not
++    # describe these features raises instead of being silently re-blocked.
++    null_dist = np.asarray(null_dist, dtype=np.float64).reshape(
++        len(null_dist), n_features
++    )
++    interval_source = np.asarray(interval_source, dtype=np.float64).reshape(
++        len(interval_source), n_features
++    )
++
++    defined = ~np.isnan(null_dist)
++    n_valid = defined.sum(axis=0)
++
++    tail_normalized = _normalize_tail_internal(tail)
++    if tail_normalized == "upper":
++        exceeds = null_dist >= observed
++    elif tail_normalized == "lower":
++        exceeds = null_dist <= observed
++    else:
++        exceeds = np.abs(null_dist) >= np.abs(observed)
++
++    numerator = np.sum(exceeds & defined, axis=0) + 1.0
++    p_values = np.where(n_valid > 0, numerator / (n_valid + 1.0), np.nan)
++
++    # An undefined observed statistic is not a significant one: no null value
++    # can exceed NaN, so the correction would report the smallest p it can
++    # produce for every flat or masked-out feature.
++    undefined = np.isnan(observed)
++    p_values = np.where(undefined, np.nan, p_values)
++
++    lower_q = (100 - ci_percentile) / 2
++    upper_q = ci_percentile + lower_q
++    ci_lower = np.full(n_features, np.nan)
++    ci_upper = np.full(n_features, np.nan)
++    has_interval = (~np.isnan(interval_source)).any(axis=0)
++    if has_interval.any():
++        usable = interval_source[:, has_interval]
++        ci_lower[has_interval] = np.nanpercentile(usable, lower_q, axis=0)
++        ci_upper[has_interval] = np.nanpercentile(usable, upper_q, axis=0)
++    ci_lower = np.where(undefined, np.nan, ci_lower)
++    ci_upper = np.where(undefined, np.nan, ci_upper)
++
++    return p_values, ci_lower, ci_upper
++
++
++def _validate_group_shapes(group1, group2):
++    """Check that two ISC groups can be compared feature by feature.
++
++    Subject counts may differ — that is the point of a two-group test — but
++    the observation and voxel axes must line up, or `group1 ISC - group2 ISC`
++    silently broadcasts one group's statistic across the other's features.
++
++    Args:
++        group1 (np.ndarray): First group, shape `(n_observations, n_subjects1)`
++            or `(n_observations, n_subjects1, n_voxels)`.
++        group2 (np.ndarray): Second group, same layout with its own subject
++            count.
++
++    Raises:
++        ValueError: If the two groups differ in dimensionality, observation
++            count, or voxel count, or are neither 2-D nor 3-D.
++    """
++    if group1.shape[0] != group2.shape[0]:
++        raise ValueError(
++            "group1 and group2 must have the same number of observations. "
++            f"Got group1.shape[0]={group1.shape[0]}, group2.shape[0]={group2.shape[0]}"
++        )
++
++    if group1.ndim != group2.ndim:
++        raise ValueError(
++            "group1 and group2 must have the same number of dimensions. "
++            f"Got group1.ndim={group1.ndim}, group2.ndim={group2.ndim}"
++        )
++
++    if group1.ndim not in [2, 3]:
++        raise ValueError(
++            f"group1 and group2 must be 2D or 3D, got shapes {group1.shape}, {group2.shape}"
++        )
++
++    if group1.ndim == 3 and group1.shape[2] != group2.shape[2]:
++        raise ValueError(
++            "group1 and group2 must have the same number of voxels. "
++            f"Got group1 with {group1.shape[2]} voxels, group2 with "
++            f"{group2.shape[2]} voxels"
++        )
++
++
++def _mask_duplicate_subject_pairs(condensed, bootstrap_subjects):
++    """Set the pairs a resampled subject forms with itself to NaN.
++
++    A subject drawn twice pairs with itself, and that pair carries no
++    information about between-subject similarity. The mask is keyed to the
++    sampled original indices, not to the similarity values: two *distinct*
++    subjects may legitimately correlate at +1 or -1, and for `'euclidean'` or
++    `'cosine'` the perfect-similarity value is not 1 at all.
++
++    Args:
++        condensed (np.ndarray): Pairwise similarities of the resampled
++            subjects in condensed upper-triangle order, shape `(n_pairs,)` or
++            `(n_pairs, n_voxels)`.
++        bootstrap_subjects (np.ndarray): The original subject index behind each
++            resampled position, shape `(n_subjects,)`.
++
++    Returns:
++        np.ndarray: `condensed` as float64 with the duplicate pairs set to NaN.
++    """
++    rows, cols = np.triu_indices(len(bootstrap_subjects), k=1)
++    duplicated = bootstrap_subjects[rows] == bootstrap_subjects[cols]
++    if condensed.ndim > 1:
++        duplicated = duplicated[:, None]
++    return np.where(duplicated, np.nan, condensed)
++
++
+ def _compute_isc_group_difference(
+     group1,
+     group2,
+@@ -311,22 +456,7 @@ def _compute_isc_group_difference(
+     group1 = np.asarray(group1)
+     group2 = np.asarray(group2)
+ 
+-    if group1.shape[0] != group2.shape[0]:
+-        raise ValueError(
+-            "group1 and group2 must have the same number of observations. "
+-            f"Got group1.shape[0]={group1.shape[0]}, group2.shape[0]={group2.shape[0]}"
+-        )
+-
+-    if group1.ndim != group2.ndim:
+-        raise ValueError(
+-            "group1 and group2 must have the same number of dimensions. "
+-            f"Got group1.ndim={group1.ndim}, group2.ndim={group2.ndim}"
+-        )
+-
+-    if group1.ndim not in [2, 3]:
+-        raise ValueError(
+-            f"group1 and group2 must be 2D or 3D, got shapes {group1.shape}, {group2.shape}"
+-        )
++    _validate_group_shapes(group1, group2)
+ 
+     if summary not in ["median", "mean"]:
+         raise ValueError(f"summary must be 'median' or 'mean', got {summary}")
+@@ -566,8 +696,8 @@ def _bootstrap_isc_group_numpy(
+             to center the draw.
+         summary (str): `'median'` (default) or `'mean'`.
+         summary_statistic (str): `'pairwise'` (default) or `'leave-one-out'`.
+-        exclude_self_corr (bool): Mask the perfect correlations a duplicated
+-            subject produces (pairwise only). Defaults to True.
++        exclude_self_corr (bool): Mask the pairs a duplicated subject forms
++            with itself (pairwise only). Defaults to True.
+         random_state (int | np.random.RandomState | None): Random state for
+             reproducibility.
+         metric (str): Similarity metric for pairwise ISC. Defaults to
+@@ -602,14 +732,14 @@ def _bootstrap_isc_group_numpy(
+         pairwise1_boot = _compute_pairwise_isc(group1_boot, metric=metric)
+         pairwise2_boot = _compute_pairwise_isc(group2_boot, metric=metric)
+ 
+-        # Handle exclude_self_corr: mask perfect correlations from duplicate subjects
++        # Handle exclude_self_corr: mask the pairs a duplicated subject forms
++        # with itself, identified by the drawn indices rather than by value
+         if exclude_self_corr:
+-            # Mask correlations >= 0.99999 (perfect correlations from duplicates)
+-            pairwise1_boot = np.where(
+-                np.abs(pairwise1_boot) >= 0.99999, np.nan, pairwise1_boot
++            pairwise1_boot = _mask_duplicate_subject_pairs(
++                pairwise1_boot, boot_indices1
+             )
+-            pairwise2_boot = np.where(
+-                np.abs(pairwise2_boot) >= 0.99999, np.nan, pairwise2_boot
++            pairwise2_boot = _mask_duplicate_subject_pairs(
++                pairwise2_boot, boot_indices2
+             )
+ 
+         # Handle single feature vs voxel-wise
+@@ -678,8 +808,8 @@ def _bootstrap_isc_group_cpu_parallel(
+         n_permute (int): Number of bootstrap iterations. Defaults to 5000.
+         summary (str): `'median'` (default) or `'mean'`.
+         summary_statistic (str): `'pairwise'` (default) or `'leave-one-out'`.
+-        exclude_self_corr (bool): Mask the perfect correlations a duplicated
+-            subject produces (pairwise only). Defaults to True.
++        exclude_self_corr (bool): Mask the pairs a duplicated subject forms
++            with itself (pairwise only). Defaults to True.
+         n_jobs (int): CPU cores; -1 (default) picks the worker count from
+             available memory.
+         random_state (int | None): Random seed for reproducibility.
+@@ -794,9 +924,9 @@ def _isc_group_permutation_test(
+             result. Defaults to False.
+         progress_bar (bool): Show a progress bar over the resamples. Defaults to
+             False.
+-        exclude_self_corr (bool): In the bootstrap, mask the perfect
+-            correlations a duplicated subject produces (pairwise only).
+-            Defaults to True.
++        exclude_self_corr (bool): In the bootstrap, mask the pairs a
++            duplicated subject forms with itself (pairwise only). Defaults to
++            True.
+         metric (str): Similarity metric for pairwise ISC; any metric accepted by
+             `sklearn.metrics.pairwise_distances`. Ignored for
+             `summary_statistic='leave-one-out'`. Defaults to `'correlation'`.
+@@ -806,7 +936,8 @@ def _isc_group_permutation_test(
+             difference), `'p'` (float or np.ndarray, p-value with the
+             `(count + 1) / (n + 1)` correction), `'ci'` (tuple
+             `(lower, upper)`), and — when `return_null=True` — `'null_dist'`
+-            (np.ndarray).
++            (np.ndarray), holding every draw with `NaN` where a draw was
++            undefined.
+ 
+     Examples:
+         ```python
+@@ -839,22 +970,7 @@ def _isc_group_permutation_test(
+     group1 = np.asarray(group1)
+     group2 = np.asarray(group2)
+ 
+-    if group1.shape[0] != group2.shape[0]:
+-        raise ValueError(
+-            "group1 and group2 must have the same number of observations. "
+-            f"Got group1.shape[0]={group1.shape[0]}, group2.shape[0]={group2.shape[0]}"
+-        )
+-
+-    if group1.ndim != group2.ndim:
+-        raise ValueError(
+-            "group1 and group2 must have the same number of dimensions. "
+-            f"Got group1.ndim={group1.ndim}, group2.ndim={group2.ndim}"
+-        )
+-
+-    if group1.ndim not in [2, 3]:
+-        raise ValueError(
+-            f"group1 and group2 must be 2D or 3D, got shapes {group1.shape}, {group2.shape}"
+-        )
++    _validate_group_shapes(group1, group2)
+ 
+     if summary not in ["median", "mean"]:
+         raise ValueError(f"summary must be 'median' or 'mean', got {summary}")
+@@ -905,35 +1021,7 @@ def _isc_group_permutation_test(
+             max_memory_gb=None,  # Auto-detect
+         )
+ 
+-    # Handle NaN values (from exclude_self_corr masking)
+-    # For single feature: remove all NaN values
+-    # For voxel-wise: keep NaN per voxel (they represent valid bootstrap samples)
+-    if null_dist.ndim == 1:
+-        # Single feature: filter out NaN values
+-        null_dist = null_dist[~np.isnan(null_dist)]
+-    # For voxel-wise, keep NaN values (they're handled by nanpercentile)
+-
+-    # Phase 3: Compute p-value and confidence interval
+-    # Handle scalar vs array observed_diff
+-    if isinstance(observed_diff, np.ndarray) and observed_diff.ndim > 0:
+-        # Voxel-wise: (n_voxels,)
+-        if null_dist.ndim == 1:
+-            # This shouldn't happen - voxel-wise should produce 2D null_dist
+-            raise ValueError("Voxel-wise data should produce 2D null_dist")
+-        # null_dist shape: (n_permute, n_voxels)
+-        p_values = _compute_pvalue(observed_diff, null_dist, tail=tail)
+-    else:
+-        # Single feature: scalar observed_diff
+-        if null_dist.ndim == 1:
+-            # null_dist shape: (n_permute,)
+-            p_values = _compute_pvalue(
+-                np.array([observed_diff]), null_dist.reshape(-1, 1), tail=tail
+-            )[0]
+-        else:
+-            # Shouldn't happen for single feature
+-            raise ValueError("Single feature should produce 1D null_dist")
+-
+-    # Compute confidence intervals.
++    # Phase 3: Compute p-value and confidence interval.
+     # For method='bootstrap' the draws in null_dist are CENTERED
+     # (boot_estimate - observed_diff) so that the permutation-style p-value tests
+     # against H0: difference == 0. A confidence interval, however, must bracket
+@@ -942,16 +1030,14 @@ def _isc_group_permutation_test(
+     # _isc_permutation_test). For method='permute' the null is a label-permutation
+     # band around zero, not a bootstrap of the estimate; its percentiles describe
+     # the null spread and are left uncentered.
+-    ci_source = null_dist + observed_diff if method == "bootstrap" else null_dist
+-    if ci_source.ndim == 1:
+-        ci_lower = np.percentile(ci_source, (100 - ci_percentile) / 2)
+-        ci_upper = np.percentile(ci_source, ci_percentile + (100 - ci_percentile) / 2)
+-    else:
+-        # Voxel-wise: compute CI per voxel
+-        ci_lower = np.nanpercentile(ci_source, (100 - ci_percentile) / 2, axis=0)
+-        ci_upper = np.nanpercentile(
+-            ci_source, ci_percentile + (100 - ci_percentile) / 2, axis=0
+-        )
++    interval_source = null_dist + observed_diff if method == "bootstrap" else null_dist
++    p_values, ci_lower, ci_upper = _summarize_isc_resamples(
++        observed_diff, null_dist, interval_source, tail, ci_percentile
++    )
++
++    voxelwise = isinstance(observed_diff, np.ndarray) and observed_diff.ndim > 0
++    if not voxelwise:
++        p_values, ci_lower, ci_upper = p_values[0], ci_lower[0], ci_upper[0]
+ 
+     # Build result dictionary
+     result = {
+@@ -1095,9 +1181,9 @@ def _bootstrap_pairwise_numpy(
+     (Chen et al. 2016): resample subjects, extract submatrix, mask
+     same-subject pairs (self-correlations from duplicates).
+ 
+-    A subject drawn twice correlates perfectly with itself; with
+-    `exclude_self_corr=True` those entries are masked as NaN before the summary,
+-    as Chen et al. (2016) recommend.
++    A subject drawn twice pairs with itself; with `exclude_self_corr=True`
++    those entries are identified by the drawn indices and masked as NaN before
++    the summary, as Chen et al. (2016) recommend.
+ 
+     Args:
+         pairwise_condensed (np.ndarray): Pre-computed pairwise correlations in
+@@ -1134,13 +1220,15 @@ def _bootstrap_pairwise_numpy(
+         # Index by bootstrap subjects (symmetric: rows and columns)
+         boot_matrix = corr_matrix[bootstrap_subjects, :][:, bootstrap_subjects]
+ 
+-        # Mask self-correlations if requested
+-        if exclude_self_corr:
+-            boot_matrix[boot_matrix >= 0.99999] = np.nan
+-
+         # Extract upper triangle (excluding diagonal)
+         boot_condensed = squareform(boot_matrix, checks=False)
+ 
++        # Mask self-correlations if requested
++        if exclude_self_corr:
++            boot_condensed = _mask_duplicate_subject_pairs(
++                boot_condensed, bootstrap_subjects
++            )
++
+     else:
+         # Voxel-wise: (n_pairs, n_voxels)
+         n_pairs, n_voxels = pairwise_condensed.shape
+@@ -1165,15 +1253,17 @@ def _bootstrap_pairwise_numpy(
+             :, bootstrap_subjects, :
+         ]
+ 
+-        # Mask self-correlations if requested (vectorized across all voxels)
+-        if exclude_self_corr:
+-            boot_matrices[boot_matrices >= 0.99999] = np.nan
+-
+         # Extract upper triangle for all voxels
+         boot_condensed = np.zeros((n_pairs, n_voxels), dtype=pairwise_condensed.dtype)
+         for v in range(n_voxels):
+             boot_condensed[:, v] = squareform(boot_matrices[:, :, v], checks=False)
+ 
++        # Mask self-correlations if requested (vectorized across all voxels)
++        if exclude_self_corr:
++            boot_condensed = _mask_duplicate_subject_pairs(
++                boot_condensed, bootstrap_subjects
++            )
++
+     # Compute summary (ignoring NaNs from masked pairs)
+     axis = 0 if boot_condensed.ndim > 1 else None
+ 
+@@ -1261,6 +1351,135 @@ def _bootstrap_pairwise_cpu_parallel(
+     return np.array(bootstraps)
+ 
+ 
++def _summarize_isc_values(values, summary, summary_statistic):
++    """Central tendency of a set of ISC values, observed or surrogate.
++
++    Pairwise values are summarized NaN-aware: a duplicated-subject pair is
++    masked before the summary. Leave-one-out values carry no such mask.
++
++    Args:
++        values (np.ndarray): Leave-one-out values, shape `(n_subjects,)` or
++            `(n_subjects, n_voxels)`, or pairwise similarities in condensed
++            form, shape `(n_pairs,)` or `(n_pairs, n_voxels)`.
++        summary (str): `'median'` or `'mean'` (Fisher z-transformed:
++            arctanh → mean → tanh).
++        summary_statistic (str): `'pairwise'` or `'leave-one-out'`, which says
++            whether the summary ignores NaN.
++
++    Returns:
++        np.ndarray: The summarized ISC, shape `()` or `(n_voxels,)`.
++
++    Raises:
++        ValueError: If `summary` is neither `'median'` nor `'mean'`.
++    """
++    if summary not in ["median", "mean"]:
++        raise ValueError(f"summary must be 'median' or 'mean', got {summary}")
++
++    nan_aware = summary_statistic == "pairwise"
++    if summary == "median":
++        return np.nanmedian(values, axis=0) if nan_aware else np.median(values, axis=0)
++
++    z = np.arctanh(np.clip(values, -0.9999, 0.9999))
++    return np.tanh(np.nanmean(z, axis=0) if nan_aware else np.mean(z, axis=0))
++
++
++def _summarize_surrogate_isc(data, summary, summary_statistic, metric):
++    """ISC of one surrogate dataset, summarized the way the observed one is.
++
++    Args:
++        data (np.ndarray): One surrogate dataset, shaped like the input.
++        summary (str): `'median'` or `'mean'` (Fisher z-transformed).
++        summary_statistic (str): `'pairwise'` or `'leave-one-out'`.
++        metric (str): Similarity metric for the pairwise statistic.
++
++    Returns:
++        np.ndarray: The surrogate ISC, shape `()` or `(n_voxels,)`.
++    """
++    if summary_statistic == "leave-one-out":
++        values = _compute_loo_isc(data)
++    else:
++        values = _compute_pairwise_isc(data, metric=metric)
++    return _summarize_isc_values(values, summary, summary_statistic)
++
++
++def _one_surrogate_isc(data, surrogate, seed, summary, summary_statistic, metric):
++    """Build one surrogate dataset from `seed` and compute its ISC.
++
++    Args:
++        data (np.ndarray): Shape `(n_observations, n_subjects)` or
++            `(n_observations, n_subjects, n_voxels)`.
++        surrogate (Callable): `circle_shift` or `phase_randomize`.
++        seed (int): This replicate's seed, drawn before the joblib block so the
++            result does not depend on the worker count.
++        summary (str): `'median'` or `'mean'`.
++        summary_statistic (str): `'pairwise'` or `'leave-one-out'`.
++        metric (str): Similarity metric for the pairwise statistic.
++
++    Returns:
++        np.ndarray: The surrogate ISC, shape `()` or `(n_voxels,)`.
++    """
++    rng = np.random.RandomState(seed)
++    if data.ndim == 3:
++        # Voxel-wise: surrogate each subject's whole time-series block. The
++        # buffer is float64 because both surrogates return float64.
++        surrogates = np.empty(data.shape, dtype=np.float64)
++        for subject in range(data.shape[1]):
++            surrogates[:, subject, :] = surrogate(data[:, subject, :], random_state=rng)
++    else:
++        surrogates = surrogate(data, random_state=rng)
++
++    return _summarize_surrogate_isc(surrogates, summary, summary_statistic, metric)
++
++
++def _surrogate_isc_null(
++    data,
++    surrogate,
++    seeds,
++    summary,
++    summary_statistic,
++    metric,
++    desc,
++    n_jobs=-1,
++    progress_bar=False,
++):
++    """Null distribution of surrogate ISC values, one per seed.
++
++    Args:
++        data (np.ndarray): Shape `(n_observations, n_subjects)` or
++            `(n_observations, n_subjects, n_voxels)`.
++        surrogate (Callable): `circle_shift` or `phase_randomize`.
++        seeds (np.ndarray): One seed per replicate.
++        summary (str): `'median'` or `'mean'`.
++        summary_statistic (str): `'pairwise'` or `'leave-one-out'`.
++        metric (str): Similarity metric for the pairwise statistic.
++        desc (str): Progress-bar label.
++        n_jobs (int): CPU workers; -1 (default) picks the count from available
++            memory.
++        progress_bar (bool): Show a progress bar. Defaults to False.
++
++    Returns:
++        np.ndarray: Shape `(n_permute,)` or `(n_permute, n_voxels)`.
++    """
++    from joblib import Parallel, delayed
++    from nltools.algorithms.backends import _auto_n_jobs_cpu, _estimate_data_size_mb
++
++    n_permute = len(seeds)
++    if n_jobs == -1:
++        n_jobs = _auto_n_jobs_cpu(
++            data_size_mb=_estimate_data_size_mb(data),
++            n_permute=n_permute,
++        )
++
++    iterator = _maybe_tqdm(range(n_permute), progress_bar=progress_bar, desc=desc)
++    surrogates = Parallel(n_jobs=n_jobs)(
++        delayed(_one_surrogate_isc)(
++            data, surrogate, seeds[i], summary, summary_statistic, metric
++        )
++        for i in iterator
++    )
++    return np.array(surrogates)
++
++
+ def _isc_permutation_test(
+     # Required
+     data: np.ndarray,
+@@ -1312,8 +1531,8 @@ def _isc_permutation_test(
+             result. Defaults to False.
+         progress_bar (bool): Show a progress bar over the resamples. Defaults to
+             False.
+-        exclude_self_corr (bool): In the pairwise bootstrap, mask the perfect
+-            correlations a duplicated subject produces as NaN. Defaults to True.
++        exclude_self_corr (bool): In the pairwise bootstrap, mask the pairs a
++            duplicated subject forms with itself as NaN. Defaults to True.
+         metric (str): Similarity metric for pairwise ISC; any metric accepted by
+             `sklearn.metrics.pairwise_distances` (`'correlation'`,
+             `'spearman'`, `'cosine'`, and `'euclidean'` take fast paths). Ignored
+@@ -1328,7 +1547,8 @@ def _isc_permutation_test(
+         dict: Keys `'isc'` (float or np.ndarray, observed ISC), `'p'` (float or
+             np.ndarray, p-value with the `(count + 1) / (n + 1)` correction),
+             `'ci'` (tuple `(lower, upper)` percentiles of the resamples), and
+-            — when `return_null=True` — `'null_dist'` (np.ndarray).
++            — when `return_null=True` — `'null_dist'` (np.ndarray), holding
++            every draw with `NaN` where a draw was undefined.
+ 
+     Examples:
+         ```python
+@@ -1375,33 +1595,17 @@ def _isc_permutation_test(
+             f"got {method}"
+         )
+ 
+-    # Phase 1: Compute ISC (run once)
++    # Phase 1: Compute ISC (run once). The per-subject or per-pair values are
++    # kept because the bootstrap resamples them directly.
+     if summary_statistic == "leave-one-out":
+-        # Compute leave-one-out values
+         loo_values = _compute_loo_isc(data)
+-
+-        # Compute observed summary statistic
+-        if summary == "median":
+-            observed_isc = np.median(loo_values, axis=0)
+-        elif summary == "mean":
+-            z = np.arctanh(np.clip(loo_values, -0.9999, 0.9999))
+-            observed_isc = np.tanh(np.mean(z, axis=0))
+-        else:
+-            raise ValueError(f"summary must be 'median' or 'mean', got {summary}")
+-
++        observed_isc = _summarize_isc_values(loo_values, summary, summary_statistic)
+     else:  # pairwise
+-        # Compute pairwise correlation matrix (condensed form)
+         pairwise_condensed = _compute_pairwise_isc(data, metric=metric)
+         n_subjects = data.shape[1]
+-
+-        # Compute observed summary statistic
+-        if summary == "median":
+-            observed_isc = np.nanmedian(pairwise_condensed, axis=0)
+-        elif summary == "mean":
+-            z = np.arctanh(np.clip(pairwise_condensed, -0.9999, 0.9999))
+-            observed_isc = np.tanh(np.nanmean(z, axis=0))
+-        else:
+-            raise ValueError(f"summary must be 'median' or 'mean', got {summary}")
++        observed_isc = _summarize_isc_values(
++            pairwise_condensed, summary, summary_statistic
++        )
+ 
+     # Phase 2: Bootstrap/permutation (run n_permute times)
+     if method == "bootstrap":
+@@ -1433,113 +1637,39 @@ def _isc_permutation_test(
+         # Center bootstrap distribution by subtracting observed (Chen et al. 2016)
+         null_distribution = bootstraps - observed_isc
+ 
+-    elif method == "circle_shift":
+-        # Import timeseries utilities
+-        from .timeseries import circle_shift
+-
+-        # Permute data and recompute ISC
+-        rng = check_random_state(random_state)
+-        seeds = rng.randint(0, 2**31 - 1, size=n_permute)
++    else:
++        # Surrogate methods: one seed per replicate, drawn before the joblib
++        # block so any worker count gives the same null.
++        from .timeseries import circle_shift, phase_randomize
+ 
+-        bootstraps = []
+-        for i in range(n_permute):
+-            # Circle shift the data
+-            # For 3D data (n_obs, n_subjects, n_voxels), apply per subject
+-            if data.ndim == 3:
+-                perm_rng = np.random.RandomState(seeds[i])
+-                data_permuted = np.empty_like(data)
+-                for subj in range(data.shape[1]):
+-                    data_permuted[:, subj, :] = circle_shift(
+-                        data[:, subj, :], random_state=perm_rng
+-                    )
+-            else:
+-                data_permuted = circle_shift(
+-                    data, random_state=np.random.RandomState(seeds[i])
+-                )
+-
+-            # Recompute ISC
+-            if summary_statistic == "leave-one-out":
+-                loo_perm = _compute_loo_isc(data_permuted)
+-                if summary == "median":
+-                    isc_perm = np.median(loo_perm, axis=0)
+-                else:
+-                    z = np.arctanh(np.clip(loo_perm, -0.9999, 0.9999))
+-                    isc_perm = np.tanh(np.mean(z, axis=0))
+-            else:  # pairwise
+-                pair_perm = _compute_pairwise_isc(data_permuted, metric=metric)
+-                if summary == "median":
+-                    isc_perm = np.nanmedian(pair_perm, axis=0)
+-                else:
+-                    z = np.arctanh(np.clip(pair_perm, -0.9999, 0.9999))
+-                    isc_perm = np.tanh(np.nanmean(z, axis=0))
+-
+-            bootstraps.append(isc_perm)
+-
+-        bootstraps = np.array(bootstraps)
+-        null_distribution = bootstraps  # Already centered for permutation methods
+-
+-    elif method == "phase_randomize":
+-        # Import timeseries utilities
+-        from .timeseries import phase_randomize
+-
+-        # Similar to circle_shift but with phase randomization
++        surrogate = circle_shift if method == "circle_shift" else phase_randomize
+         rng = check_random_state(random_state)
+         seeds = rng.randint(0, 2**31 - 1, size=n_permute)
+ 
+-        bootstraps = []
+-        for i in range(n_permute):
+-            # Phase randomize the data
+-            # For 3D data (n_obs, n_subjects, n_voxels), apply per subject
+-            if data.ndim == 3:
+-                perm_rng = np.random.RandomState(seeds[i])
+-                data_permuted = np.empty_like(data)
+-                for subj in range(data.shape[1]):
+-                    data_permuted[:, subj, :] = phase_randomize(
+-                        data[:, subj, :], random_state=perm_rng
+-                    )
+-            else:
+-                data_permuted = phase_randomize(
+-                    data, random_state=np.random.RandomState(seeds[i])
+-                )
+-
+-            # Recompute ISC
+-            if summary_statistic == "leave-one-out":
+-                loo_perm = _compute_loo_isc(data_permuted)
+-                if summary == "median":
+-                    isc_perm = np.median(loo_perm, axis=0)
+-                else:
+-                    z = np.arctanh(np.clip(loo_perm, -0.9999, 0.9999))
+-                    isc_perm = np.tanh(np.mean(z, axis=0))
+-            else:  # pairwise
+-                pair_perm = _compute_pairwise_isc(data_permuted, metric=metric)
+-                if summary == "median":
+-                    isc_perm = np.nanmedian(pair_perm, axis=0)
+-                else:
+-                    z = np.arctanh(np.clip(pair_perm, -0.9999, 0.9999))
+-                    isc_perm = np.tanh(np.nanmean(z, axis=0))
+-
+-            bootstraps.append(isc_perm)
+-
+-        bootstraps = np.array(bootstraps)
++        bootstraps = _surrogate_isc_null(
++            data,
++            surrogate,
++            seeds,
++            summary,
++            summary_statistic,
++            metric,
++            f"ISC {method}",
++            n_jobs=n_jobs,
++            progress_bar=progress_bar,
++        )
++        # Already centered: a surrogate null is built under H0.
+         null_distribution = bootstraps
+ 
+-    # Compute p-value (Phipson-Smyth correction)
+-    # NOTE: _compute_pvalue signature is (obs_stat, null_dist, tail)
+-    p_value = _compute_pvalue(observed_isc, null_distribution, tail=tail)
+-
+-    # Compute confidence interval
+-    ci_lower = (100 - ci_percentile) / 2
+-    ci_upper = ci_percentile + ci_lower
++    # Compute the p-value (Phipson-Smyth correction) and the interval over the
++    # uncentered resamples.
++    p_value, ci_lower, ci_upper = _summarize_isc_resamples(
++        observed_isc, null_distribution, bootstraps, tail, ci_percentile
++    )
+ 
+-    if observed_isc.ndim == 0 or observed_isc.shape == ():
+-        # Single value
+-        ci = (np.percentile(bootstraps, ci_lower), np.percentile(bootstraps, ci_upper))
+-    else:
+-        # Per-voxel
+-        ci = (
+-            np.percentile(bootstraps, ci_lower, axis=0),
+-            np.percentile(bootstraps, ci_upper, axis=0),
+-        )
++    if observed_isc.ndim == 0:
++        # A single feature summarizes to floats, like `observed_isc` itself.
++        p_value, ci_lower, ci_upper = p_value[0], ci_lower[0], ci_upper[0]
++    ci = (ci_lower, ci_upper)
+ 
+     # Build result dictionary
+     result = {
+diff --git a/nltools/tests/core/test_algorithms/test_intersubject.py b/nltools/tests/core/test_algorithms/test_intersubject.py
+index 0083aceb..6769876c 100644
+--- a/nltools/tests/core/test_algorithms/test_intersubject.py
++++ b/nltools/tests/core/test_algorithms/test_intersubject.py
+@@ -21,6 +21,21 @@ def test_isc_accepts_polars_dataframe(self, multisubject_correlated_data):
+         pl_result = isc(pl_df, n_samples=50, random_state=1)
+         np.testing.assert_allclose(pl_result["isc"], np_result["isc"])
+ 
++    def test_isc_returns_scalars_for_two_dimensional_input(self):
++        """2-D input gives floats for `'isc'`, `'p'` and both `'ci'` bounds.
++
++        `'p'` came back as a length-1 array while its neighbours were floats,
++        contradicting the documented return shape.
++        """
++        data = np.random.default_rng(0).standard_normal((40, 5))
++
++        result = isc(data, n_samples=20, random_state=0)
++
++        assert np.ndim(result["isc"]) == 0
++        assert np.ndim(result["p"]) == 0
++        assert np.ndim(result["ci"][0]) == 0
++        assert np.ndim(result["ci"][1]) == 0
++
+     def test_summary_statistic_selects_leave_one_out(self):
+         """`summary_statistic='leave-one-out'` reaches the engine's LOO path."""
+         data = np.random.default_rng(3).standard_normal((60, 3))
+@@ -109,6 +124,20 @@ def test_isfc_basic(self, sub_roi_data):
+             np.array(isfc_out).mean(axis=0).mean(), 0, decimal=1
+         )
+ 
++    def test_isfc_worker_count_does_not_change_integer_results(self):
++        """Parallel ISFC accumulates in float64, like the serial path.
++
++        Three identical subjects correlate perfectly, whatever the input dtype;
++        summing them in `int8` wrapped 70 + 70 to -116 and gave -0.825.
++        """
++        data = [np.array([[50], [60], [70]], dtype=np.int8) for _ in range(3)]
++
++        serial = np.array(isfc(data, n_jobs=1))
++        parallel = np.array(isfc(data, n_jobs=2))
++
++        np.testing.assert_allclose(serial, 1.0)
++        np.testing.assert_allclose(parallel, 1.0)
++
+ 
+ class TestISPS:
+     """Test intersubject phase synchrony."""
+diff --git a/nltools/tests/core/test_bootstrap.py b/nltools/tests/core/test_bootstrap.py
+index b83064bb..404bed08 100644
+--- a/nltools/tests/core/test_bootstrap.py
++++ b/nltools/tests/core/test_bootstrap.py
+@@ -189,6 +189,27 @@ def test_merge_is_order_independent(self):
+         for key in ("standard_error", "ci_lower", "ci_upper"):
+             np.testing.assert_allclose(forward[key], backward[key], rtol=1e-10)
+ 
++    def test_a_merged_accumulator_can_still_take_the_rest_of_the_run(self):
++        """Merging must not shrink the retained buffer to the draws seen so far.
++
++        `merge` replaced the full-capacity buffer with a concatenation of the
++        two prefixes while `n_replicates` still said four, so the third update
++        wrote past the end.
++        """
++        first = _BootstrapAccumulator((1,), n_replicates=4, retain_samples=True)
++        first.update(np.array([0.0]))
++        second = _BootstrapAccumulator((1,), n_replicates=4, retain_samples=True)
++        second.update(np.array([1.0]))
++
++        merged = _BootstrapAccumulator.merge(first, second)
++        merged.update(np.array([2.0]))
++        merged.update(np.array([3.0]))
++        results = merged.results()
++
++        np.testing.assert_array_equal(results["samples"], [[0.0], [1.0], [2.0], [3.0]])
++        np.testing.assert_allclose(results["ci_lower"], [0.075])
++        np.testing.assert_allclose(results["ci_upper"], [2.925])
++
+     def test_a_single_replicate_cannot_be_summarized(self):
+         rng = np.random.default_rng(6)
+         with pytest.raises(ValueError, match="at least 2"):
+@@ -481,6 +502,29 @@ def test_the_error_names_requirement_budget_and_override(self):
+         assert "memory_budget_gb=" in message
+         assert "return_samples=True" in message
+ 
++    def test_the_index_matrix_is_charged_against_the_budget(self, monkeypatch):
++        """A tiny output over many observations is still an 8 MB index matrix.
++
++        1000 draws over 1000 observations retain an int64 matrix the preflight
++        used to ignore entirely, so a run accepted against a 1 MB budget went
++        on to peak at 16 MB.
++        """
++        from nltools.algorithms.inference import bootstrap as engine
++
++        def _never(*args, **kwargs):
++            raise AssertionError("resampling started despite an over-budget preflight")
++
++        monkeypatch.setattr(engine, "_generate_bootstrap_indices", _never)
++
++        with pytest.raises(ValueError, match="exceeds the .* GB budget"):
++            _bootstrap_simple_cpu_parallel(
++                np.zeros((1000, 1)),
++                "mean",
++                n_samples=1000,
++                n_jobs=1,
++                memory_budget_gb=0.001,
++            )
++
+     def test_the_dispatch_window_never_scales_with_the_replicate_count(self):
+         from nltools.algorithms.backends import _bootstrap_replicate_window
+ 
+@@ -493,6 +537,34 @@ def test_the_dispatch_window_never_scales_with_the_replicate_count(self):
+ class TestBootstrapWorkerPlanning:
+     """`n_jobs` is a ceiling the memory planner may lower, never raise."""
+ 
++    def test_ridge_workers_are_planned_from_the_features_each_one_pickles(
++        self, monkeypatch
++    ):
++        """The closure pickles the design and the index matrix, not just `y`.
++
++        Planning from `y` alone put 8 MB of features in every worker against a
++        budget that had been checked for 8 KB.
++        """
++        from nltools.algorithms import backends
++        from nltools.algorithms.backends import _estimate_data_size_mb
++
++        recorded = []
++
++        def _spy(data_size_mb, n_samples, **kwargs):
++            recorded.append(data_size_mb)
++            return 1
++
++        monkeypatch.setattr(backends, "_bootstrap_n_jobs_cpu", _spy)
++
++        rng = np.random.default_rng(0)
++        X, y = rng.standard_normal((200, 500)), rng.standard_normal((200, 1))
++        coef = _ridge_coefficients(X, y)
++        _bootstrap_ridge_weights_cpu_parallel(
++            X, y, 1.0, coef, n_samples=10, n_jobs=1, random_state=0
++        )
++
++        assert recorded and recorded[0] >= _estimate_data_size_mb(X)
++
+     def test_a_tight_budget_lowers_the_worker_count(self):
+         from nltools.algorithms.backends import _bootstrap_n_jobs_cpu
+ 
+@@ -624,6 +696,7 @@ def test_peak_stays_within_a_small_multiple_of_the_preflight_figure(self):
+             self.N_SAMPLES,
+             confidence_level=0.95,
+             return_samples=False,
++            n_obs=10,
+             n_workers=1,
+         )
+ 
+diff --git a/nltools/tests/core/test_inference/test_cpu_parallelization.py b/nltools/tests/core/test_inference/test_cpu_parallelization.py
+index ed047555..2ea34559 100644
+--- a/nltools/tests/core/test_inference/test_cpu_parallelization.py
++++ b/nltools/tests/core/test_inference/test_cpu_parallelization.py
+@@ -3,12 +3,7 @@
+ import pytest
+ import numpy as np
+ 
+-from nltools.algorithms import (
+-    correlation_permutation_test,
+-    one_sample_permutation_test,
+-    two_sample_permutation_test,
+-)
+-from nltools.algorithms.inference import _timeseries_correlation_permutation_test
++from nltools.algorithms import one_sample_permutation_test
+ 
+ 
+ def _one_sample_at(n_jobs):
+@@ -18,48 +13,17 @@ def _one_sample_at(n_jobs):
+     )
+ 
+ 
+-def _two_sample_at(n_jobs):
+-    rng = np.random.RandomState(0)
+-    data1, data2 = rng.randn(20, 5), rng.randn(18, 5)
+-    return two_sample_permutation_test(
+-        data1, data2, n_permute=60, return_null=True, n_jobs=n_jobs, random_state=42
+-    )
+-
+-
+-def _correlation_at(n_jobs):
+-    rng = np.random.RandomState(0)
+-    data1, data2 = rng.randn(25), rng.randn(25)
+-    return correlation_permutation_test(
+-        data1, data2, n_permute=60, return_null=True, n_jobs=n_jobs, random_state=42
+-    )
+-
+-
+-def _timeseries_at(n_jobs):
+-    rng = np.random.RandomState(0)
+-    data1, data2 = rng.randn(40), rng.randn(40)
+-    return _timeseries_correlation_permutation_test(
+-        data1, data2, n_permute=60, return_null=True, n_jobs=n_jobs, random_state=42
+-    )
+-
+-
+-@pytest.mark.parametrize(
+-    ("run_at_n_jobs", "statistic_key"),
+-    [
+-        (_one_sample_at, "mean"),
+-    ],
+-    ids=["one_sample"],
+-)
+-def test_worker_count_is_numerically_invisible(run_at_n_jobs, statistic_key):
++def test_worker_count_is_numerically_invisible():
+     """Worker count never changes a seeded result: `n_jobs` is a speed knob only.
+ 
+     Randomizations are drawn before the joblib block and consumed in index order,
+     so one worker and every worker must agree bit for bit.
+     """
+-    serial = run_at_n_jobs(1)
+-    parallel = run_at_n_jobs(-1)
++    serial = _one_sample_at(1)
++    parallel = _one_sample_at(-1)
+ 
+     np.testing.assert_array_equal(serial["null_dist"], parallel["null_dist"])
+-    np.testing.assert_array_equal(serial[statistic_key], parallel[statistic_key])
++    np.testing.assert_array_equal(serial["mean"], parallel["mean"])
+     np.testing.assert_array_equal(serial["p"], parallel["p"])
+ 
+ 
+diff --git a/nltools/tests/core/test_inference/test_isc_group.py b/nltools/tests/core/test_inference/test_isc_group.py
+index fb6accf7..2147c092 100644
+--- a/nltools/tests/core/test_inference/test_isc_group.py
++++ b/nltools/tests/core/test_inference/test_isc_group.py
+@@ -28,6 +28,7 @@
+ import pytest
+ 
+ from nltools.algorithms.inference.isc import (
++    _bootstrap_isc_group_numpy,
+     _compute_isc_group_difference,
+     _compute_pairwise_isc,
+     _isc_group_permutation_test,
+@@ -97,6 +98,58 @@ def test_compute_isc_group_difference_mismatched_observations():
+         )
+ 
+ 
++def test_isc_group_bootstrap_pvalue_ignores_undefined_draws():
++    """An undefined bootstrap draw is dropped, not counted as a non-exceedance.
++
++    The same data used to give p = 1/6 as 2-D input and p = 1/21 once a
++    singleton voxel axis was added, because the voxelwise branch kept all 20
++    draws and NaN never exceeded the observed difference.
++    """
++    group1 = np.array([[0.0, 0.0], [1.0, 2.0], [2.0, 1.0]])
++    group2 = np.array([[0.0, 1.0], [1.0, 0.0], [2.0, 1.0]])
++    kwargs = {"method": "bootstrap", "n_permute": 20, "n_jobs": 1, "random_state": 0}
++
++    flat = _isc_group_permutation_test(group1, group2, **kwargs)
++    voxelwise = _isc_group_permutation_test(
++        group1[:, :, None], group2[:, :, None], **kwargs
++    )
++
++    np.testing.assert_allclose(flat["p"], 1 / 6)
++    np.testing.assert_allclose(voxelwise["p"], [1 / 6])
++
++
++def test_bootstrap_isc_group_keeps_anticorrelated_distinct_subjects():
++    """A perfect anticorrelation between two distinct subjects is not a self-correlation.
++
++    The group bootstrap masked `|r| >= 0.99999`, so a legitimate pair at -1
++    was dropped and the draw came back NaN.
++    """
++    group1 = np.array([[1.0, -1.0], [2.0, -2.0], [3.0, -3.0], [1.5, -1.5]])
++    group2 = np.array([[1.0, 0.5], [2.0, -0.5], [3.0, 2.0], [1.5, 0.25]])
++    group2_corr = np.corrcoef(group2.T)[0, 1]
++
++    draw = _bootstrap_isc_group_numpy(group1, group2, observed_diff=0.0, random_state=0)
++
++    np.testing.assert_allclose(draw, -1.0 - group2_corr)
++
++
++@pytest.mark.parametrize("method", ["bootstrap", "permute"])
++def test_isc_group_permutation_test_mismatched_voxels(method):
++    """Two groups with different voxel counts are refused, not broadcast.
++
++    group2's single-voxel statistic used to broadcast across group1's two
++    voxels and produce a full, meaningless result.
++    """
++    rng = np.random.default_rng(0)
++    group1 = rng.standard_normal((20, 3, 2))
++    group2 = rng.standard_normal((20, 3, 1))
++
++    with pytest.raises(ValueError, match="voxel"):
++        _isc_group_permutation_test(
++            group1, group2, method=method, n_permute=10, n_jobs=1, random_state=0
++        )
++
++
+ def test_compute_isc_group_difference_invalid_metric():
+     """ISC group difference raises error for invalid summary."""
+     np.random.seed(42)
+diff --git a/nltools/tests/core/test_inference/test_isc_vocabulary.py b/nltools/tests/core/test_inference/test_isc_vocabulary.py
+index 4b671dc4..9c9309b9 100644
+--- a/nltools/tests/core/test_inference/test_isc_vocabulary.py
++++ b/nltools/tests/core/test_inference/test_isc_vocabulary.py
+@@ -88,10 +88,30 @@ def _stderr_of(self, fn):
+             fn()
+         return buf.getvalue()
+ 
+-    def test_isc_silent_by_default_bar_when_asked(self, subjects_data):
+-        kwargs = {"n_samples": 20, "random_state": 0, "n_jobs": 1}
++    @pytest.mark.parametrize("method", ["bootstrap", "circle_shift", "phase_randomize"])
++    def test_isc_silent_by_default_bar_when_asked(self, subjects_data, method):
++        kwargs = {"n_samples": 20, "random_state": 0, "n_jobs": 1, "method": method}
+         assert self._stderr_of(lambda: isc(subjects_data, **kwargs)) == ""
+         assert (
+             self._stderr_of(lambda: isc(subjects_data, progress_bar=True, **kwargs))
+             != ""
+         )
++
++
++def test_isc_surrogate_worker_count_is_numerically_invisible(subjects_data):
++    """The surrogate methods parallelize their resamples without moving a number.
++
++    Seeds are drawn per replicate before the joblib block, so one worker and
++    two must agree bit for bit.
++    """
++    kwargs = {
++        "n_samples": 20,
++        "random_state": 0,
++        "method": "circle_shift",
++        "return_null": True,
++    }
++
++    serial = isc(subjects_data, n_jobs=1, **kwargs)
++    parallel = isc(subjects_data, n_jobs=2, **kwargs)
++
++    np.testing.assert_array_equal(serial["null_dist"], parallel["null_dist"])
+diff --git a/nltools/tests/core/test_isc.py b/nltools/tests/core/test_isc.py
+index af5a0ad5..81ba166a 100644
+--- a/nltools/tests/core/test_isc.py
++++ b/nltools/tests/core/test_isc.py
+@@ -23,6 +23,7 @@
+ 
+ from nltools.algorithms.inference.isc import (
+     _bootstrap_loo_numpy,
++    _bootstrap_pairwise_numpy,
+     _compute_loo_isc,
+     _compute_pairwise_isc,
+     _isc_permutation_test,
+@@ -396,51 +397,109 @@ def test_compute_pairwise_isc_cosine_handles_zero_norm():
+     assert np.all(np.isfinite(result) | np.isnan(result))
+ 
+ 
+-# =============================================================================
+-# Statistical Correctness Tests
+-# =============================================================================
++def test_isc_undefined_observed_reports_nan_not_a_significant_result():
++    """A feature whose observed ISC is undefined gets NaN for p and for both bounds.
++
++    No null value can exceed NaN, so the exceedance count was zero and p
++    collapsed to `1 / (n_permute + 1)` — in a whole-brain map every flat voxel
++    surfaced as the most significant hit — while the resamples that remained
++    defined still produced a confident-looking interval around nothing.
++    """
++    flat = _isc_permutation_test(
++        np.ones((4, 3)), method="circle_shift", n_permute=20, n_jobs=1, random_state=0
++    )
++    assert np.isnan(flat["p"]).all()
++    assert np.isnan(flat["ci"]).all()
++
++    # One constant subject makes the leave-one-out ISC undefined while the
++    # bootstrap draws that omit that subject stay finite.
++    data = np.random.default_rng(0).standard_normal((30, 4))
++    data[:, 3] = 2.0
++    loo = _isc_permutation_test(
++        data,
++        summary_statistic="leave-one-out",
++        method="bootstrap",
++        n_permute=50,
++        n_jobs=1,
++        random_state=0,
++    )
++    assert np.isnan(loo["isc"])
++    assert np.isnan(loo["p"]).all()
++    assert np.isnan(loo["ci"]).all()
++
++
++def test_isc_bootstrap_summarizes_only_defined_draws():
++    """With two subjects half the draws duplicate a subject and are undefined.
++
++    Those draws used to count toward the p-value's denominator and to poison
++    the interval, giving p = 1/21 and `ci = (nan, nan)` where the eight defined
++    draws give p = 1/9 and a degenerate interval at the observed ISC.
++    """
++    data = np.array([[0.0, 0.0], [1.0, 2.0], [2.0, 1.0]])
++
++    result = _isc_permutation_test(
++        data, method="bootstrap", n_permute=20, n_jobs=1, random_state=0
++    )
+ 
++    np.testing.assert_allclose(result["p"], 1 / 9)
++    np.testing.assert_allclose(result["ci"], (0.5, 0.5))
+ 
+-def _generate_shared_signal_isc(
+-    n_timepoints, n_subjects, isc_strength, random_state=None
+-):
++
++def test_bootstrap_pairwise_masks_duplicate_subjects_by_identity():
++    """Only pairs of the same original subject are masked, not similar ones.
++
++    Drawing subjects [0, 1, 1] gives two genuine (0, 1) pairs that happen to
++    correlate at 1.0 and one true duplicate pair; masking by value dropped all
++    three and returned NaN.
+     """
+-    Generate time series data with known ISC.
+-
+-    Creates data where all subjects share a common signal with strength
+-    controlled by isc_strength. Higher isc_strength → higher ISC.
+-
+-    Parameters
+-    ----------
+-    n_timepoints : int
+-        Number of time points
+-    n_subjects : int
+-        Number of subjects
+-    isc_strength : float
+-        Strength of shared signal (0.0 = no ISC, 1.0 = perfect ISC)
+-        Higher values → higher ISC
+-    random_state : int or RandomState, optional
+-        Random seed
+-
+-    Returns
+-    -------
+-    data : ndarray, shape (n_timepoints, n_subjects)
+-        Time series data with known ISC structure
++    result = _bootstrap_pairwise_numpy(
++        np.array([1.0, 0.2, 0.2]), bootstrap_subjects=np.array([0, 1, 1])
++    )
++
++    assert result == 1.0
++
++
++def test_isc_phase_randomize_surrogates_stay_floating_point():
++    """Voxelwise phase randomization does not truncate its surrogates.
++
++    `phase_randomize` returns float64; writing it into an integer-typed buffer
++    rounded every surrogate toward zero and destroyed the power-spectrum
++    preservation the method promises.
+     """
+-    from sklearn.utils import check_random_state
++    data = np.array([[0, 1, 2], [1, 0, 3], [2, 3, 1], [3, 2, 0], [1, 3, 2]])[:, :, None]
+ 
+-    rng = check_random_state(random_state)
++    kwargs = {
++        "method": "phase_randomize",
++        "n_permute": 10,
++        "random_state": 0,
++        "n_jobs": 1,
++        "return_null": True,
++    }
++    integer_null = _isc_permutation_test(data, **kwargs)["null_dist"]
++    float_null = _isc_permutation_test(data.astype(float), **kwargs)["null_dist"]
+ 
+-    # Generate shared signal
+-    shared_signal = rng.randn(n_timepoints)
++    np.testing.assert_allclose(integer_null, float_null)
+ 
+-    # Generate data for each subject: shared_signal * strength + noise * (1 - strength)
+-    data = np.zeros((n_timepoints, n_subjects))
+-    for i in range(n_subjects):
+-        noise = rng.randn(n_timepoints)
+-        data[:, i] = shared_signal * isc_strength + noise * np.sqrt(1 - isc_strength**2)
+ 
+-    return data
++def test_compute_pairwise_isc_euclidean_promotes_integer_input():
++    """Euclidean similarity squares in float64, so integer input cannot overflow.
++
++    Two subjects at (0, 0) and (0, 200) are 200 apart, so the similarity is
++    1 - 200 = -199. Squaring 200 in int16 wraps.
++    """
++    data = np.array([[0, 0], [200, 0]], dtype=np.int16)
++
++    np.testing.assert_allclose(
++        _compute_pairwise_isc(data, metric="euclidean"), [-199.0]
++    )
++    np.testing.assert_allclose(
++        _compute_pairwise_isc(data[:, :, None], metric="euclidean"), [[-199.0]]
++    )
++
++
++# =============================================================================
++# Statistical Correctness Tests
++# =============================================================================
+ 
+ 
+ class TestISCStatisticalCorrectness:

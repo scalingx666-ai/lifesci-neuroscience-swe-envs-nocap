@@ -1,0 +1,468 @@
+diff --git a/nitorch/tests/test_register_eval_count.py b/nitorch/tests/test_register_eval_count.py
+new file mode 100644
+index 00000000..53582ad6
+--- /dev/null
++++ b/nitorch/tests/test_register_eval_count.py
+@@ -0,0 +1,173 @@
++"""Number of loss evaluations spent by `nitorch register` (#155).
++
++- The strong Wolfe line search stops zooming once the loss is flat to
++  numerical precision (near convergence it used to spend up to 25
++  gradient evaluations for gains ~1e-8).
++- `PairwiseRegister.fit` no longer evaluates the data term at the initial
++  parameters (the optimiser does it anyway), unless a loss keeps a state
++  that this evaluation initialises.
++"""
++import torch
++import pytest
++from nitorch import spatial
++from nitorch.tools.registration import objects
++from nitorch.tools.registration.losses import MSE, MAD
++from nitorch.tools.registration.optim.wolfe import StrongWolfe
++from nitorch.tools.registration.pairwise_impl import (
++    PairwiseRegister, PairwiseRegisterStep)
++from nitorch.tools.registration.pairwise_makeobj import (
++    make_affine_optim, make_nonlin_optim)
++from nitorch.tools.registration.pairwise_run import build_joint_optim
++
++dt = torch.double
++
++
++# ----------------------------------------------------------------------
++#                        Wolfe: stagnation stop
++# ----------------------------------------------------------------------
++
++def _wolfe(closure, **kwargs):
++    f0, g0 = closure(0, grad=True)
++    return StrongWolfe(**kwargs).step(0, closure, torch.ones(1, dtype=dt),
++                                      loss=f0, grad=g0)
++
++
++def _counted(fn):
++    calls = []
++
++    def closure(a, grad=False):
++        calls.append(float(a))
++        f, g = fn(float(a))
++        f, g = torch.tensor(f, dtype=dt), torch.tensor([g], dtype=dt)
++        return (f, g) if grad else f
++    return closure, calls
++
++
++def _flat(a):
++    # Loss flat to ~1e-10 (relative), with a gradient that never meets
++    # the curvature condition -- what float32 losses look like near
++    # convergence.
++    return 1 + 1e-10 * (a - 0.3) ** 2, -1.
++
++
++def test_wolfe_stops_when_loss_is_flat():
++    closure, calls = _counted(_flat)
++    a, f, g = _wolfe(closure)
++    n_new = len(calls)
++    assert f <= 1 + 1e-10 * 0.09       # never worse than the start
++    closure, calls = _counted(_flat)
++    _wolfe(closure, ftol=0)            # previous behaviour
++    n_old = len(calls)
++    assert n_new <= 3 < n_old, (n_new, n_old)
++
++
++def test_wolfe_still_backtracks_after_overshoot():
++    # f(a) = (a - 0.1)^2: the first trial (a = 1) is much worse than f0;
++    # the zoom must still find the minimum (worse trials are not
++    # "stagnation").
++    closure, calls = _counted(lambda a: ((a - 0.1) ** 2, 2 * (a - 0.1)))
++    a, f, g = _wolfe(closure)
++    assert abs(a - 0.1) < 1e-2 and f < 0.1 ** 2
++
++
++def test_wolfe_still_expands():
++    # f(a) = (a - 50)^2 from a = 0 with lr = 1: the step must grow
++    closure, calls = _counted(lambda a: ((a - 50) ** 2, 2 * (a - 50)))
++    a, f, g = _wolfe(closure)
++    assert a > 10 and f < 40 ** 2
++
++
++def test_wolfe_line_search_exposes_ftol():
++    from nitorch.tools.registration.optim.wolfe import StrongWolfeLineSearch
++    ls = StrongWolfeLineSearch(ftol=1e-3)
++    assert ls.ftol == 1e-3 and ls.wolfe.ftol == 1e-3
++    ls.ftol = 0
++    assert ls.wolfe.ftol == 0
++
++
++# ----------------------------------------------------------------------
++#                     fit(): initial evaluation
++# ----------------------------------------------------------------------
++
++def _images(shape=(10, 10, 10)):
++    g = torch.Generator().manual_seed(0)
++    x = torch.rand([1, *shape], dtype=dt, generator=g)
++    for _ in range(2):
++        for d in range(1, 4):
++            x = (x + x.roll(1, d) + x.roll(-1, d)) / 3
++    aff = spatial.affine_default(shape, 1., dtype=dt)
++    fix = objects.Image(x, affine=aff)
++    mov = objects.Image(x.roll(1, 3), affine=aff)
++    return fix, mov
++
++
++def _setup(kind, loss='mse', max_iter=3):
++    fix, mov = _images()
++    lossobj = MSE(lam=1, dim=3) if loss == 'mse' else MAD(dim=3)
++    sim = objects.Similarity(lossobj, mov, fix)
++    affine = nonlin = None
++    if kind in ('affine', 'joint'):
++        affine = objects.AffineModel('rigid', position='sym',
++                                     penalty=[1e-5] * 12)
++        affine.frozen = False
++    if kind in ('nonlin', 'joint'):
++        nonlin = objects.SVFModel(steps=4, penalty=dict(
++            absolute=1e-4, membrane=1e-3, bending=0.2, lame=(0.05, 0.2),
++            factor=1.))
++        nonlin.set_dat(fix.shape, affine=fix.affine, dtype=dt)
++        nonlin.frozen = False
++    aopt = make_affine_optim(None, 2, max_iter=max_iter) if affine else None
++    nopt = (make_nonlin_optim(None, 2, max_iter=max_iter, nonlin=nonlin)
++            if nonlin else None)
++    optim = build_joint_optim(aopt, nopt, max_iter=2, sequential=False)
++    return sim, affine, nonlin, optim
++
++
++def _record(monkeypatch):
++    calls = []
++    for name in ('do_affine_only', 'do_affine', 'do_vel'):
++        orig = getattr(PairwiseRegisterStep, name)
++
++        def wrapper(self, x, grad=False, hess=False, in_line_search=False,
++                    _orig=orig, _name=name):
++            calls.append((_name, grad, hess, in_line_search))
++            return _orig(self, x, grad=grad, hess=hess,
++                         in_line_search=in_line_search)
++        monkeypatch.setattr(PairwiseRegisterStep, name, wrapper)
++    return calls
++
++
++def _fit(kind, loss='mse', force_init=False, monkeypatch=None):
++    sim, affine, nonlin, optim = _setup(kind, loss)
++    if force_init:
++        # pretend the loss is stateful: the initial evaluation runs, as
++        # before #155
++        monkeypatch.setattr(sim.loss, 'get_state', lambda: {})
++    PairwiseRegister([sim], affine, nonlin, optim, verbose=0).fit()
++    return [m.dat.dat.clone() for m in (affine, nonlin) if m is not None]
++
++
++@pytest.mark.parametrize('kind', ['affine', 'nonlin', 'joint'])
++def test_no_duplicate_initial_evaluation(kind, monkeypatch):
++    calls = _record(monkeypatch)
++    _fit(kind)
++    # the first evaluation is the optimiser's (with derivatives), not a
++    # loss-only evaluation at the same parameters
++    assert calls[0][1], calls[:3]
++
++
++@pytest.mark.parametrize('kind', ['affine', 'nonlin', 'joint'])
++def test_initial_evaluation_kept_for_stateful_losses(kind, monkeypatch):
++    calls = _record(monkeypatch)
++    _fit(kind, loss='mad')
++    assert not calls[0][1] and not calls[0][2], calls[:3]
++
++
++@pytest.mark.parametrize('kind', ['affine', 'nonlin', 'joint'])
++def test_removing_initial_evaluation_does_not_change_result(kind, monkeypatch):
++    new = _fit(kind)
++    with monkeypatch.context() as m:
++        old = _fit(kind, force_init=True, monkeypatch=m)
++    assert max(float(x.abs().max()) for x in new) > 1e-4  # it did move
++    for x, y in zip(new, old):
++        assert torch.allclose(x, y, rtol=0, atol=1e-12), (x - y).abs().max()
+diff --git a/nitorch/tests/test_register_symmetric.py b/nitorch/tests/test_register_symmetric.py
+index 5f102fa2..0b5baea8 100644
+--- a/nitorch/tests/test_register_symmetric.py
++++ b/nitorch/tests/test_register_symmetric.py
+@@ -373,3 +373,44 @@ def test_verbose_does_not_change_objective(step_name, optim, capsys):
+         for a, b in zip(outs[0], out):
+             assert torch.allclose(a, b, rtol=1e-12, atol=1e-12 * b.abs().max())
+     capsys.readouterr()
++
++
++@pytest.mark.parametrize('step_name', ['do_affine_only', 'do_affine'])
++def test_affine_penalty_accepts_model_parameters(step_name):
++    """Optimisers pass `AffineModel.Parameters` (not a tensor) on their
++    first evaluation: the penalty used to crash on it."""
++    fix, mov = make_images([8, 8, 8])
++    affine = _penalised_affine('affine', None)
++    nonlin = make_svf(fix) if step_name == 'do_affine' else None
++    step = PairwiseRegisterStep(make_sim(mov, fix, 'fwd'), affine, nonlin,
++                                verbose=0)
++    fn = getattr(step, step_name)
++    out1 = fn(affine.parameters(), grad=True, hess=True, in_line_search=True)
++    out0 = fn(affine.dat.dat.clone(), grad=True, hess=True,
++              in_line_search=True)
++    for a, b in zip(out1, out0):
++        assert torch.equal(a, b)
++
++
++def test_nonlin_step_includes_last_affine_penalty():
++    """In a joint model, the objective of the nonlinear step includes the
++    penalty of the last affine step (it used to be dropped: `lla` was
++    never recorded)."""
++    fix, mov = make_images([8, 8, 8], vx_mov=1.)
++    nonlin = make_svf(fix, band=0)
++    vel = nonlin.dat.dat.clone()
++
++    def nonlin_objective(penalised):
++        affine = _penalised_affine('affine', None)
++        if not penalised:
++            affine._penalty = None
++        step = PairwiseRegisterStep(make_sim(mov, fix, 'fwd'), affine,
++                                    nonlin, verbose=0)
++        step.do_affine(affine.dat.dat.clone())
++        return step.do_vel(vel, in_line_search=True), step
++
++    ll1, step = nonlin_objective(True)
++    ll0, _ = nonlin_objective(False)
++    lla = step._affine_penalty(step.affine.dat.dat)
++    assert lla > 0
++    assert torch.allclose(ll1 - ll0, lla)
+diff --git a/nitorch/tools/registration/optim/wolfe.py b/nitorch/tools/registration/optim/wolfe.py
+index 6ce13884..d7b8ba14 100644
+--- a/nitorch/tools/registration/optim/wolfe.py
++++ b/nitorch/tools/registration/optim/wolfe.py
+@@ -5,10 +5,17 @@
+ import torch
+ 
+ 
++#: Default relative tolerance on the loss below which the zoom phase of the
++#: strong Wolfe line search stops. Single-precision losses summed over
++#: millions of voxels are not resolved much below this.
++FTOL = 1e-6
++
++
+ class StrongWolfe(FirstOrder):
+     """Optimize along a search direction until Wolfe conditions are enforced"""
+ 
+-    def __init__(self, lr=1, c1=1e-4, c2=0.9, tol=1e-9, max_iter=25, **kwargs):
++    def __init__(self, lr=1, c1=1e-4, c2=0.9, tol=1e-9, max_iter=25,
++                 ftol=FTOL, **kwargs):
+         """
+ 
+         Parameters
+@@ -20,15 +27,21 @@ def __init__(self, lr=1, c1=1e-4, c2=0.9, tol=1e-9, max_iter=25, **kwargs):
+         c2 : float, default=0.9
+             Wolfe condition on gradients
+         tol : float, default=1e-9
+-            Tolerance for early stopping
++            Tolerance for early stopping (on the bracket width)
+         max_iter : int, default=25
+             Maximum number of iterations
++        ftol : float, default=1e-6
++            Relative tolerance on the loss for early stopping: once a
++            bracket is found, the search stops as soon as a new trial is
++            within `ftol * max(|f_best|, |f0|)` of the best point (the
++            loss is flat to numerical precision). 0 disables this test.
+         """
+         super().__init__(lr=lr, iter=0, **kwargs)
+         self.c1 = c1
+         self.c2 = c2
+         self.tol = tol
+         self.max_iter = max_iter
++        self.ftol = ftol
+ 
+     def iter(self, *args, **kwargs):
+         # No point iterating a Line search
+@@ -247,14 +260,34 @@ def eval_finite(a, a_low):
+                 # non-finite inside the bracket: stop and keep the best point
+                 break
+             debug('new:', new_a, new_f.item(), "\\" if new_dg < 0 else '//')
++            # `f` is the lowest value of the bracket
++            stagnated = self._stagnated(new_f, f, f0)
+             success, (a, a1), (f, f1), (g, g1), (dg, dg1) \
+                 = update_bracket(new_a, new_f, new_g, new_dg,
+                                  (a, a1), (f, f1), (g, g1), (dg, dg1))
++            if stagnated and not success:
++                # The trial is within `ftol` of the best point: the loss is
++                # flat (to numerical precision) within the bracket and
++                # zooming further wastes evaluations (typically near
++                # convergence). Keep the best point.
++                debug('stagnate', new_f.item(), f.item())
++                break
+ 
+         if not math.isfinite(f) or f > f0:
+             return 0, f0, g0
+         return a, f, g
+ 
++    def _stagnated(self, f_new, f_best, f0):
++        """True if `f_new` and `f_best` are equal up to `ftol` (relative to
++        the magnitude of the loss): the trial neither improved on the best
++        point nor was meaningfully worse, i.e., the loss is flat to
++        numerical precision. (A trial that is clearly worse is a normal
++        backtracking step and does not count as stagnation.)"""
++        if not self.ftol:
++            return False
++        f_new, f_best, f0 = float(f_new), float(f_best), float(f0)
++        return abs(f_best - f_new) <= self.ftol * max(abs(f_best), abs(f0))
++
+     @staticmethod
+     def sort_bracket(ba, bf, bg, bdg):
+         if bf[0] > bf[-1]:
+@@ -395,11 +428,11 @@ def cubic_interpolate(x1, f1, g1, x2, f2, g2, bounds=None):
+ class StrongWolfeLineSearch(LineSearch):
+ 
+     def repr_keys(self):
+-        keys = super().repr_keys() + ['c1', 'c2', 'max_iter']
++        keys = super().repr_keys() + ['c1', 'c2', 'max_iter', 'ftol']
+         return keys
+ 
+     def __init__(self, optim=None, lr=1, c1=0, c2=0.9, tol=1e-9, max_iter=25,
+-                 store_value=False, **kwargs):
++                 ftol=FTOL, store_value=False, **kwargs):
+         """
+ 
+         Parameters
+@@ -416,13 +449,17 @@ def __init__(self, optim=None, lr=1, c1=0, c2=0.9, tol=1e-9, max_iter=25,
+             Tolerance for early stopping
+         max_iter : int, default=25
+             Maximum number of iterations
++        ftol : float, default=1e-6
++            Relative tolerance on the loss for stopping the zoom phase
++            early (see `StrongWolfe`). 0 disables this test.
+         store_value : bool or float, default=False
+             Whether to store the successful parameter in `optim`.
+             If False, the original value is restored at the end of the
+             line search. If a float, the successful parameter is modulated
+             by that value before being stored.
+         """
+-        self.wolfe = StrongWolfe(lr=lr, c1=c1, c2=c2, tol=tol, max_iter=max_iter)
++        self.wolfe = StrongWolfe(lr=lr, c1=c1, c2=c2, tol=tol,
++                                 max_iter=max_iter, ftol=ftol)
+         super().__init__(optim, **kwargs)
+         self.store_value = store_value
+ 
+@@ -430,6 +467,7 @@ def __init__(self, optim=None, lr=1, c1=0, c2=0.9, tol=1e-9, max_iter=25,
+     c2 = _wrapped_prop('c2', 'wolfe')
+     tol = _wrapped_prop('tol', 'wolfe')
+     max_iter = _wrapped_prop('max_iter', 'wolfe')
++    ftol = _wrapped_prop('ftol', 'wolfe')
+     lr = _wrapped_prop('lr', 'wolfe')
+ 
+     def step(self, param=None, closure=None, **kwargs):
+diff --git a/nitorch/tools/registration/pairwise_impl.py b/nitorch/tools/registration/pairwise_impl.py
+index 1e28fc0f..d94f5142 100644
+--- a/nitorch/tools/registration/pairwise_impl.py
++++ b/nitorch/tools/registration/pairwise_impl.py
+@@ -15,7 +15,8 @@
+ from nitorch.core import utils, linalg
+ import torch
+ from . import optim as optm, utils as regutils
+-from .objects import SVFModel, ShootModel, MeanSpace, Nonlin2dModel, SumSimilarity
++from .objects import (SVFModel, ShootModel, MeanSpace, Nonlin2dModel,
++                      SumSimilarity, AffineModel)
+ 
+ 
+ # TODO:
+@@ -154,15 +155,26 @@ def fit(self):
+                 self.nonlin.set_kernel()
+ 
+         # initialize loss
+-        verbose, self.verbose = self.verbose, False
+-        if self.nonlin:
+-            step.do_vel(self.nonlin.parameters(), grad=False, hess=False)
+-            if self.affine:
+-                step.do_affine(self.affine.parameters(), grad=False, hess=False)
+-        else:
++        if not self.nonlin:
+             self.affine.position, pos = 'm', self.affine.position
+-            step.do_affine_only(self.affine.parameters(), grad=False, hess=False)
+-        self.verbose = verbose
++        if any(loss.loss.get_state() is not None for loss in self.losses):
++            # Stateful losses (warm-started EM, IRLS weights...): this
++            # evaluation initialises their state before the optimiser's
++            # first evaluation, as it always did.
++            verbose, self.verbose = self.verbose, False
++            if self.nonlin:
++                step.do_vel(self.nonlin.parameters(), grad=False, hess=False)
++                if self.affine:
++                    step.do_affine(self.affine.parameters(), grad=False, hess=False)
++            else:
++                step.do_affine_only(self.affine.parameters(), grad=False, hess=False)
++            self.verbose = verbose
++        else:
++            # Every optimiser evaluates the objective at the initial
++            # parameters itself, so evaluating the data term here would be
++            # a duplicate: only initialise the penalty terms that the
++            # steps of a joint model take from each other.
++            step.init_penalties()
+ 
+         step.framerate = self.framerate
+         if self.affine and self.nonlin:
+@@ -593,6 +605,7 @@ def print(self, step, ll, lla=None, llv=None, in_line_search=False):
+         if not in_line_search:
+             self.ll = ll
+             self.llv = llv
++            self.lla = lla
+             self.all_ll.append(ll)
+             self.ll_prev = self.ll
+             self.ll_max = max(self.ll_max, self.ll)
+@@ -600,6 +613,17 @@ def print(self, step, ll, lla=None, llv=None, in_line_search=False):
+ 
+         return ll
+ 
++    def init_penalties(self):
++        """Initialise the penalties that each step of a joint model takes
++        from the other component (`do_affine` uses the last velocity
++        penalty `llv`, `do_vel` the last affine penalty `lla`), without
++        evaluating the data term."""
++        if not (self.affine and self.nonlin):
++            return
++        self.llv = self._nonlin_penalty(self.nonlin.parameters())
++        if self.affine.penalty is not None:
++            self.lla = self._affine_penalty(self.affine.parameters())
++
+     def do_vel(self, vel, grad=False, hess=False, in_line_search=False):
+         """Forward pass for updating the nonlinear component"""
+ 
+@@ -783,11 +807,7 @@ def do_vel(self, vel, grad=False, hess=False, in_line_search=False):
+         # ==============================================================
+         #                       REGULARIZATION
+         # ==============================================================
+-        vgrad = self.nonlin.regulariser(vel0)
+-        llv = 0.5 * vel0.flatten().dot(vgrad.flatten())
+-        if grad:
+-            sumgrad += vgrad
+-        del vgrad
++        llv = self._nonlin_penalty(vel0, sumgrad if grad else None)
+ 
+         # ==============================================================
+         #                           VERBOSITY
+@@ -810,6 +830,18 @@ def do_vel(self, vel, grad=False, hess=False, in_line_search=False):
+             out.append(sumhess)
+         return tuple(out) if len(out) > 1 else out[0]
+ 
++    def _nonlin_penalty(self, vel, grad=None):
++        """Regularisation of the nonlinear parameters: `0.5 * <v, L v>`.
++
++        Its gradient (L v) is added to `grad` in place; its Hessian (L) is
++        not materialised (the nonlinear solvers apply it themselves).
++        Returns the value.
++        """
++        vgrad = self.nonlin.regulariser(vel)
++        if grad is not None:
++            grad += vgrad
++        return 0.5 * vel.flatten().dot(vgrad.flatten())
++
+     def _affine_penalty(self, logaff, grad=None, hess=None):
+         """L2 penalty on the (model-basis) affine log-parameters.
+ 
+@@ -818,6 +850,10 @@ def _affine_penalty(self, logaff, grad=None, hess=None):
+         Gram matrix M of `_optim_grad`: M.T (P * q) and M.T diag(P) M.
+         `grad` and `hess` are updated in place. Returns the value.
+         """
++        if isinstance(logaff, AffineModel.Parameters):
++            # optimisers pass the model's parameters on their first
++            # evaluation, and (model-basis) tensors afterwards
++            logaff = logaff.dat
+         penalty = self.affine.penalty
+         lla = logaff * penalty
+         if grad is not None or hess is not None:

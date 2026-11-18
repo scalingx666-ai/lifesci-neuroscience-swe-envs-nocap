@@ -1,0 +1,150 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d296dd9..66773e4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,6 +24,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
+ 
+ ### Fixed
+ 
++- A non-streaming client that disconnects from the router now aborts its request on the engine. The router kept its
++  own connection to the engine open, so the engine generated to `max_tokens` and held a decode seat.
+ - The router answers a request body that is not a JSON object with 400, as each engine does, instead of 500.
+ 
+ ## [0.1.0]
+diff --git a/tests/test_router.py b/tests/test_router.py
+index 09ecc11..09ab084 100644
+--- a/tests/test_router.py
++++ b/tests/test_router.py
+@@ -1,6 +1,7 @@
+ """The router's prefix tree and its sessionless policy (trnrt/serve/router.py), and its connection pool under many
+ concurrent streams."""
+ 
++import contextlib
+ import random
+ import sys
+ 
+@@ -341,3 +342,71 @@ async def ask(c, b) -> tuple[int, str]:
+             await _stop(servers, tasks)
+ 
+     asyncio.run(main())
++
++
++def test_a_plain_client_that_disconnects_from_the_router_aborts_its_request_on_the_worker():
++    """A non-streaming request: the worker aborts a request whose client disconnects (serve/api.py), but behind the
++    router its client is the router's pooled connection, which stayed open, so the worker generated to max_tokens and
++    held a seat. The router now watches its own client and closes the upstream request. The stub worker watches for
++    the disconnect as the engine's API does; the control is the same request sent straight to it."""
++    import asyncio
++    import time
++
++    import httpx
++    from fastapi import FastAPI, Request
++
++    from trnrt.serve.router import build_router_app
++
++    seen: list[tuple[str, float]] = []
++    worker = FastAPI()
++
++    @worker.get("/health")
++    async def health():
++        return {"status": "ok"}
++
++    @worker.post("/v1/chat/completions")
++    async def chat(req: Request):
++        await req.json()
++        t0 = time.monotonic()
++
++        async def watch():
++            while (await req.receive())["type"] != "http.disconnect":
++                pass
++
++        gone, work = asyncio.ensure_future(watch()), asyncio.ensure_future(asyncio.sleep(10))
++        await asyncio.wait({gone, work}, return_when=asyncio.FIRST_COMPLETED)
++        seen.append(("disconnect" if gone.done() else "ran to the end", time.monotonic() - t0))
++        gone.cancel()
++        work.cancel()
++        return {"choices": [{"message": {"role": "assistant", "content": "x"}}]}
++
++    async def leave_after(url: str, s: float) -> None:
++        body = {"messages": [{"role": "user", "content": "hi"}]}
++        async with httpx.AsyncClient(timeout=30) as c:  # the client itself gives up after `s`
++            with contextlib.suppress(TimeoutError):
++                await asyncio.wait_for(c.post(url + "/v1/chat/completions", json=body), s)
++
++    async def wait_seen(n: int) -> None:
++        deadline = time.monotonic() + 5
++        while len(seen) < n and time.monotonic() < deadline:
++            await asyncio.sleep(0.05)
++
++    async def main() -> None:
++        ports = [_free_port() for _ in range(2)]
++        router = Router([f"http://127.0.0.1:{ports[0]}"])
++        servers, tasks = await _start([(worker, ports[0]), (build_router_app(router, poll_s=0), ports[1])])
++        try:
++            await leave_after(f"http://127.0.0.1:{ports[0]}", 0.5)  # the control: straight to the worker
++            await wait_seen(1)
++            assert seen and seen[0][0] == "disconnect", seen
++            await leave_after(f"http://127.0.0.1:{ports[1]}", 0.5)  # through the router
++            await wait_seen(2)
++            assert len(seen) == 2 and seen[1][0] == "disconnect" and seen[1][1] < 3, seen
++            deadline = time.monotonic() + 5
++            while router.load != [0] and time.monotonic() < deadline:
++                await asyncio.sleep(0.05)
++            assert router.load == [0]
++        finally:
++            await _stop(servers, tasks)
++
++    asyncio.run(main())
+diff --git a/trnrt/serve/router.py b/trnrt/serve/router.py
+index ec5552e..907067d 100644
+--- a/trnrt/serve/router.py
++++ b/trnrt/serve/router.py
+@@ -469,6 +469,36 @@ async def _json_object(http: Request) -> dict:
+     return body
+ 
+ 
++async def _disconnected(http: Request) -> None:
++    """Returns once the client has gone away. The body is read already, so the next ASGI message is the disconnect."""
++    while (await http.receive())["type"] != "http.disconnect":
++        pass
++
++
++async def _unless_disconnected(http: Request, aw):
++    """`aw`'s result, or None if the client disconnected first (aw is then cancelled). aw's exceptions propagate.
++
++    A plain (non-streaming) request needs this: nothing cancels its handler when its client goes away, so the request to
++    the worker went on, and the worker, whose own client is this router's pooled connection, saw no disconnect and
++    generated to max_tokens, holding a decode seat. Cancelling the upstream request closes that connection (httpcore
++    closes a connection whose response was not read to the end), and the worker aborts the request (serve/api.py)."""
++    task = asyncio.ensure_future(aw)
++    gone = asyncio.ensure_future(_disconnected(http))
++    try:
++        await asyncio.wait({task, gone}, return_when=asyncio.FIRST_COMPLETED)
++    except BaseException:  # this handler was cancelled itself
++        task.cancel()
++        raise
++    finally:
++        gone.cancel()
++    if not task.done():  # the client went away first
++        task.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await task
++        return None
++    return task.result()
++
++
+ def build_router_app(router: Router, poll_s: float = 2.0, health_timeout_s: float = 5.0) -> FastAPI:
+     # A streaming request holds its connection to the worker until the last token, so the pool's connection cap is a cap
+     # on requests in flight at every worker together. httpx's default (Limits(max_connections=100), shared by all hosts)
+@@ -568,7 +598,10 @@ async def proxy(path: str, http: Request):
+                             await resp.aclose()
+                         r = resp
+                 else:
+-                    r = await client.post(url, json=body)
++                    r = await _unless_disconnected(http, client.post(url, json=body))
++                    if r is None:  # the client went away: the upstream request is cancelled and its connection closed
++                        router.load[w] -= 1
++                        return Response(status_code=499)  # nginx's "client closed request"; nobody reads it
+             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                 router.load[w] -= 1
+                 router.note_failure(w, hard=isinstance(e, httpx.ConnectError))  # refused: a dead port

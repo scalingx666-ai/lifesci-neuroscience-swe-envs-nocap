@@ -1,0 +1,487 @@
+diff --git a/encephalon/workflow/6ce2324a-6396-49d5-a29b-14058e7e2b6f.json b/encephalon/workflow/6ce2324a-6396-49d5-a29b-14058e7e2b6f.json
+new file mode 100644
+index 0000000..bd46cdf
+--- /dev/null
++++ b/encephalon/workflow/6ce2324a-6396-49d5-a29b-14058e7e2b6f.json
+@@ -0,0 +1,20 @@
++{
++  "createdAt": "2026-08-08T10:57:18.028Z",
++  "id": "6ce2324a-6396-49d5-a29b-14058e7e2b6f",
++  "kind": "workflow",
++  "payload": {
++    "summary": "Pullfrog PR #15 found that gather cache tests should not patch DatabaseSync.prototype globally and snapshot coverage must exercise both show and compact search reads.",
++    "mistake": "Global SQLite prototype patches in tests can leak across node --test file concurrency, and show-only snapshot tests do not prove FTS gather reads share the same transaction snapshot.",
++    "guidance": [
++      "Use scoped Encephalon cache test hooks instead of mutating DatabaseSync.prototype.",
++      "When changing gather snapshot behaviour, include separate coverage for show reads and compact search/FTS reads.",
++      "Keep Pullfrog review fixes as individual commits and query Encephalon immediately before each commit."
++    ],
++    "verification": [
++      "Run node --test test/cache.test.ts after cache test-hook changes.",
++      "Run full lint, typecheck, test, validate, build, and package checks before pushing."
++    ]
++  },
++  "source": "agent",
++  "subject": "review.cache-gather-test-hooks"
++}
+diff --git a/src/cache.ts b/src/cache.ts
+index 97429c5..76f7e39 100644
+--- a/src/cache.ts
++++ b/src/cache.ts
+@@ -79,11 +79,22 @@ type CompactRow = {
+   snippet: unknown
+ }
+ 
++type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
++
++type CacheReadTestHooks = {
++  afterCompactSearchRead?: ((query: string) => void) | undefined
++  afterShowRead?: ((id: string) => void) | undefined
++  onCompactSearchPrepare?: ((source: string) => void) | undefined
++  onShowPrepare?: ((source: string) => void) | undefined
++}
++
+ class CacheSchemaMismatch extends Error {}
+ 
+ let sqliteModule: SQLiteModule | undefined
+ let sqliteFeaturesVerified = false
+ 
++export const cacheReadTestHooks: CacheReadTestHooks = {}
++
+ const loadSQLite = () => {
+   if (sqliteModule === undefined) {
+     const [major = 0, minor = 0] = process.versions.node.split('.').map(Number)
+@@ -860,6 +871,20 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
+     .all(...parameters) as Array<RecordRow & CompactRow>
+ }
+ 
++const compactText = (value: unknown, field: string) => {
++  if (typeof value === 'string') {
++    return value
++  }
++  throw new CacheSchemaMismatch(`Cached compact ${field} must be text.`)
++}
++
++const compactSummary = (value: unknown) => {
++  if (value === null || typeof value === 'string') {
++    return value
++  }
++  throw new CacheSchemaMismatch('Cached compact summary must be text or null.')
++}
++
+ const compactRank = (value: unknown) => {
+   if (typeof value === 'number' && Number.isFinite(value)) {
+     return value
+@@ -874,24 +899,92 @@ const compactSnippet = (value: unknown) => {
+   throw new CacheSchemaMismatch('Cached search snippet must be text.')
+ }
+ 
++const compactRecordFromRow = (row: CompactRow): CompactBrainRecord => ({
++  id: compactText(row.id, 'id'),
++  kind: compactText(row.kind, 'kind'),
++  path: compactText(row.path, 'path'),
++  rank: compactRank(row.rank),
++  snippet: compactSnippet(row.snippet),
++  subject: compactText(row.subject, 'subject'),
++  summary: compactSummary(row.summary),
++})
++
++const createCompactSearchReader = (database: DatabaseSync, input: SearchStatementInput) => {
++  const conditions = [
++    'record_search MATCH ?',
++    input.includeSuperseded === true ? undefined : 'records.active = 1',
++    input.kind === undefined ? undefined : 'records.kind = ?',
++  ].filter((value): value is string => value !== undefined)
++  const kindParameters = input.kind === undefined ? [] : [input.kind]
++  const limit = positiveLimit(input.limit)
++  const source = `
++    SELECT
++      records.id,
++      records.kind,
++      records.subject,
++      records.path,
++      records.summary,
++      bm25(record_search) AS rank,
++      snippet(record_search, 1, '[', ']', '...', 16) AS snippet
++    FROM record_search
++    JOIN records ON records.id = record_search.id
++    WHERE ${conditions.join(' AND ')}
++    ORDER BY rank ASC, records.created_at DESC, records.id DESC
++    LIMIT ?
++  `
++  cacheReadTestHooks.onCompactSearchPrepare?.(source)
++  const statement = database.prepare(source)
++  return (query: string) => {
++    const match = literalMatchQuery(query)
++    if (match.length === 0) {
++      return []
++    }
++    const records = (statement.all(match, ...kindParameters, limit) as CompactRow[]).map(compactRecordFromRow)
++    cacheReadTestHooks.afterCompactSearchRead?.(query)
++    return records
++  }
++}
++
+ export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
+   withPreparedDatabase(input, database => searchRows(database, input).map(parseRecordRow))
+ 
+ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] =>
+-  withPreparedDatabase(input, database =>
+-    searchRows(database, input).map(row => {
+-      const record = parseRecordRow(row)
+-      return {
+-        id: record.id,
+-        kind: record.kind,
+-        path: record.path,
+-        rank: compactRank(row.rank),
+-        snippet: compactSnippet(row.snippet),
+-        subject: record.subject,
+-        summary: summaryForRecord(record),
+-      }
+-    }),
+-  )
++  withPreparedDatabase(input, database => createCompactSearchReader(database, input)(input.query))
++
++const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
++  const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
++  const source = `SELECT record_json FROM records WHERE id = ?${activeClause}`
++  cacheReadTestHooks.onShowPrepare?.(source)
++  const statement = database.prepare(source)
++  return (id: string) => {
++    const row = statement.get(id) as RecordRow | undefined
++    cacheReadTestHooks.afterShowRead?.(id)
++    return row === undefined ? null : parseRecordRow(row)
++  }
++}
++
++const readFreshTransaction = <Result>(root: string, read: (database: DatabaseSync) => Result) => {
++  const database = openReaderDatabase(root)
++  try {
++    database.exec('BEGIN')
++    const metadata = readMetadata(database)
++    if (!metadataIsFresh(root, database, metadata)) {
++      throw new CacheSchemaMismatch('The cache is stale before read.')
++    }
++    const result = read(database)
++    database.exec('ROLLBACK')
++    return result
++  } catch (error) {
++    try {
++      database.exec('ROLLBACK')
++    } catch {
++      // The original read failure is more useful than a secondary rollback failure.
++    }
++    throw error
++  } finally {
++    database.close()
++  }
++}
+ 
+ const readGatherFromDatabase = (
+   database: DatabaseSync,
+@@ -900,30 +993,15 @@ const readGatherFromDatabase = (
+ ): GatherResult => {
+   const searches = input.searches ?? []
+   const shows = input.shows ?? []
++  const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, input.includeSuperseded)
++  const searchCompactRecordsForQuery = searches.length === 0 ? () => [] : createCompactSearchReader(database, input)
+   return {
+     hydrated,
+-    records: shows.map(id => {
+-      const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
+-      const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
+-        | RecordRow
+-        | undefined
+-      return { id, record: row === undefined ? null : parseRecordRow(row) }
+-    }),
++    records: shows.map(id => ({ id, record: showRecordForId(id) })),
+     searches: searches.map(query => ({
+       kind: input.kind ?? null,
+       query,
+-      results: searchRows(database, { ...input, query }).map(row => {
+-        const record = parseRecordRow(row)
+-        return {
+-          id: record.id,
+-          kind: record.kind,
+-          path: record.path,
+-          rank: compactRank(row.rank),
+-          snippet: compactSnippet(row.snippet),
+-          subject: record.subject,
+-          summary: summaryForRecord(record),
+-        }
+-      }),
++      results: searchCompactRecordsForQuery(query),
+     })),
+   }
+ }
+@@ -951,7 +1029,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
+         field: 'shows',
+       })
+     }
+-    return readFreshDatabase(root, database => readGatherFromDatabase(database, input, hydrated))
++    return readFreshTransaction(root, database => readGatherFromDatabase(database, input, hydrated))
+   } catch (error) {
+     if (error instanceof EncephalonError) {
+       throw error
+@@ -959,7 +1037,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
+     if (isRecoverableCacheFailure(error)) {
+       const recovered = withOperationLock(root, () => rebuildCache(root))
+       try {
+-        return readFreshDatabase(root, database =>
++        return readFreshTransaction(root, database =>
+           readGatherFromDatabase(
+             database,
+             input,
+diff --git a/test/cache.test.ts b/test/cache.test.ts
+index d61eb9f..e9010e7 100644
+--- a/test/cache.test.ts
++++ b/test/cache.test.ts
+@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symli
+ import { join } from 'node:path'
+ import { DatabaseSync } from 'node:sqlite'
+ import { afterEach, describe, test } from 'node:test'
++import { cacheReadTestHooks } from '../src/cache.ts'
+ import * as api from '../src/index.ts'
+ import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
+ 
+@@ -170,6 +171,240 @@ describe('SQLite cache and reads', () => {
+     assert.equal(searchCompactRecords({ query: 'searchable marker', root })[0]?.summary, null)
+   })
+ 
++  test('gather reads every item from one cache snapshot', () => {
++    const root = createRoot()
++    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
++    const firstId = 'snapshot-v1'
++    addRecord({
++      id: firstId,
++      kind: 'context',
++      payload: { summary: 'Snapshot generation one' },
++      root,
++      source: 'agent',
++      subject: 'cache.snapshot',
++    })
++    const replacement = {
++      createdAt: '2026-08-08T00:00:01.000Z',
++      id: 'snapshot-v2',
++      kind: 'context',
++      path: 'encephalon/context/snapshot-v2.json',
++      payload: { summary: 'Snapshot generation two' },
++      source: 'agent',
++      subject: 'cache.snapshot',
++      supersedes: [firstId],
++    }
++    let mutatedBetweenItems = false
++
++    cacheReadTestHooks.afterShowRead = () => {
++      if (!mutatedBetweenItems) {
++        mutatedBetweenItems = true
++        const database = new DatabaseSync(cacheDatabasePath(root))
++        try {
++          database.exec('BEGIN IMMEDIATE')
++          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
++          database
++            .prepare(`
++              INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
++              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++            `)
++            .run(
++              replacement.id,
++              replacement.kind,
++              replacement.subject,
++              replacement.source,
++              replacement.createdAt,
++              replacement.path,
++              1,
++              'Snapshot generation two',
++              JSON.stringify(replacement),
++            )
++          database
++            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
++            .run(replacement.id, 'Snapshot generation two')
++          database.exec('COMMIT')
++        } catch (error) {
++          try {
++            database.exec('ROLLBACK')
++          } catch {}
++          throw error
++        } finally {
++          database.close()
++        }
++      }
++    }
++
++    try {
++      const gatherRecords =
++        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
++      const gathered = gatherRecords({ root, shows: [firstId, firstId] }) as {
++        records: Array<{ id: string; record: { id: string } | null }>
++      }
++      assert.equal(mutatedBetweenItems, true)
++      assert.deepEqual(
++        gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
++        [
++          [firstId, firstId],
++          [firstId, firstId],
++        ],
++      )
++    } finally {
++      cacheReadTestHooks.afterShowRead = undefined
++    }
++  })
++
++  test('gather reads every search from one cache snapshot', () => {
++    const root = createRoot()
++    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
++    const firstId = 'search-snapshot-v1'
++    addRecord({
++      id: firstId,
++      kind: 'context',
++      payload: { summary: 'Search snapshot generation one' },
++      root,
++      searchText: 'snapshot searchable generation one',
++      source: 'agent',
++      subject: 'cache.search-snapshot',
++    })
++    const replacement = {
++      createdAt: '2026-08-08T00:00:01.000Z',
++      id: 'search-snapshot-v2',
++      kind: 'context',
++      path: 'encephalon/context/search-snapshot-v2.json',
++      payload: { summary: 'Search snapshot generation two' },
++      searchText: 'snapshot searchable generation two',
++      source: 'agent',
++      subject: 'cache.search-snapshot',
++      supersedes: [firstId],
++    }
++    let mutatedBetweenSearches = false
++
++    cacheReadTestHooks.afterCompactSearchRead = () => {
++      if (!mutatedBetweenSearches) {
++        mutatedBetweenSearches = true
++        const database = new DatabaseSync(cacheDatabasePath(root))
++        try {
++          database.exec('BEGIN IMMEDIATE')
++          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
++          database
++            .prepare(`
++              INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
++              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++            `)
++            .run(
++              replacement.id,
++              replacement.kind,
++              replacement.subject,
++              replacement.source,
++              replacement.createdAt,
++              replacement.path,
++              1,
++              'Search snapshot generation two',
++              JSON.stringify(replacement),
++            )
++          database
++            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
++            .run(replacement.id, replacement.searchText)
++          database.exec('COMMIT')
++        } catch (error) {
++          try {
++            database.exec('ROLLBACK')
++          } catch {}
++          throw error
++        } finally {
++          database.close()
++        }
++      }
++    }
++
++    try {
++      const gatherRecords =
++        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
++      const gathered = gatherRecords({
++        root,
++        searches: ['snapshot searchable', 'snapshot searchable'],
++      }) as {
++        searches: Array<{ results: Array<{ id: string }> }>
++      }
++      assert.equal(mutatedBetweenSearches, true)
++      assert.deepEqual(
++        gathered.searches.map(entry => entry.results.map(result => result.id)),
++        [[firstId], [firstId]],
++      )
++    } finally {
++      cacheReadTestHooks.afterCompactSearchRead = undefined
++    }
++  })
++
++  test('gather preserves duplicate order while reusing show and search statements', () => {
++    const root = createRoot()
++    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
++    const first = addRecord({
++      id: 'reuse-v1',
++      kind: 'decision',
++      payload: { summary: 'First reusable decision' },
++      root,
++      source: 'agent',
++      subject: 'cache.reuse',
++    })
++    const second = addRecord({
++      id: 'reuse-v2',
++      kind: 'decision',
++      payload: { summary: 'Second reusable decision' },
++      root,
++      searchText: 'statement reuse marker',
++      source: 'agent',
++      subject: 'cache.reuse',
++      supersedes: [first.id],
++    })
++    let showPrepareCount = 0
++    let searchPrepareCount = 0
++    let compactSearchSelectedRecordJson = false
++
++    cacheReadTestHooks.onShowPrepare = () => {
++      showPrepareCount += 1
++    }
++    cacheReadTestHooks.onCompactSearchPrepare = source => {
++      searchPrepareCount += 1
++      compactSearchSelectedRecordJson ||= source.includes('records.record_json')
++    }
++
++    try {
++      const gatherRecords =
++        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
++      const gathered = gatherRecords({
++        root,
++        searches: ['statement reuse marker', 'statement reuse marker', '   '],
++        shows: [second.id, second.id, first.id],
++      }) as {
++        records: Array<{ id: string; record: { id: string } | null }>
++        searches: Array<{ query: string; results: Array<{ id: string }> }>
++      }
++      assert.deepEqual(
++        gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
++        [
++          [second.id, second.id],
++          [second.id, second.id],
++          [first.id, null],
++        ],
++      )
++      assert.deepEqual(
++        gathered.searches.map(entry => [entry.query, entry.results.map(result => result.id)]),
++        [
++          ['statement reuse marker', [second.id]],
++          ['statement reuse marker', [second.id]],
++          ['   ', []],
++        ],
++      )
++    } finally {
++      cacheReadTestHooks.onShowPrepare = undefined
++      cacheReadTestHooks.onCompactSearchPrepare = undefined
++    }
++
++    assert.equal(showPrepareCount, 1)
++    assert.equal(searchPrepareCount, 1)
++    assert.equal(compactSearchSelectedRecordJson, false)
++  })
++
+   test('tracks record and referenced-artifact freshness', () => {
+     const root = createRoot()
+     const id = 'architecture-with-artifact'

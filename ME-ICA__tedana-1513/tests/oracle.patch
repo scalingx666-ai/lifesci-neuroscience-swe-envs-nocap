@@ -1,0 +1,874 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e6d974cf8..05bacd754 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -47,6 +47,7 @@ Paper = "https://joss.theoj.org/papers/10.21105/joss.03669"
+ 
+ [project.optional-dependencies]
+ dev = ["pre-commit"]
++gpu = ["cupy-cuda12x>=14.2,<15"]
+ doc = [
+     "sphinx>=6.2.1",
+     "sphinx_copybutton",
+diff --git a/tedana/decay.py b/tedana/decay.py
+index 0f28de706..4188337c9 100644
+--- a/tedana/decay.py
++++ b/tedana/decay.py
+@@ -17,6 +17,166 @@
+ RepLGR = logging.getLogger("REPORT")
+ 
+ 
++def _fit_voxels_cuda(
++    data_2d,
++    echo_times_1d,
++    voxel_idx,
++    s0_initial,
++    t2s_initial,
++    n_iterations=25,
++    batch_size=32768,
++):
++    """Fit independent monoexponential models with batched CUDA Gauss--Newton.
++
++    Voxels that do not meet a strict convergence check are returned as failures
++    and are subsequently handled by the existing SciPy implementation.
++
++    Parameters
++    ----------
++    data_2d : (N, M) :obj:`numpy.ndarray`
++        Multi-echo measurements, with ``N`` observations per voxel and ``M``
++        voxels in the current adaptive-mask group.
++    echo_times_1d : (N,) :obj:`numpy.ndarray`
++        Echo time associated with each observation, in seconds.
++    voxel_idx : (V,) :obj:`numpy.ndarray`
++        Indices of the ``V`` voxels in ``data_2d`` to fit.
++    s0_initial : (M,) :obj:`numpy.ndarray`
++        Initial S0 estimates for the adaptive-mask group.
++    t2s_initial : (M,) :obj:`numpy.ndarray`
++        Initial T2* estimates, in seconds, for the adaptive-mask group.
++    n_iterations : :obj:`int`, optional
++        Number of damped Gauss--Newton iterations. Default is 25.
++    batch_size : :obj:`int`, optional
++        Maximum number of voxels transferred to and processed on the GPU in
++        one batch. Default is 32768.
++
++    Returns
++    -------
++    fitted_s0 : (V,) :obj:`numpy.ndarray`
++        Estimated S0 values. Entries for failed voxels are zero.
++    fitted_t2s : (V,) :obj:`numpy.ndarray`
++        Estimated T2* values in seconds. Entries for failed voxels are zero.
++    failures : (V,) :obj:`numpy.ndarray`
++        Boolean array indicating voxels that did not converge or had invalid
++        inputs and must be refit on the CPU.
++    s0_var : (V,) :obj:`numpy.ndarray`
++        Estimated variance of each fitted S0 value. Entries for failed voxels
++        are zero.
++    t2s_var : (V,) :obj:`numpy.ndarray`
++        Estimated variance of each fitted T2* value. Entries for failed voxels
++        are zero.
++    s0_t2s_covar : (V,) :obj:`numpy.ndarray`
++        Estimated covariance between S0 and T2*. Entries for failed voxels are
++        zero.
++
++    Raises
++    ------
++    ImportError
++        If CuPy is not installed.
++
++    Notes
++    -----
++    The function synchronizes the default CUDA stream before returning so that
++    callers can accurately measure elapsed execution time. It assumes CUDA
++    availability has already been validated by :func:`tedana.utils._resolve_backend`.
++    """
++    import cupy as cp
++
++    n_voxels = len(voxel_idx)
++    fitted_s0 = np.zeros(n_voxels)
++    fitted_t2s = np.zeros(n_voxels)
++    failures = np.ones(n_voxels, dtype=bool)
++    s0_var = np.zeros(n_voxels)
++    t2s_var = np.zeros(n_voxels)
++    s0_t2s_covar = np.zeros(n_voxels)
++    n_observations = data_2d.shape[0]
++    eps = np.finfo(np.float64).eps
++    echo_times_gpu = cp.asarray(echo_times_1d, dtype=cp.float64)
++
++    for first in range(0, n_voxels, batch_size):
++        last = min(first + batch_size, n_voxels)
++        batch_voxels = voxel_idx[first:last]
++        observations_cpu = np.ascontiguousarray(data_2d[:, batch_voxels].T, dtype=np.float64)
++        lower_s0_cpu = observations_cpu.min(axis=1)
++        s0_cpu = s0_initial[batch_voxels]
++        t2s_cpu = t2s_initial[batch_voxels]
++        initial_valid = (
++            np.isfinite(observations_cpu).all(axis=1)
++            & np.isfinite(s0_cpu)
++            & np.isfinite(t2s_cpu)
++            & (s0_cpu >= lower_s0_cpu)
++            & (t2s_cpu > 0)
++        )
++        if not initial_valid.any():
++            continue
++
++        local_idx = np.flatnonzero(initial_valid)
++        observations = cp.asarray(observations_cpu[local_idx])
++        lower_s0 = cp.asarray(lower_s0_cpu[local_idx])
++        s0 = cp.asarray(s0_cpu[local_idx])
++        t2s = cp.asarray(t2s_cpu[local_idx])
++        relative_step = cp.full(len(local_idx), cp.inf, dtype=cp.float64)
++        determinant = cp.zeros(len(local_idx), dtype=cp.float64)
++
++        for _ in range(n_iterations):
++            exponential = cp.exp(-echo_times_gpu[None, :] / t2s[:, None])
++            residual = s0[:, None] * exponential - observations
++            jacobian_s0 = exponential
++            jacobian_t2s = s0[:, None] * exponential * echo_times_gpu[None, :] / t2s[:, None] ** 2
++            a00 = cp.sum(jacobian_s0 * jacobian_s0, axis=1)
++            a01 = cp.sum(jacobian_s0 * jacobian_t2s, axis=1)
++            a11 = cp.sum(jacobian_t2s * jacobian_t2s, axis=1)
++            b0 = -cp.sum(jacobian_s0 * residual, axis=1)
++            b1 = -cp.sum(jacobian_t2s * residual, axis=1)
++            # Unitless diagonal damping stabilizes the two-parameter normal equation.
++            a00 *= 1.0 + 1e-8
++            a11 *= 1.0 + 1e-8
++            determinant = a00 * a11 - a01 * a01
++            delta_s0 = (a11 * b0 - a01 * b1) / determinant
++            delta_t2s = (a00 * b1 - a01 * b0) / determinant
++            s0 = cp.maximum(s0 + delta_s0, lower_s0)
++            t2s = cp.maximum(t2s + delta_t2s, eps)
++            relative_step = cp.maximum(
++                cp.abs(delta_s0) / (cp.abs(s0) + 1.0), cp.abs(delta_t2s) / t2s
++            )
++
++        exponential = cp.exp(-echo_times_gpu[None, :] / t2s[:, None])
++        residual = s0[:, None] * exponential - observations
++        jacobian_s0 = exponential
++        jacobian_t2s = s0[:, None] * exponential * echo_times_gpu[None, :] / t2s[:, None] ** 2
++        a00 = cp.sum(jacobian_s0 * jacobian_s0, axis=1)
++        a01 = cp.sum(jacobian_s0 * jacobian_t2s, axis=1)
++        a11 = cp.sum(jacobian_t2s * jacobian_t2s, axis=1)
++        determinant = a00 * a11 - a01 * a01
++        residual_variance = cp.sum(residual * residual, axis=1) / (n_observations - 2)
++        fitted_s0_batch = cp.asnumpy(s0)
++        fitted_t2s_batch = cp.asnumpy(t2s)
++        determinant_batch = cp.asnumpy(determinant)
++        relative_step_batch = cp.asnumpy(relative_step)
++        s0_var_batch = cp.asnumpy(a11 / determinant * residual_variance)
++        t2s_var_batch = cp.asnumpy(a00 / determinant * residual_variance)
++        s0_t2s_covar_batch = cp.asnumpy(-a01 / determinant * residual_variance)
++        converged = (
++            np.isfinite(fitted_s0_batch)
++            & np.isfinite(fitted_t2s_batch)
++            & np.isfinite(determinant_batch)
++            & (determinant_batch > 0)
++            & np.isfinite(relative_step_batch)
++            & (relative_step_batch < 1e-8)
++            & (n_observations > 2)
++        )
++        output_idx = first + local_idx[converged]
++        fitted_s0[output_idx] = fitted_s0_batch[converged]
++        fitted_t2s[output_idx] = fitted_t2s_batch[converged]
++        s0_var[output_idx] = s0_var_batch[converged]
++        t2s_var[output_idx] = t2s_var_batch[converged]
++        s0_t2s_covar[output_idx] = s0_t2s_covar_batch[converged]
++        failures[output_idx] = False
++
++    cp.cuda.Stream.null.synchronize()
++    return fitted_s0, fitted_t2s, failures, s0_var, t2s_var, s0_t2s_covar
++
++
+ def _apply_t2s_floor(t2s, echo_times):
+     """Apply a floor to T2* values to prevent zero division errors during optimal combination.
+ 
+@@ -126,6 +286,7 @@ def fit_monoexponential(
+     adaptive_mask,
+     report=True,
+     n_threads=1,
++    backend="cpu",
+     t2s_initial=None,
+     s0_initial=None,
+     voxels_to_refit=None,
+@@ -148,6 +309,10 @@ def fit_monoexponential(
+     n_threads : int, optional
+         Number of threads to use. Default is 1. If None or <= 0, uses the number
+         of available CPU cores.
++    backend : {"cpu", "cuda", "auto"}, optional
++        Compute backend for nonlinear fitting. ``cpu`` uses SciPy, ``cuda``
++        requires CuPy and a CUDA device, and ``auto`` falls back to CPU if CUDA
++        is unavailable. Default is ``cpu``.
+     t2s_initial : (Md,) :obj:`numpy.ndarray` or None, optional
+         Initial T2* estimates to use instead of log-linear fit. Default is None.
+     s0_initial : (Md,) :obj:`numpy.ndarray` or None, optional
+@@ -181,6 +346,11 @@ def fit_monoexponential(
+     -----
+     This method is slower, but more accurate, than the log-linear approach.
+     """
++    backend = utils._resolve_backend(backend)
++    if backend == "cuda":
++        cuda_batch_size = int(os.getenv("TEDANA_CUDA_BATCH_SIZE", "4096"))
++        if cuda_batch_size < 1:
++            raise ValueError("TEDANA_CUDA_BATCH_SIZE must be a positive integer")
+     if n_threads is None or n_threads <= 0:
+         n_threads = os.cpu_count() or 1
+     if report:
+@@ -249,23 +419,62 @@ def fit_monoexponential(
+         data_2d = data_cat[:, :echo_num, :].reshape(len(data_cat), -1).T
+         echo_times_1d = np.repeat(echo_times[:echo_num], n_vols)
+ 
+-        # perform a monoexponential fit of echo times against MR signal
+-        # using loglin estimates as initial starting points for fit
+-        # parallelize the curve_fit calls across voxels
+-        results = Parallel(n_jobs=n_threads)(
+-            delayed(_fit_single_voxel)(
+-                voxel=voxel,
+-                echo_times_1d=echo_times_1d,
+-                data_column=data_2d[:, voxel],
+-                s0_init=s0_init[voxel],
+-                t2s_init=t2s_init[voxel],
+-                bounds=((np.min(data_2d[:, voxel]), 0), (np.inf, np.inf)),
++        # Perform a monoexponential fit using log-linear estimates as initial values.
++        if backend == "cuda":
++            (
++                fitted_s0,
++                fitted_t2s,
++                failures,
++                fitted_s0_var,
++                fitted_t2s_var,
++                fitted_s0_t2s_covar,
++            ) = _fit_voxels_cuda(
++                data_2d,
++                echo_times_1d,
++                voxel_idx,
++                s0_init,
++                t2s_init,
++                batch_size=cuda_batch_size,
+             )
+-            for voxel in tqdm(voxel_idx, desc=f"{echo_num}-echo monoexponential")
+-        )
++            successful_voxels = voxel_idx[~failures]
++            s0_init[successful_voxels] = fitted_s0[~failures]
++            t2s_init[successful_voxels] = fitted_t2s[~failures]
++            s0_var_asc_maps[successful_voxels, i_echo] = fitted_s0_var[~failures]
++            t2s_var_asc_maps[successful_voxels, i_echo] = fitted_t2s_var[~failures]
++            t2s_s0_covar_asc_maps[successful_voxels, i_echo] = fitted_s0_t2s_covar[~failures]
++            fallback_voxels = voxel_idx[failures]
++            if len(fallback_voxels):
++                LGR.debug(
++                    "Refitting %d CUDA non-convergent voxel(s) with SciPy.", len(fallback_voxels)
++                )
++                results = Parallel(n_jobs=n_threads)(
++                    delayed(_fit_single_voxel)(
++                        voxel=voxel,
++                        echo_times_1d=echo_times_1d,
++                        data_column=data_2d[:, voxel],
++                        s0_init=s0_init[voxel],
++                        t2s_init=t2s_init[voxel],
++                        bounds=((np.min(data_2d[:, voxel]), 0), (np.inf, np.inf)),
++                    )
++                    for voxel in fallback_voxels
++                )
++            else:
++                results = []
++            fail_count = 0
++        else:
++            results = Parallel(n_jobs=n_threads)(
++                delayed(_fit_single_voxel)(
++                    voxel=voxel,
++                    echo_times_1d=echo_times_1d,
++                    data_column=data_2d[:, voxel],
++                    s0_init=s0_init[voxel],
++                    t2s_init=t2s_init[voxel],
++                    bounds=((np.min(data_2d[:, voxel]), 0), (np.inf, np.inf)),
++                )
++                for voxel in tqdm(voxel_idx, desc=f"{echo_num}-echo monoexponential")
++            )
++            fail_count = 0
+ 
+-        # Update results and count failures
+-        fail_count = 0
+         for (
+             voxel,
+             s0_voxel,
+@@ -423,6 +632,7 @@ def fit_decay(
+     fittype,
+     report=True,
+     n_threads=1,
++    backend="cpu",
+     t2s_initial=None,
+     s0_initial=None,
+     voxels_to_refit=None,
+@@ -448,6 +658,8 @@ def fit_decay(
+     n_threads : int, optional
+         Number of threads to use. Default is 1. If None or <= 0, uses the number
+         of available CPU cores.
++    backend : {"cpu", "cuda", "auto"}, optional
++        Compute backend for curve fitting. Default is ``cpu``.
+     t2s_initial : (Md,) :obj:`numpy.ndarray` or None, optional
+         Initial T2* estimates for curvefit. If None, log-linear estimates are used.
+     s0_initial : (Md,) :obj:`numpy.ndarray` or None, optional
+@@ -483,6 +695,7 @@ def fit_decay(
+     :func:`tedana.utils.make_adaptive_mask` : The function used to create the ``adaptive_mask``
+                                               parameter.
+     """
++    backend = utils._resolve_backend(backend)
+     if n_threads is None or n_threads <= 0:
+         n_threads = os.cpu_count() or 1
+     if data.shape[1] != len(tes):
+@@ -514,6 +727,7 @@ def fit_decay(
+             adaptive_mask=adaptive_mask,
+             report=report,
+             n_threads=n_threads,
++            backend=backend,
+             t2s_initial=t2s_initial,
+             s0_initial=s0_initial,
+             voxels_to_refit=voxels_to_refit,
+@@ -530,6 +744,7 @@ def fit_decay_ts(
+     adaptive_mask,
+     fittype,
+     n_threads=1,
++    backend="cpu",
+     t2s_initial=None,
+     s0_initial=None,
+     voxels_to_refit=None,
+@@ -553,6 +768,8 @@ def fit_decay_ts(
+     n_threads : int, optional
+         Number of threads to use. Default is 1. If None or <= 0, uses the number
+         of available CPU cores.
++    backend : {"cpu", "cuda", "auto"}, optional
++        Compute backend for curve fitting. Default is ``cpu``.
+     t2s_initial : (Md x T) :obj:`numpy.ndarray` or None, optional
+         Initial T2* estimates for curvefit. If None, log-linear estimates are used.
+     s0_initial : (Md x T) :obj:`numpy.ndarray` or None, optional
+@@ -587,6 +804,7 @@ def fit_decay_ts(
+     :func:`tedana.utils.make_adaptive_mask` : The function used to create the ``adaptive_mask``
+         parameter.
+     """
++    backend = utils._resolve_backend(backend)
+     if n_threads is None or n_threads <= 0:
+         n_threads = os.cpu_count() or 1
+     n_samples, _, n_vols = data.shape
+@@ -613,6 +831,7 @@ def fit_decay_ts(
+             fittype=fittype,
+             report=report,
+             n_threads=n_threads,
++            backend=backend,
+             t2s_initial=t2s_init_vol,
+             s0_initial=s0_init_vol,
+             voxels_to_refit=refit_vol,
+@@ -919,6 +1138,7 @@ def t2smap_subworkflow(
+     io_generator,
+     data_without_excluded_vols=None,
+     n_threads=1,
++    backend="cpu",
+ ):
+     """Fit a T2* map to the data.
+ 
+@@ -941,6 +1161,8 @@ def t2smap_subworkflow(
+         For more information on thresholding, see :func:`~tedana.utils.make_adaptive_mask`.
+     n_threads : int
+         Number of threads to use.
++    backend : {"cpu", "cuda", "auto"}
++        Compute backend for curve fitting.
+     interpolate_failing_voxels : bool
+         Whether to interpolate failing voxels.
+     io_generator : :obj:`tedana.io.IOGenerator`
+@@ -969,6 +1191,7 @@ def t2smap_subworkflow(
+         adaptive_mask=masksum_masked,
+         fittype=fittype,
+         n_threads=n_threads,
++        backend=backend,
+     )
+ 
+     if fittype == "curvefit":
+@@ -1024,6 +1247,7 @@ def t2smap_subworkflow(
+                 adaptive_mask=masksum_masked,
+                 fittype=fittype,
+                 n_threads=n_threads,
++                backend=backend,
+                 t2s_initial=t2s_interp,
+                 s0_initial=s0_interp,
+                 voxels_to_refit=first_failures,
+diff --git a/tedana/tests/test_decay.py b/tedana/tests/test_decay.py
+index 21cab3d66..7adcdef7f 100644
+--- a/tedana/tests/test_decay.py
++++ b/tedana/tests/test_decay.py
+@@ -1,6 +1,7 @@
+ """Tests for tedana.decay."""
+ 
+ import os.path as op
++import sys
+ 
+ import nibabel as nb
+ import numpy as np
+@@ -12,6 +13,16 @@
+ from tedana.tests.utils import get_test_data_path
+ 
+ 
++def test_backend_validation_and_auto_fallback(monkeypatch, caplog):
++    """The optional CUDA backend must not affect the default CPU installation."""
++    with pytest.raises(ValueError, match="backend must be one of"):
++        utils._resolve_backend("not-a-backend")
++
++    monkeypatch.setitem(sys.modules, "cupy", None)
++    assert utils._resolve_backend("auto") == "cpu"
++    assert "falling back to CPU" in caplog.text
++
++
+ @pytest.fixture(scope="module")
+ def testdata1():
+     tes = np.array([0.0145, 0.0385, 0.0625])
+diff --git a/tedana/tests/test_t2smap.py b/tedana/tests/test_t2smap.py
+index f7b254af6..243b458b9 100644
+--- a/tedana/tests/test_t2smap.py
++++ b/tedana/tests/test_t2smap.py
+@@ -9,6 +9,16 @@
+ 
+ from tedana import workflows
+ from tedana.tests.utils import get_test_data_path
++from tedana.workflows import t2smap as t2smap_cli
++from tedana.workflows import tedana as tedana_cli
++
++
++def test_backend_cli_option():
++    """Both workflow CLIs expose the shared backend selector."""
++    for parser in (t2smap_cli._get_parser(), tedana_cli._get_parser()):
++        backend = parser._option_string_actions["--backend"]
++        assert backend.default == "cpu"
++        assert backend.choices == ["cpu", "cuda", "auto"]
+ 
+ 
+ def _write_single_volume_echoes(data_dir, tmp_path):
+diff --git a/tedana/utils.py b/tedana/utils.py
+index c332ee039..03952a323 100644
+--- a/tedana/utils.py
++++ b/tedana/utils.py
+@@ -30,6 +30,62 @@
+ RepLGR = logging.getLogger("REPORT")
+ 
+ 
++def _resolve_backend(backend):
++    """Resolve a requested execution backend without importing CUDA on the CPU path.
++
++    This shared resolver lets individual workflow steps opt into accelerators
++    while keeping CUDA optional for CPU-only installations.
++
++    Parameters
++    ----------
++    backend : {"cpu", "cuda", "auto"}
++        Requested execution backend. ``"cpu"`` always selects the CPU.
++        ``"cuda"`` requires CuPy and at least one CUDA device. ``"auto"``
++        selects CUDA when available and otherwise falls back to the CPU.
++
++    Returns
++    -------
++    resolved_backend : {"cpu", "cuda"}
++        Available backend selected for the requested configuration.
++
++    Raises
++    ------
++    ValueError
++        If ``backend`` is not ``"cpu"``, ``"cuda"``, or ``"auto"``.
++    RuntimeError
++        If ``backend`` is ``"cuda"`` and CuPy cannot be imported or no CUDA
++        device is available.
++
++    Warns
++    -----
++    Logs a warning when ``backend`` is ``"auto"`` and CUDA is unavailable.
++    """
++    backend = backend.lower()
++    if backend not in {"cpu", "cuda", "auto"}:
++        raise ValueError("backend must be one of 'cpu', 'cuda', or 'auto'")
++    if backend == "cpu":
++        return "cpu"
++
++    try:
++        import cupy as cp
++
++        if cp.cuda.runtime.getDeviceCount() < 1:
++            raise RuntimeError("No CUDA devices were detected")
++        else:
++            LGR.info(f"Running with {cp.cuda.runtime.getDeviceCount()} GPUs")
++    except Exception as exc:
++        if backend == "cuda":
++            raise RuntimeError(
++                "The CUDA backend requires CuPy and an available CUDA device. "
++                "Install tedana with its GPU extra (tedana[gpu]) to install an appropriate "
++                "version of CuPy."
++            ) from exc
++        LGR.warning("CUDA backend unavailable (%s); falling back to CPU.", exc)
++        return "cpu"
++
++    return "cuda"
++
++
+ def make_adaptive_mask(data, n_independent_echos=None, threshold=1, methods=["dropout"]):
+     """Make map of `data` specifying longest echo a voxel can be sampled with.
+ 
+diff --git a/tedana/workflows/t2smap.py b/tedana/workflows/t2smap.py
+index 3affd8ac5..a61fbd5fc 100644
+--- a/tedana/workflows/t2smap.py
++++ b/tedana/workflows/t2smap.py
+@@ -219,6 +219,15 @@ def _get_parser():
+         ),
+         default=1,
+     )
++    performance_args.add_argument(
++        "--backend",
++        choices=["cpu", "cuda", "auto"],
++        help=(
++            "Compute backend. CUDA currently accelerates curve-fit T2*/S0 estimation only. "
++            "'auto' uses CUDA when available and otherwise uses CPU."
++        ),
++        default="cpu",
++    )
+     performance_args.add_argument(
+         "--debug",
+         dest="debug",
+@@ -269,6 +278,7 @@ def t2smap_workflow(
+     quiet=False,
+     overwrite=False,
+     n_threads=1,
++    backend="cpu",
+     t2smap_command=None,
+ ):
+     """
+@@ -332,6 +342,9 @@ def t2smap_workflow(
+         Number of threads to use. Used by threadpoolctl to set the parameter
+         outside of the workflow function, as well as the number of threads to use
+         for the decay model fitting. Default is 1.
++    backend : {'cpu', 'cuda', 'auto'}, optional
++        Compute backend. CUDA currently accelerates curve-fit T2*/S0 estimation
++        only. Default is 'cpu'.
+     t2smap_command : :obj:`str`, optional
+         The command used to run t2smap. Default is None.
+ 
+@@ -500,6 +513,7 @@ def t2smap_workflow(
+         io_generator=io_generator,
+         data_without_excluded_vols=data_without_excluded_vols,
+         n_threads=n_threads,
++        backend=backend,
+     )
+ 
+     LGR.info("Computing optimal combination")
+diff --git a/tedana/workflows/tedana.py b/tedana/workflows/tedana.py
+index 9030a0088..50da53d5e 100644
+--- a/tedana/workflows/tedana.py
++++ b/tedana/workflows/tedana.py
+@@ -401,6 +401,15 @@ def _get_parser():
+         ),
+         default=1,
+     )
++    performance_args.add_argument(
++        "--backend",
++        choices=["cpu", "cuda", "auto"],
++        help=(
++            "Compute backend. CUDA currently accelerates curve-fit T2*/S0 estimation only. "
++            "'auto' uses CUDA when available and otherwise uses CPU."
++        ),
++        default="cpu",
++    )
+     performance_args.add_argument(
+         "--debug",
+         dest="debug",
+@@ -465,6 +474,7 @@ def tedana_workflow(
+     t2smap=None,
+     mixing_file=None,
+     n_threads=1,
++    backend="cpu",
+     tedana_command=None,
+ ):
+     """Run the "canonical" TE-Dependent ANAlysis workflow.
+@@ -603,6 +613,9 @@ def tedana_workflow(
+         Number of threads to use. Used by threadpoolctl to set the parameter
+         outside of the workflow function, as well as the number of threads to use
+         for the decay model fitting. Default is 1.
++    backend : {'cpu', 'cuda', 'auto'}, optional
++        Compute backend. CUDA currently accelerates curve-fit T2*/S0 estimation
++        only. Default is 'cpu'.
+     tedana_command : :obj:`str`, optional
+         If the command-line interface was used, this is the command that was
+         run. Default is None.
+@@ -823,6 +836,7 @@ def tedana_workflow(
+             io_generator=io_generator,
+             data_without_excluded_vols=None,
+             n_threads=n_threads,
++            backend=backend,
+         )
+ 
+     # optimally combine data
+diff --git a/uv.lock b/uv.lock
+index b4c21cd61..f072b6a14 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -227,7 +227,7 @@ resolution-markers = [
+     "python_full_version < '3.11'",
+ ]
+ dependencies = [
+-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
++    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/66/54/eb9bfc647b19f2009dd5c7f5ec51c4e6ca831725f1aea7a993034f483147/contourpy-1.3.2.tar.gz", hash = "sha256:b6945942715a034c671b7fc54f9588126b0b8bf23db2696e3ca8328f3ff0ab54", size = 13466130, upload-time = "2025-04-15T17:47:53.79Z" }
+ wheels = [
+@@ -298,7 +298,7 @@ resolution-markers = [
+     "python_full_version == '3.11.*'",
+ ]
+ dependencies = [
+-    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" } },
++    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/58/01/1253e6698a07380cd31a736d248a3f2a50a7c88779a1813da27503cadc2a/contourpy-1.3.3.tar.gz", hash = "sha256:083e12155b210502d0bca491432bb04d56dc3432f95a979b429f2848c3dbe880", size = 13466174, upload-time = "2025-07-26T12:03:12.549Z" }
+ wheels = [
+@@ -479,6 +479,44 @@ toml = [
+     { name = "tomli", marker = "python_full_version <= '3.11'" },
+ ]
+ 
++[[package]]
++name = "cuda-pathfinder"
++version = "1.8.2"
++source = { registry = "https://pypi.org/simple" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/98/59/239c7259e669c46ddbcac0aa60e3a0ef00bfeaaa687f905b24dd6a7a10fe/cuda_pathfinder-1.8.2-py3-none-any.whl", hash = "sha256:4e65059febdb4d19d5cbc4798677e19db2b582f2f702f457b609e571690d357e", size = 62551, upload-time = "2026-09-17T22:19:09.396Z" },
++]
++
++[[package]]
++name = "cupy-cuda12x"
++version = "14.2.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "cuda-pathfinder" },
++    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
++    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
++]
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/41/07/7a7d5066d8e3463c771da4e0538b10fc98827c312056e7c2bca3b10d4f9f/cupy_cuda12x-14.2.0-cp310-cp310-manylinux2014_aarch64.whl", hash = "sha256:f22a4408f47b6baa791de395efec8dce8fe1d03f92b50867af6d7d25e6fb0272", size = 146929480, upload-time = "2026-08-20T02:39:33.341Z" },
++    { url = "https://files.pythonhosted.org/packages/9e/3a/2935f23741f80a0ea4dc381c58d2178d8b5c4b5a1047c9ecdfff493cefa5/cupy_cuda12x-14.2.0-cp310-cp310-manylinux2014_x86_64.whl", hash = "sha256:0d3205b1ac1093b6019530ba3b7f7080e2283820f452f0c543a3560d58e0b9bf", size = 135287243, upload-time = "2026-08-20T02:39:38.206Z" },
++    { url = "https://files.pythonhosted.org/packages/a9/87/069030499747ffad2fc7104788533917e320072470e5b49610c043753cc9/cupy_cuda12x-14.2.0-cp310-cp310-win_amd64.whl", hash = "sha256:2d0c77202f5ac5920a420888b28200a11d03d24352b7585d3cb1a84f67fbc96c", size = 98879478, upload-time = "2026-08-20T02:39:42.49Z" },
++    { url = "https://files.pythonhosted.org/packages/00/98/ac56fb7a285e264a0f29ea71d64b5c2eacd23c1f4ed9b4a8f99b16db3881/cupy_cuda12x-14.2.0-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:1c775069f0af34662a8d4ae90848e29afcaf4ba63762d556ff22b6011683e571", size = 148189237, upload-time = "2026-08-20T02:39:47.011Z" },
++    { url = "https://files.pythonhosted.org/packages/d3/49/a83b7664151a7bdfb5d7ca7f29cef4eb5574a4cb8e1f9dfbae7fea372e4f/cupy_cuda12x-14.2.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:5fe2366cc5c61a7ee4a527ce1e8951cb89092d0fb0b5830623cf114d1942c585", size = 136632369, upload-time = "2026-08-20T02:39:51.562Z" },
++    { url = "https://files.pythonhosted.org/packages/a0/d0/a3f4c7b7c4d642c7c8cf8ae6128ccd70cb05592f35b89d76281456e3de00/cupy_cuda12x-14.2.0-cp311-cp311-win_amd64.whl", hash = "sha256:eceffbf02a5833c8ba1c94615da07c374284db76a60f8c8b217b0d9d2667162a", size = 98876640, upload-time = "2026-08-20T02:39:55.735Z" },
++    { url = "https://files.pythonhosted.org/packages/d3/8c/5fe3f6719c2d4560c79c62ef6d9b7d6c34d145879ddc0c1a41f8153ad0a6/cupy_cuda12x-14.2.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:b74340aa7271f0f081f77e2e5107bac75af19b86df29213db7ada90e14428efe", size = 147490427, upload-time = "2026-08-20T02:40:00.196Z" },
++    { url = "https://files.pythonhosted.org/packages/7c/5b/65124de2dbaf2e85109f611a41947e39acd6dd938751c04b4c4d7bf6fc82/cupy_cuda12x-14.2.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:f82141761f2c81905d49387464ae29438887956d99063381c93a1d5d1b7d32e8", size = 136111459, upload-time = "2026-08-20T02:40:04.909Z" },
++    { url = "https://files.pythonhosted.org/packages/e9/18/ddea819204701024bef7fa748730702245d803847c841b737723b94fd091/cupy_cuda12x-14.2.0-cp312-cp312-win_amd64.whl", hash = "sha256:c9571d3b5f2e65758137e210f7fb3c3b34767f0af6b6ca04035a244b6141ee12", size = 98780018, upload-time = "2026-08-20T02:40:09.465Z" },
++    { url = "https://files.pythonhosted.org/packages/7a/4f/dce7be227a845943d14baef3b58be49c74a465e5d9251f38840b5b1fd89a/cupy_cuda12x-14.2.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:cfe673f73599ee0b9c2c9de5c0bb2395d98c9238c24deafa2ddcc69cacbd6af6", size = 147070561, upload-time = "2026-08-20T02:40:14.556Z" },
++    { url = "https://files.pythonhosted.org/packages/c9/02/520f7b9f92114b4df7d88aa77c36db0d556caf76a362537687e3a2e42833/cupy_cuda12x-14.2.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:efc1da23505e88d9834a3ddd3c00352c34e58e301f512d9dd593cc4bfbbdf7dc", size = 135714387, upload-time = "2026-08-20T02:40:19.077Z" },
++    { url = "https://files.pythonhosted.org/packages/29/94/2dfb330afc6756ab9a8d16e955c0458e82e769930eab01e6c491e411363d/cupy_cuda12x-14.2.0-cp313-cp313-win_amd64.whl", hash = "sha256:dcea9f2b1887ac631a9275a61577e09d1eea26bf5f95491501c3b7528cebc592", size = 98760068, upload-time = "2026-08-20T02:40:23.43Z" },
++    { url = "https://files.pythonhosted.org/packages/7e/d3/f6639af54f5872d1ef0c523601c7fe76d28783e71a3e8533e096c9ca1d43/cupy_cuda12x-14.2.0-cp314-cp314-manylinux2014_aarch64.whl", hash = "sha256:ed317136439af4780f217eda0b82f25180084eb16c44854e1bc9e055f96fd429", size = 146942115, upload-time = "2026-08-20T02:40:28.484Z" },
++    { url = "https://files.pythonhosted.org/packages/04/5e/e6134253265fefc0a35356adcebc4e3ffa81f6c9a2a74f8f9e2de32b3018/cupy_cuda12x-14.2.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:db802e4b9a85ed84fd3e84790586c06e808ee45e0214cd4e80734c09fcf93073", size = 135091580, upload-time = "2026-08-20T02:40:33.351Z" },
++    { url = "https://files.pythonhosted.org/packages/0a/98/4d3215440b7a0d8661295050653760b57f32c933f1ef1c81841b7329209e/cupy_cuda12x-14.2.0-cp314-cp314-win_amd64.whl", hash = "sha256:5f08fc1d651d2446c1d18ad94f1a710224fab36d46634d4aa356423926964591", size = 99344061, upload-time = "2026-08-20T02:40:37.459Z" },
++    { url = "https://files.pythonhosted.org/packages/3a/e9/8ed4adeb8c64f188b9ea6fba3be62fb7999584308bdf7ec6c5e17f77b99c/cupy_cuda12x-14.2.0-cp314-cp314t-manylinux2014_aarch64.whl", hash = "sha256:9dd33f9cfc7aefbd935879bf50e95db539721a0702bdb05be3c74bd46a85ba29", size = 147438535, upload-time = "2026-08-20T02:40:42.11Z" },
++    { url = "https://files.pythonhosted.org/packages/5a/c9/73227968a5b01ac31eaf1d5c58b4318e4b83654ed6dac3c310c7b2075c36/cupy_cuda12x-14.2.0-cp314-cp314t-manylinux2014_x86_64.whl", hash = "sha256:8cbbd48c9cfd6b78d0a833ebbafda3e1b057c38d6acc3c6e54de0735a7364e27", size = 135455541, upload-time = "2026-08-20T02:40:46.804Z" },
++    { url = "https://files.pythonhosted.org/packages/2e/3d/26127dd01e08ed645a70b4084ef6dde93e6a75b0a84fddc3ac6b11b05bf7/cupy_cuda12x-14.2.0-cp314-cp314t-win_amd64.whl", hash = "sha256:d14b651ed835079f8a5e273936e02eda690be7d30f2658e5f48f328322fd9d7b", size = 100242434, upload-time = "2026-08-20T02:40:51.04Z" },
++]
++
+ [[package]]
+ name = "cycler"
+ version = "0.12.1"
+@@ -527,7 +565,7 @@ name = "exceptiongroup"
+ version = "1.3.1"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+-    { name = "typing-extensions" },
++    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
+ wheels = [
+@@ -1814,10 +1852,10 @@ resolution-markers = [
+     "python_full_version < '3.11'",
+ ]
+ dependencies = [
+-    { name = "joblib" },
+-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
+-    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" } },
+-    { name = "threadpoolctl" },
++    { name = "joblib", marker = "python_full_version < '3.11'" },
++    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
++    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
++    { name = "threadpoolctl", marker = "python_full_version < '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/98/c2/a7855e41c9d285dfe86dc50b250978105dce513d6e459ea66a6aeb0e1e0c/scikit_learn-1.7.2.tar.gz", hash = "sha256:20e9e49ecd130598f1ca38a1d85090e1a600147b9c02fa6f15d69cb53d968fda", size = 7193136, upload-time = "2025-09-09T08:21:29.075Z" }
+ wheels = [
+@@ -1862,10 +1900,10 @@ resolution-markers = [
+     "python_full_version == '3.11.*'",
+ ]
+ dependencies = [
+-    { name = "joblib" },
+-    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" } },
+-    { name = "scipy", version = "1.17.0", source = { registry = "https://pypi.org/simple" } },
+-    { name = "threadpoolctl" },
++    { name = "joblib", marker = "python_full_version >= '3.11'" },
++    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
++    { name = "scipy", version = "1.17.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
++    { name = "threadpoolctl", marker = "python_full_version >= '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/0e/d4/40988bf3b8e34feec1d0e6a051446b1f66225f8529b9309becaeef62b6c4/scikit_learn-1.8.0.tar.gz", hash = "sha256:9bccbb3b40e3de10351f8f5068e105d0f4083b1a65fa07b6634fbc401a6287fd", size = 7335585, upload-time = "2025-12-10T07:08:53.618Z" }
+ wheels = [
+@@ -1915,7 +1953,7 @@ resolution-markers = [
+     "python_full_version < '3.11'",
+ ]
+ dependencies = [
+-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" } },
++    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/0f/37/6964b830433e654ec7485e45a00fc9a27cf868d622838f6b6d9c5ec0d532/scipy-1.15.3.tar.gz", hash = "sha256:eae3cf522bc7df64b42cad3925c876e1b0b6c35c1337c93e12c0f366f55b0eaf", size = 59419214, upload-time = "2025-05-08T16:13:05.955Z" }
+ wheels = [
+@@ -1975,7 +2013,7 @@ resolution-markers = [
+     "python_full_version == '3.11.*'",
+ ]
+ dependencies = [
+-    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" } },
++    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/56/3e/9cca699f3486ce6bc12ff46dc2031f1ec8eb9ccc9a320fdaf925f1417426/scipy-1.17.0.tar.gz", hash = "sha256:2591060c8e648d8b96439e111ac41fd8342fdeff1876be2e19dea3fe8930454e", size = 30396830, upload-time = "2026-01-10T21:34:23.009Z" }
+ wheels = [
+@@ -2091,23 +2129,23 @@ resolution-markers = [
+     "python_full_version < '3.11'",
+ ]
+ dependencies = [
+-    { name = "alabaster" },
+-    { name = "babel" },
+-    { name = "colorama", marker = "sys_platform == 'win32'" },
+-    { name = "docutils", version = "0.21.2", source = { registry = "https://pypi.org/simple" } },
+-    { name = "imagesize" },
+-    { name = "jinja2" },
+-    { name = "packaging" },
+-    { name = "pygments" },
+-    { name = "requests" },
+-    { name = "snowballstemmer" },
+-    { name = "sphinxcontrib-applehelp" },
+-    { name = "sphinxcontrib-devhelp" },
+-    { name = "sphinxcontrib-htmlhelp" },
+-    { name = "sphinxcontrib-jsmath" },
+-    { name = "sphinxcontrib-qthelp" },
+-    { name = "sphinxcontrib-serializinghtml" },
+-    { name = "tomli" },
++    { name = "alabaster", marker = "python_full_version < '3.11'" },
++    { name = "babel", marker = "python_full_version < '3.11'" },
++    { name = "colorama", marker = "python_full_version < '3.11' and sys_platform == 'win32'" },
++    { name = "docutils", version = "0.21.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
++    { name = "imagesize", marker = "python_full_version < '3.11'" },
++    { name = "jinja2", marker = "python_full_version < '3.11'" },
++    { name = "packaging", marker = "python_full_version < '3.11'" },
++    { name = "pygments", marker = "python_full_version < '3.11'" },
++    { name = "requests", marker = "python_full_version < '3.11'" },
++    { name = "snowballstemmer", marker = "python_full_version < '3.11'" },
++    { name = "sphinxcontrib-applehelp", marker = "python_full_version < '3.11'" },
++    { name = "sphinxcontrib-devhelp", marker = "python_full_version < '3.11'" },
++    { name = "sphinxcontrib-htmlhelp", marker = "python_full_version < '3.11'" },
++    { name = "sphinxcontrib-jsmath", marker = "python_full_version < '3.11'" },
++    { name = "sphinxcontrib-qthelp", marker = "python_full_version < '3.11'" },
++    { name = "sphinxcontrib-serializinghtml", marker = "python_full_version < '3.11'" },
++    { name = "tomli", marker = "python_full_version < '3.11'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/6f/6d/be0b61178fe2cdcb67e2a92fc9ebb488e3c51c4f74a36a7824c0adf23425/sphinx-8.1.3.tar.gz", hash = "sha256:43c1911eecb0d3e161ad78611bc905d1ad0e523e4ddc202a58a821773dc4c927", size = 8184611, upload-time = "2024-10-13T20:27:13.93Z" }
+ wheels = [
+@@ -2122,23 +2160,23 @@ resolution-markers = [
+     "python_full_version == '3.11.*'",
+ ]
+ dependencies = [
+-    { name = "alabaster" },
+-    { name = "babel" },
+-    { name = "colorama", marker = "sys_platform == 'win32'" },
+-    { name = "docutils", version = "0.22.4", source = { registry = "https://pypi.org/simple" } },
+-    { name = "imagesize" },
+-    { name = "jinja2" },
+-    { name = "packaging" },
+-    { name = "pygments" },
+-    { name = "requests" },
+-    { name = "roman-numerals" },
+-    { name = "snowballstemmer" },
+-    { name = "sphinxcontrib-applehelp" },
+-    { name = "sphinxcontrib-devhelp" },
+-    { name = "sphinxcontrib-htmlhelp" },
+-    { name = "sphinxcontrib-jsmath" },
+-    { name = "sphinxcontrib-qthelp" },
+-    { name = "sphinxcontrib-serializinghtml" },
++    { name = "alabaster", marker = "python_full_version == '3.11.*'" },
++    { name = "babel", marker = "python_full_version == '3.11.*'" },
++    { name = "colorama", marker = "python_full_version == '3.11.*' and sys_platform == 'win32'" },
++    { name = "docutils", version = "0.22.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
++    { name = "imagesize", marker = "python_full_version == '3.11.*'" },
++    { name = "jinja2", marker = "python_full_version == '3.11.*'" },
++    { name = "packaging", marker = "python_full_version == '3.11.*'" },
++    { name = "pygments", marker = "python_full_version == '3.11.*'" },
++    { name = "requests", marker = "python_full_version == '3.11.*'" },
++    { name = "roman-numerals", marker = "python_full_version == '3.11.*'" },
++    { name = "snowballstemmer", marker = "python_full_version == '3.11.*'" },
++    { name = "sphinxcontrib-applehelp", marker = "python_full_version == '3.11.*'" },
++    { name = "sphinxcontrib-devhelp", marker = "python_full_version == '3.11.*'" },
++    { name = "sphinxcontrib-htmlhelp", marker = "python_full_version == '3.11.*'" },
++    { name = "sphinxcontrib-jsmath", marker = "python_full_version == '3.11.*'" },
++    { name = "sphinxcontrib-qthelp", marker = "python_full_version == '3.11.*'" },
++    { name = "sphinxcontrib-serializinghtml", marker = "python_full_version == '3.11.*'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/42/50/a8c6ccc36d5eacdfd7913ddccd15a9cee03ecafc5ee2bc40e1f168d85022/sphinx-9.0.4.tar.gz", hash = "sha256:594ef59d042972abbc581d8baa577404abe4e6c3b04ef61bd7fc2acbd51f3fa3", size = 8710502, upload-time = "2025-12-04T07:45:27.343Z" }
+ wheels = [
+@@ -2153,23 +2191,23 @@ resolution-markers = [
+     "python_full_version >= '3.12'",
+ ]
+ dependencies = [
+-    { name = "alabaster" },
+-    { name = "babel" },
+-    { name = "colorama", marker = "sys_platform == 'win32'" },
+-    { name = "docutils", version = "0.22.4", source = { registry = "https://pypi.org/simple" } },
+-    { name = "imagesize" },
+-    { name = "jinja2" },
+-    { name = "packaging" },
+-    { name = "pygments" },
+-    { name = "requests" },
+-    { name = "roman-numerals" },
+-    { name = "snowballstemmer" },
+-    { name = "sphinxcontrib-applehelp" },
+-    { name = "sphinxcontrib-devhelp" },
+-    { name = "sphinxcontrib-htmlhelp" },
+-    { name = "sphinxcontrib-jsmath" },
+-    { name = "sphinxcontrib-qthelp" },
+-    { name = "sphinxcontrib-serializinghtml" },
++    { name = "alabaster", marker = "python_full_version >= '3.12'" },
++    { name = "babel", marker = "python_full_version >= '3.12'" },
++    { name = "colorama", marker = "python_full_version >= '3.12' and sys_platform == 'win32'" },
++    { name = "docutils", version = "0.22.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
++    { name = "imagesize", marker = "python_full_version >= '3.12'" },
++    { name = "jinja2", marker = "python_full_version >= '3.12'" },
++    { name = "packaging", marker = "python_full_version >= '3.12'" },
++    { name = "pygments", marker = "python_full_version >= '3.12'" },
++    { name = "requests", marker = "python_full_version >= '3.12'" },
++    { name = "roman-numerals", marker = "python_full_version >= '3.12'" },
++    { name = "snowballstemmer", marker = "python_full_version >= '3.12'" },
++    { name = "sphinxcontrib-applehelp", marker = "python_full_version >= '3.12'" },
++    { name = "sphinxcontrib-devhelp", marker = "python_full_version >= '3.12'" },
++    { name = "sphinxcontrib-htmlhelp", marker = "python_full_version >= '3.12'" },
++    { name = "sphinxcontrib-jsmath", marker = "python_full_version >= '3.12'" },
++    { name = "sphinxcontrib-qthelp", marker = "python_full_version >= '3.12'" },
++    { name = "sphinxcontrib-serializinghtml", marker = "python_full_version >= '3.12'" },
+ ]
+ sdist = { url = "https://files.pythonhosted.org/packages/cd/bd/f08eb0f4eed5c83f1ba2a3bd18f7745a2b1525fad70660a1c00224ec468a/sphinx-9.1.0.tar.gz", hash = "sha256:7741722357dd75f8190766926071fed3bdc211c74dd2d7d4df5404da95930ddb", size = 8718324, upload-time = "2025-12-31T15:09:27.646Z" }
+ wheels = [
+@@ -2370,6 +2408,9 @@ doc = [
+     { name = "sphinx-rtd-theme" },
+     { name = "sphinxcontrib-bibtex" },
+ ]
++gpu = [
++    { name = "cupy-cuda12x" },
++]
+ tests = [
+     { name = "coverage", extra = ["toml"] },
+     { name = "flake8" },
+@@ -2391,6 +2432,7 @@ requires-dist = [
+     { name = "bokeh", specifier = ">=3.0.0" },
+     { name = "coverage", extras = ["toml"], marker = "extra == 'all'", specifier = ">=5.2.1" },
+     { name = "coverage", extras = ["toml"], marker = "extra == 'tests'", specifier = ">=5.2.1" },
++    { name = "cupy-cuda12x", marker = "extra == 'gpu'", specifier = ">=14.2,<15" },
+     { name = "flake8", marker = "extra == 'all'", specifier = ">=3.7" },
+     { name = "flake8", marker = "extra == 'tests'", specifier = ">=3.7" },
+     { name = "flake8-absolute-import", marker = "extra == 'all'", specifier = ">=1.0" },
+@@ -2443,7 +2485,7 @@ requires-dist = [
+     { name = "threadpoolctl", specifier = ">=3.2" },
+     { name = "tqdm", specifier = ">=4.65" },
+ ]
+-provides-extras = ["all", "dev", "doc", "tests"]
++provides-extras = ["all", "dev", "doc", "gpu", "tests"]
+ 
+ [[package]]
+ name = "threadpoolctl"

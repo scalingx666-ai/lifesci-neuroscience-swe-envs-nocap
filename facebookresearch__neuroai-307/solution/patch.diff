@@ -1,0 +1,288 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 01d3d81d4..da4fa8260 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,7 +4,8 @@ All notable changes to this project will be documented in this file.
+ 
+ ## [Unreleased]
+ 
+-- `neuralbench`: `--space` selects a task's data-representation variant (`tasks/<device>/<task>/spaces/<name>.yaml`, merged over the base config; `all` runs every space). fMRI `image` ships MNI and fsaverage spaces; models on such tasks declare `compatible_spaces` and may set `default_space`, and datasets declare `available_spaces`.
++- `neuraltrain`: `DistributedClipLoss` accepts different batch sizes across ranks, so grouped batches train under DDP without `drop_last`, and the rank-based retrieval metrics sync when ranks scored different numbers of queries (#307).
++- `neuralbench`: `--space` selects a task's data-representation variant (`tasks/<device>/<task>/spaces/<name>.yaml`, merged over the base config; `all` runs every space). fMRI `image` ships MNI and fsaverage spaces; models on such tasks declare `compatible_spaces` and may set `default_space`, and datasets declare `available_spaces` (#306).
+ - `neuralbench`: `--max-neuro-hours-per-epoch HOURS` trains each epoch on a fresh random draw of `HOURS` of training windows, cached separately from uncapped runs; `OnTheFlyPreprocessor.min_temporal_samples` zero-pads short windows for fixed-patch models such as REVE, whose channel mapping now also matches Neuromag/KIT names whatever the separator and CTF names without their serial suffix (#304).
+ - `neuralbench`: new LP-FT adaptation presets (`lpft_mean`, `lpft_flatten`, `lpft_attentive`) that train the head on a frozen backbone and unfreeze it at `DownstreamWrapper.unfreeze_at_epoch`, plus `finetune_attentive` and `lora_r4_attentive`; attentive-pooling runs are tagged `<strategy>_attentive`, and the bar-chart legend names each foundation model's strategy (#305).
+ - `neuralbench`: `-m eegnex` runs braindecode's EEGNeX (#303).
+diff --git a/neuraltrain-repo/neuraltrain/losses/losses.py b/neuraltrain-repo/neuraltrain/losses/losses.py
+index 28d73e3bb..9c99e6937 100644
+--- a/neuraltrain-repo/neuraltrain/losses/losses.py
++++ b/neuraltrain-repo/neuraltrain/losses/losses.py
+@@ -131,33 +131,32 @@ def forward(self, estimate: torch.Tensor, candidate: torch.Tensor) -> torch.Tens
+ 
+ 
+ class _GatherWithGrad(torch.autograd.Function):
+-    """All-gather tensors using the collective's autograd adjoint."""
++    """All-gather tensors of per-rank length ``sizes`` along dim 0, with autograd."""
+ 
+     @staticmethod
+-    def forward(ctx, tensor):  # type: ignore[override]
+-        if not dist.is_available() or not dist.is_initialized():
+-            return (tensor,)
+-        world_size = dist.get_world_size()
+-        if world_size == 1:
+-            return (tensor,)
+-        gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+-        dist.all_gather(gathered, tensor)
+-        return tuple(gathered)
++    def forward(ctx, tensor, sizes):  # type: ignore[override]
++        ctx.sizes = sizes
++        # all_gather needs one shape on every rank
++        padded = tensor.new_zeros((max(sizes), *tensor.shape[1:]))
++        padded[: tensor.shape[0]] = tensor
++        gathered = [torch.empty_like(padded) for _ in sizes]
++        dist.all_gather(gathered, padded)
++        return tuple(chunk[:size] for chunk, size in zip(gathered, sizes))
+ 
+     @staticmethod
+     def backward(ctx, *gradients):  # type: ignore[override]
+-        if not dist.is_available() or not dist.is_initialized():
+-            return gradients[0]
+-        world_size = dist.get_world_size()
+-        if world_size == 1:
+-            return gradients[0]
+-
++        sizes = ctx.sizes
+         # Every rank evaluates the same global objective. Summing the gradient
+         # for each source slice here offsets DDP's later parameter-gradient
+         # averaging and reproduces a single-process global-batch update.
+-        all_gradients = torch.stack(gradients)
+-        dist.all_reduce(all_gradients, op=dist.ReduceOp.SUM)
+-        return all_gradients[dist.get_rank()]
++        stacked = gradients[0].new_zeros(
++            (len(sizes), max(sizes), *gradients[0].shape[1:])
++        )
++        for row, (gradient, size) in enumerate(zip(gradients, sizes)):
++            stacked[row, :size] = gradient
++        dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
++        rank = dist.get_rank()
++        return stacked[rank, : sizes[rank]], None
+ 
+ 
+ class DistributedClipLoss(ClipLoss):
+@@ -167,8 +166,8 @@ class DistributedClipLoss(ClipLoss):
+     autograd support before :class:`ClipLoss` computes the objective. Evaluation
+     and non-distributed execution use :class:`ClipLoss` directly.
+ 
+-    Multi-rank training requires equal local batch sizes on every rank and the
+-    same number of estimates and candidates per rank.
++    Ranks may hold different batch sizes, but each must hold as many
++    candidates as estimates.
+     """
+ 
+     @staticmethod
+@@ -177,38 +176,32 @@ def _world_size() -> int:
+             return 1
+         return dist.get_world_size()
+ 
+-    def _validate_equal_batches(
+-        self, estimate: torch.Tensor, candidate: torch.Tensor
+-    ) -> None:
+-        world_size = self._world_size()
+-        if world_size == 1:
+-            return
++    def _rank_sizes(self, estimate: torch.Tensor, candidate: torch.Tensor) -> list[int]:
++        """Return every rank's batch size, raising on all ranks if one is misaligned."""
+         sizes = torch.tensor(
+             [estimate.shape[0], candidate.shape[0]],
+             dtype=torch.int64,
+             device=estimate.device,
+         )
+-        gathered_sizes = [torch.empty_like(sizes) for _ in range(world_size)]
++        gathered_sizes = [torch.empty_like(sizes) for _ in range(self._world_size())]
+         dist.all_gather(gathered_sizes, sizes)
+         rank_sizes = [tuple(values.tolist()) for values in gathered_sizes]
+-        if len(set(rank_sizes)) != 1 or any(
+-            n_estimate != n_candidate for n_estimate, n_candidate in rank_sizes
+-        ):
++        if any(n_estimate != n_candidate for n_estimate, n_candidate in rank_sizes):
++            got = ", ".join(
++                f"rank {rank}: {n_estimate} estimates / {n_candidate} candidates"
++                for rank, (n_estimate, n_candidate) in enumerate(rank_sizes)
++            )
+             raise ValueError(
+-                "DistributedClipLoss requires equal aligned estimate/candidate "
+-                f"batch sizes on every rank, got {rank_sizes}; use drop_last=True"
++                "DistributedClipLoss needs as many candidates as estimates on every "
++                f"rank, got {got}"
+             )
+-
+-    @staticmethod
+-    def _gather(tensor: torch.Tensor) -> torch.Tensor:
+-        gathered = _GatherWithGrad.apply(tensor.contiguous())
+-        return torch.cat(gathered, dim=0)
++        return [n_estimate for n_estimate, _ in rank_sizes]
+ 
+     def forward(self, estimate: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+         if self.training and self._world_size() > 1:
+-            self._validate_equal_batches(estimate, candidate)
+-            estimate = self._gather(estimate)
+-            candidate = self._gather(candidate)
++            sizes = self._rank_sizes(estimate, candidate)
++            estimate = torch.cat(_GatherWithGrad.apply(estimate.contiguous(), sizes))
++            candidate = torch.cat(_GatherWithGrad.apply(candidate.contiguous(), sizes))
+         return super().forward(estimate, candidate)
+ 
+ 
+diff --git a/neuraltrain-repo/neuraltrain/losses/test_losses.py b/neuraltrain-repo/neuraltrain/losses/test_losses.py
+index 0b832095d..d14f7aba8 100644
+--- a/neuraltrain-repo/neuraltrain/losses/test_losses.py
++++ b/neuraltrain-repo/neuraltrain/losses/test_losses.py
+@@ -177,9 +177,10 @@ def _global_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+ 
+ def _distributed_clip_worker(
+     rank: int,
+-    world_size: int,
++    rank_sizes: tuple[int, ...],
+     rendezvous: str,
+ ) -> None:
++    world_size = len(rank_sizes)
+     dist.init_process_group(
+         "gloo",
+         init_method=f"file://{rendezvous}",
+@@ -188,8 +189,8 @@ def _distributed_clip_worker(
+     )
+     try:
+         inputs, candidates, weight = _global_inputs()
+-        batch_size = inputs.shape[0] // world_size
+-        rank_slice = slice(rank * batch_size, (rank + 1) * batch_size)
++        start = sum(rank_sizes[:rank])
++        rank_slice = slice(start, start + rank_sizes[rank])
+         local_inputs = inputs[rank_slice].clone().requires_grad_(True)
+         local_candidates = candidates[rank_slice].clone().requires_grad_(True)
+ 
+@@ -199,15 +200,12 @@ def _distributed_clip_worker(
+         actual = ddp_module(local_inputs, local_candidates)
+         actual.backward()
+ 
+-        uneven_values = torch.randn(2 + rank, 4)
+-        uneven_loss = losses.DistributedClipLoss(
++        misaligned = losses.DistributedClipLoss(
+             norm_kind="y", temperature=False, symmetric=False
+         )
+-        uneven_loss.eval()
+-        assert uneven_loss(uneven_values, uneven_values).ndim == 0
+-        uneven_loss.train()
+-        with pytest.raises(ValueError, match="drop_last=True"):
+-            uneven_loss(uneven_values, uneven_values)
++        extra_candidate = int(rank == 0)
++        with pytest.raises(ValueError, match="as many candidates as estimates"):
++            misaligned(torch.randn(2, 4), torch.randn(2 + extra_candidate, 4))
+ 
+         reference_inputs = inputs.clone().requires_grad_(True)
+         reference_candidates = candidates.clone().requires_grad_(True)
+@@ -238,7 +236,8 @@ def _distributed_clip_worker(
+         dist.destroy_process_group()
+ 
+ 
+-def test_distributed_clip_loss(tmp_path) -> None:
++@pytest.mark.parametrize("rank_sizes", [(3, 3), (2, 4)])
++def test_distributed_clip_loss(tmp_path, rank_sizes: tuple[int, ...]) -> None:
+     config = {
+         "name": "DistributedClipLoss",
+         "norm_kind": "xy",
+@@ -269,10 +268,10 @@ def test_distributed_clip_loss(tmp_path) -> None:
+     for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+ 
+-    world_size = 2
++    assert sum(rank_sizes) == _global_inputs()[0].shape[0]
+     mp.spawn(
+         _distributed_clip_worker,
+-        args=(world_size, str(tmp_path / "rendezvous")),
+-        nprocs=world_size,
++        args=(rank_sizes, str(tmp_path / "rendezvous")),
++        nprocs=len(rank_sizes),
+         join=True,
+     )
+diff --git a/neuraltrain-repo/neuraltrain/metrics/metrics.py b/neuraltrain-repo/neuraltrain/metrics/metrics.py
+index 420e49465..3c29b00da 100644
+--- a/neuraltrain-repo/neuraltrain/metrics/metrics.py
++++ b/neuraltrain-repo/neuraltrain/metrics/metrics.py
+@@ -229,9 +229,10 @@ def __init__(
+         self.relative = relative
+         self.add_state(
+             "ranks",
+-            default=torch.Tensor([]),
++            default=[],
+             dist_reduce_fx="cat",
+         )
++        self.ranks: list[torch.Tensor]  # For mypy
+         self.rank_count: torch.Tensor  # For mypy
+ 
+     @classmethod
+@@ -331,7 +332,7 @@ def update(
+             number of examples. Should have length of N and M, respectively
+         """
+         ranks = self._compute_ranks(x, y, x_labels, y_labels)
+-        self.ranks = torch.cat([self.ranks, ranks])  # type: ignore
++        self.ranks.append(ranks)
+ 
+     def compute(self) -> torch.Tensor:
+         agg_func: tp.Callable
+@@ -345,7 +346,7 @@ def compute(self) -> torch.Tensor:
+             raise ValueError(
+                 f'Unknown aggregation {self.reduction} for computing metric. Available aggregations are: "mean", "median" or "std".'
+             )
+-        return agg_func(self.ranks)
++        return agg_func(dim_zero_cat(self.ranks))
+ 
+     def _compute_macro_average(
+         self, ranks: torch.Tensor, labels: list[str]
+@@ -416,7 +417,7 @@ def _compute_macro_average(
+         }  # type: ignore
+ 
+     def compute(self) -> torch.Tensor:
+-        ranks = self.ranks
++        ranks = dim_zero_cat(self.ranks)
+         return (ranks < self.topk).float().mean()
+ 
+ 
+@@ -452,7 +453,7 @@ def _compute_ranks(self, scores: torch.Tensor) -> torch.Tensor:  # type: ignore[
+     def update(self, scores: torch.Tensor) -> None:  # type: ignore[override]
+         """Update internal list of ranks."""
+         ranks = self._compute_ranks(scores)
+-        self.ranks = torch.cat([self.ranks, ranks])  # type: ignore
++        self.ranks.append(ranks)
+ 
+ 
+ class InverseNormalizedRank(Rank):
+@@ -499,10 +500,10 @@ def __init__(
+         )
+         self.add_state(
+             "retrieval_sizes",
+-            default=torch.Tensor([]),
++            default=[],
+             dist_reduce_fx="cat",
+         )
+-        self.retrieval_sizes: torch.Tensor  # For mypy
++        self.retrieval_sizes: list[torch.Tensor]  # For mypy
+ 
+     @torch.inference_mode()
+     def update(
+@@ -514,13 +515,13 @@ def update(
+     ) -> None:
+         """Record per-query ranks and retrieval-set sizes for a batch."""
+         ranks = self._compute_ranks(x, y, x_labels, y_labels)
+-        self.ranks = torch.cat([self.ranks, ranks])  # type: ignore
++        self.ranks.append(ranks)
+         sizes = torch.full_like(ranks, float(y.shape[0]))
+-        self.retrieval_sizes = torch.cat([self.retrieval_sizes, sizes])
++        self.retrieval_sizes.append(sizes)
+ 
+     def compute(self) -> torch.Tensor:
+-        sizes = self.retrieval_sizes
+-        ranks = self.ranks
++        sizes = dim_zero_cat(self.retrieval_sizes)
++        ranks = dim_zero_cat(self.ranks)
+         valid = sizes > 1  # per-query AUROC undefined for a single candidate
+         auc_per_query = 1.0 - ranks[valid] / (sizes[valid] - 1)
+         return self.reduce_fn(auc_per_query)

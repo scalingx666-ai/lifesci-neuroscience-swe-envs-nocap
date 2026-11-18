@@ -1,0 +1,241 @@
+diff --git a/interface/run_e2e.py b/interface/run_e2e.py
+index 0df1f4bb9..c9808ee60 100644
+--- a/interface/run_e2e.py
++++ b/interface/run_e2e.py
+@@ -2215,6 +2215,53 @@ def _journey_return_entry(eval_dir: str, k: dict, idx: int, wf: dict,
+     }
+ 
+ 
++def _overlay_claim(ir: Any) -> dict | None:
++    """What an INTEGRATED overlay says it optimized, or None when the overlay is
++    not integrated (rejected / A/B never completed) and so claims nothing.
++
++    ``integrate_result.json`` is the only place that records both spellings of a
++    kernel: ``cand_tag`` is the overlay directory's name and ``short_name`` is the
++    symbol the workflow return uses. A claim carries the symbol plus the
++    integrated e2e delta, and is consumed at most once (``used``) so one overlay
++    can never account for two distinct acceptances.
++    """
++    if not isinstance(ir, dict):
++        return None
++    if str(ir.get("gate") or "").lower() not in ("accepted", "stack"):
++        return None
++    gain = ir.get("e2e_delta_pct")
++    return {
++        "sym": _norm_kname(str(ir.get("short_name") or "")),
++        "gain": float(gain) if isinstance(gain, (int, float))
++                and not isinstance(gain, bool) else None,
++        "used": False,
++    }
++
++
++def _claim_for(name: str, gain: Any, claims: list[dict]) -> dict | None:
++    """The overlay claim that already covers this return-named acceptance, or None
++    when the return names a kernel no overlay on disk accounted for.
++
++    Matched on the symbol first — the same normalization the profiler match uses,
++    so a spelling difference does not split one kernel in two. Falling back to the
++    integrated e2e delta covers the runs where the overlay recorded no usable
++    symbol: the return does not recompute that number, it copies the overlay's own
++    A/B result, so an EXACT hit is the same measurement rather than a coincidence.
++    The delta is only allowed to fold when exactly one unconsumed overlay claims
++    it; an ambiguous delta never merges two kernels.
++    """
++    nk = _norm_kname(name)
++    if nk:
++        for c in claims:
++            if c["sym"] and c["sym"] == nk:
++                return c
++    if isinstance(gain, (int, float)) and not isinstance(gain, bool):
++        hits = [c for c in claims if not c["used"] and c["gain"] == float(gain)]
++        if len(hits) == 1:
++            return hits[0]
++    return None
++
++
+ def build_kernel_journey(wf: dict, normalized: dict) -> dict:
+     """Build the kernel_journey handoff (recorder-input shapes the orchestrator
+     replays through the SBD SDK — KERNEL_JOURNEY_SCHEMA.md §2).
+@@ -2273,6 +2320,14 @@ def _match_profiler(short: str) -> dict | None:
+ 
+     kernels: list[dict] = []
+     seen: set[str] = set()  # dedup on the FINAL emitted kernel_id
++    # What each INTEGRATED overlay says it optimized (see _overlay_claim). The id
++    # dedup above cannot carry pass 2, because the two substreams name a kernel
++    # differently: an overlay dir is named for its CANDIDATE TAG (``cand_c0_triton``)
++    # and the workflow return for the KERNEL SYMBOL
++    # (``dsa_sparse_attn_prefill_main_kernel``). integrate_result.json is the file
++    # that ties the two together, so the claim is read from there, never from the
++    # directory name.
++    claims: list[dict] = []
+ 
+     # 1) Disk truth: one entry per optimization overlay, driven by integrate_result.
+     if eval_dir:
+@@ -2285,25 +2340,34 @@ def _match_profiler(short: str) -> dict | None:
+                 short = cand.name[len("cand_"):]
+                 if not short:
+                     continue
++                ir = _read_json(cand / "integrate_result.json")
++                claim = _overlay_claim(ir)
++                if claim:
++                    claims.append(claim)
+                 m = _match_profiler(short)
+                 kid = m["kid"] if m else _canon_kid(short)
+                 if kid in seen:
+                     continue
+                 seen.add(kid)
+-                ir = _read_json(cand / "integrate_result.json")
+                 kernels.append(_journey_overlay_entry(
+                     eval_dir, short, ir, wf, geak_sha, overall_parity,
+                     m["pct"] if m else None, m["name"] if m else None,
+                     kernel_id_override=kid))
+ 
+     # 2) Augment with accepted kernels named only in the workflow return (live path
+-    #    / no overlay on disk), deduped against the overlay entries above (by id).
++    #    / no overlay on disk), deduped against the overlay entries above: by id,
++    #    and by the identity those overlays claimed, which is what catches the same
++    #    acceptance spelled as a candidate tag on disk and as a symbol in the return.
+     accepted = list(wf.get("accepted_kernels") or []) + list(wf.get("accepted_heads") or [])
+     synth_hot: list[dict] = []
+     for idx, k in enumerate(accepted):
+         if not isinstance(k, dict):
+             continue
+         name = str(k.get("short_name") or k.get("name") or k.get("op_kind") or f"kernel{idx}")
++        claimed = _claim_for(name, k.get("e2e_delta_pct"), claims)
++        if claimed is not None:
++            claimed["used"] = True
++            continue
+         m = _match_profiler(name)
+         kid = m["kid"] if m else _canon_kid(name)
+         if kid in seen:
+diff --git a/interface/test_run_e2e_dispatch.py b/interface/test_run_e2e_dispatch.py
+index ef936e499..31ee8f982 100644
+--- a/interface/test_run_e2e_dispatch.py
++++ b/interface/test_run_e2e_dispatch.py
+@@ -1427,6 +1427,126 @@ def test_overlay_scan_skips_non_directories_and_duplicate_ids(self):
+             journey["discovery_runs"][0]["hot_kernels"][0]["selected_for_optimization"]
+         )
+ 
++    # --- overlay-vs-return identity (one acceptance, two spellings) ---------- #
++
++    def _overlay(self, eval_dir: Path, tag: str, ir: dict | None) -> Path:
++        """One candidate overlay dir, with or without its integrate_result."""
++        cand = eval_dir / "overlay" / f"cand_{tag}"
++        cand.mkdir(parents=True, exist_ok=True)
++        if ir is not None:
++            self.write_json(cand / "integrate_result.json", ir)
++        return cand
++
++    def test_return_acceptance_already_on_disk_as_an_overlay_is_not_re_emitted(self):
++        """The overlay dir is named for the CANDIDATE TAG and the workflow return
++        for the KERNEL SYMBOL, so the id dedup never fires and one acceptance is
++        emitted twice — once measured, once with a null gpu%. integrate_result
++        records both spellings, so the symbol it claims must fold them."""
++        eval_dir = self.tmp / "e2e_alias"
++        self._overlay(eval_dir, "c0_triton", {
++            "gate": "accepted", "short_name": "dsa_sparse_attn_prefill_main_kernel",
++            "cand_tag": "c0_triton", "pct_gpu_time": 20.2,
++            "isolated_speedup": 2.2, "e2e_delta_pct": 29.994,
++        })
++        wf = {"eval_dir": str(eval_dir), "accepted_heads": [{
++            "short_name": "dsa_sparse_attn_prefill_main_kernel",
++            "backend": "triton", "isolated": 1.13, "e2e_delta_pct": 29.994,
++        }]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertEqual([k["kernel_id"] for k in journey["kernels"]], ["c0_triton"])
++        # The surviving entry is the MEASURED one (gpu% from integrate_result),
++        # not the return's null.
++        self.assertEqual(journey["kernels"][0]["gpu_pct"], 20.2)
++        self.assertEqual(journey["kernels"][0]["e2e"]["e2e_gain_pct"], 29.994)
++
++    def test_sibling_candidates_for_one_symbol_each_stay_their_own_entry(self):
++        """Folding is against the RETURN, not between overlays: two candidate
++        implementations of the same kernel are two real attempts and must both
++        survive, with only the return's duplicate dropped."""
++        eval_dir = self.tmp / "e2e_siblings"
++        self._overlay(eval_dir, "c0_triton", {
++            "gate": "accepted", "short_name": "dsa_fwd", "e2e_delta_pct": 29.994})
++        self._overlay(eval_dir, "c1_tilelang", {
++            "gate": "stack", "short_name": "dsa_fwd", "e2e_delta_pct": 2.818})
++        wf = {"eval_dir": str(eval_dir),
++              "accepted_heads": [{"short_name": "dsa_fwd", "e2e_delta_pct": 29.994}]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertEqual([k["kernel_id"] for k in journey["kernels"]],
++                         ["c0_triton", "c1_tilelang"])
++
++    def test_symbol_less_overlay_folds_the_return_on_its_integrated_delta(self):
++        """Some runs record no usable symbol (integrate_result echoes the tag).
++        The return copies the overlay's own A/B delta rather than recomputing it,
++        so an exact, unambiguous hit is the same measurement."""
++        eval_dir = self.tmp / "e2e_delta_fold"
++        self._overlay(eval_dir, "decode_attention_grouped_mla", {
++            "gate": "accepted", "short_name": "decode_attention_grouped_mla",
++            "e2e_delta_pct": 11.71})
++        wf = {"eval_dir": str(eval_dir), "accepted_heads": [
++            {"short_name": "_fwd_grouped_kernel_stage1 (+_fwd_kernel_stage2)",
++             "e2e_delta_pct": 11.71}]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertEqual([k["kernel_id"] for k in journey["kernels"]],
++                         ["decode_attention_grouped_mla"])
++
++    def test_an_ambiguous_delta_never_folds_two_kernels(self):
++        """Two overlays sharing a delta cannot identify which acceptance the
++        return meant, so the return entry is kept rather than guessed away."""
++        eval_dir = self.tmp / "e2e_delta_ambig"
++        self._overlay(eval_dir, "c0_triton", {"gate": "accepted", "e2e_delta_pct": 5.0})
++        self._overlay(eval_dir, "c1_ck", {"gate": "accepted", "e2e_delta_pct": 5.0})
++        wf = {"eval_dir": str(eval_dir),
++              "accepted_kernels": [{"short_name": "some_other_gemm",
++                                    "e2e_delta_pct": 5.0}]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertIn("some_other_gemm", [k["kernel_id"] for k in journey["kernels"]])
++
++    def test_one_overlay_is_consumed_by_at_most_one_return_acceptance(self):
++        """A single overlay whose delta matches must not swallow BOTH accepted
++        records; the second is a distinct kernel and keeps its entry."""
++        eval_dir = self.tmp / "e2e_claim_once"
++        self._overlay(eval_dir, "c0_aiter", {"gate": "accepted", "e2e_delta_pct": 6.779})
++        wf = {"eval_dir": str(eval_dir), "accepted_kernels": [
++            {"short_name": "gemm_down_proj", "e2e_delta_pct": 6.779},
++            {"short_name": "gemm_gate_up", "e2e_delta_pct": 6.779},
++        ]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertEqual([k["kernel_id"] for k in journey["kernels"]],
++                         ["c0_aiter", "gemm_gate_up"])
++
++    def test_a_rejected_overlay_claims_nothing(self):
++        """Do-no-harm: an overlay the A/B REVERTED did not integrate that kernel,
++        so an acceptance the return asserts is new information, not a duplicate."""
++        eval_dir = self.tmp / "e2e_rejected"
++        self._overlay(eval_dir, "c0_triton", {
++            "gate": "rejected", "short_name": "my_gemm", "e2e_delta_pct": 1.5})
++        wf = {"eval_dir": str(eval_dir),
++              "accepted_kernels": [{"short_name": "my_gemm", "e2e_delta_pct": 1.5}]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertEqual([k["kernel_id"] for k in journey["kernels"]],
++                         ["c0_triton", "my_gemm"])
++
++    def test_an_incomplete_ab_overlay_claims_nothing(self):
++        """No integrate_result at all (cut off mid-A/B) is not an acceptance."""
++        eval_dir = self.tmp / "e2e_incomplete"
++        self._overlay(eval_dir, "c0_triton", None)
++        wf = {"eval_dir": str(eval_dir),
++              "accepted_kernels": [{"short_name": "my_gemm", "e2e_delta_pct": 1.5}]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertEqual([k["kernel_id"] for k in journey["kernels"]],
++                         ["c0_triton", "my_gemm"])
++
++    def test_folded_return_acceptance_is_absent_from_synthetic_discovery(self):
++        """A folded acceptance must not come back as a synthesized hot_kernel,
++        which would re-orphan the duplicate in the discovery substream."""
++        eval_dir = self.tmp / "e2e_fold_disc"
++        self._overlay(eval_dir, "c0_triton", {
++            "gate": "accepted", "short_name": "dsa_fwd", "e2e_delta_pct": 3.0})
++        wf = {"eval_dir": str(eval_dir),
++              "accepted_heads": [{"short_name": "dsa_fwd", "e2e_delta_pct": 3.0}]}
++        journey = rx.build_kernel_journey(wf, {"eval_dir": str(eval_dir)})
++        self.assertEqual(journey["discovery_runs"], [])
++
+     def test_journey_without_an_eval_dir_is_empty_but_valid(self):
+         journey = rx.build_kernel_journey({}, {})
+         self.assertEqual(journey["kernels"], [])

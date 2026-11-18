@@ -1,0 +1,347 @@
+diff --git a/src/Analysis/MethodTracer.php b/src/Analysis/MethodTracer.php
+index d7add4fc..6db7d704 100644
+--- a/src/Analysis/MethodTracer.php
++++ b/src/Analysis/MethodTracer.php
+@@ -452,7 +452,9 @@ private function handleStaticCall(Node\Expr\StaticCall $node): void
+                     }
+                     $fqcn = $this->parentFqcn;
+                 } else {
+-                    $fqcn = $this->useMap[$class] ?? $class;
++                    // The parser's resolved name follows imports and same-namespace
++                    // references the local useMap misses; fall back where it can't.
++                    $fqcn = PhpFileParser::resolvedName($node->class) ?? $this->useMap[$class] ?? $class;
+                 }
+ 
+                 // Job::dispatch()
+@@ -695,7 +697,7 @@ private function handleNew(Node\Expr\New_ $node): void
+                     return;
+                 }
+                 $class = $node->class->toString();
+-                $fqcn = $this->useMap[$class] ?? $class;
++                $fqcn = PhpFileParser::resolvedName($node->class) ?? $this->useMap[$class] ?? $class;
+ 
+                 if ($this->looksLikeJob($fqcn)) {
+                     // Caught by dispatch() later; skip to avoid double-counting
+@@ -747,7 +749,7 @@ private function handleAssign(Node\Expr\Assign $node): void
+                 }
+                 $varName = $node->var->name;
+                 $class = $node->expr->class->toString();
+-                $fqcn = $this->useMap[$class] ?? $class;
++                $fqcn = PhpFileParser::resolvedName($node->expr->class) ?? $this->useMap[$class] ?? $class;
+ 
+                 if (! $this->looksLikeModel($fqcn) && ! $this->isFrameworkClass($fqcn) && str_contains($fqcn, '\\')) {
+                     $this->varTypeMap[$varName] = $fqcn;
+@@ -767,7 +769,7 @@ private function handleClassConstFetch(Node\Expr\ClassConstFetch $node): void
+                 if (in_array($lower, ['self', 'static', 'parent'], true)) {
+                     return;
+                 }
+-                $fqcn = $this->useMap[$short] ?? $short;
++                $fqcn = PhpFileParser::resolvedName($node->class) ?? $this->useMap[$short] ?? $short;
+                 if (! str_contains($fqcn, '\\')) {
+                     return;
+                 }
+diff --git a/src/Parser/PhpFileParser.php b/src/Parser/PhpFileParser.php
+index 538bf820..ff3e8cc7 100644
+--- a/src/Parser/PhpFileParser.php
++++ b/src/Parser/PhpFileParser.php
+@@ -5,8 +5,10 @@
+ namespace LaraMint\LaravelBrain\Parser;
+ 
+ use PhpParser\Error;
++use PhpParser\ErrorHandler;
+ use PhpParser\Node;
+ use PhpParser\NodeTraverser;
++use PhpParser\NodeVisitor\NameResolver;
+ use PhpParser\NodeVisitorAbstract;
+ use PhpParser\Parser;
+ use PhpParser\ParserFactory;
+@@ -30,36 +32,39 @@ public function parse(string $filePath): array
+             return ['ast' => null, 'useMap' => []];
+         }
+ 
+-        try {
+-            $ast = $this->parser->parse($code);
+-        } catch (Error) {
+-            return ['ast' => null, 'useMap' => []];
+-        }
+-        $useMap = $this->extractUseMap($ast ?? []);
+-
+-        return ['ast' => $ast, 'useMap' => $useMap];
++        return $this->parseCode($code);
+     }
+ 
+     /**
+-     * @param  Node\Stmt[]  $ast
+-     * @return array<string, string> alias → FQCN
++     * @return array{ast: Node\Stmt[]|null, useMap: array<string, string>}
+      */
+-    private function extractUseMap(array $ast): array
++    public function parseCode(string $code): array
+     {
+-        $useMap = [];
+-        $traverser = new NodeTraverser;
++        try {
++            $ast = $this->parser->parse($code);
++        } catch (Error) {
++            return ['ast' => null, 'useMap' => []];
++        }
++        if ($ast === null) {
++            return ['ast' => null, 'useMap' => []];
++        }
+ 
+-        $visitor = new class extends NodeVisitorAbstract
++        // One traversal: NameResolver annotates every Name with a resolvedName
++        // attribute (additively — original nodes untouched), while the useMap
++        // visitor collects the file's imports. Collect rather than throw, so a
++        // semantically-invalid-but-parseable file (e.g. a duplicate use alias)
++        // still scans instead of aborting.
++        $useMapVisitor = new class extends NodeVisitorAbstract
+         {
++            /** @var array<string, string> */
+             public array $useMap = [];
+ 
+             public function enterNode(Node $node): ?int
+             {
+                 if ($node instanceof Node\Stmt\Use_) {
+                     foreach ($node->uses as $use) {
+-                        $fqcn = $use->name->toString();
+                         $alias = $use->alias !== null ? $use->alias->toString() : $use->name->getLast();
+-                        $this->useMap[$alias] = $fqcn;
++                        $this->useMap[$alias] = $use->name->toString();
+                     }
+                 }
+ 
+@@ -67,9 +72,42 @@ public function enterNode(Node $node): ?int
+             }
+         };
+ 
+-        $traverser->addVisitor($visitor);
++        $traverser = new NodeTraverser;
++        $traverser->addVisitor(new NameResolver(new ErrorHandler\Collecting, [
++            'preserveOriginalNames' => true,
++            'replaceNodes' => false,
++        ]));
++        $traverser->addVisitor($useMapVisitor);
+         $traverser->traverse($ast);
+ 
+-        return $visitor->useMap;
++        return ['ast' => $ast, 'useMap' => $useMapVisitor->useMap];
++    }
++
++    /**
++     * The fully-qualified name a `Name` node resolves to, following the file's
++     * imports (including group-use), the current namespace, and leading-`\`
++     * fully-qualified names.
++     *
++     * Returns null for a name the resolver leaves unresolved — the reserved
++     * `self`/`static`/`parent` keywords (which the caller resolves against the
++     * class context it already tracks), and any `Name` from an AST that was not
++     * produced by {@see parse()} / {@see parseCode()} (so consumers can safely
++     * fall back to their own resolution).
++     */
++    public static function resolvedName(?Node $name): ?string
++    {
++        if (! $name instanceof Node\Name) {
++            return null;
++        }
++        $resolved = $name->getAttribute('resolvedName');
++        if ($resolved instanceof Node\Name) {
++            $fqcn = ltrim($resolved->toString(), '\\');
++
++            // self/static/parent resolve to themselves — not a real FQCN, so
++            // report them as unresolved and let the caller use its class context.
++            return in_array(strtolower($fqcn), ['self', 'static', 'parent'], true) ? null : $fqcn;
++        }
++
++        return null;
+     }
+ }
+diff --git a/tests/Unit/MethodTracerResolutionTest.php b/tests/Unit/MethodTracerResolutionTest.php
+new file mode 100644
+index 00000000..0f366900
+--- /dev/null
++++ b/tests/Unit/MethodTracerResolutionTest.php
+@@ -0,0 +1,44 @@
++<?php
++
++use LaraMint\LaravelBrain\Analysis\MethodTracer;
++
++it('resolves a same-namespace sibling so the call chain is not lost', function () {
++    $project = fixture('laravel-project');
++
++    // Ledger::record() does `new Reconciler()` — a same-namespace sibling with no
++    // import. Without name resolution the bare "Reconciler" is unqualified (and the
++    // single-word model heuristic swallows it), so the edge goes missing.
++    $edges = (new MethodTracer)->traceMethod(
++        'App\\Services\\SameNs\\Ledger',
++        'record',
++        ['App\\' => [$project.'/app']],
++        $project,
++    );
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->calleeFqcn === 'App\\Services\\SameNs\\Reconciler'
++    ));
++
++    expect($match)->not->toBeEmpty();
++    // The callee is the fully-qualified sibling, never the bare "Reconciler".
++    foreach ($edges as $e) {
++        expect($e->calleeFqcn)->not->toBe('Reconciler');
++    }
++});
++
++it('resolves a same-namespace type stored in a variable (assign then call)', function () {
++    $project = fixture('laravel-project');
++
++    // Ledger::recordViaVar() does `$recon = new Reconciler; $recon->run();`.
++    // The assigned var's type must resolve so the later call is traced.
++    $edges = (new MethodTracer)->traceMethod(
++        'App\\Services\\SameNs\\Ledger',
++        'recordViaVar',
++        ['App\\' => [$project.'/app']],
++        $project,
++    );
++
++    expect(array_filter($edges, fn ($e) => $e->calleeFqcn === 'App\\Services\\SameNs\\Reconciler'))
++        ->not->toBeEmpty();
++});
+diff --git a/tests/Unit/PhpFileParserResolutionTest.php b/tests/Unit/PhpFileParserResolutionTest.php
+new file mode 100644
+index 00000000..b484325f
+--- /dev/null
++++ b/tests/Unit/PhpFileParserResolutionTest.php
+@@ -0,0 +1,91 @@
++<?php
++
++use LaraMint\LaravelBrain\Parser\PhpFileParser;
++use PhpParser\Node;
++use PhpParser\NodeFinder;
++
++/**
++ * Parse an inline sample and map each static-call class to its resolved FQCN.
++ * The source is a string (not a fixture file), so its group-use import is not
++ * normalised away by Pint.
++ *
++ * @return array<string, string> written name => resolved FQCN (or '(unresolved)')
++ */
++function staticCallResolutions(): array
++{
++    $code = <<<'PHP'
++    <?php
++    namespace App\Domain\Billing;
++    use App\Models\{User, Order};
++    use App\Support\Formatter as Fmt;
++    class SampleResolution {
++        public function run() {
++            User::find(1);            // group-use import
++            Order::create([]);        // group-use import
++            Fmt::money(1);            // aliased import
++            Sibling::make();          // same-namespace sibling
++            \App\Other\Thing::go();   // fully-qualified
++            self::helper();           // reserved keyword
++        }
++    }
++    PHP;
++
++    $parsed = (new PhpFileParser)->parseCode($code);
++    $out = [];
++    foreach ((new NodeFinder)->findInstanceOf($parsed['ast'], Node\Expr\StaticCall::class) as $call) {
++        if ($call->class instanceof Node\Name) {
++            $out[$call->class->toString()] = PhpFileParser::resolvedName($call->class) ?? '(unresolved)';
++        }
++    }
++
++    return $out;
++}
++
++it('resolves a group-use imported class to its full FQCN', function () {
++    $names = staticCallResolutions();
++
++    expect($names['User'] ?? null)->toBe('App\\Models\\User');
++    expect($names['Order'] ?? null)->toBe('App\\Models\\Order');
++});
++
++it('resolves an aliased import to the real class', function () {
++    expect(staticCallResolutions()['Fmt'] ?? null)->toBe('App\\Support\\Formatter');
++});
++
++it('resolves a same-namespace sibling against the current namespace', function () {
++    expect(staticCallResolutions()['Sibling'] ?? null)->toBe('App\\Domain\\Billing\\Sibling');
++});
++
++it('resolves a fully-qualified name consistently, without a leading backslash', function () {
++    expect(staticCallResolutions()['App\\Other\\Thing'] ?? null)->toBe('App\\Other\\Thing');
++});
++
++it('reports the reserved self keyword as unresolved for the caller to handle', function () {
++    expect(staticCallResolutions()['self'] ?? null)->toBe('(unresolved)');
++});
++
++it('does not abort on a semantically-invalid but parseable file (duplicate use alias)', function () {
++    // NameResolver raises on a duplicate alias; the Collecting handler must
++    // swallow it so the file still yields an AST instead of throwing.
++    $parsed = (new PhpFileParser)->parseCode('<?php namespace A; use B\\C; use D\\E as C; class X {}');
++
++    expect($parsed['ast'])->not->toBeNull();
++});
++
++it('returns null for a Name whose AST never went through the parser', function () {
++    // Guarantees the fallback contract: callers can safely `?? useMap`.
++    expect(PhpFileParser::resolvedName(new Node\Name('App\\Unparsed')))->toBeNull();
++});
++
++it('is additive — the original node is untouched, toString() unchanged', function () {
++    $parsed = (new PhpFileParser)->parseCode('<?php namespace A\\B; use C\\{D}; class X { function y() { D::z(); Sib::w(); } }');
++    $written = array_map(
++        fn ($c) => $c->class->toString(),
++        array_filter(
++            (new NodeFinder)->findInstanceOf($parsed['ast'], Node\Expr\StaticCall::class),
++            fn ($c) => $c->class instanceof Node\Name
++        )
++    );
++
++    expect($written)->toContain('D')->toContain('Sib');
++});
+diff --git a/tests/fixtures/laravel-project/app/Services/SameNs/Ledger.php b/tests/fixtures/laravel-project/app/Services/SameNs/Ledger.php
+new file mode 100644
+index 00000000..e9c97e23
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Services/SameNs/Ledger.php
+@@ -0,0 +1,22 @@
++<?php
++
++namespace App\Services\SameNs;
++
++class Ledger
++{
++    public function record(): void
++    {
++        // Same-namespace sibling, no import: the local useMap has no entry, and
++        // the bare name "Reconciler" would trip the single-word model heuristic.
++        // Only the parser's resolved FQCN links this as a service.
++        (new Reconciler)->run();
++    }
++
++    public function recordViaVar(): void
++    {
++        // The common assign-then-call shape: the resolved type must be recorded
++        // for $recon so the later method call is traced.
++        $recon = new Reconciler;
++        $recon->run();
++    }
++}
+diff --git a/tests/fixtures/laravel-project/app/Services/SameNs/Reconciler.php b/tests/fixtures/laravel-project/app/Services/SameNs/Reconciler.php
+new file mode 100644
+index 00000000..4928af88
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Services/SameNs/Reconciler.php
+@@ -0,0 +1,8 @@
++<?php
++
++namespace App\Services\SameNs;
++
++class Reconciler
++{
++    public function run(): void {}
++}

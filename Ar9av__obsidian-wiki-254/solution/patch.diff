@@ -1,0 +1,153 @@
+diff --git a/obsidian_wiki/cache.py b/obsidian_wiki/cache.py
+index e421026b..0c86511c 100644
+--- a/obsidian_wiki/cache.py
++++ b/obsidian_wiki/cache.py
+@@ -402,33 +402,70 @@ def compute_hash(path: Path) -> str:
+     return sha256_file(path)
+ 
+ 
++def _resolved_form(path: Path) -> str | None:
++    """``realpath`` of *path* as a comparable string, or ``None`` if it cannot be resolved.
++
++    ``os.path.normcase`` keeps the comparison equivalent to ``Path`` equality on
++    case-insensitive filesystems.
++    """
++    try:
++        return os.path.normcase(str(path.resolve()))
++    except OSError:
++        return None
++
++
+ def check_sources(vault: Path, source_paths: list[Path]) -> CheckResult:
+     """Classify each source as new / modified / unchanged vs. the manifest.
+ 
+     Also reports manifest entries whose source file no longer exists on disk.
+     Handles both manifest shapes and compares hashes prefix-insensitively.
++
++    Every entry and every query is resolved once and matched through an index
++    of its forms (raw key, resolved path).  Resolving is a ``realpath`` walk —
++    one ``lstat`` per path component — so doing it per (entry, query) pair, as
++    the first-match scan did, made a 3,000-entry manifest cost about a second
++    per queried file.  The index keeps the first entry for each form, which is
++    what the scan's ``break`` on first hit returned.
+     """
+     entries = list(_iter_entries(_load_manifest(vault)))
+     result: CheckResult = {
+         "new": [], "modified": [], "unchanged": [], "missing": [], "unavailable": []
+     }
+ 
++    by_form: dict[str, int] = {}
++    entry_resolved: list[str | None] = []
++    for i, (stored_key, _entry) in enumerate(entries):
++        resolved = None
++        if stored_key:
++            by_form.setdefault(stored_key, i)
++            stored_path = resolve_key(stored_key, vault)
++            if stored_path is not None:
++                resolved = _resolved_form(stored_path)
++                if resolved is not None:
++                    by_form.setdefault(resolved, i)
++        entry_resolved.append(resolved)
++
+     matched: set[int] = set()
++    query_forms: set[str] = set()
+     for path in source_paths:
+         key = str(path)
++        forms = [key]
++        resolved = _resolved_form(path)
++        if resolved is not None:
++            forms.append(resolved)
++        query_forms.update(forms)
+         if not path.exists():
+             result["missing"].append(key)
+             continue
+         current_hash = _strip_algo(compute_hash(path))
+-        entry = None
+-        for i, (stored_key, e) in enumerate(entries):
+-            if _same_source(stored_key, path, vault):
+-                entry = e
+-                matched.add(i)
+-                break
+-        if entry is None:
++        hits = [by_form[f] for f in forms if f in by_form]
++        if not hits:
+             result["new"].append(key)
+-        elif _strip_algo(entry.get("content_hash")) != current_hash:
++            continue
++        i = min(hits)   # the earliest entry matching by either form — the old scan's first hit
++        matched.add(i)
++        entry = entries[i][1]
++        if _strip_algo(entry.get("content_hash")) != current_hash:
+             result["modified"].append(key)
+         else:
+             result["unchanged"].append(key)
+@@ -439,7 +476,7 @@ def check_sources(vault: Path, source_paths: list[Path]) -> CheckResult:
+     for i, (stored_key, _entry) in enumerate(entries):
+         if i in matched:
+             continue
+-        if any(_same_source(stored_key, p, vault) for p in source_paths):
++        if stored_key in query_forms or (entry_resolved[i] is not None and entry_resolved[i] in query_forms):
+             continue
+         if _missing_on_disk(stored_key, vault):
+             bucket = "missing" if _is_vault_local(stored_key, vault, top_names) else "unavailable"
+diff --git a/tests/test_cache.py b/tests/test_cache.py
+index b6afdf19..936220c6 100644
+--- a/tests/test_cache.py
++++ b/tests/test_cache.py
+@@ -195,6 +195,56 @@ def test_relative_key_under_an_unknown_top_dir_is_unavailable(self, vault):
+         assert result["missing"] == []
+         assert "-Users-x/abc.jsonl" in result["unavailable"]
+ 
++    def test_check_sources_resolves_each_path_once(self, vault, tmp_path, monkeypatch):
++        """Matching resolves each entry and each query once (an index of forms), not once
++        per (entry, query) pair: with relative keys the string fast path never fires, and a
++        3,000-entry manifest made every queried file cost a second of ``realpath`` walks."""
++        src = tmp_path / "src"
++        src.mkdir()
++        files = []
++        for i in range(300):
++            f = src / f"f{i:03d}.md"
++            f.write_text(f"doc {i}", encoding="utf-8")
++            files.append(f)
++        sources = {}
++        for i, f in enumerate(files):
++            # "../src/f000.md" — the relative form the CLI writes for out-of-vault sources
++            sources[os.path.relpath(f, vault)] = {"content_hash": sha256_file(f) if i % 3 else "0" * 64}
++        for i in range(2000):  # unrelated entries, like a real manifest
++            sources[f"../elsewhere/e{i:04d}.md"] = {"content_hash": "1" * 64}
++        _write_manifest(vault, {"version": 1, "sources": sources})
++
++        calls = {"n": 0}
++        real_resolve = Path.resolve
++
++        def counting_resolve(self, *args, **kwargs):
++            calls["n"] += 1
++            return real_resolve(self, *args, **kwargs)
++
++        monkeypatch.setattr(Path, "resolve", counting_resolve)
++        result = check_sources(vault, files)
++
++        assert len(result["unchanged"]) == 200
++        assert len(result["modified"]) == 100
++        assert result["new"] == []
++        assert len(result["missing"]) + len(result["unavailable"]) == 2000
++        # one resolve per entry and per query (plus a handful inside helpers), never entries × queries
++        assert calls["n"] <= 3 * (2300 + 300), calls["n"]
++
++    def test_check_sources_first_entry_wins_for_duplicate_forms(self, vault, tmp_path):
++        """Two entries naming the same file in different forms: the earlier one is the match,
++        the later one is not reported missing (it is a duplicate of a scanned path)."""
++        f = tmp_path / "dup.md"
++        f.write_text("same", encoding="utf-8")
++        sources = {
++            os.path.relpath(f, vault): {"content_hash": "0" * 64},           # earlier: stale hash → modified
++            str(f): {"content_hash": sha256_file(f)},                        # later: same file, absolute form
++        }
++        _write_manifest(vault, {"version": 1, "sources": sources})
++        result = check_sources(vault, [f])
++        assert result["modified"] == [str(f)] and result["unchanged"] == []
++        assert result["missing"] == [] and result["unavailable"] == []
++
+ 
+ # ---------------------------------------------------------------------------
+ # update_source / manifest

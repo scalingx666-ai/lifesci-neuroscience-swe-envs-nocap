@@ -1,0 +1,37 @@
+# Issue
+
+**Title:** cross-validated solver
+
+## Description
+
+- **added a crossvalidation solver**
+- **new cv-solver tutorial**
+- **fixed some small bugs due to my simplifications of the LinearModelFit generator**
+- **formatting**
+
+<!--
+Thanks for making a pull request to Unfold.jl.
+We have added this PR template to help you help us.
+Make sure to read the contributing guidelines and abide by the code of conduct.
+See the comments below, fill the required fields, and check the items.
+-->
+
+<!-- Option 1, this closes an existing issue. Fill the number below-->
+
+<!-- Option 2, this is a small fix that arguably won't need an issue. Uncomment below -->
+<!--
+There is no related issue.
+-->
+
+## Checklist
+
+<!-- mark true if NA -->
+<!-- leave PR as draft until all is checked -->
+- [x] I am following the [contributing guidelines](https://github.com/unfoldtoolbox/Unfold.jl/blob/main/docs/src/90-contributing.md)
+- [x] Tests are passing
+- [ ] Lint workflow is passing
+- [ ] Docs were updated and workflow is passing
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `37eb9788e7de`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

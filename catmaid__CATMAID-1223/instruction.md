@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** commiting change for tomka: removed isNaN checks for projects and sta…
+
+## Description
+
+…cks so that links to named projects and stacks work
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `2885c6ed9cd6`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

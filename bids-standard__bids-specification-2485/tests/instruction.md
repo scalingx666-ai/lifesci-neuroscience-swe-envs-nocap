@@ -1,0 +1,21 @@
+# Issue
+
+**Title:** [FIX] Uniformize DICOM tag formatting, URLs
+
+## Description
+
+This pull request standardizes the format for referencing DICOM tags throughout the documentation and schema files. The main change is to consistently use the format `DICOM Tag (####,####)` instead of variations like `DICOM Tag ####, ####` or inline code, improving clarity and consistency for users and developers working with DICOM metadata in BIDS.
+
+This supersedes PR #1758.
+
+**Standardization of DICOM Tag References:**
+
+* Updated all DICOM tag references in documentation files (e.g., `src/common-principles.md`, `src/modality-specific-files/magnetic-resonance-imaging-data.md`, `src/modality-specific-files/magnetic-resonance-spectroscopy.md`) to use the format `DICOM Tag (####,####)`, sometimes with explicit attribute names, and updated hyperlinks accordingly. [[1]](diffhunk://#diff-38cc3c29d8cceeb219373964b67b2286b204e420aedb3029bb9344e5dad02956L501-R503) [[2]](diffhunk://#diff-c2e6acb3e26ee9df9adf3aa36bfa14ad677fcc889cbfc18acebbf9f66a913133L80-R85) [[3]](diffhunk://#diff-c2e6acb3e26ee9df9adf3aa36bfa14ad677fcc889cbfc18acebbf9f66a913133L271-R271) [[4]](diffhunk://#diff-c2e6acb3e26ee9df9adf3aa36bfa14ad677fcc889cbfc18acebbf9f66a913133L955-R955) [[5]](diffhunk://#diff-f54d659551230f8987bea969304e7f92f4bd11f74bea667d3009ec235a4624daL126-R127)
+
+**Schema and Metadata Consistency:**
+
+* Updated all DICOM tag references in entity and metadata schema files (`src/schema/objects/entities.yaml`, `src/schema/objects/metadata.yaml`) to use the standardized format, including both descriptions and display names. [[1]](diffhunk://#diff-b2ff216a7b94882e7d1d45af322955cc874f5176a75cf0cab41245b7bd75e595L223-R223) [[2]](diffhunk://#diff-b2ff216a7b94882e7d1d45af322955cc874f5176a75cf0cab41245b7bd75e595L235-R235) [[3]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L43-R43) [[4]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L233-R233) [[5]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L267-R267) [[6]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L368-R368) [[7]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L395-R395) [[8]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L411-R420) [[9]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L518-R518) [[10]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L580-R604) [[11]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L698-R698) [[12]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L793-R793) [[13]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L802-R802) [[14]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L812-R812) [[15]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L1032-R1032) [[16]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L1265-R1265) [[17]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L1533-R1533) [[18]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L1597-R1597) [[19]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L1606-R1606) [[20]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L1755-R1755) [[21]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L1978-R1978) [[22]](diffhunk://#diff-9c80bef9a8601b9410f41180bfb2631eee51fb67e7f5727ca0be4e4dfc99d844L2000-R2000)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `89a8652fd430`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

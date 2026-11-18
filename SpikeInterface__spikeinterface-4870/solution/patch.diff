@@ -1,0 +1,724 @@
+diff --git a/src/spikeinterface/postprocessing/_amplitude_scalings_numba.py b/src/spikeinterface/postprocessing/_amplitude_scalings_numba.py
+new file mode 100644
+index 0000000000..3b01c88cd2
+--- /dev/null
++++ b/src/spikeinterface/postprocessing/_amplitude_scalings_numba.py
+@@ -0,0 +1,330 @@
++"""Numba kernel for ``AmplitudeScalingNode``, giving the same scalings as its numpy path up to rounding.
++
++The node calls ``compute_scalings`` when numba is installed and every template is zero outside its sparsity.
++"""
++
++import numpy as np
++from numba import njit
++
++# A spike that collides with nothing gets the linregress slope of its waveform on its template, as from
++# _ordinary_scaling_slope. A spike that collides, as find_collisions defines it, gets its coefficient in
++# fit_collision's fit: a non-negative least-squares fit of the waveform on the colliding spikes' templates, plus an
++# intercept.
++#
++# fit_collision builds a design matrix X with one column per spike and one row per sample and channel of the
++# window, mostly zeros, and passes it to scipy.optimize.nnls. Least squares depends on X only through the normal
++# equations X'X b = X'y. The Gram matrix X'X holds the dot product of each pair of templates over the samples and
++# channels they share, and X'y holds each template's dot product with the waveform. This module computes those
++# k x k and k terms for k spikes without building X, and solves the fit on them with Lawson-Hanson, the active-set
++# method nnls also uses.
++#
++# cache=True keeps the compiled code on disk, so it compiles on first use rather than in every session.
++
++
++@njit(cache=True)
++def _is_well_conditioned(G):
++    """Whether every coefficient of the fit on ``G`` can be solved from the normal equations to float32 precision."""
++    # Solving the normal equations loses precision with the square of X's condition number, so nearly identical
++    # templates, or two spikes of one unit at one time, need the fit from X itself. Column i's squared distance from
++    # the span of the other columns is 1 / (G^-1)_ii; where it is at least 1e-8 of G_ii for every column, every
++    # subsystem nnls solves is at least as well-conditioned, since fewer columns leave each one farther from the rest.
++    try:
++        L = np.linalg.cholesky(G)
++    except Exception:
++        return False
++    inverse_L = np.linalg.solve(L, np.eye(G.shape[0]))
++    for i in range(G.shape[0]):
++        if 1.0 <= 1e-8 * G[i, i] * np.sum(inverse_L[:, i] ** 2):
++            return False
++    return True
++
++
++@njit(cache=True)
++def _solve_spd(G, b, idx):
++    """Solve ``G[idx, idx] z = b[idx]`` for a well-conditioned ``G``."""
++    # a Gram matrix is symmetric and positive definite once it is well-conditioned, so Cholesky applies
++    L = np.linalg.cholesky(G[idx][:, idx])
++    return np.linalg.solve(L.T, np.linalg.solve(L, b[idx]))
++
++
++@njit(cache=True)
++def _nnls_gram(G, b):
++    """The ``x >= 0`` minimising ``|Xx - y|^2``, given a well-conditioned ``G = X'X`` and ``b = X'y``.
++
++    This is the ``x`` that ``nnls(X, y)`` returns.
++    """
++    # Written out rather than calling scipy.optimize.nnls through numba.objmode: on systems this small, most of
++    # nnls's time is per-call overhead, paid once per collision.
++    #
++    # Lawson-Hanson: coefficients start held at zero and are freed one at a time. Each pass solves the normal
++    # equations for the free ones, and any that would go negative are returned to zero.
++    k = b.size
++    x = np.zeros(k)
++    passive = np.zeros(k, dtype=np.bool_)  # True for the free coefficients
++    scale = 0.0
++    for i in range(k):
++        scale = max(scale, abs(b[i]))
++    tol = 1e-12 * scale
++    idx = np.empty(k, dtype=np.int64)
++    # the iteration caps stop rounding from cycling coefficients in and out forever
++    for _ in range(3 * k):
++        inner_steps = 0
++        # w = b - Gx is minus the gradient of the error: free the held coefficient that lowers it fastest,
++        # and stop when raising none of them would lower it
++        best, best_w = -1, tol
++        for j in range(k):
++            if not passive[j]:
++                w = b[j]
++                for m in range(k):
++                    w -= G[j, m] * x[m]
++                if w > best_w:
++                    best, best_w = j, w
++        if best < 0:
++            break
++        passive[best] = True
++        while inner_steps <= k:
++            inner_steps += 1
++            n = 0
++            for j in range(k):
++                if passive[j]:
++                    idx[n] = j
++                    n += 1
++            z = _solve_spd(G, b, idx[:n])
++            if np.all(z > 0.0):
++                for i in range(n):
++                    x[idx[i]] = z[i]
++                break
++            # z is the unconstrained fit on the free coefficients, but some are not positive:
++            # step from x toward z until the first one reaches zero, hold it there and solve again
++            alpha = 1.0
++            for i in range(n):
++                if z[i] <= 0.0:
++                    alpha = min(alpha, x[idx[i]] / (x[idx[i]] - z[i]))
++            for i in range(n):
++                j = idx[i]
++                x[j] += alpha * (z[i] - x[j])
++                if x[j] <= 0.0:
++                    x[j] = 0.0
++                    passive[j] = False
++    return x
++
++
++@njit(cache=True, inline="always")
++def _waveform(traces, t, c, gains, offsets):
++    """One trace value, scaled by its channel's gain and offset unless ``gains`` is empty."""
++    if gains.size > 0:
++        # scaled in the gains' dtype before widening, so it rounds as the numpy path does
++        return np.float64(traces[t, c] * gains[c] + offsets[c])
++    return np.float64(traces[t, c])
++
++
++@njit(cache=True)
++def _ordinary_slope(traces, gains, offsets, sample, template, channels, cut_out_before):
++    """Least-squares slope of the waveform on the template over ``channels``, or NaN for a constant template."""
++    start = max(0, sample - cut_out_before)
++    stop = min(traces.shape[0], sample - cut_out_before + template.shape[0])
++    row = cut_out_before - sample
++    count = channels.size * (stop - start)
++    template_sum = 0.0
++    waveform_sum = 0.0
++    for t in range(start, stop):
++        for c in channels:
++            template_sum += template[row + t, c]
++            waveform_sum += _waveform(traces, t, c, gains, offsets)
++    template_mean = template_sum / count
++    waveform_mean = waveform_sum / count
++    variance = 0.0
++    covariance = 0.0
++    for t in range(start, stop):
++        for c in channels:
++            a = template[row + t, c] - template_mean
++            variance += a * a
++            covariance += a * (_waveform(traces, t, c, gains, offsets) - waveform_mean)
++    # the node passes NaN to _ordinary_scaling_slope, so linregress decides a constant template, as in the numpy path
++    if variance == 0.0:
++        return np.nan
++    return covariance / variance
++
++
++@njit(cache=True)
++def _template_terms(traces, gains, offsets, sample, template, channels, cut_out_before):
++    """Sum of a spike's template over ``channels``, its sum of squares, and its dot product with the waveform."""
++    start = max(0, sample - cut_out_before)
++    stop = min(traces.shape[0], sample - cut_out_before + template.shape[0])
++    row = cut_out_before - sample
++    total = 0.0
++    squares = 0.0
++    product = 0.0
++    for t in range(start, stop):
++        for c in channels:
++            a = np.float64(template[row + t, c])
++            total += a
++            squares += a * a
++            product += a * _waveform(traces, t, c, gains, offsets)
++    return total, squares, product
++
++
++@njit(cache=True)
++def _collision_scaling(
++    traces,
++    gains,
++    offsets,
++    samples,
++    units,
++    templates,
++    sparsity_mask,
++    sparse_starts,
++    sparse_lists,
++    spike_terms,
++    cut_out_before,
++):
++    """Scaling of the first spike in a non-negative fit of all the spikes' templates, plus an intercept.
++
++    ``spike_terms`` holds each spike's ``_template_terms``. Returns NaN where the fit should be done from ``X``: for
++    traces that are not finite, so the numpy path raises on them, and for an ill-conditioned fit.
++    """
++    num_samples, num_channels = traces.shape
++    template_length = templates.shape[1]
++    k = samples.size
++
++    # the rows of X, as fit_collision cuts them: every sample of the window on any of the spikes' channels
++    union = np.zeros(num_channels, dtype=np.bool_)
++    for i in range(k):
++        union |= sparsity_mask[units[i]]
++    union_channels = np.flatnonzero(union)
++    window_start = max(0, samples.min() - cut_out_before)
++    window_end = min(num_samples, samples.max() - cut_out_before + template_length)
++    y_sum = 0.0
++    for t in range(window_start, window_end):
++        for c in union_channels:
++            y_sum += _waveform(traces, t, c, gains, offsets)
++    if not np.isfinite(y_sum):
++        return np.nan
++
++    # the normal equations of fit_collision's X, built without X
++    col_sums = spike_terms[:, 0].copy()
++    Xy = spike_terms[:, 2].copy()
++    G = np.zeros((k, k))
++    shared = np.empty(num_channels, dtype=np.int64)
++    for i in range(k):
++        G[i, i] = spike_terms[i, 1]
++        ti = templates[units[i]]
++        row_i = cut_out_before - samples[i]
++        channels_i = sparse_lists[sparse_starts[units[i]] : sparse_starts[units[i] + 1]]
++        for j in range(i + 1, k):
++            tj = templates[units[j]]
++            row_j = cut_out_before - samples[j]
++            start = max(window_start, samples[i] - cut_out_before, samples[j] - cut_out_before)
++            stop = min(
++                window_end, samples[i] - cut_out_before + template_length, samples[j] - cut_out_before + template_length
++            )
++            # x_i'x_j: templates are zero outside their sparsity, so only shared samples and channels contribute
++            num_shared = 0
++            for c in channels_i:
++                if sparsity_mask[units[j], c]:
++                    shared[num_shared] = c
++                    num_shared += 1
++            s = 0.0
++            for t in range(start, stop):
++                for c in shared[:num_shared]:
++                    s += np.float64(ti[row_i + t, c]) * tj[row_j + t, c]
++            G[i, j] = s
++
++    # fit_collision fits the intercept by subtracting each column's mean and the waveform's mean; in terms of
++    # the column sums s and the n rows, that turns X'X into X'X - s s'/n and X'y into X'y - s sum(y)/n
++    num_rows = (window_end - window_start) * union_channels.size
++    for i in range(k):
++        Xy[i] -= col_sums[i] * y_sum / num_rows
++        for j in range(i, k):
++            G[i, j] -= col_sums[i] * col_sums[j] / num_rows
++            G[j, i] = G[i, j]
++    if not _is_well_conditioned(G):
++        return np.nan
++    return _nnls_gram(G, Xy)[0]
++
++
++@njit(cache=True)
++def compute_scalings(
++    traces,
++    gains,
++    offsets,
++    sample_indices,
++    unit_indices,
++    local_spike_indices,
++    overlap_matrix,
++    delta_collision_samples,
++    templates,
++    sparsity_mask,
++    sparse_starts,
++    sparse_lists,
++    template_is_zero,
++    cut_out_before,
++):
++    """Scaling of each spike in ``local_spike_indices``, whether it collides, and whether the numpy path must fit it.
++
++    ``templates`` are ``(units, samples, channels)``, cut to the fitted window, and zero outside ``sparsity_mask``,
++    whose channels are listed per unit in ``sparse_lists[sparse_starts[u] : sparse_starts[u + 1]]``.
++    ``sample_indices`` and ``unit_indices`` cover the chunk and its margin, and a negative
++    ``delta_collision_samples`` fits every spike alone. ``gains`` of size 0 leave the traces unscaled.
++    """
++    num_peaks = sample_indices.size
++    # a spike's column sum, x_i'x_i and x_i'y depend only on the spike, so they are computed once and reused in
++    # every collision it is in
++    spike_terms = np.zeros((num_peaks, 3))
++    if delta_collision_samples >= 0:
++        for p in range(num_peaks):
++            u = unit_indices[p]
++            channels = sparse_lists[sparse_starts[u] : sparse_starts[u + 1]]
++            total, squares, product = _template_terms(
++                traces, gains, offsets, sample_indices[p], templates[u], channels, cut_out_before
++            )
++            spike_terms[p, 0], spike_terms[p, 1], spike_terms[p, 2] = total, squares, product
++
++    num_spikes = local_spike_indices.size
++    scalings = np.zeros(num_spikes)
++    is_collision = np.zeros(num_spikes, dtype=np.bool_)
++    needs_numpy_fit = np.zeros(num_spikes, dtype=np.bool_)
++    for spike in range(num_spikes):
++        center = local_spike_indices[spike]
++        sample = sample_indices[center]
++        unit = unit_indices[center]
++        # as in find_collisions: spikes within delta_collision_samples, of units sharing a channel with this one
++        lo = hi = 0
++        if delta_collision_samples >= 0:
++            lo = np.searchsorted(sample_indices, sample - delta_collision_samples)
++            hi = np.searchsorted(sample_indices, sample + delta_collision_samples)
++        members = np.empty(hi - lo + 1, dtype=np.int64)
++        members[0] = center
++        k = 1
++        for other in range(lo, hi):
++            if other != center and overlap_matrix[unit, unit_indices[other]]:
++                members[k] = other
++                k += 1
++        if k > 1:
++            members = members[:k]
++            is_collision[spike] = True
++            scaling = _collision_scaling(
++                traces,
++                gains,
++                offsets,
++                sample_indices[members],
++                unit_indices[members],
++                templates,
++                sparsity_mask,
++                sparse_starts,
++                sparse_lists,
++                spike_terms[members],
++                cut_out_before,
++            )
++            if np.isnan(scaling):
++                needs_numpy_fit[spike] = True
++            else:
++                scalings[spike] = scaling
++        elif not template_is_zero[unit]:  # a zero template keeps a scaling of 0, as in the numpy path
++            channels = sparse_lists[sparse_starts[unit] : sparse_starts[unit + 1]]
++            slope = _ordinary_slope(traces, gains, offsets, sample, templates[unit], channels, cut_out_before)
++            if np.isnan(slope):
++                needs_numpy_fit[spike] = True
++            else:
++                scalings[spike] = slope
++    return scalings, is_collision, needs_numpy_fit
+diff --git a/src/spikeinterface/postprocessing/amplitude_scalings.py b/src/spikeinterface/postprocessing/amplitude_scalings.py
+index 69a1420638..3b6653f70c 100644
+--- a/src/spikeinterface/postprocessing/amplitude_scalings.py
++++ b/src/spikeinterface/postprocessing/amplitude_scalings.py
+@@ -1,3 +1,5 @@
++import importlib.util
++
+ import numpy as np
+ 
+ from spikeinterface.core import ChannelSparsity
+@@ -8,6 +10,8 @@
+ 
+ from spikeinterface.core.node_pipeline import SpikeRetriever, PipelineNode, find_parent_of_type
+ 
++HAVE_NUMBA = importlib.util.find_spec("numba") is not None
++
+ 
+ class ComputeAmplitudeScalings(BaseSpikeVectorExtension):
+     """
+@@ -214,6 +218,14 @@ def __init__(
+         self._handle_collisions = handle_collisions
+         self._delta_collision_samples = delta_collision_samples
+         self._template_is_zero = template_is_zero
++        # the kernel sums over sparse channels only, so it needs templates that are zero outside them; otherwise,
++        # as with a sparsity sparser than the templates, the numpy path runs
++        self._use_numba = HAVE_NUMBA and not np.any((all_templates != 0) & ~sparsity_mask[:, np.newaxis, :])
++        if self._use_numba:
++            self._cut_templates = np.ascontiguousarray(
++                all_templates[:, nbefore - cut_out_before : nbefore + cut_out_after]
++            )
++            self._sparse_channels = _channel_lists(sparsity_mask)
+ 
+         self._kwargs.update(
+             all_templates=all_templates,
+@@ -232,6 +244,8 @@ def get_dtype(self):
+         return self._dtype
+ 
+     def compute(self, traces, peaks):
++        if self._use_numba:
++            return self._compute_numba(traces, peaks)
+         gains = self._gains
+         offsets = self._offsets
+         all_templates = self._all_templates
+@@ -324,10 +338,88 @@ def compute(self, traces, peaks):
+         # TODO: switch to collision mask and return that (to use concatenation)
+         return (scalings, spike_collision_mask)
+ 
++    def _compute_numba(self, traces, peaks):
++        from ._amplitude_scalings_numba import compute_scalings
++
++        if self._gains is None:
++            gains = offsets = np.zeros(0, dtype=np.float32)
++            # numba reads neither float16 nor non-native byte order; both convert exactly
++            if traces.dtype == np.float16:
++                traces = traces.astype(np.float32)
++            elif not traces.dtype.isnative:
++                traces = traces.astype(traces.dtype.newbyteorder("="))
++        else:
++            # the numpy path scales float32 traces, so the product keeps float32 or the gains' wider dtype
++            dtype = np.result_type(np.float32, self._gains.dtype)
++            gains, offsets = self._gains.astype(dtype), self._offsets.astype(dtype)
++            traces = traces.astype(np.float32, copy=False)
++        if self._handle_collisions:
++            overlap_matrix, delta_collision_samples = self._overlap_matrix, self._delta_collision_samples
++        else:
++            overlap_matrix, delta_collision_samples = np.zeros((1, 1), dtype=bool), -1
++        local_spike_indices = np.flatnonzero(~peaks["in_margin"])
++        scalings, spike_collision_mask, needs_numpy_fit = compute_scalings(
++            traces,
++            gains,
++            offsets,
++            peaks["sample_index"],
++            peaks["unit_index"],
++            local_spike_indices,
++            overlap_matrix,
++            delta_collision_samples,
++            self._cut_templates,
++            self._sparsity_mask,
++            *self._sparse_channels,
++            np.asarray(self._template_is_zero),
++            self._cut_out_before,
++        )
++        # the kernel leaves two kinds of spike to the numpy path: collisions whose traces are not finite or whose fit
++        # is ill-conditioned, and spikes with a constant, non-zero template, whose slope linregress decides
++        refit = np.flatnonzero(needs_numpy_fit)
++        refit_collisions = refit[spike_collision_mask[refit]]
++        if refit_collisions.size > 0:
++            collisions = find_collisions(
++                peaks[local_spike_indices[refit_collisions]],
++                peaks,
++                self._delta_collision_samples,
++                self._overlap_matrix,
++                local_spike_indices[refit_collisions],
++            )
++            for i, collision in collisions.items():
++                scalings[refit_collisions[i]] = fit_collision(
++                    collision,
++                    traces,
++                    self._nbefore,
++                    self._all_templates,
++                    self._sparsity_mask,
++                    self._cut_out_before,
++                    self._cut_out_after,
++                    self._gains,
++                    self._offsets,
++                )[0]
++        for spike_index in refit[~spike_collision_mask[refit]]:
++            spike = peaks[local_spike_indices[spike_index]]
++            (sparse_indices,) = np.nonzero(self._sparsity_mask[spike["unit_index"]])
++            start = max(0, spike["sample_index"] - self._cut_out_before)
++            stop = min(traces.shape[0], spike["sample_index"] + self._cut_out_after)
++            first = self._nbefore - (spike["sample_index"] - start)
++            template = self._all_templates[spike["unit_index"]][first : first + stop - start, sparse_indices]
++            local_waveform = traces[start:stop, sparse_indices]
++            if self._gains is not None:
++                local_waveform = local_waveform * gains[sparse_indices] + offsets[sparse_indices]
++            scalings[spike_index] = _ordinary_scaling_slope(template, local_waveform)
++        return scalings.astype(self._dtype), spike_collision_mask
++
+     def get_margin(self):
+         return self._margin
+ 
+ 
++def _channel_lists(mask):
++    """The channels of each row of ``mask``, as ``lists[starts[u] : starts[u + 1]]``."""
++    starts = np.concatenate([[0], np.cumsum(mask.sum(axis=1))])
++    return starts, np.flatnonzero(mask) % mask.shape[1]
++
++
+ ### Collision handling ###
+ def _unit_pair_overlap_matrix(sparsity_mask):
+     """
+@@ -568,7 +660,8 @@ def fit_collision(
+     X = np.zeros((len(y), len(collision)))
+     for i, spike in enumerate(collision):
+ 
+-        full_template = np.zeros_like(local_waveform)
++        # float64 like X, so templates are not truncated to the dtype of unscaled integer or float16 traces
++        full_template = np.zeros(local_waveform.shape)
+ 
+         # For the collision spike, take its unit template and insert
+         # it into `full_template` at the time the collision spike occurred.
+diff --git a/src/spikeinterface/postprocessing/tests/test_amplitude_scalings.py b/src/spikeinterface/postprocessing/tests/test_amplitude_scalings.py
+index 0d6488e6b4..cb523038df 100644
+--- a/src/spikeinterface/postprocessing/tests/test_amplitude_scalings.py
++++ b/src/spikeinterface/postprocessing/tests/test_amplitude_scalings.py
+@@ -6,6 +6,9 @@
+ from spikeinterface.postprocessing import ComputeAmplitudeScalings
+ from spikeinterface.core.base import spike_peak_dtype
+ from spikeinterface.postprocessing.amplitude_scalings import (
++    HAVE_NUMBA,
++    AmplitudeScalingNode,
++    _channel_lists,
+     _ordinary_scaling_slope,
+     _unit_pair_overlap_matrix,
+     find_collisions,
+@@ -164,3 +167,231 @@ def test_scaling_values(self):
+             scalings = ext.data["amplitude_scalings"][mask]
+             median_scaling = np.median(scalings)
+             np.testing.assert_array_equal(np.round(median_scaling), 1)
++
++
++def _scalings_numpy(traces, peaks, templates, sparsity_mask, nbefore, cut_out_before, cut_out_after, delta, gains):
++    """The numpy path of `AmplitudeScalingNode.compute`, spike by spike."""
++    local_spike_indices = np.flatnonzero(~peaks["in_margin"])
++    local_spikes = peaks[local_spike_indices]
++    offsets = None if gains is None else np.zeros_like(gains)
++    collisions = {}
++    if delta >= 0:
++        overlap_matrix = _unit_pair_overlap_matrix(sparsity_mask)
++        collisions = find_collisions(local_spikes, peaks, delta, overlap_matrix, local_spike_indices)
++    scalings = np.zeros(len(local_spikes))
++    for spike_index, spike in enumerate(local_spikes):
++        if spike_index in collisions:
++            collision = collisions[spike_index]
++            fit = fit_collision(
++                collision, traces, nbefore, templates, sparsity_mask, cut_out_before, cut_out_after, gains, offsets
++            )
++            scalings[spike_index] = fit[0]
++            continue
++        unit_index = spike["unit_index"]
++        if np.all(templates[unit_index] == 0):
++            continue
++        (channels,) = np.nonzero(sparsity_mask[unit_index])
++        start = max(0, spike["sample_index"] - cut_out_before)
++        stop = min(traces.shape[0], spike["sample_index"] + cut_out_after)
++        first = nbefore - (spike["sample_index"] - start)
++        template = templates[unit_index][first : first + stop - start, channels]
++        waveform = traces[start:stop, channels]
++        if gains is not None:
++            waveform = waveform.astype("float32") * gains[channels] + offsets[channels]
++        scalings[spike_index] = _ordinary_scaling_slope(template, waveform)
++    collision_mask = np.isin(np.arange(len(local_spikes)), list(collisions))
++    return scalings, collision_mask
++
++
++def _scalings_numba(traces, peaks, templates, sparsity_mask, nbefore, cut_out_before, cut_out_after, delta, gains):
++    """The node's numba path, including the spikes it hands back to the numpy path."""
++    node = object.__new__(AmplitudeScalingNode)
++    node._gains = gains
++    node._offsets = None if gains is None else np.zeros_like(gains)
++    node._dtype = np.float64  # keep full precision for the comparison
++    node._all_templates = templates
++    node._sparsity_mask = sparsity_mask
++    node._overlap_matrix = _unit_pair_overlap_matrix(sparsity_mask)
++    node._nbefore = nbefore
++    node._cut_out_before = cut_out_before
++    node._cut_out_after = cut_out_after
++    node._handle_collisions = delta >= 0
++    node._delta_collision_samples = delta
++    node._template_is_zero = np.all(templates == 0, axis=(1, 2))
++    node._cut_templates = np.ascontiguousarray(templates[:, nbefore - cut_out_before : nbefore + cut_out_after])
++    node._sparse_channels = _channel_lists(sparsity_mask)
++    return node._compute_numba(traces, peaks)
++
++
++def _make_chunk(seed, num_units=12, num_channels=32, num_samples=6000, num_spikes=600):
++    """Spikes with random, possibly negative amplitudes on non-contiguous channels, including at both edges."""
++    rng = np.random.default_rng(seed)
++    nbefore, nafter = 20, 30
++    sparsity_mask = np.zeros((num_units, num_channels), dtype=bool)
++    for unit_index in range(num_units):
++        sparsity_mask[unit_index, rng.choice(num_channels, size=8, replace=False)] = True
++    templates = (
++        rng.normal(scale=50, size=(num_units, nbefore + nafter, num_channels)) * sparsity_mask[:, None]
++    ).astype(np.float32)
++    templates[-1] = 0  # a unit whose template is zero
++    samples = np.sort(
++        np.concatenate([rng.integers(0, num_samples, num_spikes - 4), [0, 5, num_samples - 5, num_samples - 1]])
++    )
++    peaks = np.zeros(num_spikes, dtype=spike_peak_dtype + [("in_margin", "bool")])
++    peaks["sample_index"] = samples
++    peaks["unit_index"] = rng.integers(0, num_units, num_spikes)
++    peaks["in_margin"] = (samples < 100) & (rng.random(num_spikes) < 0.5)
++    traces = rng.normal(scale=5, size=(num_samples + nafter, num_channels)).astype(np.float32)
++    for sample, unit_index in zip(samples, peaks["unit_index"]):
++        start = sample - nbefore
++        lo = max(0, -start)
++        traces[start + lo : sample + nafter] += rng.uniform(-0.5, 1.5) * templates[unit_index][lo:]
++    traces = traces[:num_samples]
++    return traces, peaks, templates, sparsity_mask, nbefore
++
++
++@pytest.mark.skipif(not HAVE_NUMBA, reason="the numba kernel needs numba")
++@pytest.mark.parametrize("gains", [None, "float32", "float64"])
++@pytest.mark.parametrize("delta", [10, -1])
++@pytest.mark.parametrize("cut_out", [(20, 30), (12, 25)])
++def test_numba_scalings_match_numpy(gains, delta, cut_out):
++    """
++    The kernel equals the numpy path up to rounding: with and without gains and collisions, a cut-out shorter
++    than the templates, spikes clipped at either edge of the
++    traces, binding non-negativity constraints and a zero template.
++    """
++    traces, peaks, templates, sparsity_mask, nbefore = _make_chunk(0)
++    if gains is not None:
++        gains = np.linspace(0.1, 0.3, traces.shape[1]).astype(gains)
++    args = (traces, peaks, templates, sparsity_mask, nbefore, *cut_out, delta, gains)
++    expected, expected_collisions = _scalings_numpy(*args)
++    scalings, collisions = _scalings_numba(*args)
++
++    np.testing.assert_array_equal(collisions, expected_collisions)
++    assert (delta < 0) or (expected_collisions.mean() > 0.3 and np.sum(expected[expected_collisions] == 0) > 10)
++    np.testing.assert_allclose(scalings, expected, rtol=1e-9, atol=1e-12)
++
++
++@pytest.mark.skipif(not HAVE_NUMBA, reason="the numba kernel needs numba")
++@pytest.mark.parametrize("return_in_uV", [True, False])
++@pytest.mark.parametrize("sparser", [False, True])
++def test_amplitude_scalings_numba_matches_numpy_extension(monkeypatch, return_in_uV, sparser):
++    """A sparsity sparser than the templates' sends the node to the numpy path, which must give the same result."""
++    from spikeinterface.core import ChannelSparsity, create_sorting_analyzer, generate_ground_truth_recording
++    from spikeinterface.postprocessing import amplitude_scalings
++
++    recording, sorting = generate_ground_truth_recording(durations=[10.0], num_units=20, seed=0)
++    analyzer = create_sorting_analyzer(sorting, recording, sparse=True, return_in_uV=return_in_uV)
++    analyzer.compute(["random_spikes", "templates"])
++    params = {}
++    if sparser:
++        # one channel fewer per unit, keeping its main channel
++        mask = analyzer.sparsity.mask.copy()
++        main_channels = analyzer.get_main_channels(outputs="index")
++        for unit_index, channels in enumerate(mask):
++            mask[unit_index, np.flatnonzero(channels & (np.arange(mask.shape[1]) != main_channels[unit_index]))[0]] = (
++                False
++            )
++        params["sparsity"] = ChannelSparsity(mask, analyzer.unit_ids, analyzer.channel_ids)
++    numba_chunks = []
++    compute_numba = amplitude_scalings.AmplitudeScalingNode._compute_numba
++    monkeypatch.setattr(
++        amplitude_scalings.AmplitudeScalingNode,
++        "_compute_numba",
++        lambda self, *args: numba_chunks.append(1) or compute_numba(self, *args),
++    )
++    results = {}
++    for have_numba in (True, False):
++        monkeypatch.setattr(amplitude_scalings, "HAVE_NUMBA", have_numba)
++        ext = analyzer.compute("amplitude_scalings", chunk_duration="1s", n_jobs=1, **params)
++        results[have_numba] = ext.data["amplitude_scalings"], ext.data["collision_mask"]
++    assert (len(numba_chunks) == 0) == sparser
++    assert results[False][1].any()
++    np.testing.assert_array_equal(results[True][1], results[False][1])
++    np.testing.assert_allclose(results[True][0], results[False][0], rtol=1e-5)
++
++
++@pytest.mark.skipif(not HAVE_NUMBA, reason="the numba kernel needs numba")
++@pytest.mark.parametrize("lag", [0, 1, 2])
++def test_numba_scalings_match_numpy_for_duplicates(lag):
++    """
++    Two spikes of one unit `lag` samples apart give nearly or exactly equal columns. At lag 0 the fit is singular,
++    so the kernel hands it to `fit_collision`, which gives the whole amplitude to the spike being scaled.
++    """
++    nbefore, nafter, num_channels = 20, 30, 8
++    rng = np.random.default_rng(0)
++    times = np.arange(nbefore + nafter)
++    template = -100 * np.exp(-0.5 * ((times - nbefore) / 2.0) ** 2)[:, None] * rng.uniform(0.3, 1, num_channels)
++    templates = template[np.newaxis].astype(np.float32)
++    sparsity_mask = np.ones((1, num_channels), dtype=bool)
++    peaks = np.zeros(2, dtype=spike_peak_dtype + [("in_margin", "bool")])
++    peaks["sample_index"] = [80, 80 + lag]
++    traces = rng.normal(size=(200, num_channels)).astype(np.float32)
++    for sample, amplitude in zip(peaks["sample_index"], [1.0, 0.6]):
++        traces[sample - nbefore : sample + nafter] += amplitude * templates[0]
++    args = (traces, peaks, templates, sparsity_mask, nbefore, nbefore, nafter, 10, None)
++    expected, expected_collisions = _scalings_numpy(*args)
++    scalings, collisions = _scalings_numba(*args)
++
++    assert collisions.all() and expected_collisions.all()
++    np.testing.assert_allclose(scalings, expected, rtol=1e-9)
++    if lag == 0:
++        np.testing.assert_allclose(scalings, 1.6, rtol=0.01)
++
++
++def _two_unit_collision(second_template_noise, lag=3, trace_noise=3.0, num_channels=8, dtype=np.float32):
++    """Two units colliding `lag` samples apart, the second's template the first's plus noise of the given scale."""
++    nbefore, nafter = 20, 30
++    rng = np.random.default_rng(1)
++    times = np.arange(nbefore + nafter)
++    first = -100 * np.exp(-0.5 * ((times - nbefore) / 2.0) ** 2)[:, None] * rng.uniform(0.3, 1, num_channels)
++    second = first + second_template_noise * rng.normal(size=first.shape)
++    templates = np.stack([first, second]).astype(np.float32)
++    sparsity_mask = np.ones((2, num_channels), dtype=bool)
++    peaks = np.zeros(2, dtype=spike_peak_dtype + [("in_margin", "bool")])
++    peaks["sample_index"] = [80, 80 + lag]
++    peaks["unit_index"] = [0, 1]
++    traces = trace_noise * rng.normal(size=(200, num_channels))
++    for sample, unit_index, amplitude in zip(peaks["sample_index"], [0, 1], [1.3, 0.7]):
++        traces[sample - nbefore : sample + nafter] += amplitude * templates[unit_index]
++    return (traces.astype(dtype), peaks, templates, sparsity_mask, nbefore, nbefore, nafter, 10, None)
++
++
++@pytest.mark.skipif(not HAVE_NUMBA, reason="the numba kernel needs numba")
++@pytest.mark.parametrize("second_template_noise", [1e-5, 1e-3])
++def test_numba_scalings_match_numpy_for_nearly_identical_templates(second_template_noise):
++    """An ill-conditioned fit goes to `fit_collision`, so it equals the numpy path rather than a truncated fit."""
++    args = _two_unit_collision(second_template_noise, lag=0, trace_noise=0.0)
++    expected, _ = _scalings_numpy(*args)
++    scalings, _ = _scalings_numba(*args)
++    assert 0 < expected[0] < 2
++    np.testing.assert_allclose(scalings, expected, rtol=1e-9)
++
++
++@pytest.mark.skipif(not HAVE_NUMBA, reason="the numba kernel needs numba")
++def test_numba_scalings_raise_on_nan_in_collision_like_numpy():
++    traces, *rest = _two_unit_collision(second_template_noise=10.0)
++    traces[82, 0] = np.nan
++    for scalings_function in (_scalings_numpy, _scalings_numba):
++        with pytest.raises(ValueError):
++            scalings_function(traces, *rest)
++
++
++@pytest.mark.skipif(not HAVE_NUMBA, reason="the numba kernel needs numba")
++@pytest.mark.parametrize("dtype", [np.float16, np.dtype(">i2"), np.dtype(">f4")])
++def test_numba_scalings_match_numpy_for_dtypes_numba_cannot_read(dtype):
++    traces, peaks, templates, sparsity_mask, nbefore = _make_chunk(0)
++    args = (traces.astype(dtype), peaks, templates, sparsity_mask, nbefore, 20, 30, 10, None)
++    expected, expected_collisions = _scalings_numpy(*args)
++    scalings, collisions = _scalings_numba(*args)
++    np.testing.assert_array_equal(collisions, expected_collisions)
++    np.testing.assert_allclose(scalings, expected, rtol=1e-9, atol=1e-12)
++
++
++@pytest.mark.parametrize("dtype", [np.int16, np.float16])
++def test_fit_collision_keeps_template_precision_for_unscaled_traces(dtype):
++    traces, peaks, templates, sparsity_mask, nbefore, cut_out_before, cut_out_after, _, _ = _two_unit_collision(10.0)
++    traces = traces.astype(dtype)
++    args = (peaks, nbefore, templates, sparsity_mask, cut_out_before, cut_out_after)
++    fit = fit_collision(peaks, traces, *args[1:])
++    np.testing.assert_allclose(fit, fit_collision(peaks, traces.astype(np.float32), *args[1:]), rtol=1e-9)

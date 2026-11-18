@@ -1,0 +1,1510 @@
+diff --git a/bmtk/simulator/dpointnet/acceleration.py b/bmtk/simulator/dpointnet/acceleration.py
+index e87b155e..f520a934 100644
+--- a/bmtk/simulator/dpointnet/acceleration.py
++++ b/bmtk/simulator/dpointnet/acceleration.py
+@@ -1,6 +1,7 @@
+ """Opt-in hardware-aware execution choices, independent of scientific settings."""
+ 
+ from numbers import Integral
++import warnings
+ 
+ import numpy as np
+ import tensorflow as tf
+@@ -64,6 +65,120 @@ def history_rows(delays, n_sources):
+ # previous dense route. Explicit ``use_adaptive_routing=True`` is still honored.
+ ADAPTIVE_ROUTING_MIN_BATCH = 8
+ 
++
++def pair_projection_predicates(
++    fused_cuda, batch_size, basis_width, *, compatibility=False, defer_basis=False,
++):
++    """Shared current/compatibility admission, independent of dynamics and precision."""
++    predicates = {
++        "compatible fused CUDA currents": bool(fused_cuda),
++        f"batch_size must be positive and known (found {batch_size})": (
++            isinstance(batch_size, Integral) and not isinstance(batch_size, bool) and batch_size > 0
++        ),
++        f"the synaptic basis must have positive width (found {basis_width})": (
++            defer_basis if basis_width is None else basis_width > 0
++        ),
++    }
++    if compatibility:
++        predicates["compatibility_v1 auto requires batch32 and four bases"] = (
++            batch_size == 32 and basis_width == 4
++        )
++    return predicates
++
++
++def finalize_acceleration_report(report, requested, effective, *, predicates=None, policy_predicates=None):
++    """Reconcile resolver intent with cell/connectivity selections for preflight.
++
++    ``effective`` contains booleans or named paths, never unresolved "auto".
++    Rollout-dependent paths are explicitly identified, not kernel-execution proof.
++    """
++    if report is None:
++        report = {
++            "profile": requested.get("acceleration_profile"),
++            "architecture": csr_spike_ops._gpu_compute_architecture(),
++            "tensorflow": tf.__version__,
++            "requested": dict(requested),
++            "selected": {}, "reasons": {}, "provenance": {}, "automatic": {},
++            "predicates": {},
++        }
++    report.setdefault("resolver_selected", dict(report["selected"]))
++    report["selected"] = dict(effective)
++    report["stage"] = "cell"
++    report["predicates"].update(predicates or {})
++    entries = {}
++    audit = []
++    for name, value in effective.items():
++        supplied = name in requested
++        request = requested.get(name)
++        provenance = report["provenance"].get(name)
++        if provenance is None:
++            provenance = (
++                "explicit_compatibility_override" if supplied and request == "auto"
++                else "explicit_override" if supplied
++                else "profile" if name in report["resolver_selected"] else "constructor_default"
++            )
++        checks = dict(report["predicates"].get(name, {}))
++        blocked = [label for label, ok in checks.items() if not ok] if value is False else []
++        policy_checks = dict((policy_predicates or {}).get(name, checks))
++        automatic = report["automatic"].get(name)
++        if automatic is not None:
++            automatic = bool(automatic and all(policy_checks.values()))
++        if value is False and supplied and request is False:
++            blocked.insert(0, "explicit False override")
++        entry = {
++            "requested": request, "supplied": supplied, "provenance": provenance,
++            "resolved": value, "predicates": checks, "blocked_by": blocked,
++            "current_policy": automatic, "policy_predicates": policy_checks,
++        }
++        entries[name] = entry
++        if value is False and automatic is True and supplied and (
++            request is False or provenance == "explicit_compatibility_override"
++        ):
++            audit.append({
++                "option": name, "classification": "avoidable_execution_override",
++                "message": (
++                    f"{name} is OFF due to {provenance}; current policy admits it. "
++                    'Use acceleration_profile="auto" and omit the override or set it to "auto".'
++                ),
++            })
++        elif value is False and blocked:
++            audit.append({
++                "option": name,
++                "classification": (
++                    "scientific_incompatibility"
++                    if any(label in ("NEST dynamics", "compute temporal gradients") for label in blocked)
++                    else "eligibility_or_dependency"
++                ),
++                "message": "; ".join(blocked),
++            })
++    report["effective"] = entries
++    for name, dependencies in {
++        "use_fused_recurrent_accumulation": (
++            "use_pair_projection", "use_direct_csr_recurrent_gradient",
++        ),
++        "use_javier_recurrent_vjp": ("use_fused_recurrent_accumulation", "use_pair_projection"),
++        "use_csr_master_weights": ("use_combined_current_sweep",),
++        "use_uint8_synapse_types": ("use_csr_master_weights",),
++        "use_adaptive_routing": ("use_uint8_synapse_types",),
++    }.items():
++        if name in entries:
++            entries[name]["dependencies"] = {
++                dependency: {
++                    "resolved": entries[dependency]["resolved"],
++                    "provenance": entries[dependency]["provenance"],
++                }
++                for dependency in dependencies if dependency in entries
++            }
++    report["optimization_audit"] = audit
++    return report
++
++
++def record_rollout_acceleration(report, selections):
++    """Record the last traced rollout's path without changing execution policy."""
++    if report is None:
++        return
++    report["rollout_selected"] = dict(selections)
++
+ # Architecture-determined limits (CUDA programming guide, technical specifications
+ # per compute capability). Multiprocessor counts differ between products; the
+ # native operator queries them and the measured kernel occupancy at launch.
+@@ -173,7 +288,7 @@ def _index_bytes(context):
+ 
+ def select_performance_projection(
+     options, context, *, compute_dtype, variable_dtype, batch_size, basis_width,
+-    architecture,
++    architecture, diagnostics=None,
+ ):
+     """Choose a qualified joint-current route without changing explicit options."""
+     reason = (
+@@ -181,23 +296,29 @@ def select_performance_projection(
+         "SASS, FP16/FP32 with FP32 masters, batch1..32, four bases, native spike inputs and "
+         "bounded routing; joint FP32 accumulation rounds once to compute dtype"
+     )
+-    eligible = (
+-        options.get("acceleration_profile", "auto") == "auto"
+-        and options.get("use_combined_current_sweep") is not False
+-        and options.get("use_fused_cuda") is not False
+-        and options.get("dynamics_mode", "nest") == "nest"
+-        and options.get("temporal_gradient_precision", "compute") == "compute"
+-        and architecture in JOINT_SWEEP_ARCHITECTURES
+-        and architecture in csr_spike_ops._SM_ARCHITECTURES
+-        and tf.as_dtype(compute_dtype) in (tf.float16, tf.float32)
+-        and tf.as_dtype(variable_dtype) == tf.float32
+-        and isinstance(batch_size, Integral) and not isinstance(batch_size, bool)
+-        and 1 <= batch_size <= JOINT_SWEEP_MAX_BATCH and basis_width == 4
+-        and context is not None and context["standard_cell"]
+-        and context["single_replica"] and context["spike_inputs"]
+-        and context["recurrent_edges"] > 0
+-        and csr_spike_ops.combined_sweep_available()
+-    )
++    context = context or {}
++    predicates = {
++        "automatic profile": options.get("acceleration_profile", "auto") == "auto",
++        "joint sweep not explicitly disabled": options.get("use_combined_current_sweep") is not False,
++        "fused currents not explicitly disabled": options.get("use_fused_cuda") is not False,
++        "NEST dynamics": options.get("dynamics_mode", "nest") == "nest",
++        "compute temporal gradients": options.get("temporal_gradient_precision", "compute") == "compute",
++        f"SM{architecture} in qualified fat-binary targets": architecture in JOINT_SWEEP_ARCHITECTURES,
++        f"SM{architecture} SASS in loaded library": architecture in csr_spike_ops._SM_ARCHITECTURES,
++        "FP16/FP32 compute": tf.as_dtype(compute_dtype) in (tf.float16, tf.float32),
++        "FP32 masters": tf.as_dtype(variable_dtype) == tf.float32,
++        f"batch1..32 (found {batch_size})": (
++            isinstance(batch_size, Integral) and not isinstance(batch_size, bool)
++            and 1 <= batch_size <= JOINT_SWEEP_MAX_BATCH
++        ),
++        f"four bases (found {basis_width})": basis_width == 4,
++        "standard high-level cell": context.get("standard_cell", False),
++        "single replica": context.get("single_replica", False),
++        "nonempty supported spike inputs": context.get("spike_inputs", False),
++        "nonempty recurrence": context.get("recurrent_edges", 0) > 0,
++        "loaded joint-sweep ABI": csr_spike_ops.combined_sweep_available(),
++    }
++    eligible = all(predicates.values())
+     tile = 256 if eligible and batch_size == 1 else 2048
+     if eligible:
+         index_bytes = _index_bytes(context)
+@@ -213,6 +334,12 @@ def routing_bytes(targets):
+         eligible = routing_bytes(tile) <= 512 * 1024**2 and combined_sweep_launch_geometry(
+             architecture, tile, index_bytes=index_bytes,
+         )["valid"]
++        predicates["routing table <= 512 MiB and launchable tile"] = eligible
++    missing = [name for name, ok in predicates.items() if not ok]
++    if missing:
++        reason += "; blocked by: " + "; ".join(missing)
++    if diagnostics is not None:
++        diagnostics.update(predicates)
+     return bool(eligible), tile, reason
+ 
+ 
+@@ -256,6 +383,7 @@ def resolve_csr_master_options(
+         "use_csr_master_weights", not missing,
+         "CSR-ordered FP32 masters read directly by native kernels with host-prepared "
+         "metadata" if not missing else "previous path kept; requires " + _option_names_requiring(missing),
++        {name: False for name in missing} if missing else {"CSR-master prerequisites": True},
+     )
+     masters = options["use_csr_master_weights"] is True
+ 
+@@ -279,6 +407,7 @@ def resolve_csr_master_options(
+         "use_uint8_synapse_types", not missing,
+         "uint8 per-edge type tail in the single CSR metadata resource" if not missing
+         else "wide types kept; requires " + _option_names_requiring(missing),
++        {name: False for name in missing} if missing else {"uint8 prerequisites": True},
+     )
+     uint8 = options["use_uint8_synapse_types"] is True
+ 
+@@ -308,7 +437,11 @@ def resolve_csr_master_options(
+             "compressed segment routing with per-launch wide/narrow tiles" if not missing
+             else "dense tile routing kept; requires " + _option_names_requiring(missing)
+         )
+-    select("use_adaptive_routing", enabled, reason)
++    checks = {name: False for name in missing}
++    checks[f"batch >= {ADAPTIVE_ROUTING_MIN_BATCH} (found {batch_size})"] = (
++        isinstance(batch_size, Integral) and batch_size >= ADAPTIVE_ROUTING_MIN_BATCH
++    )
++    select("use_adaptive_routing", enabled, reason, checks)
+ 
+ 
+ def resolve_acceleration_options(
+@@ -316,19 +449,28 @@ def resolve_acceleration_options(
+     train_recurrent_per_type=False, canonical_gradient_boundary=True,
+     performance_context=None, synapse_type_range=None,
+ ):
+-    """Resolve ``acceleration_profile="auto"`` without overriding explicit flags.
++    """Resolve automatic requests centrally, retaining explicit boolean overrides.
+ 
+     The returned report is suitable for recording with execution provenance.
+-    Omitting the profile selects auto; explicit None disables profile expansion.
++    Omission and per-option "auto" use the same current policy under auto.
++    None and "compatibility_v1" disable expansion (historical constructor policy).
+     ``synapse_type_range`` is the (min, max) per-edge synapse type ID over the
+     recurrent and every input network, used by ``use_uint8_synapse_types``.
+     """
+     options = dict(cell_params)
+     profile = options.pop("acceleration_profile", "auto")
+-    if profile is None:
++    if profile is None or profile == "compatibility_v1":
++        if profile is None and any(
++            name.startswith("use_") and value == "auto" for name, value in options.items()
++        ):
++            warnings.warn(
++                'acceleration_profile=None retains historical per-option "auto" heuristics. '
++                'Use "compatibility_v1" to name this policy, or "auto" for current policy.',
++                FutureWarning, stacklevel=2,
++            )
+         return options, None
+     if profile != "auto":
+-        raise ValueError('acceleration_profile must be None or "auto".')
++        raise ValueError('acceleration_profile must be None, "auto" or "compatibility_v1".')
+ 
+     compute_dtype = tf.as_dtype(compute_dtype)
+     variable_dtype = tf.as_dtype(variable_dtype)
+@@ -345,14 +487,24 @@ def resolve_acceleration_options(
+         "requested": dict(cell_params),
+         "selected": {},
+         "reasons": {},
++        "provenance": {},
++        "automatic": {},
++        "predicates": {},
++        "stage": "resolver",
+     }
+ 
+-    def select(name, enabled, reason):
+-        if name in options:
++    def select(name, enabled, reason, predicates=None):
++        report["automatic"][name] = bool(enabled)
++        report["predicates"][name] = predicates or {reason: bool(enabled)}
++        if name in options and options[name] != "auto":
+             report["reasons"][name] = "explicit override; constructor validation retained"
++            report["provenance"][name] = "explicit_override"
+         else:
+             options[name] = bool(enabled)
+             report["reasons"][name] = reason
++            report["provenance"][name] = (
++                "explicit_auto" if name in cell_params else "profile"
++            )
+         report["selected"][name] = options[name]
+ 
+     numeric = compute_dtype in (tf.float16, tf.float32) and variable_dtype == tf.float32
+@@ -365,14 +517,24 @@ def select(name, enabled, reason):
+         "compatible loaded CSR library and FP16/FP32 compute with FP32 masters; "
+         "SM61-compatible CSR currents; matching loaded library, FP16/FP32 compute "
+         "and FP32 masters; explicit homogeneous data-parallel GPU strategies supported",
++        {
++            "FP16/FP32 compute and FP32 masters": numeric,
++            "loaded compatible CSR library": csr_spike_ops.fused_cuda_available(),
++            "supported NEST architecture": not unsupported_nest,
++        },
+     )
+     currents = currents and options["use_fused_cuda"] is not False
++    projection_checks = {}
++    projection_options = dict(cell_params)
++    projection_options.pop("use_combined_current_sweep", None)
+     combined, tile, combined_reason = select_performance_projection(
+-        cell_params, performance_context, compute_dtype=compute_dtype,
++        projection_options, performance_context, compute_dtype=compute_dtype,
+         variable_dtype=variable_dtype, batch_size=batch_size, basis_width=basis_width,
+-        architecture=architecture,
++        architecture=architecture, diagnostics=projection_checks,
+     )
+-    select("use_combined_current_sweep", currents and combined, combined_reason)
++    projection_checks["compatible fused currents"] = currents
++    select("use_combined_current_sweep", currents and combined, combined_reason, projection_checks)
++    combined = combined and cell_params.get("use_combined_current_sweep") is not False
+     joint = options["use_combined_current_sweep"] is True
+     # Projection traversal choices inside the admitted joint sweep. Each is a
+     # pure scheduling change over the same FP32 tile accumulation and rounding;
+@@ -383,18 +545,21 @@ def select(name, enabled, reason):
+         joint and csr_spike_ops.cooperative_combined_sweep_available(),
+         "admitted joint sweep and rebuilt cooperative-row capability; register-only "
+         "eight-row warp packing for known target-unique sources below512edges per row",
++        {"joint sweep": joint, "loaded cooperative-row ABI": csr_spike_ops.cooperative_combined_sweep_available()},
+     )
+     select(
+         "use_fanout_row_projection",
+         joint and csr_spike_ops.fanout_combined_sweep_available(),
+         "admitted joint sweep and rebuilt fanout-row capability; compact nonempty-row "
+         "scan with concatenated edge walk for sources of at least512edges per row",
++        {"joint sweep": joint, "loaded fanout-row ABI": csr_spike_ops.fanout_combined_sweep_available()},
+     )
+     select(
+         "use_target_gather_projection",
+         joint and csr_spike_ops.gather_combined_sweep_available(),
+         "admitted joint sweep and rebuilt gather capability; target-major atomic-free "
+         "gather for sources with at most16incoming edges per target",
++        {"joint sweep": joint, "loaded target-gather ABI": csr_spike_ops.gather_combined_sweep_available()},
+     )
+     resolve_csr_master_options(
+         options, report, select=select, admitted=currents and combined, joint=joint,
+@@ -464,10 +629,17 @@ def select(name, enabled, reason):
+         numeric and four_basis and state_available and not unsupported_nest,
+         "compatible mode-specific state library, FP32 masters and four bases; "
+         "SM61 NEST requires rebuilt occupancy-aware launch capability",
++        {
++            "FP16/FP32 compute and FP32 masters": numeric,
++            "four synaptic bases": four_basis,
++            "mode-specific state ABI (including Pascal occupancy)": state_available,
++            "supported NEST architecture": not unsupported_nest,
++        },
+     )
+     state = options["use_fused_state"] is not False and numeric and four_basis and state_available and not unsupported_nest
+     select("use_direct_state_rnn_loop", state and currents,
+-           "compatible fused state/currents and explicit-state loop")
++           "compatible fused state/currents and explicit-state loop",
++           {"compatible fused state": state, "compatible fused currents": currents})
+     prepared = (
+         nest and options["use_direct_state_rnn_loop"] is True
+         and options.get("temporal_gradient_precision", "compute") == "compute"
+@@ -475,7 +647,7 @@ def select(name, enabled, reason):
+         and performance_context is not None and performance_context["single_replica"]
+         and performance_context["standard_cell"]
+     )
+-    if "use_prepared_cpu_poisson" in options:
++    if "use_prepared_cpu_poisson" in options and options["use_prepared_cpu_poisson"] != "auto":
+         report["reasons"]["use_prepared_cpu_poisson"] = "explicit override; constructor validation retained"
+     else:
+         # "auto" prepares exact per-step CPU Poisson counts once per rollout when
+@@ -487,6 +659,11 @@ def select(name, enabled, reason):
+             "the layer falls back to per-step sampling outside the direct loop or budget"
+         )
+     report["selected"]["use_prepared_cpu_poisson"] = options["use_prepared_cpu_poisson"]
++    report["automatic"]["use_prepared_cpu_poisson"] = prepared
++    report["provenance"]["use_prepared_cpu_poisson"] = (
++        "explicit_auto" if cell_params.get("use_prepared_cpu_poisson") == "auto"
++        else "explicit_override" if "use_prepared_cpu_poisson" in cell_params else "profile"
++    )
+     select("use_fused_nest_event_vjp",
+            nest and state and glif_state_ops.fused_nest_event_vjp_available(),
+            "compatible NEST state and loaded event-gradient operator")
+@@ -499,8 +676,11 @@ def select(name, enabled, reason):
+            "compatible state, enabled penalty tracking and loaded penalty operators")
+     select("use_forward_run_aggregation", currents and small_batch and four_basis,
+            "compatible batch1..32/four-basis CSR route")
+-    select("use_pair_projection", currents and known_batch,
+-           "compatible CSR library and known positive batch")
++    pair_predicates = pair_projection_predicates(
++        currents, batch_size, basis_width, defer_basis=True,
++    )
++    select("use_pair_projection", all(pair_predicates.values()),
++           "compatible CSR library, known positive batch and nonempty basis", pair_predicates)
+     select("use_fixed4_input_forward", currents and four_basis,
+            "compatible CSR library and four bases; each input checks exactly four incoming edges")
+     select("use_fused_current_accumulation", currents and four_basis and batch_size == 32,
+@@ -509,28 +689,37 @@ def select(name, enabled, reason):
+         "train_recurrent_per_type", train_recurrent_per_type
+     )
+     select("use_direct_csr_recurrent_gradient", currents and per_edge_training and canonical_gradient_boundary,
+-           "compatible CSR library, per-edge weights and an enclosing canonical-gradient boundary")
++           "compatible CSR library, per-edge weights and an enclosing canonical-gradient boundary",
++           {
++               "compatible fused currents": currents, "per-edge trainable recurrence": per_edge_training,
++               "canonical-gradient boundary": canonical_gradient_boundary,
++           })
+     select("use_active_row_forward", currents and small_batch and four_basis,
+            "compatible CSR library, batch1..32 and four bases")
+     select("use_device_active_queue_forward", currents and small_batch and four_basis,
+            "compatible CSR library, batch1..32 and four bases")
+-    pair_projection = options["use_pair_projection"] is True or (
+-        options["use_pair_projection"] == "auto" and batch_size == 32 and four_basis
+-    )
+-    packed = (
+-        currents and fp16_backward and four_basis and batch_size == 32
+-        and csr_spike_ops._auto_native_architecture(architecture) and pair_projection
+-    )
++    pair_projection = options["use_pair_projection"] is True
++    packed_predicates = {
++        "compatible fused currents": currents,
++        "FP16 compute-temporal backward": fp16_backward,
++        "four synaptic bases": four_basis,
++        f"batch32 (found {batch_size})": batch_size == 32,
++        f"SM{architecture} admitted for automatic packed backward": (
++            csr_spike_ops._auto_native_architecture(architecture)
++        ),
++        "use_pair_projection=True": pair_projection,
++    }
++    packed = all(packed_predicates.values())
+     select("use_packed_sm120_backward", packed,
+            "FP16 temporal backward, automatic policy SM70+, batch32, four bases and pair metadata; "
+-           "per-connectivity checks remain automatic")
++           "per-connectivity checks remain automatic", packed_predicates)
+     select("use_packed_sm120_external_backward", packed,
+-           "FP16 temporal backward, automatic policy SM70+, batch32 and four bases")
++           "FP16 temporal backward, automatic policy SM70+, batch32 and four bases", packed_predicates)
+     # Auto keeps the existing per-connectivity fallback for oversized/int64 metadata.
+-    if packed and cell_params.get("use_packed_sm120_backward") is None:
++    if packed and cell_params.get("use_packed_sm120_backward") in (None, "auto"):
+         options["use_packed_sm120_backward"] = "auto"
+         report["selected"]["use_packed_sm120_backward"] = "auto"
+-    if packed and cell_params.get("use_packed_sm120_external_backward") is None:
++    if packed and cell_params.get("use_packed_sm120_external_backward") in (None, "auto"):
+         options["use_packed_sm120_external_backward"] = "auto"
+         report["selected"]["use_packed_sm120_external_backward"] = "auto"
+     select("use_prepacked_nest_coefficients", nest and state,
+@@ -549,22 +738,34 @@ def select(name, enabled, reason):
+     carry_route = options.get("temporal_gradient_precision") == "float32" or options.get(
+         "use_direct_state_rnn_loop", False
+     )
+-    accumulator = (
+-        currents and small_batch and four_basis and carry_route
+-        and (pascal or csr_spike_ops._auto_native_architecture(architecture))
+-        and (architecture != 75 or fp16_backward)
+-        and options["use_direct_csr_recurrent_gradient"] is True
+-        and per_edge_training
+-        and pair_projection and csr_spike_ops.fused_recurrent_accumulation_available()
+-    )
++    accumulator_predicates = {
++        "compatible fused currents": currents,
++        f"batch1..32 (found {batch_size})": small_batch,
++        f"four bases (found {basis_width})": four_basis,
++        "direct state loop or FP32 temporal carry": bool(carry_route),
++        f"SM{architecture} admitted for accumulator": (
++            pascal or csr_spike_ops._auto_native_architecture(architecture)
++        ),
++        "SM75 requires FP16 temporal backward": architecture != 75 or fp16_backward,
++        "use_direct_csr_recurrent_gradient=True": options["use_direct_csr_recurrent_gradient"] is True,
++        "per-edge trainable recurrence": bool(per_edge_training),
++        "use_pair_projection=True": pair_projection,
++        "loaded fused accumulator ABI": csr_spike_ops.fused_recurrent_accumulation_available(),
++    }
++    accumulator = all(accumulator_predicates.values())
+     select("use_fused_recurrent_accumulation", accumulator,
+            "Automatic policy SM61, SM70+ (SM75 with FP16 temporal backward) accumulator library, "
+            "batch1..32/four bases, per-edge training, direct CSR "
+-           "and explicitly selected direct-loop or FP32 replay route")
++           "and explicitly selected direct-loop or FP32 replay route", accumulator_predicates)
+     select(
+         "use_javier_recurrent_vjp",
+         accumulator and options["use_fused_recurrent_accumulation"] is True and fp16_backward,
+         "compatible fused accumulator and FP16 temporal backward",
++        {
++            "accumulator eligible": accumulator,
++            "use_fused_recurrent_accumulation=True": options["use_fused_recurrent_accumulation"] is True,
++            "FP16 compute-temporal backward": fp16_backward,
++        },
+     )
+     if options["use_fused_recurrent_accumulation"] is True and not accumulator:
+         raise ValueError(
+@@ -577,7 +778,8 @@ def select(name, enabled, reason):
+         raise ValueError(
+             "use_javier_recurrent_vjp=True requires compatible FP16 native accumulation."
+         )
+-    io.log_info(f"DPointNet automatic acceleration: {report}")
++    report["resolver_selected"] = dict(report["selected"])
++    io.log_info(f"DPointNet acceleration resolver (not final cell dispatch): {report}")
+     if not currents:
+         io.log_warning(
+             "DPointNet automatic acceleration did not admit fused CSR currents; "
+diff --git a/bmtk/simulator/dpointnet/cell_models/glif3_cell.py b/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
+index a85b868d..0a50e80c 100644
+--- a/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
++++ b/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
+@@ -662,22 +662,19 @@ def _validate_direct_csr_gradient_option(value):
+ 
+ 
+ def _resolve_pair_projection(option, fused_cuda, batch_size, n_syn_basis):
++    from ..acceleration import pair_projection_predicates
++
+     option = _validate_pair_projection_option(option)
+-    incompatibilities = []
+-    if not fused_cuda:
+-        incompatibilities.append("fused CUDA currents are disabled or unavailable")
+-    if batch_size is None or batch_size < 1:
+-        incompatibilities.append("batch_size must be positive and known")
+-    if n_syn_basis < 1:
+-        incompatibilities.append("the synaptic basis must have positive width")
++    predicates = pair_projection_predicates(fused_cuda, batch_size, n_syn_basis)
++    incompatibilities = [name for name, ok in predicates.items() if not ok]
+     if option is True and incompatibilities:
+         raise ValueError(
+             "use_pair_projection=True is incompatible with this model: "
+             + "; ".join(incompatibilities)
+         )
+-    return not incompatibilities and (
+-        option is True or (option == "auto" and batch_size == 32 and n_syn_basis == 4)
+-    )
++    return option is not False and all(pair_projection_predicates(
++        fused_cuda, batch_size, n_syn_basis, compatibility=option == "auto",
++    ).values())
+ 
+ 
+ def _resolve_fused_state(
+@@ -1054,6 +1051,7 @@ def create_compute_shadow(self, initial_value, *, name, dtype=None):
+     def _guarded_type_indexed_dispatch(self):
+         return bool(
+             self.acceleration_report is not None
++            and self.acceleration_report["profile"] == "auto"
+             and self.acceleration_report["architecture"] == 86
+             and self.acceleration_report["tensorflow"].startswith("2.21.")
+             and self.temporal_gradient_precision == "compute"
+@@ -1069,13 +1067,31 @@ def native_execution_options(self):
+         This works for explicit profiles as well as auto. It describes selection,
+         not proof of kernel execution or a subclass's separate projection.
+         """
+-        return {
++        options = {
+             "use_fused_cuda": self._use_fused_cuda,
+             "use_fused_state": self._use_fused_state,
+             "use_fused_state_history": self._use_fused_state_history,
+             "use_pair_projection": self._use_pair_projection,
+             "use_fused_nest_event_vjp": self.use_fused_nest_event_vjp,
+         }
++        for name in (
++            "use_direct_state_rnn_loop", "use_native_voltage_penalty",
++            "use_combined_current_sweep", "use_direct_csr_recurrent_gradient",
++            "use_active_row_forward", "use_forward_run_aggregation",
++            "use_device_active_queue_forward", "use_fused_current_accumulation",
++            "use_prepacked_nest_coefficients", "use_type_indexed_nest_coefficients",
++            "use_static_type_indexed_nest_dispatch", "use_cooperative_row_projection",
++            "use_fanout_row_projection", "use_target_gather_projection",
++        ):
++            options[name] = getattr(self, "_" + name)
++        options.update(
++            use_fused_recurrent_accumulation=self.use_fused_recurrent_accumulation,
++            use_javier_recurrent_vjp=self.use_javier_recurrent_vjp,
++            use_csr_master_weights=self._csr_master_weights,
++            use_uint8_synapse_types=self._uint8_synapse_types,
++            use_adaptive_routing=self._adaptive_routing,
++        )
++        return options
+ 
+     def __init__(
+         self,
+@@ -1237,6 +1253,7 @@ def __init__(
+         )
+         if combined_current_target_tile_size is not UNSET:
+             execution["combined_current_target_tile_size"] = combined_current_target_tile_size
++        requested_execution = dict(execution)
+         execution, self.acceleration_report = resolve_acceleration_options(
+             execution, compute_dtype=self.compute_dtype, variable_dtype=self.variable_dtype,
+             batch_size=batch_size,
+@@ -2387,6 +2404,8 @@ def __init__(
+                     )
+                 self.acceleration_report["routing_geometry"] = self.combined_routing_geometry()
+ 
++        self._finalize_acceleration_report(requested_execution, use_pair_projection)
++
+         """
+         lgn_inputs = inputs[0]
+         # self.input_dim = inputs['lgn']['n_inputs']
+@@ -2451,6 +2470,118 @@ def __init__(
+         del bkg_input_indices, bkg_input_weights, bkg_input_syn_ids, bkg_input_weight_positive #, bkg_input_delays
+         """
+ 
++    def _finalize_acceleration_report(self, requested, pair_option):
++        from ..acceleration import finalize_acceleration_report, pair_projection_predicates
++        from ..custom_ops.csr_spike_ops import _resolve_packed_sm120_backward
++
++        effective = self.native_execution_options
++        conn = self.recurrent_fused_connectivity
++        checks = pair_projection_predicates(
++            self._use_fused_cuda, self._declared_batch_size, self._n_syn_basis,
++            compatibility=pair_option == "auto",
++        )
++        predicates = {"use_pair_projection": checks}
++        # Reuse the wrapper's topology checks, without allocating spike buffers.
++        spikes = tf.TensorSpec([self._declared_batch_size, 0], self.compute_dtype)
++        packed_checks = dict(
++            (self.acceleration_report or {}).get("predicates", {}).get("use_packed_sm120_backward", {})
++        )
++        packed_checks["native recurrent connectivity"] = conn is not None
++        effective["use_packed_sm120_backward"] = bool(
++            conn is not None and _resolve_packed_sm120_backward(
++                self._use_packed_sm120_backward, spikes, conn, self.synaptic_basis_weights,
++                diagnostics=packed_checks,
++            )
++        )
++        predicates["use_packed_sm120_backward"] = packed_checks
++        input_paths = {}
++        external_checks = dict(
++            (self.acceleration_report or {}).get("predicates", {}).get("use_packed_sm120_external_backward", {})
++        )
++        for name, net in self.inputs.items():
++            connectivity = net.get("fused_connectivity")
++            checks = {
++                "native connectivity": connectivity is not None,
++                "trainable input weights": net["input_weight_values"].trainable,
++            }
++            input_paths[name] = {
++                "fixed4_forward": bool(net.get("use_fixed4_forward", False)),
++                "fixed4_eligible": bool(connectivity is not None and connectivity["fixed4_eligible"]),
++                "packed_backward": bool(
++                    connectivity is not None and _resolve_packed_sm120_backward(
++                        net.get("use_packed_sm120_backward", False), spikes,
++                        connectivity, self.synaptic_basis_weights,
++                        diagnostics=checks,
++                    )
++                ),
++            }
++            input_paths[name]["packed_blocked_by"] = (
++                [label for label, ok in checks.items() if not ok]
++                if not input_paths[name]["packed_backward"] else []
++            )
++            policy_checks = dict(checks)
++            if connectivity is not None and connectivity["n_edges"] > 0:
++                # Removing the packing override builds this optional metadata.
++                policy_checks.pop("compact pair metadata is unavailable", None)
++            input_paths[name]["packed_eligible"] = all(policy_checks.values())
++            external_checks.update({f"{name}: {label}": ok for label, ok in checks.items()})
++        effective["use_fixed4_input_forward"] = any(
++            value["fixed4_forward"] for value in input_paths.values()
++        )
++        predicates["use_fixed4_input_forward"] = {
++            "at least one native input with exactly four incoming edges per target": (
++                any(value["fixed4_eligible"] for value in input_paths.values())
++            ),
++        }
++        effective["use_packed_sm120_external_backward"] = any(
++            value["packed_backward"] for value in input_paths.values()
++        )
++        predicates["use_packed_sm120_external_backward"] = external_checks
++        effective["use_prepared_cpu_poisson"] = (
++            "rollout_dependent" if self._use_prepared_cpu_poisson else False
++        )
++        if self._use_combined_current_sweep:
++            effective["combined_current_target_tile_size"] = self.combined_current_target_tile_size
++        for name in ("use_fused_recurrent_accumulation", "use_javier_recurrent_vjp"):
++            existing = dict((self.acceleration_report or {}).get("predicates", {}).get(name, {}))
++            existing.update({
++                "use_pair_projection=True": self._use_pair_projection,
++                "nonempty compact-pair connectivity": conn is not None and conn["n_pairs"] > 0,
++                "uint32 recurrent connectivity": conn is not None and conn["index_dtype"] == "uint32",
++                "four synaptic bases": self._n_syn_basis == 4,
++                "loaded fused accumulator ABI": fused_recurrent_accumulation_available(),
++            })
++            predicates[name] = existing
++        self.acceleration_report = finalize_acceleration_report(
++            self.acceleration_report, requested, effective, predicates=predicates,
++            policy_predicates={
++                "use_packed_sm120_external_backward": {
++                    "at least one eligible trainable native input": any(
++                        value["packed_eligible"] for value in input_paths.values()
++                    ),
++                },
++            },
++        )
++        self.acceleration_report["input_paths"] = input_paths
++        if pair_option == "auto":
++            entry = self.acceleration_report["effective"]["use_pair_projection"]
++            entry["policy_predicates"] = pair_projection_predicates(
++                self._use_fused_cuda, self._declared_batch_size, self._n_syn_basis,
++            )
++            entry["current_policy"] = all(entry["policy_predicates"].values())
++            if not self._use_pair_projection and entry["current_policy"]:
++                message = (
++                    "Pair projection OFF: compatibility_v1 auto requires batch32/four bases; "
++                    "this blocks fused recurrent accumulation and Javier VJP. "
++                    'Current acceleration_profile="auto" admits pairing at this batch.'
++                )
++                self.acceleration_report["optimization_audit"].append({
++                    "option": "use_pair_projection",
++                    "classification": "avoidable_execution_override", "message": message,
++                })
++                io.log_warning(message)
++        io.log_info(f"DPointNet final cell acceleration (not kernel-execution proof): {self.acceleration_report}")
++
+     def refresh_recurrent_weight_shadow(self):
+         """Sync the compute-dtype shadow of the recurrent weights with the trained master.
+ 
+diff --git a/bmtk/simulator/dpointnet/cell_models/state_rnn.py b/bmtk/simulator/dpointnet/cell_models/state_rnn.py
+index 4be75f52..64529b69 100644
+--- a/bmtk/simulator/dpointnet/cell_models/state_rnn.py
++++ b/bmtk/simulator/dpointnet/cell_models/state_rnn.py
+@@ -174,6 +174,8 @@ def __init__(self, *args, **kwargs):
+                 )
+ 
+     def call(self, sequences, initial_state=None, mask=None, training=False):
++        from ..acceleration import record_rollout_acceleration
++
+         if self.stateful:
+             raise ValueError(
+                 "ExplicitStateRNN requires explicit state, not stateful=True"
+@@ -200,6 +202,11 @@ def call(self, sequences, initial_state=None, mask=None, training=False):
+         self.cell.validate_state_precision(states)
+         with _rollout_context(self.cell):
+             if float32_temporal:
++                record_rollout_acceleration(getattr(self.cell, "acceleration_report", None), {
++                    "use_direct_state_rnn_loop": False,
++                    "use_prepared_cpu_poisson": False,
++                    "temporal_path": "float32_adjoint",
++                })
+                 from ..temporal_adjoint import TemporalAdjointRunner
+ 
+                 runner = TemporalAdjointRunner(
+@@ -231,6 +238,11 @@ def call(self, sequences, initial_state=None, mask=None, training=False):
+                 # the exact prepared route or its static budget is not established.
+                 prepare_noise = prepared_route and _prepared_poisson_admitted(self.cell, sequences)
+                 noise_budget = PREPARED_POISSON_AUTO_CEILING_BYTES
++            record_rollout_acceleration(getattr(self.cell, "acceleration_report", None), {
++                "use_direct_state_rnn_loop": bool(use_direct_loop),
++                "use_prepared_cpu_poisson": bool(prepare_noise and _internal_poisson_inputs(self.cell)),
++                "temporal_path": "direct_state_loop" if use_direct_loop else "keras_loop",
++            })
+             carry_weights = (
+                 use_direct_loop
+                 and getattr(self.cell, "temporal_gradient_precision", "compute")
+diff --git a/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py b/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py
+index 1bac0454..a8e6d2a3 100644
+--- a/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py
++++ b/bmtk/simulator/dpointnet/custom_ops/csr_spike_ops.py
+@@ -178,7 +178,7 @@ def _auto_native_architecture(architecture):
+     return architecture is not None and architecture >= 70
+ 
+ 
+-def _resolve_packed_sm120_backward(option, spikes, connectivity, basis):
++def _resolve_packed_sm120_backward(option, spikes, connectivity, basis, *, diagnostics=None):
+     option = _validate_packed_sm120_option(option)
+     incompatibilities = []
+     if spikes.dtype != tf.float16:
+@@ -204,6 +204,11 @@ def _resolve_packed_sm120_backward(option, spikes, connectivity, basis):
+             "use_packed_sm120_backward=True is incompatible: "
+             + "; ".join(incompatibilities)
+         )
++    if diagnostics is not None:
++        diagnostics.update({message: False for message in incompatibilities})
++        diagnostics["explicit True or automatically admitted SM70+"] = (
++            option is True or _auto_native_architecture(architecture)
++        )
+     return (
+         option is not False and not incompatibilities
+         and (option is True or _auto_native_architecture(architecture))
+@@ -459,19 +464,21 @@ def build_csr_connectivity(
+         incoming_pre_ids = np.empty(0, dtype=numpy_index_dtype)
+         incoming_edge_ids = np.empty(0, dtype=numpy_index_dtype)
+         incoming_types = np.empty(0, dtype=numpy_index_dtype)
+-        if build_fixed4_incoming and not host_lifecycle and post_ids.size == 4 * n_target_neurons:
+-            post_counts = np.bincount(post_ids, minlength=n_target_neurons)
+-            if np.all(post_counts == 4):
+-                incoming_order = np.argsort(post_ids, kind="stable").astype(
+-                    numpy_index_dtype, copy=False
+-                )
+-                source_ids = np.repeat(
+-                    np.arange(n_source_neurons, dtype=numpy_index_dtype),
+-                    counts,
+-                )
+-                incoming_pre_ids = source_ids[incoming_order]
+-                incoming_edge_ids = incoming_order
+-                incoming_types = sorted_synapse_types[incoming_order]
++        fixed4_eligible = bool(
++            not host_lifecycle and post_ids.size == 4 * n_target_neurons
++            and np.all(np.bincount(indices[:, 0], minlength=n_target_neurons) == 4)
++        )
++        if build_fixed4_incoming and fixed4_eligible:
++            incoming_order = np.argsort(post_ids, kind="stable").astype(
++                numpy_index_dtype, copy=False
++            )
++            source_ids = np.repeat(
++                np.arange(n_source_neurons, dtype=numpy_index_dtype),
++                counts,
++            )
++            incoming_pre_ids = source_ids[incoming_order]
++            incoming_edge_ids = incoming_order
++            incoming_types = sorted_synapse_types[incoming_order]
+         metadata_parts = [
+             post_ids,
+             sorted_synapse_types,
+@@ -603,6 +610,7 @@ def build_csr_connectivity(
+                 ),
+                 "has_repeated_targets": has_repeated_targets,
+                 "sorted_by_target": bool(sort_by_target),
++                "fixed4_eligible": fixed4_eligible,
+                 "fixed4_incoming": bool(incoming_pre_ids.size),
+                 "incoming_pre_ids": replica_values[0]["incoming_pre_ids"],
+                 "incoming_edge_ids": replica_values[0]["incoming_edge_ids"],
+diff --git a/bmtk/simulator/dpointnet/loss_functions/target_firing_rates.py b/bmtk/simulator/dpointnet/loss_functions/target_firing_rates.py
+index 84689e0a..d7c35156 100644
+--- a/bmtk/simulator/dpointnet/loss_functions/target_firing_rates.py
++++ b/bmtk/simulator/dpointnet/loss_functions/target_firing_rates.py
+@@ -35,6 +35,7 @@ def compiled_spike_counts(self):
+         context = getattr(cell, "_performance_auto_context", None)
+         return bool(
+             report is not None and report["architecture"] == 86
++            and report.get("profile", "auto") == "auto"
+             and report.get("tensorflow", "").startswith("2.21.")
+             and report.get("selected", {}).get("use_fused_cuda") is True
+             and context is not None and context["standard_cell"] and context["single_replica"]
+diff --git a/bmtk/simulator/dpointnet/migration.py b/bmtk/simulator/dpointnet/migration.py
+index 0f506cae..3bb2dc13 100644
+--- a/bmtk/simulator/dpointnet/migration.py
++++ b/bmtk/simulator/dpointnet/migration.py
+@@ -4,7 +4,31 @@
+ from math import isfinite
+ 
+ 
+-def preserve_previous_defaults(config):
++PROFILE_EXECUTION_OPTIONS = (
++    "use_fused_cuda", "use_fused_state", "use_fused_nest_event_vjp",
++    "use_pair_projection", "use_packed_sm120_backward", "use_packed_sm120_external_backward",
++    "use_fixed4_input_forward", "use_fused_current_accumulation",
++    "use_direct_csr_recurrent_gradient", "use_active_row_forward",
++    "use_forward_run_aggregation", "use_device_active_queue_forward",
++    "use_fused_recurrent_accumulation", "use_javier_recurrent_vjp",
++    "use_prepacked_nest_coefficients", "use_type_indexed_nest_coefficients",
++    "use_static_type_indexed_nest_dispatch", "use_direct_state_rnn_loop",
++    "use_native_voltage_penalty", "use_fused_state_history", "use_prepared_cpu_poisson",
++    "use_combined_current_sweep", "use_cooperative_row_projection",
++    "use_fanout_row_projection", "use_target_gather_projection",
++    "use_csr_master_weights", "use_uint8_synapse_types", "use_adaptive_routing",
++)
++
++
++def preserve_previous_defaults(config, *, execution_policy="preserve"):
++    """Pin historical scientific defaults, optionally discard inherited execution flags.
++
++    "preserve" retains the existing migration behavior and explicit flags;
++    "current" requests current automatic execution without changing science/RNG.
++    This returns a copy, never edits a frozen configuration in place.
++    """
++    if execution_policy not in ("preserve", "current"):
++        raise ValueError('execution_policy must be "preserve" or "current".')
+     result = deepcopy(config)
+     cell = result.get("rnn_cell_params")
+     if not isinstance(cell, dict) or cell.get("cell_model", "GLIF3Cell") not in ("GLIF3Cell", "GLIF3", "default"):
+@@ -57,4 +81,9 @@ def preserve_previous_defaults(config):
+     cell.setdefault("hard_reset", False)
+     cell.setdefault("hard_reset_gradient_mode", "exact")
+     cell["acceleration_profile"] = "auto"
++    if execution_policy == "current":
++        for name in (*PROFILE_EXECUTION_OPTIONS, "combined_current_target_tile_size"):
++            cell.pop(name, None)
++        if result.get("training"):
++            result["training"]["pack_spike_checkpoints"] = "auto"
+     return result
+diff --git a/docs/autodocs/source/dpointnet_performance.rst b/docs/autodocs/source/dpointnet_performance.rst
+index 90c4ca10..c7ec4df8 100644
+--- a/docs/autodocs/source/dpointnet_performance.rst
++++ b/docs/autodocs/source/dpointnet_performance.rst
+@@ -28,12 +28,91 @@ After building a model, inspect its choices:
+    rnn.build()
+    print(rnn.precision_report)
+    print(rnn.acceleration_report)
++   print(rnn.acceleration_report["effective"])
++   print(rnn.acceleration_report["optimization_audit"])
+ 
+ These reports explain requested/resolved settings; they do not prove that
+ every topology-specific kernel executed. Without compatible custom operators,
+ automatic selection retains supported TensorFlow paths. Explicit unsupported
+ kernel requests raise rather than silently switching implementations.
+-Explicit ``acceleration_profile=null`` disables profile expansion.
++
++Automatic requests and compatibility
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++With an omitted or ``"auto"`` profile, omitting a profile-managed execution
++option and setting that option to ``"auto"`` mean the **same current policy**.
++Explicit Boolean ``true`` and ``false`` remain
++overrides, including strict validation of unsupported ``true`` requests.
++This does not apply to scientific settings or opt-in options outside the
++profile, such as device Poisson generation.
++
++In particular, ``use_pair_projection="auto"`` now inherits the current
++profile policy at every known positive batch, just like omission; it no longer
++silently retains a batch-32-only heuristic under the automatic profile.
++For a compatible legacy FP16 model at batch 5 with four bases, trainable
++per-edge recurrence and the enclosing direct-CSR/direct-state-loop gradient
++boundary, pairing can therefore admit fused recurrent accumulation and
++Javier recurrent VJP. NEST-only joint projection, CSR masters and dependent
++uint8/adaptive routing do **not** become eligible by changing this option.
++Do not change dynamics, reset, batch, losses or precision to clear an audit.
++
++For a new compatibility run that deliberately needs historical constructor
++heuristics, use the explicitly named ``acceleration_profile="compatibility_v1"``.
++This disables profile expansion: omitted options retain constructor defaults,
++and a per-option pair ``"auto"`` keeps the historical batch32/four-basis rule.
++It is not a frozen package revision or a pin of every numerical default.
++Existing ``acceleration_profile=null`` retains the same behavior; supplying
++per-option ``"auto"`` with null emits a ``FutureWarning`` directing users to
++the named compatibility policy or current auto policy.
++Never rewrite an immutable experiment capsule to migrate it.
++
++Reading the final preflight audit
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++``resolve_acceleration_options`` returns a **resolver-stage** policy report,
++not the final cell dispatch. After successful model construction,
++``rnn.acceleration_report`` (also ``rnn.cell.acceleration_report``) is the
++authoritative **cell-stage** selection report, including compatibility/null
++profiles that previously returned no report:
++
++* ``requested`` retains the supplied values. ``resolver_selected`` retains
++  a snapshot taken before constructor/connectivity fallbacks for comparison.
++* ``selected`` contains final cell/connectivity choices, not unresolved
++  ``"auto"`` strings. Packed backward is checked against the same static
++  dtype/batch/pair/index predicates used by the native wrapper.
++  ``input_paths`` identifies fixed-four forward and packed backward separately
++  for each named input; a cell-wide Boolean means at least one input qualifies.
++* Each ``effective`` entry records ``requested``, ``supplied``, ``provenance``,
++  ``resolved``, ``current_policy``, ``predicates`` and ``blocked_by``.
++  Dependency entries include the parent's resolved choice and provenance.
++  ``policy_predicates`` records independent eligibility checks, including
++  optional metadata that removing the override would build; for named inputs,
++  the recommendation requires at least one eligible source, not every source.
++  Provenance distinguishes profile selection, explicit automatic requests,
++  Boolean overrides, historical automatic compatibility overrides and
++  constructor defaults.
++* ``optimization_audit`` separates avoidable execution overrides from
++  scientific incompatibilities (for example legacy dynamics versus a
++  NEST-only joint sweep) and hardware/connectivity/dependency exclusions.
++  At batch 5, compatibility pairing reports OFF, names the historical
++  batch32/four-basis restriction, identifies the blocked accumulator/VJP
++  dependency and points to the current-policy alternative.
++* Some choices depend on the actual rollout. Prepared CPU Poisson is reported
++  as the named path ``"rollout_dependent"``, not as an enabled kernel.
++  After a call, ``rollout_selected`` records the last traced direct/Keras/
++  FP32-adjoint path and prepared-Poisson admission. For reused graphs, this
++  describes trace-time admission, not an execution counter or profiling result.
++
++Cell selection is still not proof that every selected branch executed:
++coefficient identity is live, source traversals vary with topology, the
++recurrent carrier supersedes ordinary packed backward when used, and a caller
++can choose a different enclosing loop. Use a native trace for execution proof.
++``current_policy`` is an eligibility recommendation with the other supplied
++dependencies retained, not a measured fastest configuration or a speedup claim.
++It ignores the option's own Boolean override, but includes final topology
++eligibility evaluated independently of whether optional metadata was built.
++An override is only called avoidable when removing it actually admits the path;
++empty/incompatible recurrence or a non-four-edge input remains an exclusion.
+ 
+ Automatic state selection checks optional event-gradient, history, voltage-penalty
+ and type-indexed entry points individually, retaining compatible fallbacks when
+diff --git a/docs/autodocs/source/dpointnet_training_standards.rst b/docs/autodocs/source/dpointnet_training_standards.rst
+index f0607a41..34fb45e7 100644
+--- a/docs/autodocs/source/dpointnet_training_standards.rst
++++ b/docs/autodocs/source/dpointnet_training_standards.rst
+@@ -385,6 +385,33 @@ explicit and automatic acceleration selected:
+ 
+    migrated = preserve_previous_defaults(old_config_dict)
+ 
++By default the helper retains explicit execution overrides from the old
++configuration. Under the current automatic profile, inherited per-option
++``"auto"`` now means current policy, just like omission; it no longer selects a
++different, historical batch heuristic. Explicit Boolean overrides still win.
++Use :doc:`dpointnet_performance` to interpret the final effective audit.
++
++When deliberately adopting current execution policy while retaining the
++scientific recipe, discard the old profile-managed overlay explicitly:
++
++.. code-block:: python
++
++   migrated = preserve_previous_defaults(
++       old_config_dict, execution_policy="current"
++   )
++
++This opt-in removes profile-managed accelerator flags and the manual joint
++target tile, selects the automatic profile, and resets training spike packing
++to ``"auto"``. It does not change batch, sequence length, precision, dynamics,
++reset/credit, losses, optimizer, input generation, device-Poisson choice or RNG.
++The helper still pins omitted historical scientific defaults as described
++below. Save and review a new configuration; never modify a frozen capsule.
++
++For historical constructor execution heuristics rather than current policy,
++use ``acceleration_profile="compatibility_v1"`` with the original explicit
++options and pinned source/environment. This is a named execution policy, not
++a scientific-recipe migration or a promise of identical trajectories.
++
+ The helper recognizes ``GLIF3Cell``, its historical ``GLIF3`` selector and
+ ``default``. It pins omitted training checkpointing off, preserving the previous
+ non-recomputed route; explicit checkpoint choices remain unchanged.
+diff --git a/tests/simulator/dpointnet/test_acceleration.py b/tests/simulator/dpointnet/test_acceleration.py
+index c6588463..8554da5f 100644
+--- a/tests/simulator/dpointnet/test_acceleration.py
++++ b/tests/simulator/dpointnet/test_acceleration.py
+@@ -374,12 +374,372 @@ def test_actual_five_basis_auto_projection_and_gradients(batch):
+         conn.close()
+ 
+ 
+-def test_explicit_auto_pair_metadata_does_not_admit_variable_batch_accumulator(hardware):
+-    actual, _ = resolve(
+-        {"use_direct_state_rnn_loop": True, "use_pair_projection": "auto"},
+-        batch_size=7,
++@pytest.mark.parametrize("batch", [1, 5, 7, 8, 16, 32])
++@pytest.mark.parametrize("mode", ["legacy", "nest"])
++@pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
++@pytest.mark.parametrize("pair", ["auto", True, False])
++def test_pair_auto_inherits_current_profile_policy(hardware, batch, mode, dtype, pair):
++    params = {"dynamics_mode": mode, "use_direct_state_rnn_loop": True}
++    omitted, _ = resolve(params, batch_size=batch, compute_dtype=dtype)
++    actual, report = resolve(
++        {**params, "use_pair_projection": pair}, batch_size=batch, compute_dtype=dtype,
+     )
+-    assert not actual["use_fused_recurrent_accumulation"]
++    assert actual["use_pair_projection"] is (pair is not False)
++    for name in ("use_fused_recurrent_accumulation", "use_javier_recurrent_vjp"):
++        assert actual[name] == (omitted[name] if pair is not False else False)
++    assert report["requested"]["use_pair_projection"] == pair
++
++
++def test_compatibility_v1_preserves_historical_batch32_pair_heuristic(hardware):
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import _resolve_pair_projection
++
++    actual, report = resolve({
++        "acceleration_profile": "compatibility_v1", "use_pair_projection": "auto",
++    }, batch_size=7)
++    assert actual["use_pair_projection"] == "auto"
++    assert report is None
++    assert not _resolve_pair_projection(actual["use_pair_projection"], True, 7, 4)
++    assert _resolve_pair_projection(actual["use_pair_projection"], True, 32, 4)
++
++
++def test_null_profile_warns_for_historical_auto():
++    with pytest.warns(FutureWarning, match="compatibility_v1"):
++        actual, report = resolve({"acceleration_profile": None, "use_pair_projection": "auto"})
++    assert actual["use_pair_projection"] == "auto"
++    assert report is None
++
++
++def test_all_profile_managed_auto_requests_match_omission(hardware):
++    from bmtk.simulator.dpointnet.migration import PROFILE_EXECUTION_OPTIONS
++
++    omitted, report = resolve()
++    assert set(report["selected"]) == set(PROFILE_EXECUTION_OPTIONS)
++    params = {name: "auto" for name in report["selected"] if name.startswith("use_")}
++    actual, explicit = resolve(params)
++    assert actual == omitted
++    assert explicit["provenance"]["use_pair_projection"] == "explicit_auto"
++    assert report["provenance"]["use_pair_projection"] == "profile"
++
++
++def test_pair_policy_defers_unknown_basis_width_to_constructor(hardware):
++    actual, _ = resolve({"use_pair_projection": "auto"}, basis_width=None, batch_size=5)
++    assert actual["use_pair_projection"] is True
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import _resolve_pair_projection
++    with pytest.raises(ValueError, match="basis must have positive width"):
++        _resolve_pair_projection(actual["use_pair_projection"], True, 5, 0)
++
++
++def test_final_topology_fallback_is_not_an_avoidable_override(hardware):
++    selected, report = resolve()
++    selected = dict(report["selected"])
++    selected["use_fixed4_input_forward"] = False
++    final = acceleration.finalize_acceleration_report(
++        report, report["requested"], selected,
++        predicates={"use_fixed4_input_forward": {"exactly four incoming edges": False}},
++    )
++    entry = final["effective"]["use_fixed4_input_forward"]
++    assert entry["provenance"] == "profile"
++    assert entry["blocked_by"] == ["exactly four incoming edges"]
++    audit = next(item for item in final["optimization_audit"] if item["option"] == "use_fixed4_input_forward")
++    assert audit["classification"] == "eligibility_or_dependency"
++
++
++def test_explicit_enabled_choice_is_not_reported_blocked_by_auto_policy(hardware):
++    _, report = resolve({"use_static_type_indexed_nest_dispatch": True})
++    final = acceleration.finalize_acceleration_report(
++        report, report["requested"], report["selected"],
++    )
++    assert final["effective"]["use_static_type_indexed_nest_dispatch"]["blocked_by"] == []
++
++
++def test_resolver_snapshot_survives_constructor_fallback_and_refinalization(hardware):
++    _, report = resolve(batch_size=5)
++    name = "use_fused_recurrent_accumulation"
++    assert report["selected"][name] is True
++    report["selected"][name] = False
++    for _ in range(2):
++        final = acceleration.finalize_acceleration_report(
++            report, report["requested"], report["selected"],
++            predicates={name: {"nonempty compact-pair connectivity": False}},
++        )
++        assert final["resolver_selected"][name] is True
++        assert final["selected"][name] is False
++
++
++@pytest.mark.parametrize("name,predicate", [
++    ("use_fixed4_input_forward", "exactly four incoming edges"),
++    ("use_fused_recurrent_accumulation", "nonempty compact-pair connectivity"),
++    ("use_fused_recurrent_accumulation", "uint32 recurrent connectivity"),
++])
++@pytest.mark.parametrize("eligible", [False, True])
++def test_override_audit_requires_final_independent_eligibility(hardware, name, predicate, eligible):
++    _, report = resolve({name: False}, batch_size=5)
++    assert report["automatic"][name] is True
++    final = acceleration.finalize_acceleration_report(
++        report, report["requested"], report["selected"],
++        predicates={name: {predicate: eligible}},
++    )
++    entry = final["effective"][name]
++    assert entry["resolved"] is False
++    assert entry["current_policy"] is eligible
++    audit = next(item for item in final["optimization_audit"] if item["option"] == name)
++    assert audit["classification"] == (
++        "avoidable_execution_override" if eligible else "eligibility_or_dependency"
++    )
++
++
++@pytest.mark.skipif(
++    not acceleration.csr_spike_ops.fused_cuda_available(),
++    reason="Actual compatible GPU operator required",
++)
++@pytest.mark.parametrize("counts", [(1, 1), (4, 4), (2, 6)])
++@pytest.mark.parametrize("option", ["auto", False])
++def test_native_audit_uses_topology_not_fixed4_override(precision_policy, counts, option):
++    from test_precision_credit import make_cell
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import GLIF3Cell
++
++    network, inputs, args = make_cell(
++        return_spec=True, fused=True, acceleration_profile="auto",
++        batch_size=5, use_fixed4_input_forward=option,
++    )
++    net = inputs["drive"]
++    net.update(
++        input_type="spikes",
++        indices=np.array([[post, 0] for post, count in enumerate(counts) for _ in range(count)]),
++        weights=np.ones(sum(counts)), delays=np.ones(sum(counts)),
++        syn_ids=np.zeros(sum(counts), dtype=np.int64),
++    )
++    cell = GLIF3Cell(network, inputs, **args)
++    try:
++        eligible = counts == (4, 4)
++        entry = cell.acceleration_report["effective"]["use_fixed4_input_forward"]
++        assert entry["current_policy"] is eligible
++        assert entry["resolved"] is (eligible and option == "auto")
++        assert cell.inputs["drive"]["fused_connectivity"]["fixed4_eligible"] is eligible
++        audits = [
++            item for item in cell.acceleration_report["optimization_audit"]
++            if item["option"] == "use_fixed4_input_forward"
++        ]
++        assert any(item["classification"] == "avoidable_execution_override" for item in audits) is (
++            eligible and option is False
++        )
++    finally:
++        cell.close_fused_cuda()
++
++
++@pytest.mark.skipif(
++    not acceleration.csr_spike_ops.fused_cuda_available(),
++    reason="Actual compatible GPU operator required",
++)
++@pytest.mark.parametrize("disabled", [False, True])
++def test_native_empty_recurrence_preserves_resolver_snapshot_and_audit(precision_policy, disabled):
++    from test_precision_credit import make_cell
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import GLIF3Cell
++
++    network, inputs, args = make_cell(
++        return_spec=True, fused=True, acceleration_profile="auto",
++        batch_size=5, _canonical_gradient_boundary=True,
++        **({"use_fused_recurrent_accumulation": False} if disabled else {}),
++    )
++    for key in ("indices", "weights", "delays", "syn_ids"):
++        network["synapses"][key] = network["synapses"][key][:0]
++    cell = GLIF3Cell(network, inputs, **args)
++    try:
++        report = cell.acceleration_report
++        name = "use_fused_recurrent_accumulation"
++        assert report["resolver_selected"][name] is (not disabled)
++        entry = report["effective"][name]
++        assert entry["resolved"] is False
++        assert entry["current_policy"] is False
++        assert "nonempty compact-pair connectivity" in entry["blocked_by"]
++        assert not any(
++            item["classification"] == "avoidable_execution_override" and item["option"] == name
++            for item in report["optimization_audit"]
++        )
++    finally:
++        cell.close_fused_cuda()
++
++
++@pytest.mark.skipif(
++    not acceleration.csr_spike_ops.fused_cuda_available(),
++    reason="Actual compatible GPU operator required",
++)
++def test_native_packed_input_override_does_not_hide_metadata_eligibility(precision_policy):
++    from test_precision_credit import make_cell
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import GLIF3Cell
++
++    if not acceleration.csr_spike_ops._auto_native_architecture(
++        acceleration.csr_spike_ops._gpu_compute_architecture(),
++    ):
++        pytest.skip("Automatic packed backward requires SM70+")
++    network, inputs, args = make_cell(
++        return_spec=True, fused=True, acceleration_profile="auto",
++        batch_size=32, use_packed_sm120_external_backward=False,
++    )
++    inputs["drive"]["input_type"] = "spikes"
++    inputs["current"] = copy.deepcopy(inputs["drive"])
++    inputs["current"]["input_type"] = "current"
++    cell = GLIF3Cell(network, inputs, **args)
++    try:
++        entry = cell.acceleration_report["effective"]["use_packed_sm120_external_backward"]
++        assert entry["resolved"] is False
++        assert entry["current_policy"] is True
++        assert cell.inputs["drive"]["fused_connectivity"]["n_pairs"] == 0
++        paths = cell.acceleration_report["input_paths"]
++        assert paths["drive"]["packed_eligible"] is True
++        assert paths["current"]["packed_eligible"] is False
++    finally:
++        cell.close_fused_cuda()
++
++
++@pytest.mark.parametrize("architecture", [None, 61, 70, 75, 80, 86])
++@pytest.mark.parametrize("available", [False, True])
++def test_auto_pair_equivalence_preserves_hardware_guards(hardware, monkeypatch, architecture, available):
++    csr, _ = hardware
++    monkeypatch.setattr(csr, "_gpu_compute_architecture", lambda: architecture)
++    monkeypatch.setattr(csr, "fused_cuda_available", lambda: available and architecture is not None)
++    omitted, _ = resolve(batch_size=5)
++    actual, _ = resolve({"use_pair_projection": "auto"}, batch_size=5)
++    assert actual == omitted
++    if not available or architecture is None:
++        assert not actual["use_pair_projection"]
++        assert not actual["use_fused_recurrent_accumulation"]
++        assert not actual["use_javier_recurrent_vjp"]
++
++
++def test_cpu_final_report_contains_no_unresolved_auto(precision_policy):
++    from test_precision_credit import make_cell
++
++    cell = make_cell(
++        acceleration_profile="auto", use_pair_projection="auto",
++        use_fused_cuda=False, use_fused_state=False, batch_size=5,
++    )
++    report = cell.acceleration_report
++    assert report["stage"] == "cell"
++    assert report["selected"]["use_pair_projection"] is False
++    assert "auto" not in report["selected"].values()
++    pair = report["effective"]["use_pair_projection"]
++    assert pair["requested"] == "auto"
++    assert pair["provenance"] == "explicit_auto"
++    assert "compatible fused CUDA currents" in pair["blocked_by"]
++    assert any(
++        "use_pair_projection=True" in item["message"]
++        for item in report["optimization_audit"]
++    )
++
++
++def test_final_report_distinguishes_scientific_incompatibility_and_override(hardware):
++    options, report = resolve({"dynamics_mode": "legacy", "use_pair_projection": False}, batch_size=5)
++    final = acceleration.finalize_acceleration_report(
++        report, report["requested"], options,
++    )
++    entries = {item["option"]: item for item in final["optimization_audit"]}
++    assert entries["use_pair_projection"]["classification"] == "avoidable_execution_override"
++    assert entries["use_combined_current_sweep"]["classification"] == "scientific_incompatibility"
++    assert "NEST dynamics" in final["effective"]["use_combined_current_sweep"]["blocked_by"]
++    assert "use_pair_projection=True" in final["effective"]["use_fused_recurrent_accumulation"]["blocked_by"]
++
++
++@pytest.mark.skipif(
++    not acceleration.csr_spike_ops.fused_cuda_available(),
++    reason="Actual compatible GPU operator required",
++)
++@pytest.mark.parametrize("profile", ["auto", "compatibility_v1"])
++@pytest.mark.parametrize("pair", ["auto", False])
++def test_native_batch5_reports_requested_policy_and_actual_pairing(precision_policy, profile, pair):
++    from test_precision_credit import make_cell
++
++    cell = make_cell(
++        batch_size=5, acceleration_profile=profile, use_pair_projection=pair,
++        fused=True, use_fused_cuda=True, _canonical_gradient_boundary=True,
++    )
++    try:
++        report = cell.acceleration_report
++        entry = report["effective"]["use_pair_projection"]
++        assert entry["requested"] == pair
++        assert entry["resolved"] is (profile == "auto" and pair == "auto")
++        assert report["selected"]["use_pair_projection"] == cell._use_pair_projection
++        if profile == "compatibility_v1" and pair == "auto":
++            assert entry["provenance"] == "explicit_compatibility_override"
++            assert entry["current_policy"] is True
++            assert "compatibility_v1 auto requires batch32 and four bases" in entry["blocked_by"]
++            assert any(
++                "blocks fused recurrent accumulation and Javier VJP" in item["message"]
++                for item in report["optimization_audit"]
++            )
++    finally:
++        cell.close_fused_cuda()
++
++
++@pytest.mark.skipif(
++    not acceleration.csr_spike_ops.fused_cuda_available(),
++    reason="Actual compatible GPU operator required",
++)
++@pytest.mark.parametrize("batch", [1, 5, 7, 8, 16, 32])
++@pytest.mark.parametrize("mode", ["legacy", "nest"])
++@pytest.mark.parametrize("selective", [False, True])
++def test_native_omitted_and_auto_pair_values_vjps_and_restore(
++    precision_policy, tmp_path, batch, mode, selective,
++):
++    from test_precision_credit import make_cell
++    from bmtk.simulator.dpointnet.cell_models.state_rnn import ExplicitStateRNN
++
++    csr = acceleration.csr_spike_ops
++    if not csr._auto_native_architecture(csr._gpu_compute_architecture()):
++        pytest.skip("Automatic accumulator requires SM70+")
++    cells = [
++        make_cell(
++            mode=mode, selective=selective, fused=True, acceleration_profile="auto",
++            batch_size=batch, _canonical_gradient_boundary=True,
++            **({"use_pair_projection": "auto"} if explicit else {}),
++        )
++        for explicit in (False, True)
++    ]
++    results = []
++    try:
++        for index, cell in enumerate(cells):
++            assert cell._use_pair_projection is True
++            assert cell.use_fused_recurrent_accumulation is True
++            assert cell.use_javier_recurrent_vjp is selective
++            assert cell.acceleration_report["selected"]["use_pair_projection"] is True
++            layer = ExplicitStateRNN(cell, return_sequences=True, return_state=True)
++            states = list(cell.zero_state(batch, cell.compute_dtype))
++            states[0] = tf.ones_like(states[0])
++            sequences = tf.ones([batch, 5, 2], cell.compute_dtype)
++
++            @tf.function
++            def evaluate():
++                with tf.GradientTape() as tape:
++                    output = layer(sequences, initial_state=states)
++                    loss = sum(
++                        tf.reduce_sum(tf.cast(value, tf.float32))
++                        for value in tf.nest.flatten(output)
++                        if value.dtype.is_floating
++                    )
++                return output, tape.gradient(loss, cell.recurrent_weight_values)
++
++            output, gradient = evaluate()
++            assert gradient is not None
++            assert np.all(np.isfinite(gradient))
++            assert np.any(gradient.numpy() != 0)
++            results.append((output, gradient))
++            original = cell.canonical_weight_values().numpy().copy()
++            checkpoint = tf.train.Checkpoint(cell=cell)
++            path = checkpoint.save(str(tmp_path / f"cell-{index}"))
++            cell.recurrent_weight_values.assign_add(tf.ones_like(cell.recurrent_weight_values))
++            checkpoint.restore(path).assert_consumed()
++            cell.refresh_recurrent_weight_shadow()
++            np.testing.assert_array_equal(cell.canonical_weight_values(), original)
++            replay, replay_gradient = evaluate()
++            for before, after in zip(tf.nest.flatten(output), tf.nest.flatten(replay)):
++                np.testing.assert_array_equal(before, after)
++            np.testing.assert_array_equal(gradient, replay_gradient)
++            assert cell.acceleration_report["rollout_selected"]["use_direct_state_rnn_loop"]
++        for left, right in zip(tf.nest.flatten(results[0]), tf.nest.flatten(results[1])):
++            np.testing.assert_array_equal(left, right)
++    finally:
++        for cell in cells:
++            cell.close_fused_cuda()
+ 
+ 
+ @pytest.mark.parametrize("profile", [True, False, "fast", 1])
+diff --git a/tests/simulator/dpointnet/test_alpha_basis.py b/tests/simulator/dpointnet/test_alpha_basis.py
+index 8e80f452..22fb5de8 100644
+--- a/tests/simulator/dpointnet/test_alpha_basis.py
++++ b/tests/simulator/dpointnet/test_alpha_basis.py
+@@ -277,7 +277,7 @@ def test_real_sonata_rnn_uses_shared_basis_for_recurrent_and_input(
+     rnn.cell_params["acceleration_profile"] = acceleration_profile
+     try:
+         rnn.build()
+-        assert (rnn.acceleration_report is None) == (acceleration_profile is None)
++        assert rnn.acceleration_report["profile"] == acceleration_profile
+         assert rnn.cell.synaptic_basis_weights.shape == (2, 5 if provided else 4)
+         assert (rnn.alpha_basis_fit is None) == provided
+         if provided:
+diff --git a/tests/simulator/dpointnet/test_glif_extension_contracts.py b/tests/simulator/dpointnet/test_glif_extension_contracts.py
+index 054b5da9..0e8e20fb 100644
+--- a/tests/simulator/dpointnet/test_glif_extension_contracts.py
++++ b/tests/simulator/dpointnet/test_glif_extension_contracts.py
+@@ -174,9 +174,10 @@ def test_public_shadow_creation_preserves_explicit_dtype_refresh_and_restore(tmp
+ 
+ def test_native_options_are_actual_explicit_selections_not_mutable_policy():
+     cell = make_cell("nest", selective=False)
+-    assert cell.acceleration_report is None
++    assert cell.acceleration_report["profile"] is None
++    assert cell.acceleration_report["stage"] == "cell"
+     options = cell.native_execution_options
+-    assert set(options) == {
++    assert set(options) >= {
+         "use_fused_cuda", "use_fused_state", "use_fused_state_history",
+         "use_pair_projection", "use_fused_nest_event_vjp",
+     }
+diff --git a/tests/simulator/dpointnet/test_performance_auto.py b/tests/simulator/dpointnet/test_performance_auto.py
+index fe220d83..eb755cdd 100644
+--- a/tests/simulator/dpointnet/test_performance_auto.py
++++ b/tests/simulator/dpointnet/test_performance_auto.py
+@@ -218,7 +218,7 @@ def test_high_level_build_accepts_uncapped_delay_with_acceleration_disabled(max_
+             rnn._inputs_order.append(name)
+         rnn.build(training=False)
+         assert rnn.cell.max_delay == 3
+-        assert rnn.cell.acceleration_report is None
++        assert rnn.cell.acceleration_report["profile"] is None
+     finally:
+         tf.keras.mixed_precision.set_global_policy(policy)
+ 
+@@ -249,6 +249,9 @@ def test_rate_count_auto_uses_declared_single_replica_boundary():
+     assert not objective.compiled_spike_counts
+     rnn._cell = cell
+     assert objective.compiled_spike_counts
++    cell.acceleration_report["profile"] = "compatibility_v1"
++    assert not objective.compiled_spike_counts
++    cell.acceleration_report["profile"] = "auto"
+     assert not TargetFiringRate(rnn, 5.0, compiled_spike_counts=False).compiled_spike_counts
+     metadata["single_replica"] = False
+     assert not objective.compiled_spike_counts
+@@ -633,6 +636,24 @@ def resolve(options=None, metadata=None, **overrides):
+ )
+ 
+ 
++@pytest.mark.parametrize("boundary", [{}, {"dynamics_mode": "legacy"}, {"use_fused_cuda": False}])
++def test_joint_override_recommendation_ignores_only_own_override(monkeypatch, boundary):
++    _resolver_hardware(monkeypatch)
++    options, report = resolve({"use_combined_current_sweep": False, **boundary})
++    assert options["use_combined_current_sweep"] is False
++    assert options["use_csr_master_weights"] is False
++    assert all(options[name] is False for name in PROJECTION_OPTIONS)
++    final = acceleration.finalize_acceleration_report(
++        report, report["requested"], report["selected"],
++    )
++    entry = final["effective"]["use_combined_current_sweep"]
++    assert entry["current_policy"] is (not boundary)
++    audit = next(
++        item for item in final["optimization_audit"] if item["option"] == "use_combined_current_sweep"
++    )
++    assert (audit["classification"] == "avoidable_execution_override") is (not boundary)
++
++
+ @pytest.mark.parametrize("batch", [1, 16, 32])
+ @pytest.mark.parametrize("dtype", [tf.float16, tf.float32])
+ def test_auto_selects_projection_traversals_and_prepared_poisson_with_joint_sweep(
+diff --git a/tests/simulator/dpointnet/test_training_standards.py b/tests/simulator/dpointnet/test_training_standards.py
+index 18c65417..9df7d1a7 100644
+--- a/tests/simulator/dpointnet/test_training_standards.py
++++ b/tests/simulator/dpointnet/test_training_standards.py
+@@ -367,6 +367,36 @@ def test_migration_preserves_explicit_nest_inference_reset_and_voltage_conventio
+     assert "voltage_gradient_dampening" not in cell
+ 
+ 
++def test_migration_separates_science_from_inherited_execution_policy():
++    from bmtk.simulator.dpointnet.migration import PROFILE_EXECUTION_OPTIONS
++
++    science = {
++        "dynamics_mode": "legacy", "hard_reset": False,
++        "detach_reset": False, "detach_asc_reset": False,
++        "spike_surrogate": "triangular", "spike_surrogate_gain": 0.1,
++        "recurrent_spike_gradient_scale": 0.1, "voltage_state_gradient_scale": 1.0,
++        "state_precision": "compute", "use_device_poisson": True, "noise_seed": 5,
++    }
++    original = {
++        "run": {"batch_size": 5, "seq_len": 500, "dt": 1, "dtype": "float16"},
++        "rnn_cell_params": {**science, **{name: False for name in PROFILE_EXECUTION_OPTIONS}},
++        "training": {"gradient_checkpointing": True, "pack_spike_checkpoints": False},
++    }
++    original["rnn_cell_params"]["use_pair_projection"] = "auto"
++    retained = copy.deepcopy(original)
++    old = preserve_previous_defaults(original)
++    current = preserve_previous_defaults(original, execution_policy="current")
++    assert original == retained
++    assert old["rnn_cell_params"]["use_pair_projection"] == "auto"
++    assert all(name not in current["rnn_cell_params"] for name in PROFILE_EXECUTION_OPTIONS)
++    assert current["run"] == original["run"]
++    for name, value in science.items():
++        assert old["rnn_cell_params"][name] == current["rnn_cell_params"][name] == value
++    assert current["training"] == {"gradient_checkpointing": True, "pack_spike_checkpoints": "auto"}
++    with pytest.raises(ValueError, match="execution_policy"):
++        preserve_previous_defaults(original, execution_policy="fast")
++
++
+ @pytest.mark.parametrize("supplied", [{"batch_size": 2}, {"seq_len": 5}, {}])
+ def test_project_batch_and_window_remain_required(supplied):
+     rnn = RNN(**supplied)

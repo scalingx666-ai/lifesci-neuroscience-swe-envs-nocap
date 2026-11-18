@@ -1,0 +1,882 @@
+diff --git a/developnotes.md b/developnotes.md
+index 0879e85..07c409e 100644
+--- a/developnotes.md
++++ b/developnotes.md
+@@ -118,6 +118,43 @@ git tag -l | xargs git tag -d
+ git fetch --tags
+ ```
+ 
++Future performance PR: interval and slicing kernels
++===================================================
++
++Create a separate PR titled "Further optimize interval and event slicing kernels"
++for deeper performance work that should stay out of the current interval/event
++slicing PR.
++
++Suggested scope:
++
++* Optimize `IntervalArray.intersect()` sorted-input handling:
++  * Avoid `argsort` / copy when interval data is already sorted.
++  * Preserve non-mutating behavior and existing overlap semantics.
++  * Add benchmarks for already-sorted large interval arrays and singleton queries.
++* Improve singleton interval intersection:
++  * For sorted / merged interval arrays, use `searchsorted` to narrow candidates
++    before overlap checks.
++  * Keep the current boolean-mask path only for unsorted or non-merged cases.
++  * Test singleton on left operand, singleton on right operand, no overlap, and
++    `boundaries=False`.
++* Evaluate an event slicing direct-copy kernel:
++  * Prototype a numba or pure NumPy preallocated copy path that avoids
++    constructing a large `take_idx`.
++  * Compare speed and peak memory against the current take-index approach.
++  * Preserve dtype, empty result behavior, single-series shape, and ragged
++    multi-series output.
++* Evaluate an analog slicing direct-copy / take-index path:
++  * Replace remaining per-interval slice concatenation only if benchmarks show
++    meaningful gains.
++  * Test multi-interval restrictions, all-empty restrictions, and whole-support
++    no-op restrictions.
++
++Acceptance criteria:
++
++* Correctness parity with existing tests plus new edge-case tests.
++* Benchmarks showing either clear speedup or lower memory use.
++* No new public API, dependencies, or behavioral changes.
++
+ to get local tags to match those of remote.
+ 
+ See [here](http://stackoverflow.com/questions/1841341/remove-local-tags-that-are-no-longer-on-the-remote-repository).
+diff --git a/nelpy/core/_analogsignalarray.py b/nelpy/core/_analogsignalarray.py
+index 3d0d553..03cdbb7 100644
+--- a/nelpy/core/_analogsignalarray.py
++++ b/nelpy/core/_analogsignalarray.py
+@@ -1251,13 +1251,14 @@ def _restrict_to_interval_array_fast(self, *, intervalarray=None, update=True):
+         except AttributeError:
+             raise AttributeError("IntervalArray expected")
+ 
+-        indices = []
+-        for interval in intervalarray.merge().data:
+-            a_start = interval[0]
+-            a_stop = interval[1]
+-            frm, to = np.searchsorted(self._abscissa_vals, (a_start, a_stop + 1e-10))
+-            indices.append((frm, to))
+-        indices = np.array(indices, ndmin=2)
++        intervals = intervalarray.merge().data
++        stops = intervals[:, 1] + 1e-10
++        indices = np.column_stack(
++            (
++                np.searchsorted(self._abscissa_vals, intervals[:, 0]),
++                np.searchsorted(self._abscissa_vals, stops),
++            )
++        )
+         if np.diff(indices).sum() < len(self._abscissa_vals):
+             logger.info("ignoring signal outside of support")
+         # check if only one interval and interval is already bounds of data
+@@ -1268,17 +1269,15 @@ def _restrict_to_interval_array_fast(self, *, intervalarray=None, update=True):
+                     self._abscissa.support = intervalarray
+                     return
+         try:
+-            data_list = []
+-            for start, stop in indices:
+-                data_list.append(self._data[:, start:stop])
+-            self._data = np.hstack(data_list)
++            self._data = np.hstack(
++                [self._data[:, start:stop] for start, stop in indices]
++            )
+         except IndexError:
+             self._data = np.zeros([0, self.data.shape[0]])
+             self._data[:] = np.nan
+-        time_list = []
+-        for start, stop in indices:
+-            time_list.extend(self._abscissa_vals[start:stop])
+-        self._abscissa_vals = np.array(time_list)
++        self._abscissa_vals = np.concatenate(
++            [self._abscissa_vals[start:stop] for start, stop in indices]
++        )
+         if update:
+             self._abscissa.support = intervalarray
+ 
+diff --git a/nelpy/core/_eventarray.py b/nelpy/core/_eventarray.py
+index e656914..9b0dab2 100644
+--- a/nelpy/core/_eventarray.py
++++ b/nelpy/core/_eventarray.py
+@@ -382,6 +382,36 @@ def __getattr__(self, name):
+ 
+ 
+ ########################################################################
++def _restrict_event_series_to_intervals(evt_data, intervals):
++    """Return one sorted event series restricted to sorted interval bounds."""
++    evt_data = np.asarray(evt_data)
++    if evt_data.dtype == object:
++        try:
++            evt_data = evt_data.astype(float)
++        except (TypeError, ValueError):
++            pass
++
++    if evt_data.size == 0:
++        return np.empty(0, dtype=evt_data.dtype), 0
++
++    start_idx = np.searchsorted(evt_data, intervals[:, 0])
++    stop_idx = np.searchsorted(evt_data, intervals[:, 1])
++    counts = stop_idx - start_idx
++    keep = counts > 0
++
++    if not np.any(keep):
++        return np.empty(0, dtype=evt_data.dtype), 0
++
++    start_idx = start_idx[keep]
++    counts = counts[keep]
++    total = counts.sum()
++    output_offsets = np.empty_like(counts)
++    output_offsets[0] = 0
++    output_offsets[1:] = np.cumsum(counts[:-1])
++    take_idx = np.arange(total) + np.repeat(start_idx - output_offsets, counts)
++    return evt_data[take_idx], total
++
++
+ # class EventArray
+ ########################################################################
+ class EventArray(BaseEventArray):
+@@ -812,33 +842,23 @@ def _restrict_to_interval(self, intervalslice, *, data=None):
+ 
+         issue_warning = False
+         if not self.isempty:
+-            for series, evt_data in enumerate(data):
+-                indices = []
+-                for epdata in newintervals.data:
+-                    t_start = epdata[0]
+-                    t_stop = epdata[1]
+-                    frm, to = np.searchsorted(evt_data, (t_start, t_stop))
+-                    indices.append((frm, to))
+-                indices = np.array(indices, ndmin=2)
+-                if np.diff(indices).sum() < len(evt_data):
++            intervals = newintervals.data
++            singleseries = len(self._data) == 1
++            restricted_series = []
++
++            for evt_data in data:
++                restricted_data, n_kept = _restrict_event_series_to_intervals(
++                    evt_data, intervals
++                )
++                if n_kept < len(evt_data):
+                     issue_warning = True
+-                singleseries = len(self._data) == 1
+-                if singleseries:
+-                    data_list = []
+-                    for start, stop in indices:
+-                        data_list.extend(evt_data[start:stop])
+-                    data = np.array(data_list, ndmin=2)
+-                else:
+-                    # here we have to do some annoying conversion between
+-                    # arrays and lists to fully support jagged array
+-                    # mutation
+-                    data_list = []
+-                    for start, stop in indices:
+-                        data_list.extend(evt_data[start:stop])
+-                    data_ = data.tolist()  # this creates copy
+-                    data_[series] = np.array(data_list)
+-                    data = utils.ragged_array(data_)
+-            self._data = data
++                restricted_series.append(restricted_data)
++
++            if singleseries:
++                self._data = np.array(restricted_series[0], ndmin=2)
++            else:
++                self._data = utils.ragged_array(restricted_series)
++
+             if issue_warning:
+                 logger.info("ignoring events outside of eventarray support")
+ 
+diff --git a/nelpy/core/_intervalarray.py b/nelpy/core/_intervalarray.py
+index 4bb21c6..cbc8ef6 100644
+--- a/nelpy/core/_intervalarray.py
++++ b/nelpy/core/_intervalarray.py
+@@ -689,31 +689,66 @@ def intersect(self, interval, *, boundaries=True):
+             logging.warning("interval intersection is empty")
+             return type(self)(empty=True)
+ 
+-        new_intervals = []
++        interval_data_a = _sorted_interval_data(self.data, assume_sorted=self.issorted)
++        interval_data_b = _sorted_interval_data(
++            interval.data, assume_sorted=interval.issorted
++        )
+ 
+         # Extract starts and stops and convert to np.array of float64 (for numba)
+-        interval_starts_a = np.array(self.starts, dtype=np.float64)
+-        interval_stops_a = np.array(self.stops, dtype=np.float64)
+-        if interval.data.ndim == 1:
+-            interval_starts_b = np.array([interval.data[0]], dtype=np.float64)
+-            interval_stops_b = np.array([interval.data[1]], dtype=np.float64)
++        interval_starts_a = interval_data_a[:, 0]
++        interval_stops_a = interval_data_a[:, 1]
++        interval_starts_b = interval_data_b[:, 0]
++        interval_stops_b = interval_data_b[:, 1]
++
++        if len(interval_starts_a) == 1 or len(interval_starts_b) == 1:
++            if len(interval_starts_b) == 1:
++                keep = (interval_starts_a < interval_stops_b[0]) & (
++                    interval_starts_b[0] < interval_stops_a
++                )
++                if boundaries:
++                    new_starts = np.maximum(
++                        interval_starts_a[keep], interval_starts_b[0]
++                    )
++                    new_stops = np.minimum(interval_stops_a[keep], interval_stops_b[0])
++                else:
++                    new_starts = np.minimum(
++                        interval_starts_a[keep], interval_starts_b[0]
++                    )
++                    new_stops = np.maximum(interval_stops_a[keep], interval_stops_b[0])
++            else:
++                keep = (interval_starts_a[0] < interval_stops_b) & (
++                    interval_starts_b < interval_stops_a[0]
++                )
++                if boundaries:
++                    new_starts = np.maximum(
++                        interval_starts_a[0], interval_starts_b[keep]
++                    )
++                    new_stops = np.minimum(interval_stops_a[0], interval_stops_b[keep])
++                else:
++                    new_starts = np.minimum(
++                        interval_starts_a[0], interval_starts_b[keep]
++                    )
++                    new_stops = np.maximum(interval_stops_a[0], interval_stops_b[keep])
++        elif _is_interval_data_merged(interval_data_a) and _is_interval_data_merged(
++            interval_data_b
++        ):
++            new_starts, new_stops = interval_intersect_sorted(
++                interval_starts_a,
++                interval_stops_a,
++                interval_starts_b,
++                interval_stops_b,
++                boundaries,
++            )
+         else:
+-            interval_starts_b = np.array(interval.data[:, 0], dtype=np.float64)
+-            interval_stops_b = np.array(interval.data[:, 1], dtype=np.float64)
+-
+-        new_starts, new_stops = interval_intersect(
+-            interval_starts_a,
+-            interval_stops_a,
+-            interval_starts_b,
+-            interval_stops_b,
+-            boundaries,
+-        )
+-
+-        for start, stop in zip(new_starts, new_stops):
+-            new_intervals.append([start, stop])
++            new_starts, new_stops = interval_intersect(
++                interval_starts_a,
++                interval_stops_a,
++                interval_starts_b,
++                interval_stops_b,
++                boundaries,
++            )
+ 
+-        # convert to np.array of float64
+-        new_intervals = np.array(new_intervals, dtype=np.float64)
++        new_intervals = np.column_stack((new_starts, new_stops))
+ 
+         out = type(self)(new_intervals)
+         out._domain = self.domain
+@@ -834,6 +869,8 @@ def merge(self, *, gap=0.0, overlap=0.0):
+ 
+         if self.isempty:
+             return self
++        if self.n_intervals == 1:
++            return self
+ 
+         if (self.ismerged) and (gap == 0.0):
+             # already merged
+@@ -844,35 +881,18 @@ def merge(self, *, gap=0.0, overlap=0.0):
+         if not newintervalarray.issorted:
+             newintervalarray._sort()
+ 
+-        overlap_ = overlap
+-
+-        while not newintervalarray._ismerged(overlap=overlap) or gap > 0:
+-            stops = newintervalarray.stops[:-1] + gap
+-            starts = newintervalarray.starts[1:] + overlap_
+-            to_merge = (stops - starts) >= 0
+-
+-            new_starts = [newintervalarray.starts[0]]
+-            new_stops = []
+-
+-            next_stop = newintervalarray.stops[0]
+-            for i in range(newintervalarray.data.shape[0] - 1):
+-                this_stop = newintervalarray.stops[i]
+-                next_stop = max(next_stop, this_stop)
+-                if not to_merge[i]:
+-                    new_stops.append(next_stop)
+-                    new_starts.append(newintervalarray.starts[i + 1])
++        starts = newintervalarray.starts
++        stops = newintervalarray.stops
++        covered_stops = np.maximum.accumulate(stops[:-1] + gap)
++        is_new_group = np.empty(newintervalarray.n_intervals, dtype=bool)
++        is_new_group[0] = True
++        is_new_group[1:] = starts[1:] > covered_stops - overlap
+ 
+-            new_stops.append(max(newintervalarray.stops[-1], next_stop))
++        group_starts = np.flatnonzero(is_new_group)
++        new_starts = starts[group_starts]
++        new_stops = np.maximum.reduceat(stops, group_starts)
+ 
+-            new_starts = np.array(new_starts)
+-            new_stops = np.array(new_stops)
+-
+-            newintervalarray._data = np.vstack([new_starts, new_stops]).T
+-
+-            # after one pass, all the gap offsets have been added, and
+-            # then we just need to keep merging...
+-            gap = 0.0
+-            overlap_ = 0.0
++        newintervalarray._data = np.column_stack((new_starts, new_stops))
+ 
+         return newintervalarray
+ 
+@@ -1208,6 +1228,26 @@ def __init__(self, *args, **kwargs):
+         self.base_unit = self.formatter.base_unit
+ 
+ 
++def _sorted_interval_data(data, *, assume_sorted=False):
++    """Return interval data sorted by starts without mutating the source array."""
++    data = np.asarray(data, dtype=np.float64)
++    if data.ndim == 1:
++        data = np.array([data], dtype=np.float64)
++    if assume_sorted:
++        return data
++    order = np.argsort(data[:, 0])
++    return data[order]
++
++
++def _is_interval_data_merged(data):
++    """Return True when sorted interval data are non-overlapping."""
++    if len(data) < 2:
++        return True
++    if not utils.is_sorted(data[:, 1]):
++        return False
++    return np.all(data[1:, 0] - data[:-1, 1] > 0)
++
++
+ @jit(nopython=True)
+ def interval_intersect(
+     interval_starts_a,
+@@ -1230,3 +1270,36 @@ def interval_intersect(
+                 new_stops.append(new_stop)
+ 
+     return np.array(new_starts), np.array(new_stops)
++
++
++@jit(nopython=True)
++def interval_intersect_sorted(
++    interval_starts_a,
++    interval_stops_a,
++    interval_starts_b,
++    interval_stops_b,
++    boundaries=True,
++):  # pragma: no cover
++    new_starts = []
++    new_stops = []
++    idx_a = 0
++    idx_b = 0
++
++    while idx_a < len(interval_starts_a) and idx_b < len(interval_starts_b):
++        start_a = interval_starts_a[idx_a]
++        stop_a = interval_stops_a[idx_a]
++        start_b = interval_starts_b[idx_b]
++        stop_b = interval_stops_b[idx_b]
++
++        if start_a < stop_b and start_b < stop_a:
++            new_start = max(start_a, start_b) if boundaries else min(start_a, start_b)
++            new_stop = min(stop_a, stop_b) if boundaries else max(stop_a, stop_b)
++            new_starts.append(new_start)
++            new_stops.append(new_stop)
++
++        if stop_a <= stop_b:
++            idx_a += 1
++        else:
++            idx_b += 1
++
++    return np.array(new_starts), np.array(new_stops)
+diff --git a/tests/test_AnalogSignalArray.py b/tests/test_AnalogSignalArray.py
+index 7e207e7..b67353f 100644
+--- a/tests/test_AnalogSignalArray.py
++++ b/tests/test_AnalogSignalArray.py
+@@ -11,6 +11,20 @@
+ )
+ 
+ 
++def _reference_restrict_analog(data, abscissa_vals, intervals):
++    indices = np.column_stack(
++        (
++            np.searchsorted(abscissa_vals, intervals[:, 0]),
++            np.searchsorted(abscissa_vals, intervals[:, 1] + 1e-10),
++        )
++    )
++    restricted_data = np.hstack([data[:, start:stop] for start, stop in indices])
++    restricted_abscissa = np.concatenate(
++        [abscissa_vals[start:stop] for start, stop in indices]
++    )
++    return restricted_data, restricted_abscissa
++
++
+ class TestRegularlySampledAnalogSignalArray:
+     def test_copy(self):
+         data = np.arange(100)
+@@ -370,6 +384,54 @@ def test_analogsignalarray_aliases():
+     assert asa.n_epochs == asa.n_intervals
+ 
+ 
++def test_rsasa_interval_restriction_randomized_matches_reference():
++    rng = np.random.default_rng(20260515)
++
++    for n_samples in (50, 200, 750):
++        abscissa = np.arange(n_samples, dtype=float) / 20.0
++        data = rng.normal(size=(4, n_samples))
++        asa = RegularlySampledAnalogSignalArray(data=data, abscissa_vals=abscissa)
++        original_data = asa.data.copy()
++        original_abscissa = asa.abscissa_vals.copy()
++        starts = np.sort(rng.uniform(abscissa[0], abscissa[-1], size=20))
++        intervals = nel.EpochArray(np.column_stack((starts, starts + 0.075))).merge()
++
++        sliced = asa[intervals]
++        expected_data, expected_abscissa = _reference_restrict_analog(
++            data, abscissa, intervals.data
++        )
++
++        assert np.allclose(sliced.data, expected_data)
++        assert np.allclose(sliced.abscissa_vals, expected_abscissa)
++        assert np.allclose(asa.data, original_data)
++        assert np.allclose(asa.abscissa_vals, original_abscissa)
++
++
++def test_rsasa_interval_restriction_empty_and_full_support_cases():
++    abscissa = np.arange(10, dtype=float)
++    data = np.vstack((np.arange(10), np.arange(10) + 100))
++    asa = RegularlySampledAnalogSignalArray(data=data, abscissa_vals=abscissa)
++
++    no_samples = asa[nel.EpochArray([[10.25, 10.5], [11.0, 12.0]])]
++    full = asa[nel.EpochArray([[0.0, 9.0]])]
++
++    assert no_samples.data.shape == (2, 0)
++    assert len(no_samples.abscissa_vals) == 0
++    assert np.allclose(full.data, data)
++    assert np.allclose(full.abscissa_vals, abscissa)
++
++
++def test_rsasa_interval_restriction_includes_stop_sample():
++    abscissa = np.array([0.0, 0.5, 1.0, 1.5, 2.0])
++    data = np.array([[10.0, 11.0, 12.0, 13.0, 14.0]])
++    asa = RegularlySampledAnalogSignalArray(data=data, abscissa_vals=abscissa)
++
++    sliced = asa[nel.EpochArray([[0.5, 1.0], [2.0, 2.0]])]
++
++    assert np.allclose(sliced.abscissa_vals, np.array([0.5, 1.0, 2.0]))
++    assert np.allclose(sliced.data, np.array([[11.0, 12.0, 14.0]]))
++
++
+ # ---- PositionArray: 1D and 2D ----
+ def test_positionarray_1d():
+     x = np.linspace(0, 100, 1000)
+diff --git a/tests/test_EventArray.py b/tests/test_EventArray.py
+index e559897..5770f67 100644
+--- a/tests/test_EventArray.py
++++ b/tests/test_EventArray.py
+@@ -1,9 +1,22 @@
+ import numpy as np
+ 
+ import nelpy as nel
++from nelpy.core._eventarray import _restrict_event_series_to_intervals
+ from nelpy.utils import ragged_array
+ 
+ 
++def _reference_restrict_events(events, intervals):
++    events = np.asarray(events)
++    pieces = []
++    for start, stop in intervals:
++        start_idx = np.searchsorted(events, start)
++        stop_idx = np.searchsorted(events, stop)
++        pieces.append(events[start_idx:stop_idx])
++    if not pieces:
++        return np.empty(0, dtype=events.dtype)
++    return np.concatenate(pieces)
++
++
+ class TestEventArray:
+     def test_copy(self):
+         abscissa_vals = np.array([[2, 3, 4, 5], [11, 12, 13, 14]])
+@@ -437,3 +450,164 @@ def test_16(self):
+             sta.iloc[[1, 4], :].data,
+         ):
+             assert np.allclose(aa, bb)
++
++
++def test_eventarray_interval_slice_many_empty_intervals_preserves_order():
++    sta = nel.SpikeTrainArray(
++        [[1, 3, 5, 7], [2, 4, 6, 8]],
++        support=nel.EpochArray([0, 10]),
++        fs=1,
++    )
++
++    sliced = sta[nel.EpochArray([[0, 0.5], [2.5, 3.5], [9, 9.5]])]
++
++    assert sliced.n_series == 2
++    assert np.allclose(sliced.data[0], np.array([3]))
++    assert np.allclose(sliced.data[1], np.array([]))
++
++
++def test_eventarray_interval_slice_all_empty_single_series_shape():
++    sta = nel.SpikeTrainArray([1, 2], support=nel.EpochArray([0, 10]), fs=1)
++
++    sliced = sta[nel.EpochArray([3, 4])]
++
++    assert sliced.n_series == 1
++    assert sliced.data.shape == (1, 0)
++
++
++def test_eventarray_interval_slice_multiseries_jagged_result():
++    sta = nel.SpikeTrainArray(
++        [[0.5, 1.5, 3.5, 8.0], [2.0, 2.5], [1.0, 4.0, 9.0]],
++        support=nel.EpochArray([0, 10]),
++        fs=1,
++    )
++
++    sliced = sta[nel.EpochArray([[1, 3], [7, 9]])]
++
++    expected = ragged_array(
++        [np.array([1.5, 8.0]), np.array([2.0, 2.5]), np.array([1.0])]
++    )
++    for actual, target in zip(sliced.data, expected):
++        assert np.allclose(actual, target)
++
++
++def test_restrict_event_series_to_intervals_matches_reference():
++    rng = np.random.default_rng(20260514)
++    events = np.sort(rng.uniform(0, 100, size=1000))
++    starts = np.arange(0, 100, 0.5)
++    intervals = np.column_stack((starts, starts + 0.1))
++
++    restricted, _ = _restrict_event_series_to_intervals(events, intervals)
++    reference = np.concatenate(
++        [
++            events[start:stop]
++            for start, stop in np.column_stack(
++                (
++                    np.searchsorted(events, intervals[:, 0]),
++                    np.searchsorted(events, intervals[:, 1]),
++                )
++            )
++        ]
++    )
++
++    assert np.allclose(restricted, reference)
++
++
++def test_restrict_event_series_to_intervals_randomized_stress():
++    rng = np.random.default_rng(20260515)
++
++    cases = [
++        np.array([], dtype=float),
++        np.array([0.0, 1.0, 1.5, 2.0, 9.5]),
++        np.sort(rng.uniform(0, 25, size=200)),
++        np.sort(rng.uniform(0, 25, size=1500)),
++    ]
++
++    for events in cases:
++        for _ in range(20):
++            starts = np.sort(rng.uniform(-2, 27, size=40))
++            widths = rng.uniform(0.0, 0.3, size=starts.size)
++            intervals = np.column_stack((starts, starts + widths))
++            intervals = nel.EpochArray(intervals).merge().data
++
++            restricted, n_kept = _restrict_event_series_to_intervals(events, intervals)
++            expected = _reference_restrict_events(events, intervals)
++
++            assert np.allclose(restricted, expected)
++            assert n_kept == expected.size
++            assert restricted.dtype == np.asarray(events).dtype
++
++
++def test_eventarray_interval_slice_boundary_semantics():
++    sta = nel.SpikeTrainArray(
++        [[1.0, 2.0, 3.0], [0.999, 1.0, 1.999, 2.0]],
++        support=nel.EpochArray([0, 4]),
++        fs=1,
++    )
++
++    sliced = sta[nel.EpochArray([[1.0, 2.0], [3.0, 3.5]])]
++
++    assert np.allclose(sliced.data[0], np.array([1.0, 3.0]))
++    assert np.allclose(sliced.data[1], np.array([1.0, 1.999]))
++
++
++def test_spiketrainarray_interval_slice_randomized_matches_reference():
++    rng = np.random.default_rng(20260515)
++    series = [np.sort(rng.uniform(0, 30, size=size)) for size in (0, 1, 50, 250, 400)]
++    sta = nel.SpikeTrainArray(series, support=nel.EpochArray([0, 30]), fs=1)
++    original = [events.copy() for events in sta.data]
++    starts = np.sort(rng.uniform(0, 29.8, size=45))
++    intervals = nel.EpochArray(np.column_stack((starts, starts + 0.05))).merge()
++
++    sliced = sta[intervals]
++
++    assert sliced.n_series == len(series)
++    for actual, events in zip(sliced.data, series):
++        assert np.allclose(actual, _reference_restrict_events(events, intervals.data))
++    for actual, expected in zip(sta.data, original):
++        assert np.allclose(actual, expected)
++
++
++def test_spiketrainarray_single_series_interval_slice_matches_reference():
++    events = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 8.0, 9.0])
++    intervals = nel.EpochArray([[0.0, 1.0], [1.5, 1.6], [8.5, 9.5]]).merge()
++    sta = nel.SpikeTrainArray(events, support=nel.EpochArray([0, 10]), fs=1)
++
++    sliced = sta[intervals]
++
++    assert sliced.n_series == 1
++    assert sliced.data.shape == (1, 4)
++    assert np.allclose(
++        sliced.data[0], _reference_restrict_events(events, intervals.data)
++    )
++
++
++def test_restrict_event_series_to_intervals_empty_inputs():
++    intervals = np.array([[0, 1], [2, 3]])
++
++    restricted, n_kept = _restrict_event_series_to_intervals(np.array([]), intervals)
++
++    assert restricted.size == 0
++    assert n_kept == 0
++
++
++def test_restrict_event_series_to_intervals_no_hits():
++    events = np.array([10.0, 11.0])
++    intervals = np.array([[0, 1], [2, 3]])
++
++    restricted, n_kept = _restrict_event_series_to_intervals(events, intervals)
++
++    assert restricted.size == 0
++    assert restricted.dtype == events.dtype
++    assert n_kept == 0
++
++
++def test_restrict_event_series_to_intervals_object_wrapper():
++    events = np.array([1.0, 2.0, 3.0], dtype=object)
++    intervals = np.array([[1.5, 3.5]])
++
++    restricted, n_kept = _restrict_event_series_to_intervals(events, intervals)
++
++    assert np.allclose(restricted, np.array([2.0, 3.0]))
++    assert restricted.dtype == float
++    assert n_kept == 2
+diff --git a/tests/test_IntervalArray.py b/tests/test_IntervalArray.py
+index 0bb3066..271ca75 100644
+--- a/tests/test_IntervalArray.py
++++ b/tests/test_IntervalArray.py
+@@ -5,6 +5,41 @@
+ import nelpy as nel
+ 
+ 
++def _reference_merge(data, *, gap=0.0, overlap=0.0):
++    data = np.asarray(data, dtype=float)
++    if data.size == 0:
++        return np.empty((0, 2))
++
++    data = data[np.argsort(data[:, 0])]
++    merged = [data[0].copy()]
++    covered_stop = data[0, 1]
++    for start, stop in data[1:]:
++        if start <= covered_stop + gap - overlap:
++            merged[-1][1] = max(merged[-1][1], stop)
++            covered_stop = max(covered_stop, stop)
++        else:
++            merged.append(np.array([start, stop]))
++            covered_stop = stop
++    return np.asarray(merged)
++
++
++def _reference_intersect(data_a, data_b, *, boundaries=True):
++    data_a = np.asarray(data_a, dtype=float)
++    data_b = np.asarray(data_b, dtype=float)
++    out = []
++    for a_start, a_stop in data_a[np.argsort(data_a[:, 0])]:
++        for b_start, b_stop in data_b[np.argsort(data_b[:, 0])]:
++            if a_start < b_stop and b_start < a_stop:
++                if boundaries:
++                    out.append([max(a_start, b_start), min(a_stop, b_stop)])
++                else:
++                    out.append([min(a_start, b_start), max(a_stop, b_stop)])
++    if not out:
++        return np.empty((0, 2))
++    out = np.asarray(out)
++    return out[np.lexsort((out[:, 1], out[:, 0]))]
++
++
+ class TestEpochArray:
+     def test_partition(self):
+         ep = nel.EpochArray([0, 10])
+@@ -31,6 +66,27 @@ def test_merge(self):
+         assert np.allclose(merged.starts, np.array([1.0, 12.0, 15.0, 20.0, 30.0]))
+         assert np.allclose(merged.stops, np.array([8.0, 13.0, 18.0, 25.0, 35.0]))
+ 
++    def test_merge_with_gap(self):
++        epoch = nel.EpochArray([[0, 1], [1.5, 2], [2.4, 3]])
++
++        merged = epoch.merge(gap=0.6)
++
++        assert np.allclose(merged.data, np.array([[0, 3]]))
++
++    def test_merge_with_overlap(self):
++        epoch = nel.EpochArray([[0, 1], [0.8, 2], [1.9, 3]])
++
++        merged = epoch.merge(overlap=0.2)
++
++        assert np.allclose(merged.data, np.array([[0, 2], [1.9, 3]]))
++
++    def test_merge_transitive_overlap(self):
++        epoch = nel.EpochArray([[0, 2], [1.5, 3], [2.8, 4]])
++
++        merged = epoch.merge()
++
++        assert np.allclose(merged.data, np.array([[0, 4]]))
++
+     def test_intersection_of_contiguous_epochs(self):
+         """We want contiguous intervals to stay contiguous, even if intersecting"""
+         x = nel.EpochArray([[2, 3], [3, 4], [5, 7]])
+@@ -39,6 +95,135 @@ def test_intersection_of_contiguous_epochs(self):
+         assert x[y].n_intervals == 3
+         assert y[x].n_intervals == 3
+ 
++    def test_intersection_of_merged_epochs_matches_pairwise_overlap(self):
++        """Fast merged-interval intersection should preserve overlap semantics."""
++        x = nel.EpochArray([[0, 2], [4, 6], [8, 10]])
++        y = nel.EpochArray([[1, 5], [7, 9]])
++
++        assert np.allclose(x[y].data, np.array([[1, 2], [4, 5], [8, 9]]))
++        assert np.allclose(y[x].data, np.array([[1, 2], [4, 5], [8, 9]]))
++
++    def test_singleton_intersection_without_boundaries(self):
++        x = nel.EpochArray([[0, 2], [4, 6], [8, 10]])
++        y = nel.EpochArray([1, 5])
++
++        assert np.allclose(
++            x.intersect(y, boundaries=False).data,
++            np.array([[0, 5], [1, 6]]),
++        )
++        assert np.allclose(
++            y.intersect(x, boundaries=False).data,
++            np.array([[0, 5], [1, 6]]),
++        )
++
++    def test_singleton_intersection_empty_overlap(self):
++        x = nel.EpochArray([[0, 2], [4, 6]])
++        y = nel.EpochArray([10, 12])
++
++        assert x[y].isempty
++        assert y[x].isempty
++
++    def test_nonmerged_intersection_falls_back_to_pairwise(self):
++        x = nel.EpochArray([[0, 5], [2, 7]])
++        y = nel.EpochArray([[1, 3], [4, 6]])
++
++        assert np.allclose(
++            x[y].data,
++            np.array([[1, 3], [2, 3], [4, 5], [4, 6]]),
++        )
++
++    def test_intersection_with_unsorted_private_data_uses_sorted_inputs(self):
++        x = nel.EpochArray([[0, 2], [4, 6]])
++        y = nel.EpochArray([[1, 5], [7, 8]])
++        x._data = np.array([[4.0, 6.0], [0.0, 2.0]])
++        original_data = x.data.copy()
++
++        assert np.allclose(x[y].data, np.array([[1, 2], [4, 5]]))
++        assert np.allclose(x.data, original_data)
++
++    def test_intersection_sorted_inputs_skip_argsort(self, monkeypatch):
++        x = nel.EpochArray([[0, 2], [4, 6]])
++        y = nel.EpochArray([[1, 5], [7, 8]])
++
++        def fail_argsort(*args, **kwargs):
++            raise AssertionError("sorted intersection should not call argsort")
++
++        monkeypatch.setattr(np, "argsort", fail_argsort)
++
++        assert np.allclose(x[y].data, np.array([[1, 2], [4, 5]]))
++
++    def test_merge_matches_reference_for_randomized_intervals(self):
++        rng = np.random.default_rng(20260515)
++        cases = [
++            {"gap": 0.0, "overlap": 0.0},
++            {"gap": 0.08, "overlap": 0.0},
++            {"gap": 0.0, "overlap": 0.08},
++        ]
++
++        for kwargs in cases:
++            for _ in range(30):
++                starts = np.sort(rng.uniform(0, 10, size=24))
++                lengths = rng.uniform(0.01, 0.5, size=starts.size)
++                data = np.column_stack((starts, starts + lengths))
++                data[1] = data[0]  # duplicate interval
++                data[4] = [data[3, 1], data[3, 1] + 0.2]  # touching boundary
++                data[8] = [data[7, 0] + 0.01, data[7, 1] - 0.01]  # nested
++                rng.shuffle(data)
++
++                merged = nel.EpochArray(data).merge(**kwargs)
++                expected = _reference_merge(data, **kwargs)
++
++                assert np.allclose(merged.data, expected)
++
++    def test_intersect_matches_reference_for_randomized_intervals(self):
++        rng = np.random.default_rng(20260515)
++
++        for boundaries in (True, False):
++            for _ in range(30):
++                starts_a = np.sort(rng.uniform(0, 12, size=16))
++                starts_b = np.sort(rng.uniform(0, 12, size=11))
++                data_a = np.column_stack(
++                    (starts_a, starts_a + rng.uniform(0.05, 1.2, size=starts_a.size))
++                )
++                data_b = np.column_stack(
++                    (starts_b, starts_b + rng.uniform(0.05, 1.2, size=starts_b.size))
++                )
++                data_a[3] = [data_a[2, 1], data_a[2, 1] + 0.4]
++                data_b[4] = [data_a[5, 0], data_a[5, 1]]
++
++                x = nel.EpochArray(data_a).merge()
++                y = nel.EpochArray(data_b).merge()
++                expected = _reference_intersect(x.data, y.data, boundaries=boundaries)
++
++                actual = x.intersect(y, boundaries=boundaries)
++                reverse = y.intersect(x, boundaries=boundaries)
++
++                assert np.allclose(actual.data, expected)
++                assert np.allclose(reverse.data, expected)
++
++    def test_intersect_singleton_and_no_overlap_match_reference(self):
++        many = np.array([[0.0, 1.0], [2.0, 4.0], [4.0, 5.0], [8.0, 10.0]])
++        singleton = np.array([[3.0, 8.5]])
++        miss = np.array([[10.5, 11.0]])
++
++        for boundaries in (True, False):
++            expected = _reference_intersect(many, singleton, boundaries=boundaries)
++            assert np.allclose(
++                nel.EpochArray(many)
++                .intersect(nel.EpochArray(singleton), boundaries=boundaries)
++                .data,
++                expected,
++            )
++            assert np.allclose(
++                nel.EpochArray(singleton)
++                .intersect(nel.EpochArray(many), boundaries=boundaries)
++                .data,
++                expected,
++            )
++
++        assert nel.EpochArray(many).intersect(nel.EpochArray(miss)).isempty
++        assert nel.EpochArray(miss).intersect(nel.EpochArray(many)).isempty
++
+ 
+ # epochs_a = nel.EpochArray([[0, 5], [5,10], [10,12], [12,16], [14,18]])
+ # epochs_b = nel.EpochArray([[3, 12], [15,20], [15,18]])

@@ -1,0 +1,979 @@
+diff --git a/config/laravel-brain.php b/config/laravel-brain.php
+index 224f2259..73e16331 100644
+--- a/config/laravel-brain.php
++++ b/config/laravel-brain.php
+@@ -194,14 +194,21 @@
+     // -------------------------------------------------------------------------
+     // Event Listeners
+     // -------------------------------------------------------------------------
+-    // Directories (relative to project root) scanned for listener classes.
+-    // A class whose handle() type-hints an event in its first parameter is
+-    // linked to that event, so the graph shows what runs when it dispatches.
++    // Event → listener edges are discovered from every registration form:
++    //   - convention: a class under "paths" whose handle()/__invoke() type-hints
++    //     the event in its first parameter;
++    //   - attribute: a class or method marked #[AsEventListener] under "paths";
++    //   - $listen / $subscribe: the maps declared in the providers under
++    //     "provider_paths" (subscriber subscribe() methods are followed too).
++    // So the graph shows what runs when an event dispatches, however it is wired.
+     //
+     'listeners' => [
+         'paths' => [
+             'app/Listeners',
+         ],
++        'provider_paths' => [
++            'app/Providers',
++        ],
+     ],
+ 
+     // -------------------------------------------------------------------------
+diff --git a/src/Analysis/ListenerAnalyzer.php b/src/Analysis/ListenerAnalyzer.php
+index 45694a91..1cd0c33c 100644
+--- a/src/Analysis/ListenerAnalyzer.php
++++ b/src/Analysis/ListenerAnalyzer.php
+@@ -6,75 +6,149 @@
+ 
+ use LaraMint\LaravelBrain\Parser\PhpFileParser;
+ use PhpParser\Node;
+-use PhpParser\NodeTraverser;
+-use PhpParser\NodeVisitorAbstract;
++use PhpParser\NodeFinder;
+ 
+ /**
+  * Links dispatched events to the listeners that handle them.
+  *
+- * This pass discovers listeners by convention: a class under the configured
+- * listener directories whose `handle()` type-hints an event in its first
+- * parameter is treated as a listener for that event. It emits one
+- * event → listener CallChainEdge per discovered pairing, so the graph can
+- * answer "what runs when this event is dispatched".
++ * Edges are discovered from every way Laravel wires a listener to an event:
+  *
+- * Other registration sources ($listen arrays, subscribers, attributes) are
+- * intentionally out of scope here and handled as follow-ups.
++ *  - by convention   — a class under the listener directories whose `handle()`
++ *                      or `__invoke()` type-hints an event in its first parameter;
++ *  - by attribute    — a class or method marked `#[AsEventListener]`, with the
++ *                      event taken from the attribute or the method's first parameter;
++ *  - by `$listen`     — the `EventServiceProvider::$listen` map of event => listeners;
++ *  - by `$subscribe`  — a subscriber listed in `$subscribe`, whose `subscribe()`
++ *                      method registers handlers via `$events->listen(...)` or a
++ *                      returned `[event => method]` map.
++ *
++ * Each pairing becomes one event → listener CallChainEdge, so the graph can
++ * answer "what runs when this event is dispatched", regardless of how the
++ * listener was registered.
+  */
+ class ListenerAnalyzer
+ {
+     private PhpFileParser $parser;
+ 
+-    /** @var string[] directories (relative to project root) to scan for listeners */
++    private NodeFinder $finder;
++
++    /** @var string[] directories (relative to project root) scanned for listeners */
+     private array $listenerPaths;
+ 
++    /** @var string[] provider directories (relative to project root) scanned for listen/subscribe registrations */
++    private array $providerPaths;
++
++    /** @var array<string, string[]> namespace prefix => base paths, used to locate subscriber files */
++    private array $psr4Map = [];
++
+     /**
+      * @param  string[]  $listenerPaths
++     * @param  string[]  $providerPaths
+      */
+-    public function __construct(array $listenerPaths = ['app/Listeners'])
++    public function __construct(array $listenerPaths = ['app/Listeners'], array $providerPaths = ['app/Providers'])
+     {
+         $this->parser = new PhpFileParser;
++        $this->finder = new NodeFinder;
+         $this->listenerPaths = $listenerPaths !== [] ? $listenerPaths : ['app/Listeners'];
++        $this->providerPaths = $providerPaths !== [] ? $providerPaths : ['app/Providers'];
+     }
+ 
+     /**
++     * @param  array<string, string[]>  $psr4Map  namespace prefix => base paths (locates $subscribe classes)
+      * @return CallChainEdge[] event → listener edges
+      */
+-    public function analyze(string $projectRoot): array
++    public function analyze(string $projectRoot, array $psr4Map = []): array
+     {
+-        return $this->discoverByConvention($projectRoot);
++        $this->psr4Map = $psr4Map;
++        $edges = [];
++        foreach ($this->listenerFiles($projectRoot) as $file) {
++            array_push($edges, ...$this->edgesFromListenerFile($file));
++        }
++        foreach ($this->providerFiles($projectRoot) as $file) {
++            array_push($edges, ...$this->edgesFromProviderFile($file, $projectRoot));
++        }
++
++        return $this->dedupe($edges);
+     }
+ 
+     /**
++     * Convention + attribute discovery for a single listener class file.
++     *
+      * @return CallChainEdge[]
+      */
+-    private function discoverByConvention(string $projectRoot): array
++    private function edgesFromListenerFile(string $file): array
+     {
++        $context = $this->context($file);
++        if ($context === null) {
++            return [];
++        }
++        [$ast, $useMap, $namespace] = $context;
++
++        $class = $this->finder->findFirstInstanceOf($ast, Node\Stmt\Class_::class);
++        if (! $class instanceof Node\Stmt\Class_ || $class->name === null) {
++            return [];
++        }
++        $listenerFqcn = $this->qualify($class->name->toString(), $namespace);
++
+         $edges = [];
+ 
+-        foreach ($this->listenerPaths as $relativePath) {
+-            $basePath = rtrim($projectRoot, '/').'/'.ltrim($relativePath, '/');
+-            if (! is_dir($basePath)) {
++        // Convention: handle()/__invoke() whose first parameter type-hints the event.
++        foreach ($class->getMethods() as $method) {
++            $name = $method->name->toString();
++            if ($name !== 'handle' && $name !== '__invoke') {
+                 continue;
+             }
++            $event = $this->paramEvent($method, $useMap, $namespace);
++            if ($event !== null) {
++                $edges[] = $this->edge($event, $listenerFqcn, $name);
++            }
++        }
+ 
+-            $it = new \RecursiveIteratorIterator(
+-                new \RecursiveDirectoryIterator($basePath, \FilesystemIterator::SKIP_DOTS)
+-            );
+-            foreach ($it as $fileInfo) {
+-                if (! $fileInfo->isFile() || $fileInfo->getExtension() !== 'php') {
++        // Attribute: #[AsEventListener] on the class, or on individual methods.
++        // A class-level attribute names its event explicitly; without one there is
++        // no method to infer from, so the convention pass above already covers it.
++        foreach ($this->attributeEvents($class->attrGroups, $useMap, $namespace) as [$event, $method]) {
++            if ($event !== null) {
++                $edges[] = $this->edge($event, $listenerFqcn, $method ?? 'handle');
++            }
++        }
++        foreach ($class->getMethods() as $method) {
++            foreach ($this->attributeEvents($method->attrGroups, $useMap, $namespace) as [$event, $named]) {
++                $resolved = $event ?? $this->paramEvent($method, $useMap, $namespace);
++                if ($resolved !== null) {
++                    $edges[] = $this->edge($resolved, $listenerFqcn, $named ?? $method->name->toString());
++                }
++            }
++        }
++
++        return $edges;
++    }
++
++    /**
++     * $listen + $subscribe discovery for a single service-provider file.
++     *
++     * @return CallChainEdge[]
++     */
++    private function edgesFromProviderFile(string $file, string $projectRoot): array
++    {
++        $context = $this->context($file);
++        if ($context === null) {
++            return [];
++        }
++        [$ast, $useMap, $namespace] = $context;
++
++        $edges = [];
++        foreach ($this->finder->findInstanceOf($ast, Node\Stmt\Property::class) as $property) {
++            foreach ($property->props as $prop) {
++                $default = $prop->default;
++                if (! $default instanceof Node\Expr\Array_) {
+                     continue;
+                 }
+-                $pairing = $this->pairingFromFile($fileInfo->getPathname());
+-                if ($pairing !== null) {
+-                    [$eventFqcn, $listenerFqcn] = $pairing;
+-                    $edges[] = new CallChainEdge(
+-                        callerFqcn: $eventFqcn,
+-                        callerMethod: '__construct',
+-                        calleeFqcn: $listenerFqcn,
+-                        calleeMethod: 'handle',
+-                        type: 'listener',
+-                    );
++                if ($prop->name->toString() === 'listen') {
++                    array_push($edges, ...$this->edgesFromListenMap($default, $useMap, $namespace));
++                }
++                if ($prop->name->toString() === 'subscribe') {
++                    array_push($edges, ...$this->edgesFromSubscribeList($default, $useMap, $namespace, $projectRoot));
+                 }
+             }
+         }
+@@ -83,73 +157,375 @@ private function discoverByConvention(string $projectRoot): array
+     }
+ 
+     /**
+-     * @return array{0: string, 1: string}|null [eventFqcn, listenerFqcn]
++     * Parse an `EventServiceProvider::$listen` map: event => [listeners].
++     *
++     * @return CallChainEdge[]
+      */
+-    private function pairingFromFile(string $file): ?array
++    private function edgesFromListenMap(Node\Expr\Array_ $map, array $useMap, string $namespace): array
+     {
+-        $parsed = $this->parser->parse($file);
+-        if ($parsed['ast'] === null) {
+-            return null;
++        $edges = [];
++        foreach ($map->items as $item) {
++            if (! $item instanceof Node\Expr\ArrayItem || $item->key === null) {
++                continue;
++            }
++            $event = $this->classRef($item->key, $useMap, $namespace);
++            if ($event === null) {
++                continue;
++            }
++            // Listeners may be an array (the common form) or a single class — Laravel allows both.
++            $listenerValues = [];
++            if ($item->value instanceof Node\Expr\Array_) {
++                foreach ($item->value->items as $listener) {
++                    if ($listener instanceof Node\Expr\ArrayItem) {
++                        $listenerValues[] = $listener->value;
++                    }
++                }
++            } else {
++                $listenerValues[] = $item->value;
++            }
++            foreach ($listenerValues as $value) {
++                $ref = $this->listenerRef($value, $useMap, $namespace, null);
++                if ($ref !== null) {
++                    $edges[] = $this->edge($event, $ref[0], $ref[1]);
++                }
++            }
+         }
+-        $useMap = $parsed['useMap'];
+ 
+-        $traverser = new NodeTraverser;
+-        $visitor = new class($useMap) extends NodeVisitorAbstract
+-        {
+-            public ?string $listenerFqcn = null;
++        return $edges;
++    }
+ 
+-            public ?string $eventFqcn = null;
++    /**
++     * Parse an `$subscribe` list and each named subscriber's `subscribe()` method.
++     *
++     * @return CallChainEdge[]
++     */
++    private function edgesFromSubscribeList(Node\Expr\Array_ $list, array $useMap, string $namespace, string $projectRoot): array
++    {
++        $edges = [];
++        foreach ($list->items as $item) {
++            if (! $item instanceof Node\Expr\ArrayItem) {
++                continue;
++            }
++            $subscriber = $this->classRef($item->value, $useMap, $namespace);
++            if ($subscriber !== null) {
++                array_push($edges, ...$this->edgesFromSubscriber($subscriber, $projectRoot));
++            }
++        }
+ 
+-            private array $useMap;
++        return $edges;
++    }
+ 
+-            private string $namespace = '';
++    /**
++     * Resolve a subscriber class to its file and read the event → handler
++     * pairings registered inside its `subscribe()` method.
++     *
++     * @return CallChainEdge[]
++     */
++    private function edgesFromSubscriber(string $subscriberFqcn, string $projectRoot): array
++    {
++        $file = $this->resolveClassFile($subscriberFqcn, $projectRoot);
++        if ($file === null) {
++            return [];
++        }
++        $context = $this->context($file);
++        if ($context === null) {
++            return [];
++        }
++        [$ast, $useMap, $namespace] = $context;
+ 
+-            public function __construct(array $useMap)
+-            {
+-                $this->useMap = $useMap;
++        $subscribe = null;
++        foreach ($this->finder->findInstanceOf($ast, Node\Stmt\ClassMethod::class) as $method) {
++            if ($method->name->toString() === 'subscribe') {
++                $subscribe = $method;
++                break;
+             }
++        }
++        if ($subscribe === null) {
++            return [];
++        }
+ 
+-            public function enterNode(Node $node): ?int
+-            {
+-                if ($node instanceof Node\Stmt\Namespace_ && $node->name !== null) {
+-                    $this->namespace = $node->name->toString();
+-                }
+-                if ($node instanceof Node\Stmt\Class_ && $node->name !== null) {
+-                    $this->listenerFqcn = $this->namespace !== ''
+-                        ? $this->namespace.'\\'.$node->name->toString()
+-                        : $node->name->toString();
++        $edges = [];
++
++        // Imperative form: $events->listen(Event::class, handler).
++        foreach ($this->finder->findInstanceOf($subscribe, Node\Expr\MethodCall::class) as $call) {
++            if (! $call->name instanceof Node\Identifier || $call->name->toString() !== 'listen') {
++                continue;
++            }
++            $args = $call->getArgs();
++            $event = isset($args[0]) ? $this->classRef($args[0]->value, $useMap, $namespace) : null;
++            if ($event === null) {
++                continue;
++            }
++            $ref = isset($args[1]) ? $this->listenerRef($args[1]->value, $useMap, $namespace, $subscriberFqcn) : null;
++            if ($ref !== null) {
++                $edges[] = $this->edge($event, $ref[0], $ref[1]);
++            }
++        }
++
++        // Return-map form: return [Event::class => 'method' | [self::class, 'method']].
++        foreach ($this->finder->findInstanceOf($subscribe, Node\Stmt\Return_::class) as $return) {
++            if (! $return->expr instanceof Node\Expr\Array_) {
++                continue;
++            }
++            foreach ($return->expr->items as $item) {
++                if (! $item instanceof Node\Expr\ArrayItem || $item->key === null) {
++                    continue;
+                 }
+-                if ($node instanceof Node\Stmt\ClassMethod
+-                    && in_array($node->name->toString(), ['handle', '__invoke'], true)) {
+-                    $param = $node->params[0] ?? null;
+-                    if ($param !== null && $param->type instanceof Node\Name) {
+-                        $this->eventFqcn = $this->resolve($param->type->toString());
+-                    }
++                $event = $this->classRef($item->key, $useMap, $namespace);
++                $ref = $event === null ? null : $this->listenerRef($item->value, $useMap, $namespace, $subscriberFqcn);
++                if ($event !== null && $ref !== null) {
++                    $edges[] = $this->edge($event, $ref[0], $ref[1]);
+                 }
++            }
++        }
++
++        return $edges;
++    }
++
++    /**
++     * Resolve a listener reference into [classFqcn, method].
++     *
++     * Accepts `Listener::class`, `[Listener::class, 'method']`, `'Listener@method'`,
++     * a bare `'method'` string (handler on $defaultClass), or `self::class`.
++     *
++     * @return array{0: string, 1: string}|null
++     */
++    private function listenerRef(Node\Expr $value, array $useMap, string $namespace, ?string $defaultClass): ?array
++    {
++        if ($value instanceof Node\Expr\Array_) {
++            $items = array_values(array_filter(
++                $value->items,
++                static fn ($i): bool => $i instanceof Node\Expr\ArrayItem,
++            ));
++            $class = isset($items[0]) ? $this->classRef($items[0]->value, $useMap, $namespace, $defaultClass) : null;
++            $method = isset($items[1]) && $items[1]->value instanceof Node\Scalar\String_
++                ? $items[1]->value->value
++                : 'handle';
++
++            return $class === null ? null : [$class, $method];
++        }
+ 
+-                return null;
++        if ($value instanceof Node\Scalar\String_) {
++            if (str_contains($value->value, '@')) {
++                [$class, $method] = explode('@', $value->value, 2);
++
++                return [$this->qualify($class, $namespace, $useMap), $method];
++            }
++            // A bare string is a method name on the subscriber, else a listener class.
++            if ($defaultClass !== null && ! str_contains($value->value, '\\')) {
++                return [$defaultClass, $value->value];
++            }
++
++            return [$this->qualify($value->value, $namespace, $useMap), 'handle'];
++        }
++
++        $class = $this->classRef($value, $useMap, $namespace, $defaultClass);
++
++        return $class === null ? null : [$class, 'handle'];
++    }
++
++    /**
++     * Resolve `Event::class`, `self::class`, or a string literal to an FQCN.
++     */
++    private function classRef(Node\Expr $expr, array $useMap, string $namespace, ?string $self = null): ?string
++    {
++        if ($expr instanceof Node\Expr\ClassConstFetch
++            && $expr->class instanceof Node\Name
++            && $expr->name instanceof Node\Identifier
++            && $expr->name->toString() === 'class') {
++            $name = $expr->class->toString();
++            if ($self !== null && ($name === 'self' || $name === 'static')) {
++                return $self;
+             }
+ 
+-            private function resolve(string $name): string
+-            {
+-                if (isset($this->useMap[$name])) {
+-                    return $this->useMap[$name];
++            return $this->qualify($name, $namespace, $useMap);
++        }
++
++        if ($expr instanceof Node\Scalar\String_) {
++            return ltrim($expr->value, '\\');
++        }
++
++        return null;
++    }
++
++    /**
++     * Read the event/method pairs declared by `#[AsEventListener]` attributes.
++     *
++     * @param  Node\AttributeGroup[]  $groups
++     * @return list<array{0: ?string, 1: ?string}> [eventFqcn|null, method|null]
++     */
++    private function attributeEvents(array $groups, array $useMap, string $namespace): array
++    {
++        $found = [];
++        foreach ($groups as $group) {
++            foreach ($group->attrs as $attr) {
++                if ($attr->name->getLast() !== 'AsEventListener') {
++                    continue;
+                 }
+-                if (str_contains($name, '\\')) {
+-                    return ltrim($name, '\\');
++                $event = null;
++                $method = null;
++                $positional = 0;
++                foreach ($attr->args as $arg) {
++                    $key = $arg->name?->toString();
++                    if ($key === 'event' || ($key === null && $positional === 0)) {
++                        $event = $this->classRef($arg->value, $useMap, $namespace);
++                    } elseif (($key === 'method' || ($key === null && $positional === 1)) && $arg->value instanceof Node\Scalar\String_) {
++                        $method = $arg->value->value;
++                    }
++                    if ($key === null) {
++                        $positional++;
++                    }
+                 }
+-
+-                return ($this->namespace !== '' ? $this->namespace.'\\' : '').$name;
++                $found[] = [$event, $method];
+             }
+-        };
++        }
++
++        return $found;
++    }
++
++    private function paramEvent(Node\Stmt\ClassMethod $method, array $useMap, string $namespace): ?string
++    {
++        $param = $method->params[0] ?? null;
++        if ($param !== null && $param->type instanceof Node\Name) {
++            return $this->qualify($param->type->toString(), $namespace, $useMap);
++        }
++
++        return null;
++    }
++
++    /**
++     * Resolve a (possibly short or aliased) class name to an FQCN.
++     *
++     * @param  array<string, string>  $useMap
++     */
++    private function qualify(string $name, string $namespace, array $useMap = []): string
++    {
++        $name = ltrim($name, '\\');
++        if (isset($useMap[$name])) {
++            return $useMap[$name];
++        }
++        $head = strtok($name, '\\');
++        if ($head !== false && $head !== $name && isset($useMap[$head])) {
++            return $useMap[$head].substr($name, strlen($head));
++        }
++        if (str_contains($name, '\\')) {
++            return $name;
++        }
+ 
+-        $traverser->addVisitor($visitor);
+-        $traverser->traverse($parsed['ast']);
++        return $namespace !== '' ? $namespace.'\\'.$name : $name;
++    }
+ 
+-        if ($visitor->listenerFqcn === null || $visitor->eventFqcn === null) {
++    /**
++     * @return array{0: Node\Stmt[], 1: array<string, string>, 2: string}|null [ast, useMap, namespace]
++     */
++    private function context(string $file): ?array
++    {
++        $parsed = $this->parser->parse($file);
++        if ($parsed['ast'] === null) {
+             return null;
+         }
++        $namespaceNode = $this->finder->findFirstInstanceOf($parsed['ast'], Node\Stmt\Namespace_::class);
++        $namespace = $namespaceNode instanceof Node\Stmt\Namespace_ && $namespaceNode->name !== null
++            ? $namespaceNode->name->toString()
++            : '';
++
++        return [$parsed['ast'], $parsed['useMap'], $namespace];
++    }
++
++    private function edge(string $eventFqcn, string $listenerFqcn, string $method): CallChainEdge
++    {
++        return new CallChainEdge(
++            callerFqcn: $eventFqcn,
++            callerMethod: '__construct',
++            calleeFqcn: $listenerFqcn,
++            calleeMethod: $method,
++            type: 'listener',
++        );
++    }
++
++    /**
++     * @param  CallChainEdge[]  $edges
++     * @return CallChainEdge[]
++     */
++    private function dedupe(array $edges): array
++    {
++        $unique = [];
++        foreach ($edges as $edge) {
++            $key = "{$edge->callerFqcn}|{$edge->calleeFqcn}|{$edge->calleeMethod}";
++            $unique[$key] = $edge;
++        }
++
++        return array_values($unique);
++    }
++
++    /**
++     * @return iterable<string>
++     */
++    private function listenerFiles(string $projectRoot): iterable
++    {
++        return $this->phpFiles($this->listenerPaths, $projectRoot);
++    }
++
++    /**
++     * @return iterable<string>
++     */
++    private function providerFiles(string $projectRoot): iterable
++    {
++        return $this->phpFiles($this->providerPaths, $projectRoot);
++    }
++
++    /**
++     * @param  string[]  $relativePaths
++     * @return iterable<string>
++     */
++    private function phpFiles(array $relativePaths, string $projectRoot): iterable
++    {
++        foreach ($relativePaths as $relativePath) {
++            $basePath = rtrim($projectRoot, '/').'/'.ltrim($relativePath, '/');
++            if (! is_dir($basePath)) {
++                continue;
++            }
++            $it = new \RecursiveIteratorIterator(
++                new \RecursiveDirectoryIterator($basePath, \FilesystemIterator::SKIP_DOTS)
++            );
++            foreach ($it as $fileInfo) {
++                if ($fileInfo->isFile() && $fileInfo->getExtension() === 'php') {
++                    yield $fileInfo->getPathname();
++                }
++            }
++        }
++    }
++
++    private function resolveClassFile(string $fqcn, string $projectRoot): ?string
++    {
++        // Prefer the real PSR-4 map (handles non-App\ roots, packages, custom layouts).
++        foreach ($this->psr4Map as $prefix => $basePaths) {
++            if (str_starts_with($fqcn, $prefix)) {
++                $relative = str_replace('\\', '/', substr($fqcn, strlen($prefix))).'.php';
++                foreach ($basePaths as $basePath) {
++                    $path = rtrim($basePath, '/').'/'.ltrim($relative, '/');
++                    if (is_file($path)) {
++                        return $path;
++                    }
++                }
++            }
++        }
++
++        // Fallback for when no map was supplied: the conventional App\ => app/ root.
++        $candidates = [];
++        if (str_starts_with($fqcn, 'App\\')) {
++            $candidates[] = 'app/'.str_replace('\\', '/', substr($fqcn, 4)).'.php';
++        }
++        $candidates[] = 'app/'.str_replace('\\', '/', $fqcn).'.php';
++        $candidates[] = str_replace('\\', '/', $fqcn).'.php';
++
++        foreach ($candidates as $candidate) {
++            $path = rtrim($projectRoot, '/').'/'.$candidate;
++            if (is_file($path)) {
++                return $path;
++            }
++        }
+ 
+-        return [$visitor->eventFqcn, $visitor->listenerFqcn];
++        return null;
+     }
+ }
+diff --git a/src/Analysis/ProjectAnalyzer.php b/src/Analysis/ProjectAnalyzer.php
+index 8d8c4761..4554c6f4 100644
+--- a/src/Analysis/ProjectAnalyzer.php
++++ b/src/Analysis/ProjectAnalyzer.php
+@@ -71,7 +71,11 @@ public function __construct()
+         $this->channelAnalyzer = new ChannelAnalyzer($channelPaths);
+ 
+         $listenerPaths = config('laravel-brain.listeners.paths', ['app/Listeners']);
+-        $this->listenerAnalyzer = new ListenerAnalyzer(is_array($listenerPaths) ? $listenerPaths : []);
++        $providerPaths = config('laravel-brain.listeners.provider_paths', ['app/Providers']);
++        $this->listenerAnalyzer = new ListenerAnalyzer(
++            is_array($listenerPaths) ? $listenerPaths : [],
++            is_array($providerPaths) ? $providerPaths : [],
++        );
+ 
+         $cmdConfig = config('laravel-brain.commands', []);
+         $this->consoleAnalyzer = new ConsoleAnalyzer(
+@@ -153,8 +157,8 @@ public function analyze(string $projectRoot, ?callable $onProgress = null): Anal
+             }
+         }
+ 
+-        // Link dispatched events to the listeners that handle them (discovered by convention).
+-        foreach ($this->listenerAnalyzer->analyze($projectRoot) as $edge) {
++        // Link dispatched events to the listeners that handle them.
++        foreach ($this->listenerAnalyzer->analyze($projectRoot, $psr4Map) as $edge) {
+             $callChain[] = $edge;
+         }
+ 
+diff --git a/tests/Unit/ListenerAnalyzerTest.php b/tests/Unit/ListenerAnalyzerTest.php
+index a531a665..6f50b8c4 100644
+--- a/tests/Unit/ListenerAnalyzerTest.php
++++ b/tests/Unit/ListenerAnalyzerTest.php
+@@ -37,6 +37,146 @@
+         ->type->toBe('listener');
+ });
+ 
++it('discovers a listener registered via the $listen array', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->callerFqcn === 'App\\Events\\OrderShipped' && $e->calleeFqcn === 'App\\Listeners\\SendShipmentNotification'
++    ));
++
++    expect($match)->toHaveCount(1);
++    expect($match[0])
++        ->callerMethod->toBe('__construct')
++        ->calleeMethod->toBe('handle')
++        ->type->toBe('listener');
++});
++
++it('discovers subscriber handlers from listen() calls and the returned map', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $byHandler = fn (string $method) => array_values(array_filter(
++        $edges,
++        fn ($e) => $e->calleeFqcn === 'App\\Subscribers\\UserEventSubscriber' && $e->calleeMethod === $method
++    ));
++
++    $imperative = $byHandler('handlePasswordReset');
++    expect($imperative)->toHaveCount(1);
++    expect($imperative[0])
++        ->callerFqcn->toBe('App\\Events\\PasswordReset')
++        ->type->toBe('listener');
++
++    $returned = $byHandler('handleAccountDeleted');
++    expect($returned)->toHaveCount(1);
++    expect($returned[0])->callerFqcn->toBe('App\\Events\\AccountDeleted');
++});
++
++it('discovers a listener registered via the #[AsEventListener] attribute', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->calleeFqcn === 'App\\Listeners\\SendPodcastNotification'
++    ));
++
++    expect($match)->toHaveCount(1);
++    expect($match[0])
++        ->callerFqcn->toBe('App\\Events\\PodcastProcessed')
++        ->calleeMethod->toBe('notify')
++        ->type->toBe('listener');
++});
++
++it('discovers a listener registered via a class-level #[AsEventListener] attribute', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->calleeFqcn === 'App\\Listeners\\ProcessInvoice'
++    ));
++
++    expect($match)->toHaveCount(1);
++    expect($match[0])
++        ->callerFqcn->toBe('App\\Events\\InvoiceRequested')
++        ->calleeMethod->toBe('handle')
++        ->type->toBe('listener');
++});
++
++it('does not duplicate a listener registered by both convention and $listen', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->calleeFqcn === 'App\\Listeners\\HandleUserLoggedIn'
++    ));
++
++    expect($match)->toHaveCount(1);
++});
++
++it('resolves the Class@method and string-FQCN-key forms in $listen', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->callerFqcn === 'App\\Events\\ReportReady'
++    ));
++
++    expect($match)->toHaveCount(1);
++    expect($match[0])
++        ->calleeFqcn->toBe('App\\Listeners\\SendShipmentNotification')
++        ->calleeMethod->toBe('sendReport')
++        ->type->toBe('listener');
++});
++
++it('resolves an aliased event import and the [Class, method] tuple form', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->callerFqcn === 'App\\Events\\PaymentCaptured'
++    ));
++
++    expect($match)->toHaveCount(1);
++    expect($match[0])
++        ->calleeFqcn->toBe('App\\Listeners\\SendShipmentNotification')
++        ->calleeMethod->toBe('onCaptured');
++});
++
++it('resolves a single (non-array) listener value in $listen', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->callerFqcn === 'App\\Events\\InvoiceArchived'
++    ));
++
++    expect($match)->toHaveCount(1);
++    expect($match[0])
++        ->calleeFqcn->toBe('App\\Listeners\\SendShipmentNotification')
++        ->calleeMethod->toBe('handle');
++});
++
++it('reads the positional method argument of #[AsEventListener]', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_values(array_filter(
++        $edges,
++        fn ($e) => $e->calleeFqcn === 'App\\Listeners\\ArchivePodcast'
++    ));
++
++    expect($match)->toHaveCount(1);
++    expect($match[0])
++        ->callerFqcn->toBe('App\\Events\\PodcastArchived')
++        ->calleeMethod->toBe('archive');
++});
++
++it('does not emit an edge for a listener registered nowhere', function () {
++    $edges = (new ListenerAnalyzer)->analyze(fixture('laravel-project'));
++
++    $match = array_filter($edges, fn ($e) => $e->calleeFqcn === 'App\\Listeners\\UnregisteredListener');
++
++    expect($match)->toBe([]);
++});
++
+ it('connects a dispatched event to its listener in the graph', function () {
+     $project = fixture('laravel-project');
+     $routes = (new RouteAnalyzer)->analyze($project);
+diff --git a/tests/fixtures/laravel-project/app/Listeners/ArchivePodcast.php b/tests/fixtures/laravel-project/app/Listeners/ArchivePodcast.php
+new file mode 100644
+index 00000000..d6d2340c
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Listeners/ArchivePodcast.php
+@@ -0,0 +1,12 @@
++<?php
++
++namespace App\Listeners;
++
++use App\Events\PodcastArchived;
++use Illuminate\Events\Attributes\AsEventListener;
++
++class ArchivePodcast
++{
++    #[AsEventListener(PodcastArchived::class, 'archive')]
++    public function archive(): void {}
++}
+diff --git a/tests/fixtures/laravel-project/app/Listeners/ProcessInvoice.php b/tests/fixtures/laravel-project/app/Listeners/ProcessInvoice.php
+new file mode 100644
+index 00000000..a230ebd0
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Listeners/ProcessInvoice.php
+@@ -0,0 +1,13 @@
++<?php
++
++namespace App\Listeners;
++
++use App\Events\InvoiceRequested;
++use Illuminate\Events\Attributes\AsEventListener;
++
++// Class-level attribute names the event explicitly; handle() carries no hint.
++#[AsEventListener(event: InvoiceRequested::class)]
++class ProcessInvoice
++{
++    public function handle(): void {}
++}
+diff --git a/tests/fixtures/laravel-project/app/Listeners/SendPodcastNotification.php b/tests/fixtures/laravel-project/app/Listeners/SendPodcastNotification.php
+new file mode 100644
+index 00000000..19fb9f99
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Listeners/SendPodcastNotification.php
+@@ -0,0 +1,14 @@
++<?php
++
++namespace App\Listeners;
++
++use App\Events\PodcastProcessed;
++use Illuminate\Events\Attributes\AsEventListener;
++
++// Registered only via the attribute; notify() carries no event type-hint, so
++// the event comes from the attribute argument, not convention.
++class SendPodcastNotification
++{
++    #[AsEventListener(event: PodcastProcessed::class)]
++    public function notify(): void {}
++}
+diff --git a/tests/fixtures/laravel-project/app/Listeners/SendShipmentNotification.php b/tests/fixtures/laravel-project/app/Listeners/SendShipmentNotification.php
+new file mode 100644
+index 00000000..2106d570
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Listeners/SendShipmentNotification.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Listeners;
++
++// Registered only via EventServiceProvider::$listen — handle() does not
++// type-hint the event, so convention discovery cannot reach it.
++class SendShipmentNotification
++{
++    public function handle($event): void {}
++}
+diff --git a/tests/fixtures/laravel-project/app/Listeners/UnregisteredListener.php b/tests/fixtures/laravel-project/app/Listeners/UnregisteredListener.php
+new file mode 100644
+index 00000000..47e24ec9
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Listeners/UnregisteredListener.php
+@@ -0,0 +1,9 @@
++<?php
++
++namespace App\Listeners;
++
++// Untyped handle() and not present in $listen/$subscribe/attribute — must yield no edge.
++class UnregisteredListener
++{
++    public function handle($event): void {}
++}
+diff --git a/tests/fixtures/laravel-project/app/Providers/EventServiceProvider.php b/tests/fixtures/laravel-project/app/Providers/EventServiceProvider.php
+new file mode 100644
+index 00000000..28920773
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Providers/EventServiceProvider.php
+@@ -0,0 +1,38 @@
++<?php
++
++namespace App\Providers;
++
++use App\Events\InvoiceArchived;
++use App\Events\OrderShipped;
++use App\Events\PaymentCaptured as Captured;
++use App\Events\UserLoggedIn;
++use App\Listeners\HandleUserLoggedIn;
++use App\Listeners\SendShipmentNotification;
++use App\Subscribers\UserEventSubscriber;
++
++class EventServiceProvider
++{
++    protected $listen = [
++        OrderShipped::class => [
++            SendShipmentNotification::class,
++        ],
++        // Also discoverable by convention — must not produce a duplicate edge.
++        UserLoggedIn::class => [
++            HandleUserLoggedIn::class,
++        ],
++        // String FQCN key + legacy 'Class@method' listener string.
++        'App\Events\ReportReady' => [
++            'App\Listeners\SendShipmentNotification@sendReport',
++        ],
++        // Aliased import + [Class::class, 'method'] tuple shape.
++        Captured::class => [
++            [SendShipmentNotification::class, 'onCaptured'],
++        ],
++        // Single listener value (not wrapped in an array).
++        InvoiceArchived::class => SendShipmentNotification::class,
++    ];
++
++    protected $subscribe = [
++        UserEventSubscriber::class,
++    ];
++}
+diff --git a/tests/fixtures/laravel-project/app/Subscribers/UserEventSubscriber.php b/tests/fixtures/laravel-project/app/Subscribers/UserEventSubscriber.php
+new file mode 100644
+index 00000000..2ec8112e
+--- /dev/null
++++ b/tests/fixtures/laravel-project/app/Subscribers/UserEventSubscriber.php
+@@ -0,0 +1,26 @@
++<?php
++
++namespace App\Subscribers;
++
++use App\Events\AccountDeleted;
++use App\Events\PasswordReset;
++use Illuminate\Events\Dispatcher;
++
++class UserEventSubscriber
++{
++    public function subscribe(Dispatcher $events): array
++    {
++        $events->listen(
++            PasswordReset::class,
++            [self::class, 'handlePasswordReset'],
++        );
++
++        return [
++            AccountDeleted::class => 'handleAccountDeleted',
++        ];
++    }
++
++    public function handlePasswordReset(PasswordReset $event): void {}
++
++    public function handleAccountDeleted(AccountDeleted $event): void {}
++}

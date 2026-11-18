@@ -1,0 +1,414 @@
+diff --git a/e2e_workflow/scripts/harness_lib.py b/e2e_workflow/scripts/harness_lib.py
+index 5db579c03..39df4a88a 100644
+--- a/e2e_workflow/scripts/harness_lib.py
++++ b/e2e_workflow/scripts/harness_lib.py
+@@ -17,8 +17,10 @@
+     in the LIVE server is ALREADY gone (decode runs inside the server's own CUDA graph). Result: a huge
+     isolated "speedup" that evaporates on integration.
+     Fix: `time_op` scores CUDA-EVENT DEVICE time (the GPU timeline between two events), which excludes
+-    host launch/dispatch entirely — so collapsing dispatch buys nothing and no `inner` amortization is
+-    needed (inner=1). WALL time is measured alongside as a reference only. It also FLUSHES the last-level/
++    host launch/dispatch — so collapsing dispatch buys nothing and no `inner` amortization is
++    needed (inner=1). That exclusion is CONDITIONAL, so `time_op` also reports `primed`/`host_ms` saying
++    how far it holds (the receipt `oracle_freezer` prints and `director` gates on).
++    WALL time is measured alongside as a reference only. It also FLUSHES the last-level/
+     Infinity cache before each sample so a memory-bound decode kernel reads its weights cold from HBM,
+     matching deployment (the model working set >> cache, evicted between decode steps). `graph=True` times
+     a captured-graph replay (the exact decode deployment context) with the same event+flush method.
+@@ -322,8 +324,19 @@ def time_op(call, warmup=10, repeats=50, inner=1, graph=False, flush_cache=True,
+     `graph=True` times a captured CUDA-graph replay (the decode deployment context) with the same
+     event+flush method; falls back to eager event timing if capture is unavailable (see the `timer` field).
+ 
+-    Returns median device ms (float), or {ms, wall_ms, timer} when detail=True. None if `call` raises.
+-    On a box without CUDA, device time is unavailable so ms == wall_ms and timer='wall'."""
++    The device-time guarantee is CONDITIONAL, and `primed` says how far it holds. Read it as THREE
++    states, never a bool (see `_host_dispatch_ms`):
++      True    -> dispatch is cheaper than the kernel, so `ms` is dominated by device work. Score it.
++      False   -> this op dispatches slower than it computes; `ms` is a HOST-BOUND latency, not a kernel
++                 time, and a candidate can "win" on it by collapsing dispatch alone.
++      ABSENT  -> the timer could not tell (no CUDA). NOT the same as False.
++    `primed=True` does NOT mean the window is overhead-free: a window costs a few us beyond the kernel
++    either way, negligible for a 100us GEMM and most of the number for a 5us op. Raise `inner` when that
++    matters — the overhead is per-window, so it divides away.
++
++    Returns median device ms (float), or {ms, wall_ms, timer} when detail=True — plus {primed, host_ms}
++    whenever the timer can produce them. None if `call` raises. On a box without CUDA, device time is
++    unavailable so ms == wall_ms and timer='wall'."""
+     torch = _torch()
+     inner = max(1, int(inner))
+     try:
+@@ -335,20 +348,60 @@ def time_op(call, warmup=10, repeats=50, inner=1, graph=False, flush_cache=True,
+             g = _try_capture(torch, call, inner)
+             if g is not None:
+                 dev, wall = _time_graph(torch, g, warmup, repeats, flush_cache)
+-                return _timing_result(dev, wall, "cuda_event_graph", detail)
++                # One replay issues all `inner` launches, so divide to put host on the SAME per-launch
++                # basis as `dev` -- otherwise a clean inner>1 graph reads as host-bound.
++                host = _host_dispatch_ms(torch, lambda: g[0].replay()) / g[1]
++                return _timing_result(dev, wall, "cuda_event_graph", detail, host, host < dev)
+         if have_cuda:
+             dev, wall = _time_events(torch, call, warmup, repeats, inner, flush_cache)
+-            return _timing_result(dev, wall, "cuda_event", detail)
++            host = _host_dispatch_ms(torch, call)
++            return _timing_result(dev, wall, "cuda_event", detail, host, host < dev)
+         wall = _time_wall(torch, call, warmup, repeats, inner)   # no device timeline -> wall only
+         return _timing_result(wall, wall, "wall", detail)
+     except Exception:
+         return None
+ 
+ 
+-def _timing_result(dev_ms, wall_ms, timer, detail):
+-    if detail:
+-        return {"ms": dev_ms, "wall_ms": wall_ms, "timer": timer}
+-    return dev_ms
++def _timing_result(dev_ms, wall_ms, timer, detail, host_ms=None, primed=None):
++    if not detail:
++        return dev_ms
++    d = {"ms": dev_ms, "wall_ms": wall_ms, "timer": timer}
++    if host_ms is not None:
++        # Both keys or neither. A consumer distinguishes "host-bound" from "cannot tell" by PRESENCE
++        # (oracle_freezer.md step 4), so half a receipt would be read as a whole one.
++        d["host_ms"] = host_ms
++        d["primed"] = bool(primed)
++    return d
++
++
++_HOST_PROBE_LAUNCHES = 30
++
++
++def _host_dispatch_ms(torch, call):
++    """Host cost of issuing ONE `call()`, measured on a DRAINED queue.
++
++    Deliberately not derived from `wall_ms`: that is host+device together, so on a long kernel it is
++    essentially the device time and every slow kernel would look slow to dispatch too. `primed =
++    host_ms < dev_ms` then reads as director.md states it — a host that cannot issue faster than the GPU
++    executes cannot keep the queue full, so the event window measures host latency, not kernel time.
++
++    `_HOST_PROBE_LAUNCHES` is fixed and owned here. It used to be the caller's `inner`, which defaults to
++    1, making the estimate a single cold read of a Python dispatch path; on MI355X that overstated a
++    512^3 GEMM's dispatch ~2x and flipped a genuinely primed measurement to False. It stays small so the
++    launches do not backpressure the host, which would reintroduce that inflation.
++
++    Callers put the result on the same per-launch basis as `dev`: eager `call()` is one launch; a graph
++    replay is `inner`, so that caller divides."""
++    n = max(1, _HOST_PROBE_LAUNCHES)
++    for _ in range(3):
++        call()                      # the dispatch path must be HOT: we want steady-state issue cost
++    sync(torch)
++    t0 = time.perf_counter()
++    for _ in range(n):
++        call()
++    ms = (time.perf_counter() - t0) * 1e3 / n
++    sync(torch)
++    return ms
+ 
+ 
+ _CACHE_FLUSH_BUF = None
+@@ -376,7 +429,14 @@ def flush_cache(torch=None, mb=None):
+ def _time_events(torch, call, warmup, repeats, inner, flush):
+     """Median (device_ms, wall_ms) over `repeats` samples of `inner` back-to-back launches: device via
+     cuda.Event (host-free), wall via perf_counter (reference). Cache flushed before each sample when
+-    `flush`, so a memory-bound kernel is timed cold."""
++    `flush`, so a memory-bound kernel is timed cold.
++
++    The per-sample sync is deliberate. Batching the samples into one queue with no intervening sync was
++    tried and REJECTED on measurement: fitting per-launch ms against 1/inner on MI355X (torch 2.9 / ROCm
++    7.2) to separate kernel time K from per-window overhead E showed batching RAISED E in 5 of 6
++    configurations, and under `flush` let the two timers disagree on K itself by up to 2.8x -- flush and
++    kernel become two commands in a packed queue, so the cold-HBM guarantee stops holding. Do not
++    reintroduce it without re-running that fit."""
+     for _ in range(max(1, warmup)):
+         call()
+     sync(torch)
+diff --git a/e2e_workflow/scripts/tests/test_harness_lib.py b/e2e_workflow/scripts/tests/test_harness_lib.py
+index 99e3aa69a..6db7f5bef 100644
+--- a/e2e_workflow/scripts/tests/test_harness_lib.py
++++ b/e2e_workflow/scripts/tests/test_harness_lib.py
+@@ -504,7 +504,9 @@ class _HarnessTestCase(unittest.TestCase):
+ 
+     CUDA = False
+     EVENT_MS = (1.0,)
+-    WALL_MS = None                      # per-sample wall ms; None -> a flat 1.0 ms every sample
++    # Per-sample wall ms; None -> a flat 1.0 ms every sample. On the CUDA paths the LAST entry is the
++    # host-dispatch probe's span, not a sample.
++    WALL_MS = None
+ 
+     def setUp(self):
+         self.stack = _Stack(cuda=self.CUDA, event_ms=self.EVENT_MS)
+@@ -947,7 +949,9 @@ def test_an_unqueryable_device_makes_the_op_untimeable(self):
+ 
+ class TestTimeOpEvents(_CudaTestCase):
+     EVENT_MS = (6.0, 2.0, 4.0)
+-    WALL_MS = (30.0, 10.0, 20.0)
++    # three samples, then the probe: it issues a fixed number of launches, so scale by the constant
++    # rather than hard-coding it -- the last entry reads as "1.0 ms to issue one launch".
++    WALL_MS = (30.0, 10.0, 20.0, 1.0 * hl._HOST_PROBE_LAUNCHES)
+ 
+     def test_device_time_is_the_cuda_event_median_and_wall_is_reported_alongside(self):
+         box, call = self._counting_call()
+@@ -955,32 +959,56 @@ def test_device_time_is_the_cuda_event_median_and_wall_is_reported_alongside(sel
+         self.assertEqual(got["timer"], "cuda_event")
+         self.assertEqual(got["ms"], 4.0)                    # median of the scripted 6, 2, 4
+         self.assertAlmostEqual(got["wall_ms"], 20.0)        # host+device reference, measured alongside
+-        self.assertEqual(box["n"], 5)
++        # warmup 2 + 3 samples + the host probe's own 3 warmups + its timed launches
++        self.assertEqual(box["n"], 5 + 3 + hl._HOST_PROBE_LAUNCHES)
+ 
+     def test_device_and_wall_are_both_divided_by_inner(self):
+         got = hl.time_op(lambda: None, warmup=1, repeats=3, inner=2, detail=True)
+         self.assertEqual(got["ms"], 2.0)
+         self.assertAlmostEqual(got["wall_ms"], 10.0)
++        self.assertAlmostEqual(got["host_ms"], 1.0)         # eager call() is one launch -> no division
+ 
+     def test_the_cache_is_flushed_once_per_sample_outside_the_event_window(self):
+         hl.time_op(lambda: None, warmup=1, repeats=3)
+         self.assertIsNotNone(hl._CACHE_FLUSH_BUF)
+-        # sync() before each sample plus the post-warmup sync
+-        self.assertEqual(self.stack.syncs, 4)
++        # sync() before each sample, the post-warmup sync, and the host probe's own two
++        self.assertEqual(self.stack.syncs, 6)
+ 
+     def test_flush_can_be_disabled_for_a_deliberately_hot_measurement(self):
+         hl.time_op(lambda: None, warmup=1, repeats=2, flush_cache=False)
+         self.assertIsNone(hl._CACHE_FLUSH_BUF)
+ 
+     def test_each_sample_records_start_and_end_and_waits_on_the_end_event(self):
++        # Pinned deliberately: a batched variant dropping these syncs measured WORSE per-window overhead
++        # (see _time_events). The host probe adds no events -- it times the issue path only.
+         hl.time_op(lambda: None, warmup=1, repeats=2)
+         self.assertEqual([k for k, _ in self.stack.events],
+                          ["record", "record", "synchronize"] * 2)
+ 
++    def test_a_receipt_says_the_window_held_when_dispatch_outruns_the_kernel(self):
++        got = hl.time_op(lambda: None, warmup=1, repeats=3, detail=True)
++        self.assertAlmostEqual(got["host_ms"], 1.0)         # host issues a launch in 1ms...
++        self.assertEqual(got["ms"], 4.0)                    # ...the GPU needs 4ms to run it
++        self.assertIs(got["primed"], True)                  # so the number is dominated by device work
++
++
++class TestTimeOpEventsHostBound(_CudaTestCase):
++    """The op the receipt exists to catch: dispatch costs MORE than the kernel, so no amount of
++    run-ahead keeps the queue full and `ms` is a host latency wearing a device number's clothes."""
++
++    EVENT_MS = (2.0,)
++    WALL_MS = (30.0, 10.0, 20.0, 5.0 * hl._HOST_PROBE_LAUNCHES)  # 5ms to issue vs a 2ms kernel
++
++    def test_primed_is_false_when_the_host_cannot_keep_the_queue_full(self):
++        got = hl.time_op(lambda: None, warmup=1, repeats=3, detail=True)
++        self.assertAlmostEqual(got["host_ms"], 5.0)
++        self.assertEqual(got["ms"], 2.0)
++        self.assertIs(got["primed"], False)                 # NOT absent -- the timer answered, negatively
++
+ 
+ class TestTimeOpGraph(_CudaTestCase):
+     EVENT_MS = (9.0, 3.0, 6.0)
+-    WALL_MS = (90.0, 30.0, 60.0)
++    WALL_MS = (90.0, 30.0, 60.0, 3.0 * hl._HOST_PROBE_LAUNCHES)  # samples, then the probe
+ 
+     def test_a_captured_graph_is_replayed_and_timed_with_the_same_event_method(self):
+         box, call = self._counting_call()
+@@ -990,7 +1018,15 @@ def test_a_captured_graph_is_replayed_and_timed_with_the_same_event_method(self)
+         self.assertAlmostEqual(got["wall_ms"], 60.0)
+         # capture warms up on a side stream (3 launches) then records `inner` launches
+         self.assertEqual(box["n"], 4)
+-        self.assertEqual(self.stack.replays, 5)             # 2 warmup replays + 3 timed replays
++        # 2 warmup + 3 timed + the host probe's 3 warmups and its timed launches
++        self.assertEqual(self.stack.replays, 5 + 3 + hl._HOST_PROBE_LAUNCHES)
++
++    def test_the_replay_carries_the_same_receipt_as_the_eager_path(self):
++        # Collapsing dispatch is the point of a graph, so this reads as primed -- but it is MEASURED,
++        # not assumed: a replay slower to issue than to execute is still host-bound.
++        got = hl.time_op(lambda: None, warmup=1, repeats=3, graph=True, detail=True)
++        self.assertAlmostEqual(got["host_ms"], 3.0)
++        self.assertIs(got["primed"], True)                  # 3ms to issue a replay vs 6ms of kernel
+ 
+     def test_capture_runs_on_a_side_stream_that_is_joined_before_recording(self):
+         hl.time_op(lambda: None, warmup=1, repeats=1, graph=True)
+@@ -1004,7 +1040,8 @@ def test_inner_divides_the_replay_time_it_amortizes(self):
+         box, call = self._counting_call()
+         got = hl.time_op(call, warmup=1, repeats=3, inner=3, graph=True, detail=True)
+         self.assertEqual(got["ms"], 2.0)                    # 6.0 scripted / inner 3
+-        self.assertAlmostEqual(got["wall_ms"], 20.0)
++        self.assertAlmostEqual(got["wall_ms"], 20.0)        # 60ms sample median / inner 3
++        self.assertAlmostEqual(got["host_ms"], 1.0)         # one replay issues all 3 -> 3ms / 3
+         self.assertEqual(box["n"], 6)                       # 3 side-stream warmups + 3 captured
+ 
+     def test_an_uncapturable_op_falls_back_to_eager_event_timing(self):
+@@ -1014,7 +1051,8 @@ def test_an_uncapturable_op_falls_back_to_eager_event_timing(self):
+         self.assertEqual(got["timer"], "cuda_event")        # the `timer` field is how the UT sees it
+         self.assertEqual(got["ms"], 6.0)
+         self.assertEqual(self.stack.replays, 0)
+-        self.assertEqual(box["n"], 8)                       # 3 failed-capture warmups + 2 + 3
++        # 3 failed-capture warmups + 2 warmup + 3 samples + the host probe's warmups and launches
++        self.assertEqual(box["n"], 8 + 3 + hl._HOST_PROBE_LAUNCHES)
+ 
+     def test_graph_replay_can_also_be_timed_hot(self):
+         hl.time_op(lambda: None, warmup=1, repeats=2, graph=True, flush_cache=False)
+@@ -1029,6 +1067,21 @@ def test_detail_exposes_both_clocks_and_which_timer_produced_them(self):
+     def test_the_bare_form_is_the_device_ms_the_speedup_is_scored_on(self):
+         self.assertEqual(hl._timing_result(1.5, 2.25, "cuda_event", False), 1.5)
+ 
++    def test_the_receipt_keys_travel_together_or_not_at_all(self):
++        # A consumer tells "host-bound" from "cannot tell" by PRESENCE, so half a receipt reads as a
++        # whole one. host_ms is the sole gate on both keys.
++        self.assertEqual(hl._timing_result(1.5, 2.25, "cuda_event", True, 0.5, True),
++                         {"ms": 1.5, "wall_ms": 2.25, "timer": "cuda_event",
++                          "host_ms": 0.5, "primed": True})
++        self.assertEqual(set(hl._timing_result(1.5, 2.25, "cuda_event", True, None, True)),
++                         {"ms", "wall_ms", "timer"})
++
++    def test_primed_is_serialized_as_a_real_bool_for_the_receipt_json(self):
++        # The receipt is a JSON line the gate parses; an int here serializes as 0/1 and misses `=== true`.
++        got = hl._timing_result(1.5, 2.25, "cuda_event", True, 0.5, 1)
++        self.assertIs(got["primed"], True)
++        self.assertIn('"primed": true', json.dumps(got))
++
+ 
+ # --------------------------------------------------------------------------- #
+ # flush_cache -- reading a memory-bound kernel's weights COLD from HBM
+diff --git a/kernel_workflow/kernel_lane.js b/kernel_workflow/kernel_lane.js
+index 224a3952a..af2b47b51 100644
+--- a/kernel_workflow/kernel_lane.js
++++ b/kernel_workflow/kernel_lane.js
+@@ -209,6 +209,10 @@ const KB_COLD_DIRECTION = String(A.kb_cold_direction != null ? A.kb_cold_directi
+ let kbCapBound = 0;      // rounds where the cap actually had to strip something
+ const UPDATE_EXPERIENCE = String(A.update_experience != null ? A.update_experience : 'on').trim().toLowerCase() || 'on';
+ const UPDATE_EXPERIENCE_ON = UPDATE_EXPERIENCE !== 'off' && UPDATE_EXPERIENCE !== 'false' && UPDATE_EXPERIENCE !== 'none';
++// Did the CALLER freeze this kernel through oracle_freezer? Only the bake-off dispatcher does, so this
++// tells director whether a GEAK_TIMING_RECEIPT is producible at all before it gates on one. Must be an
++// ARG: this file never runs Freeze itself, and a workflow script has no filesystem access to go looking.
++const FROZEN_ORACLE = String(A.frozen_oracle != null ? A.frozen_oracle : 'false') === 'true';
+ 
+ // ---------------------------------------------------------------------------
+ // WARM-START (local experience KB). Before the optimize loop, search the machine-produced
+@@ -549,6 +553,9 @@ const VALIDATE_SCHEMA = obj({
+   director_verified_speedup_weighted: { type: 'number' }, // PRIMARY when workload_aligned
+   tech_lead_reported_speedup_geomean: { type: 'number' },
+   validation_status: { type: 'string' }, correctness: { type: 'string' },
++  // clean | host_bound | unprimed | unknown | not_applicable. Declared so the relaying agent has no
++  // reason to drop it -- the gate calls it REQUIRED so a speedup never travels downstream unlabelled.
++  timing_basis: { type: 'string' },
+   per_case: perCase, applied_to_original: { type: 'string' },
+   arbitration_note: { type: 'string' }, final_patch: { type: 'string' },
+ }, ['director_verified_speedup_geomean', 'validation_status']);
+@@ -1560,7 +1567,7 @@ phase('Validate');
+ const validation = await agentT(
+   roleAgent('director', 'validate', 'Independently validate the final patch vs the TRUE baseline.', {
+     KERNEL_PATH_ORIG, EVAL_DIR, WORKSPACE: CANONICAL, SKILL_DIR: WORKFLOW_DIR, GPU_ID: GPU_POOL,
+-    APPLY_TO_ORIGINAL, COMMANDMENT,
++    APPLY_TO_ORIGINAL, COMMANDMENT, FROZEN_ORACLE: FROZEN_ORACLE ? 'true' : 'false',
+     FINAL_PATCH: report ? report.final_patch : `${EVAL_DIR}/final_patch.diff`,
+     TECH_LEAD_REPORTED_GEOMEAN: report ? report.final_speedup_geomean : cumulative,
+     ...(HAS_WORKLOAD && report && report.final_speedup_weighted != null
+@@ -1766,6 +1773,10 @@ return {
+   final_arithmetic: validation ? validation.director_verified_speedup_arithmetic : null,
+   tech_lead_reported_geomean: report ? report.final_speedup_geomean : cumulative,
+   validation_status: validation ? validation.validation_status : 'unknown',
++  // What KIND of number `final_speedup` is, so bake-off ranking and campaign summaries don't read a
++  // host_bound/unprimed float as a clean device-time win. 'not_applicable' = this lane's own baseline
++  // ratio, no frozen-oracle receipt behind it.
++  timing_basis: validation ? validation.timing_basis || 'unknown' : 'unknown',
+   rounds: report ? report.rounds : round,
+   budget_used: dispatched,
+   budget_total: BUDGET,
+diff --git a/kernel_workflow/kernel_workflow.js b/kernel_workflow/kernel_workflow.js
+index 859084bb6..cc17b1a4d 100644
+--- a/kernel_workflow/kernel_workflow.js
++++ b/kernel_workflow/kernel_workflow.js
+@@ -375,6 +375,11 @@ const results = await Promise.all(lanes.map(l => sem.with(1, async ([gpu]) => {
+   try {
+     const r = await workflow({ scriptPath: WORKER }, {
+       kernel_path: oracle.task_dir, workflow_dir: WORKFLOW_DIR,
++      // This lane runs on an oracle_freezer-frozen task dir, so a GEAK_TIMING_RECEIPT is EXPECTED and
++      // its absence is a real fault. The optimize/author path spreads {...A} and never sets this, so a
++      // pass-through lane (and e2e, which calls this worker directly) correctly defaults to false —
++      // there is no Freeze on those routes, so director must not demand a receipt they cannot produce.
++      frozen_oracle: 'true',
+       mode: l.mode, target_language: l.lang,
+       op_spec: oracle.op_spec || OP_SPEC, workload_spec_path: oracle.workload_path || WORKLOAD_SPEC_PATH || '',
+       budget: BUDGET, gpu_ids: gpu, gpu_mode: GPU_MODE, task: TASK, apply_to_original: 'false',
+diff --git a/kernel_workflow/roles/director.md b/kernel_workflow/roles/director.md
+index 156d19b8c..40056bd1e 100644
+--- a/kernel_workflow/roles/director.md
++++ b/kernel_workflow/roles/director.md
+@@ -246,24 +246,39 @@ baseline latencies recorded at benchmark setup).
+    - Within 10%, or Director higher → `accepted`.
+    - Director LOWER than claim by >10% → `flagged` (use Director's measured numbers as official).
+    - Correctness fail / patch fails to apply → `flagged`.
+-   **TIMING RECEIPT GATE — run this BEFORE the comparisons above.** Parse `GEAK_TIMING_RECEIPT` out of the
+-   FULL_BENCHMARK output (see `oracle_freezer.md` step 4) and copy it verbatim into
++   **TIMING RECEIPT GATE — run this BEFORE the comparisons above.**
++   **First check `FROZEN_ORACLE`.** The receipt comes from `oracle_freezer`'s generated `unittest.py`, and
++   `oracle_freezer` runs ONLY in the bake-off dispatcher's Freeze phase. A pass-through lane
++   (`mode=optimize`/`author`, or any caller invoking `kernel_lane.js` directly, e.g. e2e) never freezes,
++   so there is no FULL_BENCHMARK output to parse and nothing to demand.
++   - `FROZEN_ORACLE` is NOT `true` → set `timing_basis: "not_applicable"`, emit `timing_receipt: null`,
++     and note in `arbitration_note` that the baseline came from this lane's own `baseline_timing.json`.
++     Do NOT set `status: "flagged"` on this basis — go straight to the comparisons above and let
++     correctness / patch-install / arbitration decide status on their own merits. A missing receipt here
++     is the SHAPE of the route, not a fault in the run.
++
++   `FROZEN_ORACLE=true` → a receipt is expected and its absence IS a fault. Parse `GEAK_TIMING_RECEIPT`
++   out of the FULL_BENCHMARK output (see `oracle_freezer.md` step 4) and copy it verbatim into
+    `director_validation.json` as `timing_receipt`. A speedup is a claim about DEVICE time; the receipt is
+    the only evidence that it is one. Then:
+-   - `all_primed: true` → proceed normally.
++   - `all_primed: true` → set `timing_basis: "clean"` and proceed normally.
+    - `all_primed: false` with `timer_unprimed: false` → at least one leg is HOST-BOUND at these dims. The
+      ratio is a dispatch-latency ratio, not a kernel speedup. Still report the number, but set
+      `timing_basis: "host_bound"` and name the affected cases in `arbitration_note` — a host-bound win does
+      NOT survive integration into a server that already replays this op inside its own graph.
+-   - `timer_unprimed: true` → the task was frozen against a `harness_lib.py` that predates dispatch priming,
+-     so BOTH legs carry a bubble of unknown sign. Set `timing_basis: "unprimed"` and `status: "flagged"`.
+-     Do not attempt a correction factor: the bubble is a constant that inflates whichever leg is relatively
+-     smaller, so it moves different cases in different directions. Re-freeze against a current
++   - `timer_unprimed: true` → the task was frozen against a `harness_lib.py` that predates the receipt, so
++     BOTH legs carry a dispatch component of unknown sign. Set `timing_basis: "unprimed"` and
++     `status: "flagged"`. Do not attempt a correction factor: it inflates whichever leg is relatively
++     smaller, so it moves different cases in different directions. Re-freezing against a current
+      `$HARNESS_LIB` is the only fix.
+    - Receipt ABSENT entirely → the unittest is older than this contract. `timing_basis: "unknown"`,
+-     `status: "flagged"`. Absence is not evidence of priming.
++     `status: "flagged"`. Absence is not evidence of priming. Reachable ONLY when `FROZEN_ORACLE=true`;
++     collapsing it with the `not_applicable` case above would hide a stale-unittest fault behind the
++     normal shape of the default mode.
+    Whatever the outcome, `timing_basis` is REQUIRED in `director_validation.json`, and any campaign summary
+    that quotes the speedup must carry it — an unlabelled number is read as a clean device-time win.
++   `not_applicable` is a label, not a pass: the number is this lane's own baseline ratio, not a
++   receipt-backed device-time claim, and a cross-lane comparison must not treat it as one.
+ 7. If `APPLY_TO_ORIGINAL=true` AND status is `accepted`:
+    ```bash
+    cd "$KERNEL_PATH_ORIG"
+@@ -287,6 +302,8 @@ Return JSON:
+   "director_verified_speedup_weighted": 0.0,
+   "tech_lead_reported_speedup_geomean": 0.0,
+   "validation_status": "accepted|flagged",
++  "timing_basis": "clean|host_bound|unprimed|unknown|not_applicable",
++  "timing_receipt": null,
+   "correctness": "pass|fail",
+   "per_case": [{"name": "...", "baseline_ms": 0.0, "optimized_ms": 0.0, "speedup": 0.0}],
+   "applied_to_original": "true|false",
+diff --git a/kernel_workflow/roles/oracle_freezer.md b/kernel_workflow/roles/oracle_freezer.md
+index e3b5d9763..a2101fb91 100644
+--- a/kernel_workflow/roles/oracle_freezer.md
++++ b/kernel_workflow/roles/oracle_freezer.md
+@@ -179,12 +179,15 @@ values are regenerated from the recorded seed on every run.
+     that true and then reports whether it actually held. Throw the receipt away and you are back to
+     asserting a guarantee you never checked — which is the hole a candidate exploits by collapsing dispatch
+     instead of shortening the kernel. Read `primed` as THREE states, never as a bool:
+-    - `True` → every event window brackets kernel time only. Score normally.
++    - `True` → dispatch is cheaper than the kernel, so the number is dominated by device work. Score
++      normally. NOT a claim the window is overhead-free: a window costs a few us beyond the kernel —
++      nothing for a 100us GEMM, most of the number for a 5us op. Raise `inner` if the op is that small;
++      the overhead is per-window, so it divides away.
+     - `False` → this op dispatches slower than it computes even at full run-ahead. `ms` is a HOST-BOUND
+       latency, not a kernel time. Still print it, but mark that case `host_bound`.
+-    - **absent** → the vendored `harness_lib.py` predates priming, so every number in this run carries a
+-      dispatch bubble whose SIGN is not knowable from the number alone (it inflates whichever leg is
+-      relatively smaller). Mark that case `timer_unprimed`.
++    - **absent** → the vendored `harness_lib.py` predates the receipt (or there is no CUDA device), so
++      every number in this run carries a dispatch component whose SIGN is not knowable from the number
++      alone (it inflates whichever leg is relatively smaller). Mark that case `timer_unprimed`.
+     Do NOT collapse absent into `False`: "this op is host-bound" and "this timer cannot tell" call for
+     different fixes — accept the label vs. re-freeze against a current `$HARNESS_LIB`.
+   - Print ONE machine-readable receipt line after the score lines, covering BOTH legs of EVERY case:

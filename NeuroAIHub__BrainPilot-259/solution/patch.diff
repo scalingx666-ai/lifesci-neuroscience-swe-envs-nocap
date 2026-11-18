@@ -1,0 +1,527 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 5cd3deda..e7383d84 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -29,6 +29,11 @@ services:
+       - BP_MODEL_PROVIDER=${BP_MODEL_PROVIDER:-}
+       - BP_MOCK=${BP_MOCK:-}
+     volumes:
++      # The whole data root is persisted here. Besides per-session
++      # `workspaces/<sid>/`, this holds the #257 cross-session persistent root
++      # `data/<BP_USER_ID>/` (default user `local`) — uploads/datasets placed
++      # there stay reusable across sessions. No extra mount needed; set
++      # BP_USER_ID per-user in multi-tenant hosting.
+       - ${BP_DATA_DIR:-./brainpilot}:/root/.bp-root:rw
+     healthcheck:
+       test: ["CMD", "curl", "-f", "http://localhost:${BP_SANDBOX_PORT:-8081}/health"]
+diff --git a/packages/protocol/src/http.ts b/packages/protocol/src/http.ts
+index a159e738..32d09c92 100644
+--- a/packages/protocol/src/http.ts
++++ b/packages/protocol/src/http.ts
+@@ -269,7 +269,13 @@ export const RUNTIME_ROUTES = {
+   interrupt: { method: "POST", path: "/sessions/:id/interrupt" },
+   listAgents: { method: "GET", path: "/sessions/:id/agents" },
+   evictSession: { method: "POST", path: "/sessions/:id/evict" },
+-  /** Workspace files (`workspaces/:id/`). `?path=` is relative to the workspace root. */
++  /**
++   * Workspace files. `?path=` addresses one of two roots (#257):
++   *  - `/workspace[/...]` (or a bare relative path) → per-session workspace
++   *    `workspaces/:id/` (the agent's cwd);
++   *  - `/data[/...]` → the shared per-user persistent root `data/<userId>/`,
++   *    reusable across sessions. Each root is traversal-guarded independently.
++   */
+   listFiles: { method: "GET", path: "/sessions/:id/files" },
+   readFile: { method: "GET", path: "/sessions/:id/files/content" },
+   readRawFile: { method: "GET", path: "/sessions/:id/files/raw" },
+diff --git a/packages/runtime/src/__tests__/server.test.ts b/packages/runtime/src/__tests__/server.test.ts
+index fdfbd379..46f6f241 100644
+--- a/packages/runtime/src/__tests__/server.test.ts
++++ b/packages/runtime/src/__tests__/server.test.ts
+@@ -353,6 +353,41 @@ describe("workspace file routes", () => {
+     expect(res.status).toBe(400);
+   });
+ 
++  // #257: uploading to /data writes the shared persistent root, readable from a
++  // DIFFERENT session id via the same /data path (cross-session reuse).
++  it("uploads to /data and reads it back from another session (#257)", async () => {
++    const { app: a, dataRoot } = await appWithWorkspace();
++    const contentBase64 = Buffer.from("reusable dataset").toString("base64");
++    const up = await a.request("/sessions/s1/files", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ path: "/data/lib/set.csv", contentBase64 }),
++    });
++    expect(up.status).toBe(201);
++    const body = (await up.json()) as { path: string };
++    // path round-trips WITH the /data prefix
++    expect(body.path).toBe("/data/lib/set.csv");
++
++    // A different session id resolves the same /data root.
++    const read = await a.request("/sessions/other-session/files/content?path=/data/lib/set.csv");
++    expect(read.status).toBe(200);
++    expect((await read.json()) as { content: string }).toMatchObject({ content: "reusable dataset" });
++
++    // On disk it lives under data/local/, not workspaces/.
++    const onDisk = await readFile(join(dataRoot, "data", "local", "lib", "set.csv"), "utf8");
++    expect(onDisk).toBe("reusable dataset");
++  });
++
++  it("rejects a /data upload that escapes the data root with 400 (#257)", async () => {
++    const { app: a } = await appWithWorkspace();
++    const res = await a.request("/sessions/s1/files", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ path: "/data/../workspaces/evil", contentBase64: "eA==" }),
++    });
++    expect(res.status).toBe(400);
++  });
++
+   // #60: a composer upload staged under workspaces/local/ (the draft sandbox id)
+   // must be drained into the real session workspace before the agent runs, so
+   // the agent's cwd (workspaces/<sid>/) contains the file the user attached.
+diff --git a/packages/runtime/src/__tests__/session-manager.test.ts b/packages/runtime/src/__tests__/session-manager.test.ts
+index a16664f6..ba17c61c 100644
+--- a/packages/runtime/src/__tests__/session-manager.test.ts
++++ b/packages/runtime/src/__tests__/session-manager.test.ts
+@@ -1,9 +1,9 @@
+ import { describe, it, expect, beforeEach } from "vitest";
+-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
++import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { parseEvent, type AgUiEvent } from "@brainpilot/protocol";
+-import { SessionManager } from "../session-manager.js";
++import { SessionManager, resolvePersistentUserId } from "../session-manager.js";
+ import { mockAgentFactory } from "../agent-factory.js";
+ import { PERSONAS } from "../personas.js";
+ 
+@@ -239,6 +239,90 @@ describe("SessionManager workspace path normalization (#5)", () => {
+   });
+ });
+ 
++describe("SessionManager persistent cross-session root (#257)", () => {
++  let root: string;
++  beforeEach(async () => {
++    root = await mkdtemp(join(tmpdir(), "bp-data-"));
++  });
++
++  const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
++
++  it("a /data write is visible from a DIFFERENT session (cross-session reuse)", async () => {
++    const m = new SessionManager({ dataRoot: root, persist: false, agentFactory: mockAgentFactory });
++    const a = await m.createSession({ title: "A" });
++    const b = await m.createSession({ title: "B" });
++
++    // Upload into the persistent root from session A...
++    const wrote = await m.writeSessionFile(a.id, "/data/dataset.csv", b64("shared,data"));
++    // ...the returned path carries the /data prefix so it round-trips.
++    expect(wrote.path).toBe("/data/dataset.csv");
++
++    // ...and session B reads the SAME bytes via /data (would be impossible with
++    // the per-session workspace, which is scoped to one sid).
++    const read = await m.readSessionFile(b.id, "/data/dataset.csv");
++    expect(read.content).toBe("shared,data");
++
++    // On disk it lives under data/<userId>/, NOT workspaces/<sid>/.
++    const onDisk = await readFile(join(root, "data", "local", "dataset.csv"), "utf8");
++    expect(onDisk).toBe("shared,data");
++  });
++
++  it("a workspace write stays per-session (NOT visible via another session)", async () => {
++    const m = new SessionManager({ dataRoot: root, persist: false, agentFactory: mockAgentFactory });
++    const a = await m.createSession({ title: "A" });
++    const b = await m.createSession({ title: "B" });
++    await m.writeSessionFile(a.id, "notes.txt", b64("only in A"));
++    // B's workspace does not have it → read throws (ENOENT).
++    await expect(m.readSessionFile(b.id, "notes.txt")).rejects.toThrow();
++  });
++
++  it("guards each root independently: /data cannot escape into the workspace or beyond", async () => {
++    const m = new SessionManager({ dataRoot: root, persist: false, agentFactory: mockAgentFactory });
++    const s = await m.createSession({ title: "S" });
++    // `..` from /data must not reach the sibling workspaces/ tree or outside dataRoot.
++    await expect(m.writeSessionFile(s.id, "/data/../workspaces/evil.txt", b64("x"))).rejects.toThrow(
++      /escapes/,
++    );
++    await expect(m.readSessionFile(s.id, "/data/../../etc/passwd")).rejects.toThrow(/escapes/);
++  });
++
++  it("honors a custom persistentUserId in the on-disk layout", async () => {
++    const m = new SessionManager({
++      dataRoot: root,
++      persist: false,
++      agentFactory: mockAgentFactory,
++      persistentUserId: "alice",
++    });
++    const s = await m.createSession({ title: "S" });
++    await m.writeSessionFile(s.id, "/data/lib.txt", b64("hi"));
++    const onDisk = await readFile(join(root, "data", "alice", "lib.txt"), "utf8");
++    expect(onDisk).toBe("hi");
++  });
++});
++
++describe("resolvePersistentUserId (#257)", () => {
++  it("defaults to `local` when unset", () => {
++    expect(resolvePersistentUserId(undefined, {})).toBe("local");
++    expect(resolvePersistentUserId("   ", {})).toBe("local");
++  });
++  it("reads BP_USER_ID from env when no explicit option", () => {
++    expect(resolvePersistentUserId(undefined, { BP_USER_ID: "bob" })).toBe("bob");
++  });
++  it("explicit option wins over env", () => {
++    expect(resolvePersistentUserId("carol", { BP_USER_ID: "bob" })).toBe("carol");
++  });
++  it("sanitizes separators and traversal to a single safe segment", () => {
++    // Whatever the input, the result is a single segment with no separators or
++    // `..` (so the "persistent root" can never escape `data/`).
++    for (const bad of ["../../etc", "a/b", "..", "x/../y", "..\\..\\z"]) {
++      const out = resolvePersistentUserId(bad, {});
++      expect(out).not.toContain("..");
++      expect(out).not.toMatch(/[\\/]/);
++    }
++    expect(resolvePersistentUserId("a/b", {})).toBe("a_b");
++  });
++});
++
+ describe("SessionManager memory watchdog (§R-4 / #20)", () => {
+   it("is fully opt-out when no budget is set (identical to today)", async () => {
+     const m = new SessionManager({ persist: false, agentFactory: mockAgentFactory });
+diff --git a/packages/runtime/src/personas.ts b/packages/runtime/src/personas.ts
+index 1223c872..3e1fc114 100644
+--- a/packages/runtime/src/personas.ts
++++ b/packages/runtime/src/personas.ts
+@@ -67,6 +67,44 @@ export function withLanguageDirective(persona: string): string {
+   return `${persona}\n\n${LANGUAGE_DIRECTIVE}`;
+ }
+ 
++/**
++ * Persistent cross-session storage directive (#257). Your working directory is
++ * the per-session workspace — anything there is scoped to THIS session. A
++ * separate persistent root, given here as an absolute path, is SHARED across all
++ * of the user's sessions: files there (uploaded datasets, reference documents,
++ * reusable models) remain available in future sessions. `${absPath}` is
++ * interpolated at load time with the deployment's real path so the agent can
++ * `read`/`write`/`bash` it directly.
++ */
++export function persistentRootDirective(absPath: string): string {
++  return `## Persistent cross-session storage
++
++Your working directory is this session's workspace — files you create there are
++scoped to THIS session only. There is ALSO a persistent, cross-session storage
++root at this absolute path:
++
++    ${absPath}
++
++Files under that path are SHARED across all of the user's sessions and persist
++beyond this one. The user's uploaded datasets, reference documents, and reusable
++artifacts may live there, and anything you place there stays available in future
++sessions. Use your normal file tools (\`read\`, \`write\`, \`edit\`, \`bash\`) with
++that absolute path to access it.
++
++Prefer it for data the user will reuse later or across sessions; keep
++session-specific scratch work in your workspace. Treat existing files there as
++the user's library — the high-impact-action rules apply before you overwrite,
++move, or delete anything you did not create.`;
++}
++
++/**
++ * Append the persistent-root directive to a resolved persona (#257). Applied at
++ * persona load time (non-trace roles), after the language directive.
++ */
++export function withPersistentRootDirective(persona: string, absPath: string): string {
++  return `${persona}\n\n${persistentRootDirective(absPath)}`;
++}
++
+ /** A2A messaging contract — identical mechanics for every non-trace agent. */
+ const A2A_EXPERT = `## Communicating back to the Principal
+ 
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index 8686fb1d..3276c038 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -33,7 +33,7 @@ import { MasAgent, addUsage, emptyTokenUsage } from "./mas-agent.js";
+ import { systemToolsForRole, builtinToolNamesForRole, type ToolDeps } from "./tools/system-tools.js";
+ import { ev } from "./events.js";
+ import { selectFactory, isMockMode } from "./agent-factory.js";
+-import { personaFor, withLanguageDirective } from "./personas.js";
++import { personaFor, withLanguageDirective, withPersistentRootDirective } from "./personas.js";
+ import { renderAgentStatusBlock, collectAgentStatusLines } from "./extensions/agent-status.js";
+ import { McpBridge, loadMcpServersConfig } from "./mcp-bridge.js";
+ import { materializeSkills } from "./materialize-skills.js";
+@@ -98,6 +98,24 @@ function resolveMaxConcurrentAgents(opt?: number): number {
+   return DEFAULT_MAX_CONCURRENT_AGENTS;
+ }
+ 
++/** #257 default per-user persistent root id (self-hosted single user). */
++const DEFAULT_PERSISTENT_USER_ID = "local";
++
++/**
++ * #257: resolve the persistent-root user id. Explicit option wins, else
++ * `BP_USER_ID`, else `local`. The id names a subdir under `<dataRoot>/data/`,
++ * so it is sanitized to a single safe path segment (no separators, no `..`) —
++ * a hostile `BP_USER_ID` must not let the "persistent root" escape `data/`.
++ * An empty/blank value falls back to the default.
++ */
++export function resolvePersistentUserId(opt?: string, env = process.env): string {
++  const raw = (opt ?? env.BP_USER_ID ?? "").trim();
++  const candidate = raw === "" ? DEFAULT_PERSISTENT_USER_ID : raw;
++  // Collapse any path separators / traversal to keep this a single segment.
++  const safe = candidate.replace(/[\\/]/g, "_").replace(/\.\.+/g, "_");
++  return safe === "" || safe === "." ? DEFAULT_PERSISTENT_USER_ID : safe;
++}
++
+ /**
+  * A minimal FIFO counting semaphore. `acquire()` resolves with a `release` fn
+  * once a slot is free; excess acquirers queue in order. Used per-session to
+@@ -240,6 +258,16 @@ export interface SessionManagerOptions {
+    * Hosts raise this to accept large datasets/models. Tests inject directly.
+    */
+   uploadMaxBytes?: number;
++  /**
++   * #257: per-user persistent root identity. Files under
++   * `<dataRoot>/data/<persistentUserId>/` are shared across ALL sessions of
++   * this runtime (a private "library" that outlives any single session),
++   * unlike the per-session `workspaces/<sid>/`. Default `local` (self-hosted
++   * single user); env override `BP_USER_ID`. Hosted deployments set this
++   * per-user (they already isolate users by container/dataRoot, so this just
++   * names the on-disk subdir). Tests inject directly.
++   */
++  persistentUserId?: string;
+ }
+ 
+ /** Roles inferred from agent name. */
+@@ -339,6 +367,11 @@ export class SessionManager {
+   // so hosted deployments can accept large files; default 20 MiB.
+   private readonly uploadMaxBytes: number;
+ 
++  // #257: per-user persistent root identity. `data/<persistentUserId>/` is
++  // shared across all sessions (cross-session library), unlike per-session
++  // `workspaces/<sid>/`. Default `local`; env `BP_USER_ID`.
++  private readonly persistentUserId: string;
++
+   constructor(opts: SessionManagerOptions = {}) {
+     this.dataRoot = opts.dataRoot ?? process.env.BP_DATA_DIR ?? join(process.cwd(), ".bp-data");
+     this.agentFactory = opts.agentFactory ?? selectFactory();
+@@ -364,6 +397,7 @@ export class SessionManager {
+ 
+     this.maxConcurrentAgents = resolveMaxConcurrentAgents(opts.maxConcurrentAgents);
+     this.uploadMaxBytes = resolveUploadMaxBytes(opts.uploadMaxBytes);
++    this.persistentUserId = resolvePersistentUserId(opts.persistentUserId);
+ 
+     const limitBytes = opts.memLimitBytes ?? parseMemLimitMb(process.env);
+     this.memWatchdog =
+@@ -430,6 +464,17 @@ export class SessionManager {
+   private workspaceDir(sid: string): string {
+     return join(this.dataRoot, "workspaces", sid);
+   }
++  /**
++   * #257: the per-user persistent root, shared across all sessions —
++   * `<dataRoot>/data/<persistentUserId>/`. Files here outlive any single
++   * session (a reusable "library"), unlike `workspaces/<sid>/`. The whole
++   * `dataRoot` is already the persisted volume, so no extra mount is needed.
++   * Addressed by agents/file-routes via the `/data` prefix (see
++   * `resolveManagedPath`).
++   */
++  private persistentDir(): string {
++    return join(this.dataRoot, "data", this.persistentUserId);
++  }
+   /**
+    * #60: composer uploads in single-user mode are POSTed against the literal
+    * sandbox id `"local"` (the web `LOCAL_SANDBOX.id`), because a file can be
+@@ -458,32 +503,57 @@ export class SessionManager {
+   /* ----------------------------- workspace files ----------------------------- */
+ 
+   /**
+-   * Resolve a workspace-relative path to an absolute one, refusing anything that
+-   * escapes the session's `workspaces/<sid>/` root (path traversal guard). This
+-   * is the single enforcement point for all file routes.
++   * Resolve a managed file path to an absolute one, refusing anything that
++   * escapes its declared root (path-traversal guard). This is the single
++   * enforcement point for all file routes.
+    *
+-   * The SPA addresses files with a `/workspace`-rooted convention
+-   * (`/workspace`, `/workspace/sub/file.txt`); we normalize that to a path
+-   * relative to the on-disk workspace root before resolving.
++   * TWO roots are addressable (#257):
++   *  - `/workspace[/...]` → the per-session workspace `workspaces/<sid>/`
++   *    (the agent's cwd; default when no prefix is given, for backward compat).
++   *  - `/data[/...]`      → the shared per-user persistent root
++   *    `data/<userId>/`, reusable across sessions.
++   * Each is guarded WITHIN ITS OWN boundary: a `/data` path can never reach the
++   * session workspace and vice-versa, and neither can escape via `..`.
++   *
++   * Returns the absolute path plus which root it resolved against, so callers
++   * that echo a path back (writeSessionFile) can re-emit the correct prefix.
+    */
+-  private resolveWorkspacePath(sid: string, rawPath: string): string {
+-    const root = this.workspaceDir(sid);
++  private resolveManagedPath(
++    sid: string,
++    rawPath: string,
++  ): { abs: string; root: string; prefix: "/workspace" | "/data" } {
+     let rel = rawPath ?? "";
+-    if (rel === "/workspace") rel = "";
+-    else if (rel.startsWith("/workspace/")) rel = rel.slice("/workspace/".length);
+-    // Cross-platform (#5): the runtime now emits POSIX `/` in all
+-    // workspace-relative paths it hands out (writeSessionFile, skill_search).
+-    // Accept either separator on the way back in so an LLM that round-trips
+-    // a path we gave it (or pre-#5 clients with cached `\` paths) still
+-    // resolves correctly. `\` is not a legal Windows filename character, so
+-    // this collapse is unambiguous.
++    // Cross-platform (#5): accept `\` on the way in (an LLM/pre-#5 client may
++    // round-trip a `\` path we handed out). `\` is not a legal filename char.
+     rel = rel.replace(/\\/g, "/");
++
++    // Pick the root by prefix. `/data` selects the persistent library; anything
++    // else defaults to the session workspace (bare relative paths included, so
++    // existing callers keep working unchanged).
++    let root: string;
++    let prefix: "/workspace" | "/data";
++    if (rel === "/data" || rel.startsWith("/data/")) {
++      root = this.persistentDir();
++      prefix = "/data";
++      rel = rel === "/data" ? "" : rel.slice("/data/".length);
++    } else {
++      root = this.workspaceDir(sid);
++      prefix = "/workspace";
++      if (rel === "/workspace") rel = "";
++      else if (rel.startsWith("/workspace/")) rel = rel.slice("/workspace/".length);
++    }
++
+     rel = rel.replace(/^\/+/, ""); // never let a leading slash make it absolute
+     const abs = resolve(root, rel);
+     if (abs !== root && !abs.startsWith(root + sep)) {
+-      throw new Error(`path escapes workspace: ${rawPath}`);
++      throw new Error(`path escapes ${prefix === "/data" ? "data root" : "workspace"}: ${rawPath}`);
+     }
+-    return abs;
++    return { abs, root, prefix };
++  }
++
++  /** Back-compat shim: resolve to just the absolute path (workspace or /data). */
++  private resolveWorkspacePath(sid: string, rawPath: string): string {
++    return this.resolveManagedPath(sid, rawPath).abs;
+   }
+ 
+   /** List one directory level under the session workspace (default: root). */
+@@ -560,13 +630,16 @@ export class SessionManager {
+   }
+ 
+   /**
+-   * #47: write an uploaded file into the session workspace. Content arrives
+-   * base64-encoded (binary-safe over the JSON byte chain). The same
+-   * `resolveWorkspacePath` guard prevents path traversal; parent dirs are
+-   * created so an upload like `docs/foo.pdf` works. The file lands in the
+-   * agent's cwd, so it can `read` it by its workspace-relative path.
+-   * `maxBytes` bounds the decoded size (default: the configured upload cap,
+-   * `BP_UPLOAD_MAX_BYTES` / 20 MiB — see #256).
++   * #47: write an uploaded file into a managed root. Content arrives
++   * base64-encoded (binary-safe over the JSON byte chain). The
++   * `resolveManagedPath` guard prevents path traversal; parent dirs are
++   * created so an upload like `docs/foo.pdf` works.
++   *
++   * Target is chosen by the path prefix (#257): a `/data/...` path writes to the
++   * shared cross-session persistent root (reusable in later sessions); anything
++   * else writes to the session workspace (the agent's cwd). `maxBytes` bounds
++   * the decoded size (default: the configured upload cap, `BP_UPLOAD_MAX_BYTES`
++   * / 20 MiB — see #256).
+    */
+   async writeSessionFile(
+     sid: string,
+@@ -578,20 +651,24 @@ export class SessionManager {
+     if (buf.byteLength > maxBytes) {
+       throw new Error(`file too large: ${buf.byteLength} bytes exceeds limit of ${maxBytes}`);
+     }
+-    const abs = this.resolveWorkspacePath(sid, rel);
++    const { abs, root, prefix } = this.resolveManagedPath(sid, rel);
+     await mkdir(dirname(abs), { recursive: true });
+     await writeFile(abs, buf);
+-    return { path: this.relWorkspacePath(sid, abs), size: buf.byteLength };
++    return { path: this.relManagedPath(abs, root, prefix), size: buf.byteLength };
+   }
+ 
+   /**
+-   * #256: stream an uploaded file into the session workspace without buffering
+-   * the whole payload. The raw request body (`application/octet-stream`) is
+-   * piped to disk; bytes are counted as they flow and the write is aborted
+-   * (and the partial file removed) the moment the configured cap is exceeded,
+-   * so a hostile/oversize upload can't fill the disk. Same traversal guard and
++   * #256: stream an uploaded file into a managed root without buffering the
++   * whole payload. The raw request body (`application/octet-stream`) is piped
++   * to disk; bytes are counted as they flow and the write is aborted (and the
++   * partial file removed) the moment the configured cap is exceeded, so a
++   * hostile/oversize upload can't fill the disk. Same traversal guard and
+    * parent-dir creation as `writeSessionFile`; symmetric with `readSessionFileRaw`.
+    *
++   * Like `writeSessionFile`, the target root is chosen by the path prefix
++   * (#257): a `/data/...` path streams into the shared cross-session persistent
++   * root; anything else into the session workspace.
++   *
+    * `body` accepts a web `ReadableStream` (Hono's `c.req.raw.body`) or a Node
+    * `Readable`; `null`/absent is treated as an empty file.
+    */
+@@ -601,7 +678,7 @@ export class SessionManager {
+     body: ReadableStream<Uint8Array> | Readable | null,
+     maxBytes = this.uploadMaxBytes,
+   ): Promise<{ path: string; size: number }> {
+-    const abs = this.resolveWorkspacePath(sid, rel);
++    const { abs, root, prefix } = this.resolveManagedPath(sid, rel);
+     await mkdir(dirname(abs), { recursive: true });
+ 
+     // Normalize either stream flavor to a Node Readable.
+@@ -637,18 +714,19 @@ export class SessionManager {
+       }
+       throw err;
+     }
+-    return { path: this.relWorkspacePath(sid, abs), size };
++    return { path: this.relManagedPath(abs, root, prefix), size };
+   }
+ 
+   /**
+-   * Workspace-relative form of an absolute path under the session root.
+-   * Cross-platform (#5): always emit POSIX `/` so the API contract is identical
+-   * across hosts; the frontend embeds this in URL query strings
+-   * (`?path=foo/bar.txt`) and the model echoes it back via `read_file`.
++   * Root-relative form of an absolute managed path, carrying the `/data` prefix
++   * back for persistent-root writes so the path round-trips (#257). Cross-platform
++   * (#5): always emit POSIX `/` so the API contract is identical across hosts;
++   * the frontend embeds this in URL query strings (`?path=foo/bar.txt`) and the
++   * model echoes it back via `read_file`.
+    */
+-  private relWorkspacePath(sid: string, abs: string): string {
+-    const root = this.workspaceDir(sid);
+-    return abs === root ? "" : abs.slice(root.length + 1).split(sep).join("/");
++  private relManagedPath(abs: string, root: string, prefix: "/workspace" | "/data"): string {
++    const relPart = abs === root ? "" : abs.slice(root.length + 1).split(sep).join("/");
++    return prefix === "/data" ? (relPart ? `/data/${relPart}` : "/data") : relPart;
+   }
+ 
+   /**
+@@ -743,7 +821,15 @@ export class SessionManager {
+     // #97: append the language-following directive here (not in the persona text
+     // / on-disk prompt.md) so it also reaches users who scaffolded earlier, and
+     // applies whether the persona came from disk or the built-in constant.
+-    return withLanguageDirective(base ?? personaFor(name, role));
++    let persona = withLanguageDirective(base ?? personaFor(name, role));
++    // #257: tell working agents (not the passive trace recorder) where the
++    // shared cross-session persistent root lives, by absolute path, so they can
++    // read/write reusable data directly. Injected at load time (like the
++    // language directive) so it reaches on-disk personas too.
++    if (role !== "trace") {
++      persona = withPersistentRootDirective(persona, this.persistentDir());
++    }
++    return persona;
+   }
+ 
+   /* ---------------------------- session CRUD ---------------------------- */
+@@ -828,6 +914,10 @@ export class SessionManager {
+     if (this.persist) {
+       await mkdir(join(this.bpDir(id), "history"), { recursive: true });
+       await mkdir(this.workspaceDir(id), { recursive: true });
++      // #257: ensure the shared per-user persistent root exists so the agent
++      // (and file routes) can read/write the cross-session library from the
++      // first session onward. Cheap + idempotent.
++      await mkdir(this.persistentDir(), { recursive: true });
+       // On restore, meta.json on disk is the authority — do not write it back.
+       if (!_restore) await this.writeMeta(entry);
+       // Only (re)write the ref when the caller chose one — restore must not

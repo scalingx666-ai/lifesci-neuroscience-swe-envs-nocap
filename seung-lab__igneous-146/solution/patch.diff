@@ -1,0 +1,331 @@
+diff --git a/igneous/task_creation/mesh.py b/igneous/task_creation/mesh.py
+index da8b57dd..785c10fe 100644
+--- a/igneous/task_creation/mesh.py
++++ b/igneous/task_creation/mesh.py
+@@ -161,7 +161,7 @@ def create_meshing_tasks(
+     mesh_dir=None, cdn_cache=False, dust_threshold=None,
+     object_ids=None, progress=False, fill_missing=False,
+     encoding='precomputed', spatial_index=True, sharded=False,
+-    compress='gzip', closed_dataset_edges=True
++    compress='gzip', closed_dataset_edges=True, dust_global=False
+   ):
+   shape = Vec(*shape)
+ 
+@@ -199,6 +199,7 @@ def task(self, shape, offset):
+         mesh_dir=mesh_dir, 
+         cache_control=('' if cdn_cache else 'no-cache'),
+         dust_threshold=dust_threshold,
++        dust_global=bool(dust_global),
+         progress=progress,
+         object_ids=object_ids,
+         fill_missing=fill_missing,
+@@ -228,6 +229,7 @@ def on_finish(self):
+           'sharded': sharded,
+           'compress': compress,
+           'closed_dataset_edges': closed_dataset_edges,
++          'dust_global': bool(dust_global),
+         },
+         'by': operator_contact(),
+         'date': strftime('%Y-%m-%d %H:%M %Z'),
+diff --git a/igneous/task_creation/skeleton.py b/igneous/task_creation/skeleton.py
+index fda546b1..16744d73 100644
+--- a/igneous/task_creation/skeleton.py
++++ b/igneous/task_creation/skeleton.py
+@@ -48,7 +48,8 @@ def create_skeletonizing_tasks(
+     dust_threshold=1000, progress=False,
+     parallel=1, fill_missing=False, 
+     sharded=False, spatial_index=True,
+-    synapses=None, num_synapses=None
++    synapses=None, num_synapses=None,
++    dust_global=False
+   ):
+   """
+   Assign tasks with one voxel overlap in a regular grid 
+@@ -98,6 +99,9 @@ def create_skeletonizing_tasks(
+     volumes.
+   dust_threshold: don't skeletonize labels smaller than this number of voxels
+     as seen by a single task.
++  dust_global: Use global voxel counts for the dust threshold instead of from
++    just the cutout (if dust_threshold > 0). However, you must have generated 
++    voxel_counts.mb prior to running skeletonization.
+   progress: show a progress bar
+   parallel: number of processes to deploy against a single task. parallelizes
+     over labels, it won't speed up a single complex label. You can be slightly
+@@ -124,6 +128,15 @@ def create_skeletonizing_tasks(
+   shape = Vec(*shape)
+   vol = CloudVolume(cloudpath, mip=mip, info=info)
+ 
++  if dust_threshold > 0 and dust_global:
++    cf = CloudFiles(cloudpath)
++    vxctfile = cf.join(vol.key, 'stats', 'voxel_counts.mb')
++    if not cf.exists(vxctfile):
++      raise FileNotFoundError(
++        f"To use global dust thresholds, you must pre-compute the global voxel"
++        f" counts using 'igneous image voxels'. {vxctfile} not found."
++      )
++
+   kdtree, labelsmap = None, None
+   if synapses:
+     centroids, kdtree, labelsmap = synapses_in_space(synapses, N=num_synapses)
+@@ -172,6 +185,7 @@ def task(self, shape, offset):
+         spatial_index=bool(spatial_index),
+         spatial_grid_shape=shape.clone(), # used for writing index filenames
+         synapses=bbox_synapses,
++        dust_global=dust_global,
+       )
+ 
+     def synapses_for_bbox(self, shape, offset):
+@@ -214,6 +228,7 @@ def on_finish(self):
+           'sharded': bool(sharded),
+           'spatial_index': bool(spatial_index),
+           'synapses': bool(synapses),
++          'dust_global': bool(dust_global),
+         },
+         'by': operator_contact(),
+         'date': strftime('%Y-%m-%d %H:%M %Z'),
+diff --git a/igneous/tasks/mesh/mesh.py b/igneous/tasks/mesh/mesh.py
+index 27d51fc8..9a08dd5b 100644
+--- a/igneous/tasks/mesh/mesh.py
++++ b/igneous/tasks/mesh/mesh.py
+@@ -9,7 +9,7 @@
+ import numpy as np
+ from tqdm import tqdm
+ 
+-from cloudfiles import CloudFiles
++from cloudfiles import CloudFiles, CloudFile
+ import cloudfiles.paths
+ 
+ from cloudvolume import CloudVolume, view
+@@ -91,6 +91,7 @@ def __init__(self, shape, offset, layer_path, **kwargs):
+       'draco_compression_level': kwargs.get('draco_compression_level', 1),
+       'draco_create_metadata': kwargs.get('draco_create_metadata', False),
+       'dust_threshold': kwargs.get('dust_threshold', None),
++      'dust_global': kwargs.get('dust_global', False),
+       'encoding': kwargs.get('encoding', 'precomputed'),
+       'fill_missing': kwargs.get('fill_missing', False),
+       'generate_manifests': kwargs.get('generate_manifests', False),
+@@ -174,7 +175,10 @@ def execute(self):
+     if self.options["closed_dataset_edges"]:
+       data, left_offset = self._handle_dataset_boundary(data, data_bounds)
+ 
+-    data = self._remove_dust(data, self.options['dust_threshold'])
++    data = self._remove_dust(
++      data, 
++      self.options['dust_threshold'], self.options['dust_global']
++    )
+     data = self._remap(data)
+ 
+     if self.options['object_ids']:
+@@ -234,13 +238,35 @@ def get_mesh_dir(self):
+     else:
+       raise ValueError("The mesh destination is not present in the info file.")
+ 
+-  def _remove_dust(self, data, dust_threshold):
+-    if dust_threshold:
++  def _remove_dust(self, data, dust_threshold, dust_global):
++    if not dust_threshold:
++      return data
++
++    if not dust_global:
+       segids, pxct = fastremap.unique(data, return_counts=True)
+       dust_segids = [ sid for sid, ct in zip(segids, pxct) if ct < int(dust_threshold) ]
+-      data = fastremap.mask(data, dust_segids, in_place=True)
++      return fastremap.mask(data, dust_segids, in_place=True)
++    else:
++      return self.apply_dust_global_threshold(dust_threshold, data)
++
++  def apply_dust_global_threshold(self, dust_threshold, all_labels):
++    path = self._volume.meta.join(self._volume.cloudpath, self._volume.key, 'stats', 'voxel_counts.mb')
++    cf = CloudFile(path)
++
++    if not cf.exists():
++      raise FileNotFoundError(f"Cannot apply global dust threshold without {path}")
++
++    mb = MapBuffer(cf, frombytesfn=lambda x: int.from_bytes(x, byteorder='little'))
++    uniq = fastremap.unique(all_labels)
++
++    valid_objects = []
++    for label in uniq:
++      if label == 0:
++        continue
++      if mb[label] >= self.dust_threshold:
++        valid_objects.append(label)
+ 
+-    return data
++    return fastremap.mask_except(all_labels, valid_objects)
+ 
+   def _remap(self, data):
+     if self.options['remap_table'] is None:
+diff --git a/igneous/tasks/skeleton.py b/igneous/tasks/skeleton.py
+index ecfb80b8..8f51641a 100644
+--- a/igneous/tasks/skeleton.py
++++ b/igneous/tasks/skeleton.py
+@@ -71,7 +71,7 @@ def __init__(
+     dust_threshold=1000, progress=False,
+     parallel=1, fill_missing=False, sharded=False,
+     spatial_index=True, spatial_grid_shape=None,
+-    synapses=None
++    synapses=None, dust_global=False
+   ):
+     super(SkeletonTask, self).__init__(
+       cloudpath, shape, offset, mip, 
+@@ -81,7 +81,7 @@ def __init__(
+       fix_avocados, fill_holes,
+       dust_threshold, progress, parallel,
+       fill_missing, bool(sharded), bool(spatial_index),
+-      spatial_grid_shape, synapses
++      spatial_grid_shape, synapses, bool(dust_global)
+     )
+     self.bounds = Bbox(offset, Vec(*shape) + Vec(*offset))
+     self.index_bounds = Bbox(offset, Vec(*spatial_grid_shape) + Vec(*offset))
+@@ -111,11 +111,16 @@ def execute(self):
+         all_labels, self.synapses
+       )
+ 
++    dust_threshold = self.dust_threshold
++    if self.dust_global and dust_threshold > 0:
++      dust_threshold = 0
++      all_labels = self.apply_global_dust_threshold(vol, all_labels)
++
+     skeletons = kimimaro.skeletonize(
+       all_labels, self.teasar_params, 
+       object_ids=self.object_ids, 
+       anisotropy=vol.resolution,
+-      dust_threshold=self.dust_threshold, 
++      dust_threshold=dust_threshold, 
+       progress=self.progress, 
+       fix_branching=self.fix_branching,
+       fix_borders=self.fix_borders,
+@@ -153,6 +158,25 @@ def execute(self):
+     if self.spatial_index:
+       self.upload_spatial_index(vol, path, index_bbox, skeletons)
+   
++  def apply_global_dust_threshold(self, vol, all_labels):
++    path = vol.meta.join(self.cloudpath, vol.key, 'stats', 'voxel_counts.mb')
++    cf = CloudFile(path)
++
++    if not cf.exists():
++      raise FileNotFoundError(f"Cannot apply global dust threshold without {path}")
++
++    mb = MapBuffer(cf, frombytesfn=lambda x: int.from_bytes(x, byteorder='little'))
++    uniq = fastremap.unique(all_labels)
++
++    valid_objects = []
++    for label in uniq:
++      if label == 0:
++        continue
++      if mb[label] >= self.dust_threshold:
++        valid_objects.append(label)
++
++    return fastremap.mask_except(all_labels, valid_objects)
++
+   def upload_batch(self, vol, path, bbox, skeletons):
+     mbuf = MapBuffer(
+       skeletons, compress="br", 
+diff --git a/igneous_cli/cli.py b/igneous_cli/cli.py
+index 245f0d64..521d7dfb 100644
+--- a/igneous_cli/cli.py
++++ b/igneous_cli/cli.py
+@@ -785,6 +785,7 @@ def mesh_xfer(
+ @click.option('--fill-missing', is_flag=True, default=False, help="Interpret missing image files as background instead of failing.")
+ @click.option('--max-error', default=40, help="Maximum simplification error in physical units.", show_default=True)
+ @click.option('--dust-threshold', default=None, help="Skip meshing objects smaller than this number of voxels within a cutout. No default limit. Typical value: 1000.", type=int)
++@click.option('--dust-global/--dust-local', is_flag=True, default=False, help="Use global voxel counts for the dust threshold (when >0). To use this feature you must first compute the global voxel counts using the 'igneous image voxels' command.", show_default=True)
+ @click.option('--dir', default=None, help="Write meshes into this directory instead of the one indicated in the info file.")
+ @click.option('--compress', default="gzip", help="Set the image compression scheme. Options: 'none', 'gzip', 'br'", show_default=True)
+ @click.option('--spatial-index/--skip-spatial-index', is_flag=True, default=True, help="Create the spatial index.", show_default=True)
+@@ -795,7 +796,8 @@ def mesh_forge(
+   ctx, path, queue, mip, shape, 
+   simplify, fill_missing, max_error, 
+   dust_threshold, dir, compress, 
+-  spatial_index, sharded, closed_edge
++  spatial_index, sharded, closed_edge,
++  dust_global
+ ):
+   """
+   (1) Synthesize meshes from segmentation cutouts.
+@@ -819,7 +821,8 @@ def mesh_forge(
+     mesh_dir=dir, cdn_cache=False, dust_threshold=dust_threshold,
+     object_ids=None, progress=False, fill_missing=fill_missing,
+     encoding='precomputed', spatial_index=spatial_index, 
+-    sharded=sharded, compress=compress, closed_dataset_edges=closed_edge
++    sharded=sharded, compress=compress, closed_dataset_edges=closed_edge,
++    dust_global=dust_global
+   )
+ 
+   parallel = int(ctx.obj.get("parallel", 1))
+@@ -1009,6 +1012,7 @@ def skeletongroup():
+ @click.option('--fix-avocados', is_flag=True, default=False, help="Fixes somata where nuclei and cytoplasm have separate segmentations.", show_default=True)
+ @click.option('--fill-holes', is_flag=True, default=False, help="Preprocess each cutout to eliminate background holes and holes caused by entirely contained inclusions. Warning: May remove labels that are considered inclusions.", show_default=True)
+ @click.option('--dust-threshold', default=1000, help="Skip skeletonizing objects smaller than this number of voxels within a cutout.", type=int, show_default=True)
++@click.option('--dust-global/--dust-local', is_flag=True, default=False, help="Use global voxel counts for the dust threshold (when >0). To use this feature you must first compute the global voxel counts using the 'igneous image voxels' command.", show_default=True)
+ @click.option('--spatial-index/--skip-spatial-index', is_flag=True, default=True, help="Create the spatial index.", show_default=True)
+ @click.option('--scale', default=4, help="Multiplies invalidation radius by distance from boundary.", type=float, show_default=True)
+ @click.option('--const', default=10, help="Adds constant amount to invalidation radius in physical units.", type=float, show_default=True)
+@@ -1021,7 +1025,7 @@ def skeletongroup():
+ @click.pass_context
+ def skeleton_forge(
+   ctx, path, queue, mip, shape, 
+-  fill_missing, dust_threshold, spatial_index,
++  fill_missing, dust_threshold, dust_global, spatial_index,
+   fix_branching, fix_borders, fix_avocados, 
+   fill_holes, scale, const, soma_detect, soma_accept,
+   soma_scale, soma_const, max_paths, sharded
+@@ -1066,6 +1070,7 @@ def skeleton_forge(
+     dust_threshold=dust_threshold, progress=False,
+     parallel=1, fill_missing=fill_missing, 
+     sharded=sharded, spatial_index=spatial_index,
++    dust_global=dust_global,
+   )
+ 
+   parallel = int(ctx.obj.get("parallel", 1))
+diff --git a/test/test_tasks.py b/test/test_tasks.py
+index c5e6fbfc..3c51acd1 100755
+--- a/test/test_tasks.py
++++ b/test/test_tasks.py
+@@ -11,6 +11,7 @@
+ from cloudvolume import CloudVolume, EmptyVolumeException, view
+ import cloudvolume.lib as lib
+ from cloudfiles import CloudFiles
++import fastremap
+ from taskqueue import MockTaskQueue, TaskQueue
+ import tinybrain
+ 
+@@ -524,3 +525,37 @@ def test_skeletonization_task():
+     })
+     tq.insert_all(tasks)
+ 
++
++def test_voxel_counting_task():
++    directory = '/tmp/removeme/voxelcounting/'
++    layer_path = 'file://' + directory
++    delete_layer(layer_path)
++
++    img = np.random.randint(0, 50, size=(1024,1024,256), dtype=np.uint8)
++    cv = CloudVolume.from_numpy(
++        img,
++        layer_type='segmentation',
++        vol_path=layer_path,
++    )
++
++    tq = MockTaskQueue()
++    tasks = tc.create_voxel_counting_tasks(layer_path, mip=0)
++    tq.insert_all(tasks)
++    tc.accumulate_voxel_counts(layer_path, mip=0)
++
++    from mapbuffer import MapBuffer
++    mb = CloudFiles(layer_path).get(f"{cv.key}/stats/voxel_counts.mb")
++    mb = MapBuffer(mb, frombytesfn=lambda x: int.from_bytes(x, byteorder='little'))
++    uniq, cts = fastremap.unique(img, return_counts=True)
++    
++    cts_dict_gt = { label: ct for label, ct in zip(uniq, cts) }
++    cts_dict_task = mb.todict()
++
++    assert cts_dict_task == cts_dict_gt
++
++
++
++
++
++
++

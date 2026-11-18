@@ -1,0 +1,1830 @@
+diff --git a/bmtk/simulator/dpointnet/cell_models/glif3_cell.py b/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
+index 7b231e2c..1e373965 100644
+--- a/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
++++ b/bmtk/simulator/dpointnet/cell_models/glif3_cell.py
+@@ -3,6 +3,12 @@
+ import numpy as np
+ import pickle as pkl
+ from pathlib import Path
++from .nest_dynamics import (
++    integration_coefficients,
++    active_update,
++    spike_reset,
++    time_steps,
++)
+ from bmtk.simulator.dpointnet.io_tools import io
+ from bmtk.simulator.dpointnet.custom_ops import (
+     build_csr_connectivity,
+@@ -630,6 +636,8 @@ def _resolve_fused_state(option, n_syn_basis, pseudo_gauss):
+ 
+ 
+ class GLIF3Cell(tf.keras.layers.Layer):
++    noise_state_index = 6
++
+     def _tracked_weight(self, initial_value, name, trainable, dtype, constraint=None):
+         initial_value = np.asarray(initial_value)
+         kwargs = {
+@@ -670,7 +678,7 @@ def __init__(
+         # train_input=False,
+         # train_noise=True,
+         noise_seed=0,
+-        hard_reset=False,
++        hard_reset=None,
+         tau_basis=None,
+         synaptic_basis_weights=None,
+         use_fused_cuda=False,
+@@ -687,10 +695,24 @@ def __init__(
+         track_voltage_penalty=False,
+         voltage_penalty_mode="range",
+         return_voltage_sequences=True,
++        dynamics_mode="legacy",
+         # current_input=False,
+     ):
+         super().__init__()
+ 
++        if dynamics_mode not in ("nest", "legacy"):
++            raise ValueError("dynamics_mode must be 'nest' or 'legacy'")
++        self.dynamics_mode = dynamics_mode
++        self.spike_time_offset_steps = int(dynamics_mode == "nest")
++        if not np.isfinite(dt) or dt <= 0:
++            raise ValueError("dt must be finite and positive")
++        if hard_reset is None:
++            hard_reset = dynamics_mode == "nest"
++        if dynamics_mode == "nest" and use_fused_state is True:
++            raise ValueError(
++                "NEST dynamics require use_fused_state=False or 'auto'; the legacy fused state kernel is not compatible"
++            )
++
+         if (
+             use_small_batch_recurrent_backward is not True
+             and use_small_batch_recurrent_backward is not False
+@@ -825,15 +847,25 @@ def __init__(
+             psc_initial_np[None, :], dtype=self.compute_dtype
+         )  # expand the dimension for processing different receptor types
+ 
+-        network_max_delay = np.max(glif_network["synapses"]["delays"])
++        network_max_delay = np.max(glif_network["synapses"]["delays"], initial=dt)
+         if max_delay is None or max_delay <= 0:
+             self.max_delay = int(np.round(network_max_delay))
+         else:
+             self.max_delay = int(np.round(np.min([network_max_delay, max_delay])))
++        self._delay_limit_ms = self.max_delay
++        if dynamics_mode == "nest":
++            self._delay_limit_ms = float(
++                network_max_delay
++                if max_delay is None or max_delay <= 0
++                else min(network_max_delay, max_delay)
++            )
++            self.max_delay = max(1, int(time_steps(self._delay_limit_ms, dt)))
+ 
+         # Gather the neuron parameters for every neuron
+         t_ref_per_neuron = _node_params["t_ref"][self._node_type_ids]
+         t_ref_steps = np.ceil(t_ref_per_neuron / dt).astype(np.int16)
++        if dynamics_mode == "nest":
++            t_ref_steps = time_steps(t_ref_per_neuron, dt).astype(np.int16)
+         t_ref_steps = np.maximum(t_ref_steps, 1)
+         max_ref_steps = int(np.max(t_ref_steps))
+         if max_ref_steps > 127:
+@@ -892,6 +924,55 @@ def __init__(
+             dtype=self.compute_dtype,
+         )
+ 
++        if dynamics_mode == "nest":
++            _, _, psc_voltage, rise_voltage = integration_coefficients(
++                dt, _node_params["C_m"], _node_params["g"], tau_basis
++            )
++            self.psc_voltage = tf.constant(
++                psc_voltage[self._node_type_ids], dtype=self.compute_dtype
++            )
++            self.rise_voltage = tf.constant(
++                rise_voltage[self._node_type_ids], dtype=self.compute_dtype
++            )
++            rates = np.asarray(_node_params["k"])[self._node_type_ids]
++            if not np.isfinite(rates).all() or (rates <= 0).any():
++                raise ValueError(
++                    "NEST adaptation decay rates must be finite and positive"
++                )
++            self.asc_decay = tf.constant(np.exp(-dt * rates), dtype=self.compute_dtype)
++            self.asc_mean = tf.constant(
++                -np.expm1(-dt * rates) / (dt * rates), dtype=self.compute_dtype
++            )
++            self.asc_refractory_decay = tf.constant(
++                np.asarray(_node_params.get("asc_r", np.ones_like(_node_params["k"])))[
++                    self._node_type_ids
++                ]
++                * np.exp(-rates * t_ref_per_neuron[:, None]),
++                dtype=self.compute_dtype,
++            )
++            reset = (
++                np.asarray(_node_params["V_reset"]) - _node_params["E_L"]
++            ) / voltage_scale
++            self.v_reset = tf.constant(
++                reset[self._node_type_ids], dtype=self.compute_dtype
++            )
++            initial = (
++                np.asarray(_node_params.get("V_m", _node_params["E_L"]))
++                - _node_params["E_L"]
++            ) / voltage_scale
++            self.initial_voltage = tf.constant(
++                initial[self._node_type_ids], dtype=self.compute_dtype
++            )
++            initial_asc = (
++                np.asarray(
++                    _node_params.get("asc_init", np.zeros_like(_node_params["k"]))
++                )
++                / voltage_scale[:, None]
++            )
++            self.initial_asc = tf.constant(
++                initial_asc[self._node_type_ids].reshape(-1), dtype=self.compute_dtype
++            )
++
+         ## TODO: This shouldn't be stored in a separate pickle.
+         # path = os.path.join(glif_network["data_dir"], 'tf_data', 'syn_id_to_syn_weights_dict.pkl')
+         # path = 'GLIF_network/tf_data/syn_id_to_syn_weights_dict.pkl'
+@@ -918,7 +999,7 @@ def __init__(
+         self.synaptic_basis_weights = tf.constant(
+             _synaptic_basis_weights, dtype=self.compute_dtype
+         )
+-        self._use_fused_state = _resolve_fused_state(
++        self._use_fused_state = dynamics_mode == "legacy" and _resolve_fused_state(
+             use_fused_state, self._n_syn_basis, self._pseudo_gauss
+         )
+         if self._use_fused_state:
+@@ -970,9 +1051,14 @@ def __init__(
+             * lr_scale
+             / recurrent_weight_scale
+         ).astype(np.float32)
+-        delays = np.round(np.clip(delays, dt, self.max_delay) / dt).astype(
++        delays = np.round(np.clip(delays, dt, self._delay_limit_ms) / dt).astype(
+             np.int32
+         )  # Use the maximum delay to clip the synaptic delays
++        if dynamics_mode == "nest":
++            delays = time_steps(
++                np.clip(glif_network["synapses"]["delays"], dt, self._delay_limit_ms),
++                dt,
++            )
+         indices[:, 1] = indices[:, 1] + self._n_neurons * (
+             delays - 1
+         )  # Introduce the delays in the presynaptic neuron indices
+@@ -1076,6 +1162,7 @@ def __init__(
+         # TODO: Inputs needs to be a list since order is extremely important
+         self.inputs_idx = np.zeros(len(inputs) + 1, dtype=int)
+         self.inputs = {}
++        self._input_history_size = 0
+ 
+         for idx, (input_name, input_network) in enumerate(inputs.items()):
+             # TODO: Use a named tuple instead of dict
+@@ -1084,8 +1171,24 @@ def __init__(
+             input_dense_shape = (self._n_neurons, n_input_nodes)
+ 
+             input_props["input_dim"] = n_input_nodes
++            input_indices = np.array(input_network["indices"], dtype=np.int64)
++            input_props["history_start"] = self._input_history_size
++            if dynamics_mode == "nest":
++                input_delays = np.asarray(input_network["delays"], dtype=float)
++                if not np.isfinite(input_delays).all() or (input_delays < dt).any():
++                    raise ValueError(
++                        "NEST input delays must be finite and at least one timestep"
++                    )
++                input_steps = time_steps(input_delays, dt)
++                history_steps = int(input_steps.max(initial=1)) - 1
++                input_indices[:, 1] += n_input_nodes * (input_steps - 1)
++                input_dense_shape = (
++                    self._n_neurons,
++                    n_input_nodes * (history_steps + 1),
++                )
++                self._input_history_size += n_input_nodes * history_steps
++            input_props["history_stop"] = self._input_history_size
+             input_props["input_dense_shape"] = input_dense_shape
+-            input_indices = np.array(input_network["indices"])
+             input_weights = np.array(input_network["weights"])
+             input_syn_ids = np.array(input_network["syn_ids"])
+             input_weights = (
+@@ -1508,6 +1611,16 @@ def reset_voltage_penalty_state(self, state):
+     def calculate_noise_current(
+         self, batch_size, noise_step, input_net, initial_currents=None
+     ):
++        rest_of_brain = GLIF3Cell.sample_noise_spikes(
++            self, batch_size, noise_step, input_net
++        )
++        if initial_currents is None:
++            return self.calculate_input_current_from_spikes(rest_of_brain, input_net)
++        return self.calculate_input_current_from_spikes(
++            rest_of_brain, input_net, initial_currents=initial_currents
++        )
++
++    def sample_noise_spikes(self, batch_size, noise_step, input_net):
+         step_seed = tf.cast(noise_step[0], tf.int32)
+         base_seed = tf.cast(self.noise_seed, tf.int32)
+         replica_context = tf.distribute.get_replica_context()
+@@ -1522,7 +1635,10 @@ def calculate_noise_current(
+         poisson_shape = tf.stack(
+             [
+                 tf.cast(batch_size, tf.int32),
+-                tf.cast(input_net["input_dense_shape"][1], tf.int32),
++                tf.cast(
++                    input_net.get("input_dim", input_net["input_dense_shape"][1]),
++                    tf.int32,
++                ),
+             ],
+             axis=0,
+         )
+@@ -1533,18 +1649,20 @@ def calculate_noise_current(
+             lam=input_net["spike_prob"],
+             dtype=tf.int32,
+         )
+-        if initial_currents is None:
+-            return self.calculate_input_current_from_spikes(rest_of_brain, input_net)
+-        return self.calculate_input_current_from_spikes(
+-            rest_of_brain, input_net, initial_currents=initial_currents
+-        )
++        return rest_of_brain
+ 
+     def call(self, inputs, states):
+         # lgn_inputs = inputs[:, :self.input_dim]
+ 
+         batch_size = tf.cast(tf.shape(inputs)[0], dtype=tf.int64)
+ 
+-        z_buf, v, r, asc, psc_rise, psc, noise_step = states
++        expected_states = 8 if self._input_history_size else 7
++        if len(states) != expected_states:
++            raise ValueError(
++                f"Expected {expected_states} states including external delay history, got {len(states)}"
++            )
++        z_buf, v, r, asc, psc_rise, psc, noise_step = states[:7]
++        new_input_history = []
+         prev_z = z_buf[:, : self._n_neurons]
+ 
+         i_rec = self.calculate_i_rec_with_custom_grad(z_buf)
+@@ -1552,7 +1670,10 @@ def call(self, inputs, states):
+         rec_inputs = i_rec
+         extern_currents = []
+         for idx, input_net in enumerate(self.inputs.values()):
+-            if input_net["input_type"] in ("poisson_spikes_internal", "noisy_current"):
++            if self.dynamics_mode == "legacy" and input_net["input_type"] in (
++                "poisson_spikes_internal",
++                "noisy_current",
++            ):
+                 if self._use_fused_current_accumulation:
+                     rec_inputs = self.calculate_noise_current(
+                         batch_size,
+@@ -1567,6 +1688,33 @@ def call(self, inputs, states):
+                 continue
+ 
+             input_spikes = inputs[:, self.inputs_idx[idx] : self.inputs_idx[idx + 1]]
++            if self.dynamics_mode == "nest":
++                if input_net["input_type"] in (
++                    "poisson_spikes_internal",
++                    "noisy_current",
++                ):
++                    input_spikes = self.sample_noise_spikes(
++                        batch_size, noise_step, input_net
++                    )
++                input_spikes = tf.cast(input_spikes, self.compute_dtype)
++                history_start, history_stop = (
++                    input_net["history_start"],
++                    input_net["history_stop"],
++                )
++                if history_stop > history_start:
++                    input_spikes = tf.concat(
++                        [
++                            input_spikes,
++                            tf.cast(
++                                states[7][:, history_start:history_stop],
++                                self.compute_dtype,
++                            ),
++                        ],
++                        axis=1,
++                    )
++                    new_input_history.append(
++                        input_spikes[:, : history_stop - history_start]
++                    )
+             if input_net["input_type"] == "current":
+                 extern_currents.append(
+                     self.calculate_input_current_from_firing_probabilities(
+@@ -1596,7 +1744,43 @@ def call(self, inputs, states):
+         # Scale with the learning rate
+         rec_inputs = rec_inputs * self._lr_scale
+ 
+-        if self._use_fused_state:
++        if self.dynamics_mode == "nest":
++            new_psc, new_psc_rise = self.update_psc(psc, psc_rise, rec_inputs)
++            new_v, new_r, adaptation, active = active_update(
++                straight_through_dampen(v, self._voltage_gradient_dampening),
++                r,
++                tf.reshape(asc, [batch_size, self._n_neurons, 2]),
++                tf.reshape(psc, [batch_size, self._n_neurons, self._n_syn_basis]),
++                tf.reshape(psc_rise, [batch_size, self._n_neurons, self._n_syn_basis]),
++                decay=self.decay,
++                current_factor=self.current_factor,
++                asc_decay=self.asc_decay,
++                asc_mean=self.asc_mean,
++                psc_voltage=self.psc_voltage,
++                rise_voltage=self.rise_voltage,
++                reset_voltage=self.v_reset,
++                hard_reset=self._hard_reset,
++            )
++            new_z = (
++                spike_gauss(new_v - self.v_th, self._gauss_std, self._dampening_factor)
++                if self._pseudo_gauss
++                else spike_function(new_v - self.v_th, self._dampening_factor)
++            )
++            new_z = tf.where(active, new_z, tf.zeros_like(new_z))
++            new_v, new_r, adaptation = spike_reset(
++                new_v,
++                new_r,
++                adaptation,
++                new_z,
++                reset_voltage=self.v_reset,
++                refractory_steps=self.t_ref_steps,
++                asc_amplitudes=self.asc_amps,
++                asc_refractory_decay=self.asc_refractory_decay,
++                hard_reset=self._hard_reset,
++            )
++            new_asc = tf.reshape(adaptation, [batch_size, self._n_neurons * 2])
++            new_z_buf = tf.concat([new_z, z_buf[:, : -self._n_neurons]], axis=1)
++        elif self._use_fused_state:
+             new_v, new_r, new_asc, new_psc_rise, new_psc = fused_dense_state(
+                 prev_z,
+                 v,
+@@ -1654,6 +1838,8 @@ def call(self, inputs, states):
+             new_psc,
+             noise_step + 1,
+         )
++        if self._input_history_size:
++            new_state = new_state + (tf.concat(new_input_history, axis=1),)
+         return outputs, new_state
+ 
+     @property
+@@ -1675,6 +1861,8 @@ def state_size(self):
+             self._n_neurons * self._n_syn_basis,  # psc
+             tf.TensorShape([]),  # noise timestep
+         )
++        if getattr(self, "_input_history_size", 0):
++            state_size = state_size + (self._input_history_size,)
+         return state_size
+ 
+     def zero_state(self, batch_size, dtype, with_names=False):
+@@ -1682,6 +1870,9 @@ def zero_state(self, batch_size, dtype, with_names=False):
+         v0 = tf.zeros((batch_size, self._n_neurons), dtype)
+         r0 = tf.zeros((batch_size, self._n_neurons), self._refractory_state_dtype)
+         asc = tf.zeros((batch_size, self._n_neurons * 2), dtype)
++        if getattr(self, "dynamics_mode", "legacy") == "nest":
++            v0 = v0 + tf.cast(self.initial_voltage, dtype)
++            asc = asc + tf.cast(self.initial_asc, dtype)
+         psc_rise0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), dtype)
+         psc0 = tf.zeros((batch_size, self._n_neurons * self._n_syn_basis), dtype)
+         noise_step0 = tf.zeros((batch_size,), dtype=tf.int32)
+@@ -1695,6 +1886,9 @@ def zero_state(self, batch_size, dtype, with_names=False):
+             "psc0",
+             "noise_step0",
+         )
++        if getattr(self, "_input_history_size", 0):
++            state = state + (tf.zeros((batch_size, self._input_history_size), dtype),)
++            state_names = state_names + ("input_history0",)
+         if with_names:
+             return state, state_names
+         return state
+diff --git a/bmtk/simulator/dpointnet/cell_models/nest_dynamics.py b/bmtk/simulator/dpointnet/cell_models/nest_dynamics.py
+new file mode 100644
+index 00000000..064731b5
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/cell_models/nest_dynamics.py
+@@ -0,0 +1,100 @@
++import numpy as np
++from scipy.special import exprel
++import tensorflow as tf
++
++
++def time_steps(milliseconds, dt):
++    step_ticks = int(round(dt * 1000))
++    if step_ticks < 1 or not np.isclose(step_ticks, dt * 1000, rtol=0, atol=1e-6):
++        raise ValueError("NEST-compatible dt must be a multiple of 0.001 ms")
++    values = np.asarray(milliseconds, dtype=np.float64)
++    if not np.isfinite(values).all() or (values < 0).any():
++        raise ValueError("NEST times must be finite and nonnegative")
++    ticks = np.rint(values * 1000).astype(np.int64)
++    return (ticks + step_ticks - 1) // step_ticks
++
++
++def integration_coefficients(dt, capacitance, conductance, tau_basis):
++    if not np.isfinite(dt) or dt <= 0:
++        raise ValueError("dt must be finite and positive")
++    capacitance = np.asarray(capacitance, dtype=np.float64)
++    conductance = np.asarray(conductance, dtype=np.float64)
++    tau_basis = np.asarray(tau_basis, dtype=np.float64)
++    if any(
++        not np.isfinite(values).all() or (values <= 0).any()
++        for values in (capacitance, conductance, tau_basis)
++    ):
++        raise ValueError(
++            "Capacitance, conductance and synaptic time constants must be positive"
++        )
++    membrane_rate = conductance / capacitance
++    decay = np.exp(-dt * membrane_rate)
++    difference = dt * (membrane_rate[:, None] - 1 / tau_basis[None, :])
++    current = decay[:, None] * dt * exprel(difference) / capacitance[:, None]
++    integral = np.empty_like(difference)
++    small = np.abs(difference) < 1e-3
++    values = difference[small]
++    integral[small] = (
++        0.5 + values / 3 + values**2 / 8 + values**3 / 30 + values**4 / 144
++    )
++    values = difference[~small]
++    integral[~small] = ((values - 1) * np.expm1(values) + values) / values**2
++    rise = decay[:, None] * dt**2 * integral / capacitance[:, None]
++    return decay, -np.expm1(-dt * membrane_rate) / conductance, current, rise
++
++
++def active_update(
++    voltage,
++    refractory,
++    adaptation,
++    psc,
++    psc_rise,
++    *,
++    decay,
++    current_factor,
++    asc_decay,
++    asc_mean,
++    psc_voltage,
++    rise_voltage,
++    reset_voltage,
++    hard_reset,
++    direct_current=0.0
++):
++    active = refractory <= 0
++    mean_adaptation = tf.reduce_sum(adaptation * asc_mean, axis=-1)
++    candidate = (
++        decay * voltage
++        + current_factor * (direct_current + mean_adaptation)
++        + tf.reduce_sum(psc * psc_voltage + psc_rise * rise_voltage, axis=-1)
++    )
++    voltage = tf.where(active, candidate, reset_voltage) if hard_reset else candidate
++    adaptation = tf.where(active[..., None], adaptation * asc_decay, adaptation)
++    remaining = tf.maximum(refractory - tf.cast(1, refractory.dtype), 0)
++    return voltage, remaining, adaptation, active
++
++
++def spike_reset(
++    voltage,
++    refractory,
++    adaptation,
++    spikes,
++    *,
++    reset_voltage,
++    refractory_steps,
++    asc_amplitudes,
++    asc_refractory_decay,
++    hard_reset
++):
++    fired = tf.stop_gradient(spikes) > 0
++    voltage = (
++        tf.where(fired, reset_voltage, voltage)
++        if hard_reset
++        else voltage - tf.stop_gradient(spikes) * (1 - reset_voltage)
++    )
++    refractory = tf.where(
++        fired, tf.cast(refractory_steps, refractory.dtype), refractory
++    )
++    adaptation = tf.where(
++        fired[..., None], asc_amplitudes + adaptation * asc_refractory_decay, adaptation
++    )
++    return voltage, refractory, adaptation
+diff --git a/bmtk/simulator/dpointnet/cell_models/state_rnn.py b/bmtk/simulator/dpointnet/cell_models/state_rnn.py
+new file mode 100644
+index 00000000..04126dcf
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/cell_models/state_rnn.py
+@@ -0,0 +1,89 @@
++import inspect
++
++import tensorflow as tf
++
++
++class ExplicitStateRNN(tf.keras.layers.RNN):
++    def call(self, sequences, initial_state=None, mask=None, training=False):
++        if self.stateful:
++            raise ValueError(
++                "ExplicitStateRNN requires explicit state, not stateful=True"
++            )
++        if isinstance(sequences, (list, tuple)):
++            sequences, *initial_state = sequences
++        if isinstance(mask, (list, tuple)):
++            mask = mask[0]
++        if initial_state is None:
++            initial_state = self.cell.zero_state(
++                tf.shape(sequences)[1 if getattr(self, "time_major", False) else 0],
++                self.compute_dtype,
++            )
++        states = [tf.convert_to_tensor(value) for value in initial_state]
++        if hasattr(self, "inner_loop"):
++            last, sequence, states = self.inner_loop(
++                sequences, states, mask, training=training
++            )
++        else:
++            cell_kwargs = (
++                {"training": training}
++                if "training" in inspect.signature(self.cell.call).parameters
++                else {}
++            )
++
++            def step(inputs, states):
++                return self.cell(inputs, states, **cell_kwargs)
++
++            last, sequence, states = tf.keras.backend.rnn(
++                step,
++                sequences,
++                states,
++                go_backwards=self.go_backwards,
++                mask=mask,
++                unroll=self.unroll,
++                input_length=sequences.shape[0 if self.time_major else 1],
++                time_major=self.time_major,
++                zero_output_for_mask=self.zero_output_for_mask,
++                return_all_outputs=self.return_sequences,
++            )
++        output = sequence if self.return_sequences else last
++        return (output, *states) if self.return_state else output
++
++    def compute_output_shape(self, sequences_shape, initial_state_shape=None):
++        batch, length = sequences_shape[:2]
++        output_shape = (
++            (batch, length, self.cell.output_size)
++            if self.return_sequences
++            else (batch, self.cell.output_size)
++        )
++        if not self.return_state:
++            return output_shape
++        state_shapes = [
++            (batch,)
++            + (tuple(size.as_list()) if isinstance(size, tf.TensorShape) else (size,))
++            for size in self.cell.state_size
++        ]
++        return (output_shape, *state_shapes)
++
++    def compute_output_spec(
++        self, sequences, initial_state=None, mask=None, training=False
++    ):
++        shapes = self.compute_output_shape(sequences.shape)
++        if not self.return_state:
++            return tf.keras.KerasTensor(shapes, dtype=self.compute_dtype)
++        initial_state = (
++            initial_state
++            if initial_state is not None
++            else self.cell.zero_state(1, self.compute_dtype)
++        )
++        output_dtype = (
++            self.cell.compute_dtype
++            if self.cell._return_voltage_sequences
++            else "float32"
++        )
++        return (
++            tf.keras.KerasTensor(shapes[0], dtype=output_dtype),
++            *(
++                tf.keras.KerasTensor(shape, dtype=state.dtype)
++                for shape, state in zip(shapes[1:], initial_state)
++            ),
++        )
+diff --git a/bmtk/simulator/dpointnet/network_adaptor.py b/bmtk/simulator/dpointnet/network_adaptor.py
+index ac3a7b24..1fee787f 100644
+--- a/bmtk/simulator/dpointnet/network_adaptor.py
++++ b/bmtk/simulator/dpointnet/network_adaptor.py
+@@ -675,6 +675,17 @@ def _build_recurrent_dict(self):
+             }
+         }
+ 
++        for name, default in (
++            ("V_m", rec_dict["node_params"]["E_L"]),
++            ("asc_init", np.zeros_like(rec_dict["node_params"]["k"])),
++            ("asc_r", np.ones_like(rec_dict["node_params"]["k"])),
++        ):
++            rec_dict["node_params"][name] = (
++                np.asarray(self._dynamics_params_lu[name], dtype=np.float32)
++                if name in self._dynamics_params_lu
++                else default
++            )
++
+         if self._cache_file and not Path(self._cache_file).exists():
+             Path(self._cache_file).parent.mkdir(exist_ok=True, parents=True)
+             with open(self._cache_file, 'wb') as f:
+diff --git a/bmtk/simulator/dpointnet/results.py b/bmtk/simulator/dpointnet/results.py
+index b1950fd7..8c6663b6 100644
+--- a/bmtk/simulator/dpointnet/results.py
++++ b/bmtk/simulator/dpointnet/results.py
+@@ -24,8 +24,8 @@ def mean_firing_rate(self):
+ 
+     def to_dataframe(self):
+         batch_num, spike_steps, tf_ids = np.nonzero(self._spikes_tables)
+-        timestamps = spike_steps*self.parent.dt
+-        
++        timestamps = (spike_steps + self.parent.time_offset_steps) * self.parent.dt
++
+         tf2bmtk_id_map = TFIDMap().tf2bmtk_id_map()
+         return pd.DataFrame({
+             'batch_num': batch_num,
+@@ -39,7 +39,7 @@ def to_spikes_table(self):
+ 
+     def to_pickle(self, file_path, split_batches=False, ):
+         raise NotImplementedError()
+-    
++
+     def to_npz(self, file_path):
+         raise NotImplementedError()
+ 
+@@ -114,7 +114,7 @@ def raster(self, batch_nums=None, max_rows=5, show=True):
+                 batch_nums = spikes_df['batch_num'].unique()
+             elif isinstance(batch_nums, (int, np.number)):
+                 batch_nums = [batch_nums]
+-            
++
+             n_batches = len(batch_nums)
+             fig, axes = _SpikesResults.make_subplot(n_batches, max_rows=max_rows)
+             for bnum, batch_df in spikes_df.groupby('batch_num'):
+@@ -122,15 +122,15 @@ def raster(self, batch_nums=None, max_rows=5, show=True):
+                     continue
+                 else:         
+                     r, c, ax = next(axes)
+-                    
++
+                     ax.scatter(batch_df['timestamps'], batch_df['node_ids'])
+                     ax.set_title(f'batch {bnum}')
+-                    
++
+                     if c == 1:
+                         ax.set_ylabel('node id')
+                     if r == min(max_rows, n_batches) - 1:
+                         ax.set_xlabel('timestamps (ms)')
+-        
++
+             plt.tight_layout()
+ 
+         if show:
+@@ -141,7 +141,7 @@ def raster(self, batch_nums=None, max_rows=5, show=True):
+     @staticmethod
+     def make_subplot(n_batches, max_rows=5):
+         import matplotlib.pyplot as plt
+-       
++
+         n_rows = min(n_batches, max_rows)
+         n_cols = int(np.ceil(n_batches/max_rows))
+         fig, axes = plt.subplots(n_rows, n_cols)
+@@ -159,7 +159,6 @@ def axes_generator(axes, n_rows, n_cols):
+                 yield r, 1, axes[r]
+ 
+ 
+-
+ class _ModelState:
+     def __init__(self, parent, model_state, **kwargs):
+         pass
+@@ -190,7 +189,7 @@ def __to_sonata_helper(self, file_path, batch_num=None, overwrite=True):
+ 
+                 pop_grp = h5.create_group(grp_name)
+                 node_idxs = pop_df.index.values
+-                
++
+                 if self.parent.batch_size == 1:
+                     batch_data_paths = [(0, 'data')]
+                 elif batch_num is not None:
+@@ -204,11 +203,19 @@ def __to_sonata_helper(self, file_path, batch_num=None, overwrite=True):
+ 
+                 mapping_grp = pop_grp.create_group('mapping')
+                 mapping_grp.create_dataset('node_id', data=pop_df['node_id'])
+-                mapping_grp.create_dataset('time', data=[0.0, self.parent.seq_len*self.parent.dt, self.parent.dt])
++                mapping_grp.create_dataset(
++                    "time",
++                    data=[
++                        self.parent.time_offset_steps * self.parent.dt,
++                        (self.parent.seq_len + self.parent.time_offset_steps)
++                        * self.parent.dt,
++                        self.parent.dt,
++                    ],
++                )
+                 mapping_grp.create_dataset('index_pointer', data=np.arange(len(node_idxs), dtype='int'))
+                 mapping_grp.create_dataset('element_ids', data=np.zeros(len(node_idxs), dtype='int')) 
+                 mapping_grp.create_dataset('element_pos', data=np.zeros(len(node_idxs), dtype='int')) 
+-                
++
+     def to_sonata(self, file_path, split_batches=False, overwrite=True):
+         if split_batches:
+             ext = ''.join(Path(file_path).suffixes)
+@@ -217,16 +224,18 @@ def to_sonata(self, file_path, split_batches=False, overwrite=True):
+                 self.__to_sonata_helper(batched_file_path, batch_num=batch_num, overwrite=overwrite)
+ 
+         else:
+-             self.__to_sonata_helper(file_path, overwrite=overwrite)
++            self.__to_sonata_helper(file_path, overwrite=overwrite)
+ 
+     def to_pickle(self, file_path, split_batches=False, overwrite=True):
+         raise NotImplementedError()
+ 
+ 
+ class RNNExtractorResults:
+-    def __init__(self, seq_len, dt, batch_size, extractor_results):
++
++    def __init__(self, seq_len, dt, batch_size, extractor_results, time_offset_steps=0):
+         self.seq_len = seq_len
+         self.dt = dt
++        self.time_offset_steps = time_offset_steps
+         self.batch_size = batch_size
+         # bmtk_ids = TFIDMap().recurrent_bmtk_ids()
+ 
+@@ -240,7 +249,7 @@ def spikes(self):
+         if self._spikes is None:
+             self._spikes = _SpikesResults(self, self._extractor_results[0][0])
+         return self._spikes
+-    
++
+     @property
+     def voltages(self):
+         if self._voltages is None:
+diff --git a/bmtk/simulator/dpointnet/rnn_model.py b/bmtk/simulator/dpointnet/rnn_model.py
+index b184fbaf..49dfdd66 100644
+--- a/bmtk/simulator/dpointnet/rnn_model.py
++++ b/bmtk/simulator/dpointnet/rnn_model.py
+@@ -324,7 +324,48 @@ def recurrent_network(self):
+     def add_input(self, name, mod):
+         self._input_generators_mods[name] = mod
+ 
+-    def build(self, rebuild=False, seq_len=None, dtype=tf.float32, use_dummy_state_input=False, use_state_input=True, n_output=2, return_state=True, batch_size=None, **kwargs):
++    def _resolve_cell_params(self, training=False, check_built=True):
++        cell_params = {} if self.cell_params is None else dict(self.cell_params)
++        if training and issubclass(self.cell_cls, GLIF3Cell):
++            if cell_params.get("hard_reset"):
++                raise ValueError(
++                    "GLIF training requires hard_reset=False. Hard reset blocks the "
++                    "voltage-state gradient at spikes and during refractory clamping; "
++                    "the spike surrogate does not restore that path. Set "
++                    "rnn_cell_params.hard_reset=False or omit it for training."
++                )
++            if check_built and self._model_built and self._cell._hard_reset:
++                raise ValueError(
++                    "Cannot train a model already built with hard reset. Build a "
++                    "separate soft-reset training model and transfer weights explicitly; "
++                    "changing cell_params does not change an existing traced graph."
++                )
++            cell_params["hard_reset"] = False
++        return cell_params
++
++    def _prepare_training_model(self):
++        self._resolve_cell_params(training=True)
++        if not self._model_built:
++            self.build(training=True)
++
++    def build(
++        self,
++        rebuild=False,
++        seq_len=None,
++        dtype=tf.float32,
++        use_dummy_state_input=False,
++        use_state_input=True,
++        n_output=2,
++        return_state=True,
++        batch_size=None,
++        training=None,
++        **kwargs,
++    ):
++        if training is None:
++            training = self.training_engine is not None
++        cell_params = self._resolve_cell_params(
++            training=training, check_built=not rebuild
++        )
+         if self._model_built and not rebuild:
+             io.log_debug('Model already built. Skipping.')
+             return
+@@ -389,7 +430,6 @@ def build(self, rebuild=False, seq_len=None, dtype=tf.float32, use_dummy_state_i
+         # what makes the loop-invariant connectivity-variable reads be hoisted out of the RNN
+         # while_loop instead of stacked per timestep (the cause of full-network OOM). Mirrors
+         # the reference V1_GLIF_model, which builds create_model() within strategy.scope().
+-        cell_params = {} if self.cell_params is None else dict(self.cell_params)
+         if issubclass(self.cell_cls, GLIF3Cell):
+             cell_params.setdefault('batch_size', _batch_size)
+         with self.strategy.scope():
+@@ -406,7 +446,20 @@ def build(self, rebuild=False, seq_len=None, dtype=tf.float32, use_dummy_state_i
+                 initial_state_holder = None
+                 rnn_initial_state = self.zero_state
+ 
+-            rnn = tf.keras.layers.RNN(self._cell, return_sequences=True, return_state=return_state, name='rsnn')
++            from .cell_models.state_rnn import ExplicitStateRNN
++
++            rnn_class = (
++                ExplicitStateRNN
++                if isinstance(self._cell, GLIF3Cell)
++                and self._cell.dynamics_mode == "nest"
++                else tf.keras.layers.RNN
++            )
++            rnn = rnn_class(
++                self._cell,
++                return_sequences=True,
++                return_state=return_state,
++                name="rsnn",
++            )
+             # Keep the cell's provided state dtypes instead of letting Keras autocast them to the
+             # compute dtype. Matches the reference (V1_GLIF_model create_model).
+             rnn._autocast = False
+@@ -568,7 +621,7 @@ def state_only_model(self):
+             else:
+                 full_inputs = rnn_inputs
+                 state_inputs = []
+-            state_rnn = tf.keras.layers.RNN(
++            state_rnn = type(self.rsnn_layer)(
+                 self.rsnn_layer.cell,
+                 return_sequences=False,
+                 return_state=True,
+@@ -653,7 +706,8 @@ def run_inference(self, spikes=None, initial_state=None, inference=None, **kwarg
+             seq_len=result_seq_len,
+             dt=self.dt,
+             batch_size=result_batch_size,
+-            extractor_results=out
++            extractor_results=out,
++            time_offset_steps=getattr(self.cell, "spike_time_offset_steps", 0),
+         )
+         return extractor_results
+ 
+@@ -666,13 +720,15 @@ def cleanup(self):
+                 close_fused_cuda()
+ 
+     def train(self, training_engine=None):
+-        if self.extractor_model is None:
+-            with self.strategy.scope():
+-                self.extractor_model = self._build_extractor_model()
+-
+         training_engine = training_engine or self.training_engine
+         if training_engine is None:
+             io.log_debug('No training condition has been set, skipping training.')
++            return
++        self._prepare_training_model()
++
++        if self.extractor_model is None:
++            with self.strategy.scope():
++                self.extractor_model = self._build_extractor_model()
+ 
+         ## Build the optimizer (in strategy scope so its slot variables are created correctly)
+         with self.strategy.scope():
+diff --git a/bmtk/simulator/dpointnet/state_modules/cached_states.py b/bmtk/simulator/dpointnet/state_modules/cached_states.py
+index 2087a8e0..a44d6e00 100644
+--- a/bmtk/simulator/dpointnet/state_modules/cached_states.py
++++ b/bmtk/simulator/dpointnet/state_modules/cached_states.py
+@@ -104,6 +104,23 @@ def get_state(self, rnn=None, **kwargs):
+         init_state = self._load_fn(selected_file, rnn)
+         expected_state = rnn.cell.zero_state(batch_size=rnn.batch_size, dtype=rnn.dtype)
+         if len(init_state) == len(expected_state) - 1:
++            if len(init_state) > 6 and tf.as_dtype(init_state[6].dtype).is_integer:
++                raise ValueError(
++                    "Cached state is missing external delay history, not the noise step"
++                )
+             batch_size = tf.shape(init_state[0])[0]
+-            init_state = tuple(init_state) + (tf.zeros((batch_size,), dtype=tf.int32),)
++            init_state = (
++                tuple(init_state[:6])
++                + (tf.zeros((batch_size,), dtype=tf.int32),)
++                + tuple(init_state[6:])
++            )
++        if len(init_state) != len(expected_state):
++            raise ValueError(
++                "Cached state does not match the selected dynamics state layout"
++            )
++        for actual, expected in zip(init_state, expected_state):
++            if tuple(actual.shape) != tuple(expected.shape):
++                raise ValueError(
++                    "Cached state shape does not match the selected dynamics"
++                )
+         return init_state
+diff --git a/bmtk/simulator/dpointnet/state_modules/input_state.py b/bmtk/simulator/dpointnet/state_modules/input_state.py
+index 0a5d28cd..dfc0f2c5 100644
+--- a/bmtk/simulator/dpointnet/state_modules/input_state.py
++++ b/bmtk/simulator/dpointnet/state_modules/input_state.py
+@@ -15,6 +15,10 @@ def _complete_noise_state(state_out, initial_state, sequence_length):
+             f"State-only rollout returned {len(state_out)} states; "
+             f"expected {len(initial_state)}."
+         )
++    if len(state_out) > 6 and tf.as_dtype(state_out[6].dtype).is_integer:
++        raise ValueError(
++            "Rollout is missing external delay history, not the noise step"
++        )
+     noise_step = initial_state[6] + tf.cast(sequence_length, tf.int32)
+     return state_out[:6] + (noise_step,) + state_out[6:]
+ 
+diff --git a/bmtk/simulator/dpointnet/training.py b/bmtk/simulator/dpointnet/training.py
+index 1351441b..37f8ee9d 100644
+--- a/bmtk/simulator/dpointnet/training.py
++++ b/bmtk/simulator/dpointnet/training.py
+@@ -302,6 +302,9 @@ def training_approach(self):
+ 
+     @property
+     def step_train_function(self):
++        prepare_training_model = getattr(self.rnn, "_prepare_training_model", None)
++        if prepare_training_model is not None:
++            prepare_training_model()
+         if self._training_fnc is None:
+             if not self.learning_rule.uses_bptt:
+                 if self.n_parameters != 1:
+@@ -530,6 +533,9 @@ def _run_extractor(self, x, init_state):
+         return self.rnn.run_extractor(x, init_state)
+ 
+     def prepare_gradient_checkpointing(self):
++        prepare_training_model = getattr(self.rnn, "_prepare_training_model", None)
++        if prepare_training_model is not None:
++            prepare_training_model()
+         cell = getattr(self.rnn, "cell", None)
+         use_direct_csr_gradient = getattr(
+             cell, "_use_direct_csr_recurrent_gradient", False
+@@ -971,6 +977,9 @@ def _next_spikes_with_retry(self, input_itr, max_retries=8):
+         raise last_err
+ 
+     def train(self):
++        prepare_training_model = getattr(self.rnn, "_prepare_training_model", None)
++        if prepare_training_model is not None:
++            prepare_training_model()
+         input_generators = []
+         input_batch_sizes = []
+         input_seq_lens = []
+diff --git a/docs/autodocs/source/dpointnet_guide.rst b/docs/autodocs/source/dpointnet_guide.rst
+index e3f7cd98..ac22f0dd 100644
+--- a/docs/autodocs/source/dpointnet_guide.rst
++++ b/docs/autodocs/source/dpointnet_guide.rst
+@@ -31,6 +31,128 @@ or without a gpu:
+ 
+     $ pip install tensorflow
+ 
++GLIF dynamics and explicit state
++-------------------------------
++
++``GLIF3Cell`` defaults to ``dynamics_mode="legacy"`` to preserve existing
++trajectories and checkpoints. Legacy remains the throughput-oriented starting
++point. NEST is currently an opt-in compatibility mode for NEST-aligned dynamics
++and validation, not a change to the default or a performance optimization.
++Set ``dynamics_mode="nest"`` explicitly to use NEST-compatible refractory timing,
++time-averaged adaptation current,
++spike-boundary adaptation reset, and exact alpha-current-to-voltage integration.
++In NEST mode, SONATA initial voltage, adaptation state and recurrent/external
++delays are honored. Times are converted through NEST's 0.001-ms ticks and then
++rounded upward to simulation steps; ``dt`` must be a positive multiple of 0.001
++ms and external delays must be at least one step. Reported spikes and voltage
++samples use end-of-step timestamps.
++
++For inference-only NEST execution, use these ``rnn_cell_params``:
++
++.. code-block:: json
++
++  {
++    "rnn_cell_params": {
++      "dynamics_mode": "nest",
++      "hard_reset": true,
++      "use_fused_cuda": "auto",
++      "use_fused_state": false
++    }
++  }
++
++For opt-in NEST training, set ``hard_reset=false`` or omit it. An RNN with configured training,
++or built with ``rnn.build(training=True)``, resolves omitted or ``null`` reset to
++soft reset before constructing the cell. Explicit ``hard_reset=true`` raises a
++``ValueError`` in DPointNet training, including legacy-mode training. This check
++also applies to direct ``TrainingEngine`` execution and checkpoint preparation.
++
++.. code-block:: json
++
++  {
++    "rnn_cell_params": {
++      "dynamics_mode": "nest",
++      "hard_reset": false,
++      "use_fused_cuda": true,
++      "use_fused_state": false
++    }
++  }
++
++Build the CUDA operators before running this training example. Soft reset retains
++the direct voltage-state gradient through spikes. Hard reset cuts that path at
++spikes and during refractory clamping; the spike surrogate still supplies some
++gradients but does not restore the lost path. This safeguard does not claim that
++hard-reset training is mathematically impossible or that soft reset solves all
++long-horizon credit-assignment problems.
++
++Inference-only construction and direct ``GLIF3Cell`` construction retain the
++mode-dependent default: hard reset in NEST and soft reset in legacy. Direct cell
++users writing their own ``GradientTape`` loops must select soft reset explicitly;
++an arbitrary external tape cannot be detected by the RNN training guard.
++
++A prebuilt hard-reset model is rejected for training even if its config dictionary
++is subsequently changed. Build a separate soft-reset training model and transfer
++weights explicitly instead of mutating a traced graph. Conversely, inference and
++validation on a trained model keep its soft reset. For hard-reset evaluation,
++create a separate inference-only model with the learned weights and report the
++reset setting. Switching reset modes changes forward dynamics, not merely
++gradients; evaluate that mismatch before drawing scientific conclusions.
++
++NEST mode uses ``ExplicitStateRNN`` to preserve scalar integer noise counters and
++external delay history in symbolic Keras models and across chunks. Supply complete
++initial state from ``cell.zero_state``; cached state without required delay history
++is rejected. The wrapper supports explicit state, not Keras ``stateful=true``.
++Keras 2 symbolic calls pack the sequence and initial states into one input list;
++the wrapper unpacks them and uses the backend recurrent loop. Keras 3 retains its
++native ``inner_loop``. Both paths preserve integer counters and floating state.
++
++The legacy fused state operator cannot implement these updates: NEST mode rejects
++``use_fused_state=true`` and keeps ``"auto"`` on TensorFlow state updates. Fused
++current projection is independent and remains available. Exact integration of a
++fitted alpha basis does not make that basis identical to the source synapse model;
++validate synaptic approximation, precision and network-level behavior separately.
++
++Performance qualification
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++A 2026-09-16 RTX 3090 benchmark measured median training updates of 4.38 s for
++legacy fused state, 5.93 s for legacy TensorFlow state, and 8.66 s for NEST
++TensorFlow state. All retained fused CUDA currents. The workload used 66,658
++neurons, FP16 compute, effective batch 32 (parallel 16+16), 500 timesteps, nine
++paper losses, soft reset, exact chunk-25 BPTT, and compact online voltage loss.
++Each run excluded three warmups and timed 20 synchronized updates with matched
++inputs, source, and ``TF_GPU_ALLOCATOR=cuda_malloc_async`` under TensorFlow 2.21.
++
++NEST took about twice the legacy fused-state time; disabling fused state alone
++increased legacy time by 35%. The remaining difference also includes changed
++activity and state/output handling. Default BFC allocation failed in NEST
++backward on this 24 GiB GPU; the async allocator completed without reducing batch
++size or changing losses. This is a workload-specific feasibility result, not a
++universal allocator recommendation. These short soft-reset updates do not
++establish convergence, hard-reset inference speed, or full-network NEST parity.
++Choose dynamics for the scientific protocol and do not silently switch modes.
++
++CUDA and fallback regression agreement
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++``tests/simulator/dpointnet/test_nest_dynamics.py`` compares fixed-input CPU,
++GPU TensorFlow fallback and fused CUDA rollouts, including both reset modes,
++float32/mixed float16, 1/0.25-ms steps, low/strong drive, gradients and chunk state.
++A separate check compares seeded internal Poisson histories exactly. The bounded
++fixture requires equal per-neuron spike counts, spike-time differences of at most
++one step, and exact noise counters/external delay histories. When spike times are
++identical, continuous states and gradients must satisfy rtol/atol 1e-5 (float32)
++or 2e-2 (float16). If jitter occurs, unshifted numerical errors are reported in
++JUnit properties but pointwise continuous-state/gradient parity is not asserted.
++Existing individual kernel tolerances remain unchanged.
++
++This is not bitwise equality: the tested lower-drive float16/0.25-ms cases can
++shift a spike by one step, producing a large instantaneous voltage difference
++at reset. All tested 1-ms cases matched spike times, but that is not a full-network
++or cross-architecture guarantee. Run with ``--junitxml=REPORT.xml`` to retain
++per-case timing, spike jitter, state errors, gradient errors and whether continuous
++parity was checked. Setting ``CUDA_VISIBLE_DEVICES=''`` tests CPU-only support;
++CUDA-specific comparisons then skip rather than falsely reporting a CUDA pass.
++
+ Optional fused CUDA operator
+ ----------------------------
+ 
+@@ -145,6 +267,7 @@ use the JSON boolean ``true`` explicitly, together with ``use_active_row_forward
+       "dtype": "float16"
+     },
+     "rnn_cell_params": {
++      "dynamics_mode": "legacy",
+       "use_fused_cuda": true,
+       "use_fused_state": true,
+       "use_active_row_forward": true,
+@@ -384,6 +507,9 @@ the `GLIF point-neuron models <https://brain-map.org/our-research/computational-
+                 * - pseudo_gauss
+                   - 
+                   - False
++                * - dynamics_mode
++                  - Select ``"legacy"`` for the historical DPointNet update equations or ``"nest"`` for NEST-compatible timing, integration, delays, state, and timestamps.
++                  - "legacy"
+                 * - train_recurrent
+                   - 
+                   - True
+@@ -394,8 +520,8 @@ the `GLIF point-neuron models <https://brain-map.org/our-research/computational-
+                   - 
+                   - 0
+                 * - hard_reset
+-                  - 
+-                  - False
++                  - Reset voltage to ``V_reset`` after a spike when true; use subtractive soft reset when false. Training resolves omitted or null to ``False`` and rejects explicit ``True``. Inference-only and direct-cell defaults are ``False`` in legacy and ``True`` in NEST; existing models retain their built reset setting.
++                  - False for training; otherwise mode-dependent
+                 * - tau_basis
+                   - 
+                   - <None>
+diff --git a/tests/simulator/dpointnet/test_nest_dynamics.py b/tests/simulator/dpointnet/test_nest_dynamics.py
+new file mode 100644
+index 00000000..12a78ffe
+--- /dev/null
++++ b/tests/simulator/dpointnet/test_nest_dynamics.py
+@@ -0,0 +1,609 @@
++import copy
++import gc
++import time
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++from scipy.linalg import expm
++
++tf = pytest.importorskip("tensorflow")
++from bmtk.simulator.dpointnet.cell_models.nest_dynamics import (
++    integration_coefficients,
++    active_update,
++    spike_reset,
++    time_steps,
++)
++
++
++def make_network_inputs(delay=1.0, internal_noise=False):
++    nodes = {
++        "C_m": np.array([100.0]),
++        "g": np.array([10.0]),
++        "E_L": np.array([-70.0]),
++        "V_m": np.array([-70.0]),
++        "V_th": np.array([-50.0]),
++        "V_reset": np.array([-70.0]),
++        "t_ref": np.array([2.0]),
++        "k": np.array([[0.01, 0.1]]),
++        "asc_amps": np.array([[0.0, 0.0]]),
++    }
++    network = {
++        "n_nodes": 1,
++        "node_type_ids": np.array([0]),
++        "node_params": nodes,
++        "synapses": {
++            "indices": np.array([[0, 0]], dtype=np.uint32),
++            "weights": np.array([0.0]),
++            "delays": np.array([2.0]),
++            "dense_shape": (1, 1),
++            "syn_ids": np.array([0]),
++            "dynamics_params": {"basis_weights": [[1.0]]},
++        },
++    }
++    inputs = {
++        "drive": {
++            "n_inputs": 1,
++            "indices": np.array([[0, 0]]),
++            "weights": np.array([10.0]),
++            "delays": np.array([delay]),
++            "syn_ids": np.array([0]),
++            "input_type": "spikes",
++            "options": {"trainable": True},
++        }
++    }
++    if internal_noise:
++        inputs["drive"]["input_type"] = "poisson_spikes_internal"
++        inputs["drive"]["options"]["firing_rate"] = 250.0
++    return network, inputs
++
++
++def make_cell(
++    dt=1.0,
++    delay=1.0,
++    hard_reset=True,
++    mode="nest",
++    internal_noise=False,
++    use_fused_cuda=False,
++):
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import GLIF3Cell
++
++    network, inputs = make_network_inputs(delay, internal_noise)
++    cell_options = {}
++    if mode is not None:
++        cell_options["dynamics_mode"] = mode
++    return GLIF3Cell(
++        network,
++        inputs,
++        dt=dt,
++        tau_basis=[2.0],
++        hard_reset=hard_reset,
++        train_recurrent_per_type=False,
++        use_fused_cuda=use_fused_cuda,
++        **cell_options,
++    )
++
++
++@pytest.mark.parametrize(
++    "build_mode", ["configured_training", "explicit_training", "inference"]
++)
++@pytest.mark.parametrize("mode", ["nest", "legacy"])
++def test_rnn_build_resolves_reset_for_training_and_inference(build_mode, mode):
++    from bmtk.simulator.dpointnet.rnn_model import RNN
++
++    network, inputs = make_network_inputs()
++    rnn = RNN(
++        seq_len=4,
++        batch_size=1,
++        cell_params={"dynamics_mode": mode, "tau_basis": [2.0]},
++    )
++    rnn._recurrent_networks["test"] = SimpleNamespace(
++        to_dict=lambda: copy.deepcopy(network)
++    )
++    rnn._input_networks["drive"] = SimpleNamespace(
++        name="drive", n_spiking_nodes=1, to_dict=lambda: copy.deepcopy(inputs["drive"])
++    )
++    if build_mode == "configured_training":
++        engine = rnn.set_training(rnn=rnn, n_epochs=1, steps_per_epoch=1)
++        engine.add_parameters("test", batch_size=1, seq_len=4)
++    try:
++        if build_mode == "explicit_training":
++            rnn.build(training=True)
++        else:
++            rnn.build()
++        expected_hard_reset = mode == "nest" and build_mode == "inference"
++        assert rnn.cell._hard_reset is expected_hard_reset
++        assert "hard_reset" not in rnn.cell_params
++        if expected_hard_reset:
++            with pytest.raises(ValueError, match="already built with hard reset"):
++                rnn._prepare_training_model()
++        else:
++            rnn._prepare_training_model()
++            assert rnn.cell._hard_reset is False
++    finally:
++        rnn.cleanup()
++
++
++def test_default_dynamics_mode_preserves_legacy_behavior():
++    cell = make_cell(mode=None, hard_reset=None)
++
++    assert cell.dynamics_mode == "legacy"
++    assert cell._hard_reset is False
++    assert len(cell.zero_state(1, tf.float32)) == 7
++
++
++def test_full_cell_delays_and_input_gradient():
++    immediate = make_cell(delay=1.0)
++    delayed = make_cell(delay=3.0)
++
++    def run(cell):
++        state = cell.zero_state(1, tf.float32)
++        voltages = []
++        for step in range(8):
++            output, state = cell(tf.constant([[1.0 if step == 0 else 0.0]]), state)
++            voltages.append(output[0, 1])
++        return tf.stack(voltages), state
++
++    with tf.GradientTape() as tape:
++        values, state = run(delayed)
++        loss = tf.reduce_sum(values)
++    gradient = tape.gradient(loss, delayed.inputs["drive"]["input_weight_values"])
++    baseline, _ = run(immediate)
++    np.testing.assert_allclose(values[2:], baseline[:-2], atol=1e-8)
++    assert len(state) == 8 and state[6].numpy()[0] == 8
++    assert np.isfinite(gradient.numpy()).all() and np.any(gradient.numpy() != 0)
++
++
++def test_submillisecond_recurrent_delay_buffer_has_step_units():
++    cell = make_cell(dt=0.25, delay=0.5)
++    assert cell.max_delay == 8
++    assert tuple(cell.recurrent_dense_shape) == (1, 8)
++    assert cell.recurrent_indices.numpy()[0, 1] == 7
++
++
++def test_refractory_quantization_uses_nest_ticks_then_ceiling():
++    np.testing.assert_array_equal(
++        time_steps([1.65, 3.25, 3.2500000000000004], 1.0), [2, 4, 4]
++    )
++    np.testing.assert_array_equal(
++        time_steps([1.65, 3.25, 3.2500000000000004], 0.25), [7, 13, 13]
++    )
++
++
++def test_cell_rnn_chunk_continuation_and_soft_reset_training():
++    from bmtk.simulator.dpointnet.cell_models.state_rnn import ExplicitStateRNN
++
++    cell = make_cell(delay=3.0, hard_reset=False)
++    layer = ExplicitStateRNN(cell, return_sequences=True, return_state=True)
++    layer._autocast = False
++    values = tf.constant([[[2.0], [0.0], [1.0], [0.0], [0.0], [3.0], [0.0], [0.0]]])
++    initial = cell.zero_state(1, tf.float32)
++    with tf.GradientTape() as tape:
++        full = layer(values, initial_state=initial)
++        loss = tf.reduce_sum(full[0][..., 1])
++    gradient = tape.gradient(loss, cell.inputs["drive"]["input_weight_values"])
++    assert (
++        gradient is not None and np.isfinite(gradient).all() and np.any(gradient != 0)
++    )
++    first = layer(values[:, :4], initial_state=initial)
++    second = layer(values[:, 4:], initial_state=first[1:])
++    np.testing.assert_allclose(
++        full[0], tf.concat([first[0], second[0]], axis=1), atol=1e-7
++    )
++    for expected, actual in zip(full[1:], second[1:]):
++        np.testing.assert_allclose(expected, actual, atol=1e-7)
++
++
++@pytest.mark.parametrize("return_sequences", [False, True])
++@pytest.mark.parametrize("return_state", [False, True])
++@pytest.mark.parametrize("unroll,explicit_state", [(False, True), (True, False)])
++def test_explicit_rnn_matches_direct_cell_values_and_gradients(
++    return_sequences, return_state, unroll, explicit_state
++):
++    from bmtk.simulator.dpointnet.cell_models.state_rnn import ExplicitStateRNN
++
++    cell = make_cell(delay=3.0, hard_reset=False)
++    layer = ExplicitStateRNN(
++        cell,
++        return_sequences=return_sequences,
++        return_state=return_state,
++        unroll=unroll,
++    )
++    layer._autocast = False
++    values = tf.constant([[[2.0], [0.0], [1.0], [0.0], [0.0], [3.0], [0.0], [0.0]]])
++    initial = cell.zero_state(1, tf.float32)
++    variables = [
++        values,
++        cell.recurrent_weight_values,
++        cell.inputs["drive"]["input_weight_values"],
++    ]
++    with tf.GradientTape() as tape:
++        tape.watch(values)
++        actual = layer(values, initial_state=initial if explicit_state else None)
++        actual_output = actual[0] if return_state else actual
++        loss = tf.reduce_sum(actual_output[..., 1])
++    actual_gradients = tape.gradient(loss, variables)
++
++    with tf.GradientTape() as tape:
++        tape.watch(values)
++        reference_state = initial
++        reference_outputs = []
++        for inputs in tf.unstack(values, axis=1):
++            output, reference_state = cell(inputs, reference_state)
++            reference_outputs.append(output)
++        reference_output = (
++            tf.stack(reference_outputs, axis=1)
++            if return_sequences
++            else reference_outputs[-1]
++        )
++        reference_loss = tf.reduce_sum(reference_output[..., 1])
++    reference_gradients = tape.gradient(reference_loss, variables)
++
++    np.testing.assert_allclose(actual_output, reference_output, rtol=1e-5, atol=1e-7)
++    if return_state:
++        for actual_state, expected_state in zip(actual[1:], reference_state):
++            assert actual_state.dtype == expected_state.dtype
++            np.testing.assert_allclose(
++                actual_state, expected_state, rtol=1e-5, atol=1e-7
++            )
++    assert actual_gradients[0] is None and reference_gradients[0] is None
++    for actual_gradient, expected_gradient in zip(
++        actual_gradients[1:], reference_gradients[1:]
++    ):
++        assert actual_gradient is not None and expected_gradient is not None
++        np.testing.assert_allclose(
++            actual_gradient, expected_gradient, rtol=1e-5, atol=1e-7
++        )
++    assert np.any(actual_gradients[-1].numpy() != 0)
++
++
++def test_fused_legacy_state_cannot_be_selected_for_nest_mode():
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import GLIF3Cell
++
++    with pytest.raises(ValueError, match="legacy fused state"):
++        GLIF3Cell({}, {}, dynamics_mode="nest", use_fused_state=True)
++
++
++@pytest.mark.parametrize("dt", [1.0, 0.25])
++@pytest.mark.parametrize("policy", ["float32", "mixed_float16"])
++@pytest.mark.parametrize("hard_reset,batch_size", [(True, 1), (False, 5)])
++@pytest.mark.parametrize("drive_scale", [0.05, 1.0])
++def test_nest_cuda_matches_cpu_and_gpu_fallback(
++    dt, policy, hard_reset, batch_size, drive_scale, record_property
++):
++    from bmtk.simulator.dpointnet.cell_models.glif3_cell import GLIF3Cell
++    from bmtk.simulator.dpointnet.cell_models.state_rnn import ExplicitStateRNN
++    from bmtk.simulator.dpointnet.custom_ops import fused_cuda_available
++
++    if not fused_cuda_available():
++        pytest.skip("Fused CUDA operators unavailable")
++    network = {
++        "n_nodes": 3,
++        "node_type_ids": np.array([0, 1, 0]),
++        "node_params": {
++            "C_m": np.array([100.0, 80.0]),
++            "g": np.array([10.0, 8.0]),
++            "E_L": np.array([-70.0, -65.0]),
++            "V_m": np.array([-69.0, -64.0]),
++            "V_th": np.array([-50.0, -45.0]),
++            "V_reset": np.array([-68.0, -64.0]),
++            "t_ref": np.array([2.0, 1.65]),
++            "k": np.array([[0.01, 0.1], [0.02, 0.15]]),
++            "asc_amps": np.array([[-10.0, -50.0], [-20.0, -40.0]]),
++            "asc_init": np.array([[-1.0, -2.0], [-2.0, -1.0]]),
++        },
++        "synapses": {
++            "indices": np.array([[0, 0], [0, 1], [1, 0], [2, 1], [2, 2]]),
++            "weights": np.array([80.0, -100.0, 40.0, -60.0, 50.0]),
++            "delays": np.array([1.0, 2.0, 3.0, 1.0, 2.0]),
++            "dense_shape": (3, 3),
++            "syn_ids": np.array([0, 1, 0, 1, 0]),
++            "dynamics_params": {
++                "basis_weights": [[1.0, 0.3, 0.1, 0.05], [0.1, 1.0, 0.2, 0.1]]
++            },
++        },
++    }
++    inputs = {
++        "drive": {
++            "n_inputs": 4,
++            "indices": np.array(
++                [[0, 0], [0, 1], [1, 1], [2, 0], [2, 2]], dtype=np.uint32
++            ),
++            "weights": np.array([1200.0, 800.0, 1000.0, 900.0, 700.0]),
++            "delays": np.array([1.0, 3.0, 2.0, 1.0, 3.0]),
++            "syn_ids": np.array([0, 1, 0, 1, 0]),
++            "input_type": "spikes",
++            "options": {"trainable": True},
++        }
++    }
++    steps = int(40 / dt)
++    inputs["drive"]["weights"] *= drive_scale
++    values = np.zeros((batch_size, steps, 4), np.float32)
++    values[:, (np.array([0.0, 5.0, 13.0, 25.0]) / dt).astype(int), :3] = [1.0, 2.0, 1.0]
++    values *= np.arange(1, batch_size + 1, dtype=np.float32)[:, None, None]
++    old_policy = tf.keras.mixed_precision.global_policy()
++    results = {}
++    tolerance = 2e-2 if policy == "mixed_float16" else 1e-5
++    try:
++        tf.keras.mixed_precision.set_global_policy(policy)
++        for label, device, fused in (
++            ("cpu", "/CPU:0", False),
++            ("gpu_fallback", "/GPU:0", False),
++            ("cuda", "/GPU:0", True),
++        ):
++            started = time.perf_counter()
++            with tf.device(device):
++                cell = GLIF3Cell(
++                    copy.deepcopy(network),
++                    copy.deepcopy(inputs),
++                    dt=dt,
++                    tau_basis=[2.0, 6.0, 10.0, 20.0],
++                    dynamics_mode="nest",
++                    hard_reset=hard_reset,
++                    use_fused_cuda=fused,
++                    use_fused_state=False,
++                    train_recurrent_per_type=False,
++                    batch_size=batch_size,
++                )
++                assert cell._use_fused_cuda is fused
++                layer = ExplicitStateRNN(cell, return_sequences=True, return_state=True)
++                layer._autocast = False
++                sequence = tf.constant(values, dtype=cell.compute_dtype)
++                initial = list(cell.zero_state(batch_size, cell.compute_dtype))
++                initial[6] = tf.fill((batch_size,), 4095)
++
++                @tf.function(
++                    input_signature=[
++                        tf.TensorSpec((batch_size, None, 4), sequence.dtype),
++                        [tf.TensorSpec(value.shape, value.dtype) for value in initial],
++                    ]
++                )
++                def rollout(sequence, initial):
++                    return layer(sequence, initial_state=initial)
++
++                with tf.GradientTape() as tape:
++                    full = rollout(sequence, initial)
++                    loss = tf.reduce_mean(tf.cast(full[0][..., 3:], tf.float32))
++                gradients = tape.gradient(
++                    loss,
++                    (
++                        cell.recurrent_weight_values,
++                        cell.inputs["drive"]["input_weight_values"],
++                    ),
++                )
++                split = int(7 / dt)
++                first = rollout(sequence[:, :split], initial)
++                second = rollout(sequence[:, split:], list(first[1:]))
++                np.testing.assert_allclose(
++                    full[0],
++                    tf.concat([first[0], second[0]], axis=1),
++                    rtol=tolerance,
++                    atol=tolerance,
++                )
++                for expected, actual in zip(full[1:], second[1:]):
++                    np.testing.assert_allclose(
++                        actual, expected, rtol=tolerance, atol=tolerance
++                    )
++                for gradient in gradients:
++                    assert gradient is not None
++                    assert np.isfinite(gradient).all() and np.any(gradient != 0)
++                results[label] = (
++                    [value.numpy() for value in full],
++                    [value.numpy() for value in gradients],
++                )
++                spike_count = np.count_nonzero(full[0][..., :3])
++                record_property(f"{label}_spikes", int(spike_count))
++                if drive_scale == 1.0:
++                    assert spike_count > 0
++                np.testing.assert_array_equal(
++                    full[7], np.full(batch_size, 4095 + steps)
++                )
++            record_property(f"{label}_seconds", time.perf_counter() - started)
++            cell.close_fused_cuda()
++            del rollout, layer, cell
++            gc.collect()
++        expected_outputs, expected_gradients = results["cpu"]
++        for label in ("gpu_fallback", "cuda"):
++            outputs, gradients = results[label]
++            voltage_delta = np.abs(
++                outputs[0][..., 3:].astype(np.float64) - expected_outputs[0][..., 3:]
++            )
++            record_property(
++                f"{label}_voltage_max_abs_mv", float(np.max(voltage_delta) * 20)
++            )
++            record_property(
++                f"{label}_voltage_max_scaled_error",
++                float(
++                    np.max(
++                        voltage_delta
++                        / np.maximum(1, np.abs(expected_outputs[0][..., 3:]))
++                    )
++                ),
++            )
++            spike_differences = []
++            for sample in range(batch_size):
++                for neuron in range(3):
++                    actual_steps = np.flatnonzero(outputs[0][sample, :, neuron])
++                    expected_steps = np.flatnonzero(
++                        expected_outputs[0][sample, :, neuron]
++                    )
++                    np.testing.assert_equal(actual_steps.size, expected_steps.size)
++                    spike_differences.extend(np.abs(actual_steps - expected_steps))
++            max_spike_error = max(spike_differences, default=0)
++            assert max_spike_error <= 1
++            spikes_match = max_spike_error == 0
++            record_property(f"{label}_spike_times_exact", bool(spikes_match))
++            record_property(
++                f"{label}_max_spike_time_error_ms", float(max_spike_error * dt)
++            )
++            record_property(
++                f"{label}_jittered_spikes", int(np.count_nonzero(spike_differences))
++            )
++            record_property(f"{label}_continuous_parity_checked", bool(spikes_match))
++            for index, (actual, expected) in enumerate(zip(outputs, expected_outputs)):
++                record_property(
++                    f"{label}_state_{index}_max_abs",
++                    float(np.max(np.abs(actual.astype(np.float64) - expected))),
++                )
++                if index in (7, 8) or (spikes_match and index in (1, 3)):
++                    np.testing.assert_array_equal(actual, expected)
++                elif spikes_match:
++                    np.testing.assert_allclose(
++                        actual, expected, rtol=tolerance, atol=tolerance
++                    )
++            for index, (actual, expected) in enumerate(
++                zip(gradients, expected_gradients)
++            ):
++                record_property(
++                    f"{label}_gradient_{index}_max_abs",
++                    float(np.max(np.abs(actual - expected))),
++                )
++                if spikes_match:
++                    np.testing.assert_allclose(
++                        actual, expected, rtol=tolerance, atol=tolerance
++                    )
++    finally:
++        tf.keras.mixed_precision.set_global_policy(old_policy)
++
++
++def test_nest_internal_noise_matches_cuda_and_cpu():
++    from bmtk.simulator.dpointnet.custom_ops import fused_cuda_available
++
++    if not fused_cuda_available():
++        pytest.skip("Fused CUDA operators unavailable")
++    results = []
++    for device, fused in (("/CPU:0", False), ("/GPU:0", True)):
++        with tf.device(device):
++            cell = make_cell(delay=3.0, internal_noise=True, use_fused_cuda=fused)
++            state = list(cell.zero_state(5, tf.float32))
++            state[6] = tf.fill((5,), 4095)
++            outputs = []
++            histories = []
++            for step in range(16):
++                output, state = cell(tf.zeros((5, 0)), state)
++                outputs.append(output.numpy())
++                histories.append(state[-1].numpy())
++            results.append((np.array(outputs), np.array(histories), state))
++            cell.close_fused_cuda()
++    expected, actual = results
++    assert np.count_nonzero(expected[1]) > 0
++    np.testing.assert_array_equal(actual[1], expected[1])
++    np.testing.assert_array_equal(actual[2][6], expected[2][6])
++    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-5, atol=1e-5)
++    for expected_state, actual_state in zip(expected[2], actual[2]):
++        np.testing.assert_allclose(actual_state, expected_state, rtol=1e-5, atol=1e-5)
++
++
++def test_internal_noise_uses_original_population_size_and_delayed_history():
++    cell = make_cell(delay=3.0, internal_noise=True)
++    initial = cell.zero_state(2, tf.float32)
++    expected = cell.sample_noise_spikes(2, initial[6], cell.inputs["drive"])
++    assert expected.shape == (2, 1)
++    _, state = cell(tf.zeros((2, 0)), initial)
++    np.testing.assert_array_equal(state[7][:, :1], expected)
++    np.testing.assert_array_equal(state[7][:, 1:], [[0.0], [0.0]])
++    np.testing.assert_array_equal(state[6], [1, 1])
++
++
++def test_cached_legacy_state_cannot_silently_drop_input_history(tmp_path):
++    from types import SimpleNamespace
++    from bmtk.simulator.dpointnet.state_modules.cached_states import CachedInitState
++
++    cell = make_cell(delay=3.0)
++    complete, names = cell.zero_state(1, tf.float32, with_names=True)
++    filename = tmp_path / "state.npz"
++    np.savez(filename, **dict(zip(names, [value.numpy() for value in complete])))
++    rnn = SimpleNamespace(cell=cell, batch_size=1, dtype=tf.float32)
++    cached = CachedInitState(str(filename), file_type="npz", rnn=rnn)
++    state = cached.get_state()
++    assert len(state) == 8
++    cached._load_fn = lambda *_: complete[:7]
++    with pytest.raises(ValueError, match="missing external delay history"):
++        cached.get_state()
++
++
++@pytest.mark.parametrize("return_sequences", [True, False])
++def test_symbolic_rnn_preserves_scalar_noise_and_following_history(return_sequences):
++    from bmtk.simulator.dpointnet.cell_models.state_rnn import ExplicitStateRNN
++
++    cell = make_cell(delay=3.0)
++    initial, names = cell.zero_state(1, tf.float32, with_names=True)
++    values = tf.keras.Input(shape=(None, 1))
++    state_inputs = [
++        tf.keras.Input(shape=state.shape[1:], dtype=state.dtype, name=name)
++        for state, name in zip(initial, names)
++    ]
++    layer = ExplicitStateRNN(cell, return_sequences=return_sequences, return_state=True)
++    layer._autocast = False
++    outputs = layer(values, initial_state=state_inputs)
++    model = tf.keras.Model([values, *state_inputs], outputs)
++    assert len(model.outputs) == 9
++    first = model([tf.ones((1, 4, 1)), *initial])
++    assert first[7].dtype == tf.int32 and first[8].shape == (1, 2)
++    np.testing.assert_array_equal(first[7], [4])
++    np.testing.assert_array_equal(first[8], [[1.0, 1.0]])
++    late_initial = list(initial)
++    late_initial[6] = tf.constant([4095], tf.int32)
++    late = model([tf.ones((1, 4, 1)), *late_initial])
++    np.testing.assert_array_equal(late[7], [4099])
++    second = model([tf.zeros((1, 4, 1)), *first[1:]])
++    full = model(
++        [tf.concat([tf.ones((1, 4, 1)), tf.zeros((1, 4, 1))], axis=1), *initial]
++    )
++    for expected, actual in zip(full[1:], second[1:]):
++        np.testing.assert_allclose(expected, actual, atol=1e-7)
++
++
++@pytest.mark.parametrize("dt", [1.0, 0.25])
++@pytest.mark.parametrize("tau", [2.0, 10.0, 10.000001, 30.0])
++def test_exact_synaptic_integral_matches_matrix_exponential(dt, tau):
++    decay, current_factor, current, rise = integration_coefficients(
++        dt, [100.0], [10.0], [tau]
++    )
++    generator = np.array([[-0.1, 0.01, 0], [0, -1 / tau, 1], [0, 0, -1 / tau]])
++    expected = expm(dt * generator)
++    np.testing.assert_allclose(
++        [decay[0], current[0, 0], rise[0, 0]], expected[0], rtol=1e-12, atol=1e-15
++    )
++    np.testing.assert_allclose(current_factor, [(1 - np.exp(-dt / 10)) / 10])
++
++
++def test_nest_refractory_holds_adaptation_and_blocks_last_refractory_step():
++    voltage = tf.constant([[0.7]])
++    adaptation = tf.constant([[[-0.1, -0.2]]])
++    result = active_update(
++        voltage,
++        tf.constant([[1]]),
++        adaptation,
++        tf.zeros((1, 1, 1)),
++        tf.zeros((1, 1, 1)),
++        decay=0.9,
++        current_factor=0.1,
++        asc_decay=0.8,
++        asc_mean=0.9,
++        psc_voltage=1.0,
++        rise_voltage=1.0,
++        reset_voltage=0.0,
++        hard_reset=True,
++    )
++    assert result[0].numpy()[0, 0] == 0
++    assert result[1].numpy()[0, 0] == 0
++    assert not result[3].numpy()[0, 0]
++    np.testing.assert_array_equal(result[2], adaptation)
++
++
++def test_reset_applies_refractory_decay_only_to_old_adaptation():
++    voltage, remaining, adaptation = spike_reset(
++        tf.constant([[1.2]]),
++        tf.constant([[0]]),
++        tf.constant([[[-2.0, -4.0]]]),
++        tf.constant([[1.0]]),
++        reset_voltage=0.0,
++        refractory_steps=3,
++        asc_amplitudes=tf.constant([-1.0, -2.0]),
++        asc_refractory_decay=0.5,
++        hard_reset=True,
++    )
++    np.testing.assert_allclose(adaptation, [[[-2.0, -4.0]]])
++    assert voltage.numpy()[0, 0] == 0
++    assert remaining.numpy()[0, 0] == 3
+diff --git a/tests/simulator/dpointnet/test_training.py b/tests/simulator/dpointnet/test_training.py
+index 22db1f28..58b36d26 100644
+--- a/tests/simulator/dpointnet/test_training.py
++++ b/tests/simulator/dpointnet/test_training.py
+@@ -37,6 +37,96 @@
+ from bmtk.simulator.dpointnet.state_modules.input_state import _complete_noise_state
+ 
+ 
++@pytest.mark.parametrize("mode", ["nest", "legacy"])
++@pytest.mark.parametrize(
++    "reset_options", [{}, {"hard_reset": None}, {"hard_reset": False}]
++)
++def test_training_resolves_soft_reset_without_changing_inference_params(
++    mode, reset_options
++):
++    rnn = RNN(cell_params={"dynamics_mode": mode, **reset_options})
++    original = dict(rnn.cell_params)
++
++    assert rnn._resolve_cell_params(training=True)["hard_reset"] is False
++    assert rnn._resolve_cell_params(training=False) == original
++    assert rnn.cell_params == original
++
++
++@pytest.mark.parametrize("mode", ["nest", "legacy"])
++def test_training_build_rejects_explicit_hard_reset_before_loading_network(mode):
++    rnn = RNN(cell_params={"dynamics_mode": mode, "hard_reset": True})
++    rnn.set_training(rnn=rnn, n_epochs=1, steps_per_epoch=1)
++
++    with pytest.raises(ValueError, match="GLIF training requires hard_reset=False"):
++        rnn.build()
++    assert rnn._model_built is False
++    assert rnn._resolve_cell_params(training=False)["hard_reset"] is True
++
++
++def test_training_rejects_prebuilt_hard_reset_even_when_option_is_changed():
++    rnn = RNN(cell_params={"dynamics_mode": "nest", "hard_reset": False})
++    rnn._model_built = True
++    rnn._cell = SimpleNamespace(_hard_reset=True)
++
++    with pytest.raises(ValueError, match="already built with hard reset"):
++        rnn.build(training=True)
++    assert rnn._cell._hard_reset is True
++
++
++def test_training_reset_resolution_leaves_other_cell_classes_unchanged():
++    rnn = RNN(cell_cls=tf.keras.layers.SimpleRNNCell, cell_params={"hard_reset": True})
++
++    assert rnn._resolve_cell_params(training=True) == {"hard_reset": True}
++
++
++@pytest.mark.parametrize("entry_point", ["rnn", "engine", "step", "checkpointing"])
++@pytest.mark.parametrize("prebuilt", [False, True])
++def test_training_entry_points_reject_hard_reset(entry_point, prebuilt):
++    rnn = RNN(cell_params={"dynamics_mode": "nest"})
++    if prebuilt:
++        rnn._model_built = True
++        rnn._cell = SimpleNamespace(_hard_reset=True)
++    else:
++        rnn.cell_params["hard_reset"] = True
++    engine = training.TrainingEngine(rnn, n_epochs=1, steps_per_epoch=1)
++    engine._training_fnc = lambda: None
++
++    with pytest.raises(ValueError, match="hard.reset"):
++        if entry_point == "rnn":
++            rnn.train(engine)
++        elif entry_point == "engine":
++            engine.train()
++        elif entry_point == "checkpointing":
++            engine.prepare_gradient_checkpointing()
++        else:
++            engine.step_train_function
++
++
++def test_training_prepares_unbuilt_model_without_mutating_config(monkeypatch):
++    rnn = RNN(cell_params={"dynamics_mode": "nest"})
++    build_calls = []
++
++    def build(**kwargs):
++        build_calls.append(kwargs)
++        rnn._cell = SimpleNamespace(_hard_reset=False)
++        rnn._model_built = True
++
++    monkeypatch.setattr(rnn, "build", build)
++    rnn._prepare_training_model()
++    rnn._prepare_training_model()
++
++    assert build_calls == [{"training": True}]
++    assert rnn.cell_params == {"dynamics_mode": "nest"}
++
++
++def test_train_without_engine_does_not_build_inference_model():
++    rnn = RNN(cell_params={"dynamics_mode": "nest"})
++
++    rnn.train()
++
++    assert rnn._model_built is False
++
++
+ def test_dpointnet_import_preserves_default_tensorflow_allocator():
+     environment = os.environ.copy()
+     environment.pop("TF_GPU_ALLOCATOR", None)
+@@ -762,7 +852,9 @@ def set_optimizer(self, optimizer):
+         def train(self):
+             self.trained = True
+ 
+-    rnn = object.__new__(RNN)
++    rnn = RNN()
++    rnn._model_built = True
++    rnn._cell = SimpleNamespace(_hard_reset=False)
+     rnn.extractor_model = object()
+     rnn.strategy = tf.distribute.get_strategy()
+     rnn.dtype = tf.float16

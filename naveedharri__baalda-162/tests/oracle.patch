@@ -1,0 +1,2424 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 78f72d00..2b0bace7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+ ## [Unreleased]
+ 
+ ### Added
++- **Attachment transport (desktop).** `AttachmentSync.pass` uses the server's
++  `intent → PUT → complete` flow when offered (404 ⇒ legacy POST, remembered per server
++  URL): a dedupe hit sends zero bytes, 402 aborts the pass with one toast, 413/415 skip
++  the file permanently, `upload_incomplete` retries the PUT, multipart parts carry ETags.
++  Bytes move through Rust (`attachments.rs upload_file`/`download_file`, `reqwest` with
++  `redirect::Policy::none()`, no bearer on presigned URLs, hash-as-you-write into a
++  `.tmp` then rename). `list_attachments` caches `(size, mtime, sha256)` in
++  `attachment_hashes` inside `.context/index.sqlite` and hashes misses with the streamed
++  `sha256_file`, so a vault of videos is no longer re-read on every reconcile.
+ - **Search over files.** `index.rs` gains a tier-2 `files`/`files_fts`/`file_text`
+   schema for every surfaced non-note file; `extract.rs` pulls text from txt/csv/json/
+   code, html (tag-stripped), docx/xlsx/pptx (`zip` + `quick-xml`) and zip entry names,
+diff --git a/app/apps/desktop/src-tauri/Cargo.lock b/app/apps/desktop/src-tauri/Cargo.lock
+index 32256634..1a29f026 100644
+--- a/app/apps/desktop/src-tauri/Cargo.lock
++++ b/app/apps/desktop/src-tauri/Cargo.lock
+@@ -885,6 +885,7 @@ dependencies = [
+  "once_cell",
+  "quick-xml 0.37.5",
+  "regex",
++ "reqwest",
+  "rusqlite",
+  "serde",
+  "serde_json",
+@@ -902,6 +903,8 @@ dependencies = [
+  "tauri-plugin-single-instance",
+  "tauri-plugin-updater",
+  "tempfile",
++ "tokio",
++ "tokio-util",
+  "trash",
+  "uuid",
+  "walkdir",
+diff --git a/app/apps/desktop/src-tauri/Cargo.toml b/app/apps/desktop/src-tauri/Cargo.toml
+index 0483c8b4..8e9368dd 100644
+--- a/app/apps/desktop/src-tauri/Cargo.toml
++++ b/app/apps/desktop/src-tauri/Cargo.toml
+@@ -67,6 +67,26 @@ tauri-plugin-deep-link = "2.4.9"
+ # uses — Office writes deflate. Both MIT.
+ zip = { version = "2", default-features = false, features = ["deflate"] }
+ quick-xml = "0.37"
++# Attachment transport (`attachments.rs`): bytes move through Rust, not the
++# webview — no bucket CORS, no `connect-src` to widen for a self-hosted MinIO,
++# and a 500 MB video never enters the JS heap.
++#
++# reqwest is ALREADY in the tree via `tauri-plugin-updater`; these are exactly
++# the features it already turns on (`cargo tree -i reqwest -e features`:
++# json/stream/rustls-no-provider), so this is the same single copy rather than a
++# second one. `default-features = false` is load-bearing — reqwest's defaults
++# pull native-tls/openssl, which nothing here builds today. `rustls-no-provider`
++# leaves the crypto provider to rustls' own crate features (ring), which is what
++# the updater already relies on; `stream` is what lets a request body be a file
++# read incrementally instead of a Vec.
++reqwest = { version = "0.13", default-features = false, features = [
++    "stream",
++    "rustls-no-provider",
++] }
++# Async file I/O for the same streaming path. Both are already in the tree under
++# reqwest/hyper; naming them here only makes the dependency honest.
++tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
++tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+ 
+ # The updater is desktop-only — gate it so mobile targets don't try to build it.
+ [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+@@ -77,6 +97,11 @@ tauri-plugin-single-instance = { version = "2.4.3", features = ["deep-link"] }
+ 
+ [dev-dependencies]
+ tempfile = "3"
++# A current-thread runtime for the async transport tests (`attachments.rs`).
++# Deliberately NOT the `macros` feature: `#[tokio::test]` would pull
++# `tokio-macros` and a second `syn` into the lockfile for two tests that a
++# three-line `block_on` helper covers.
++tokio = { version = "1", features = ["rt"] }
+ 
+ # There is no workspace Cargo.toml above this crate, so this is the only place a
+ # release profile can go. Cargo's defaults build the shipped binary with no LTO
+diff --git a/app/apps/desktop/src-tauri/src/attachments.rs b/app/apps/desktop/src-tauri/src/attachments.rs
+index d9263225..994d3307 100644
+--- a/app/apps/desktop/src-tauri/src/attachments.rs
++++ b/app/apps/desktop/src-tauri/src/attachments.rs
+@@ -4,10 +4,15 @@
+ //! pipeline — this module only reads/writes raw bytes and lists metadata.
+ 
+ use crate::error::{AppError, AppResult};
++use crate::notefile::sha256_file;
+ use crate::vault::{is_ignored_name, resolve_in_vault};
++use once_cell::sync::Lazy;
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+-use std::path::Path;
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+ 
+ /// Metadata for one attachment file (vault-relative), used by the sync diff.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -118,21 +123,95 @@ pub fn write_binary_file(vault: &Path, rel: &str, bytes: &[u8]) -> AppResult<()>
+     Ok(())
+ }
+ 
++/// One cached hash: what a file looked like the last time we hashed it.
++///
++/// `(size, mtime_ns)` is the validity key — the same pair the `files` table
++/// uses to decide a note/binary is unchanged. Not a perfect change detector in
++/// theory (a same-size write inside one filesystem timestamp tick), but the
++/// files under `attachments/` are content-addressed and never edited in place,
++/// so in practice a changed file is a NEW path.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct HashEntry {
++    pub size: u64,
++    pub mtime_ns: i64,
++    pub sha256: String,
++}
++
++/// What one `attachments/` walk produced.
++pub struct AttachmentListing {
++    /// The listing itself, sorted by path.
++    pub items: Vec<AttachmentMeta>,
++    /// The cache as it should now be persisted: exactly the files that exist,
++    /// so writing it back is also the prune.
++    pub cache: HashMap<String, HashEntry>,
++    /// How many files actually had to be read+hashed this pass (0 = all cached).
++    pub hashed: usize,
++    /// Whether `cache` differs from what was passed in (nothing to write if not).
++    pub changed: bool,
++}
++
+ /// List every file under the vault's `attachments/` dir (recursively), skipping
+ /// dotfiles/dotfolders. Returns an empty list if the dir is absent.
++///
++/// Uncached: hashes every file. Kept for callers (and tests) that have no index
++/// to cache into — {@link list_attachments_cached} is what the sync path uses.
+ pub fn list_attachments(vault: &Path) -> AppResult<Vec<AttachmentMeta>> {
++    Ok(list_attachments_cached(vault, &HashMap::new())?.items)
++}
++
++/// The same walk, but reusing a previously-computed sha256 whenever the file's
++/// `(size, mtime)` is unchanged.
++///
++/// This is the difference between an attachment reconcile that costs a `stat`
++/// per file and one that re-reads every byte in `attachments/` — which the
++/// watcher can fire every few seconds, and which on a vault holding a few
++/// hundred megabytes of images and video is seconds of disk I/O for an answer
++/// that never changes. Files that DO need hashing are streamed
++/// (`notefile::sha256_file`), so a 500 MB video costs a 64 KB buffer rather
++/// than a 500 MB allocation.
++pub fn list_attachments_cached(
++    vault: &Path,
++    cached: &HashMap<String, HashEntry>,
++) -> AppResult<AttachmentListing> {
+     let root = vault.join("attachments");
+-    let mut out = Vec::new();
+-    if !root.is_dir() {
+-        return Ok(out);
++    let mut found: Vec<(String, PathBuf, u64, i64)> = Vec::new();
++    if root.is_dir() {
++        walk(vault, &root, &mut found)?;
+     }
+-    walk(vault, &root, &mut out)?;
+     // Deterministic order (stable diffs, stable tests).
+-    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+-    Ok(out)
++    found.sort_by(|a, b| a.0.cmp(&b.0));
++
++    let mut items = Vec::with_capacity(found.len());
++    let mut cache: HashMap<String, HashEntry> = HashMap::with_capacity(found.len());
++    let mut hashed = 0usize;
++    for (rel, abs, size, mtime_ns) in found {
++        let hit = cached
++            .get(&rel)
++            .filter(|e| e.size == size && e.mtime_ns == mtime_ns)
++            .map(|e| e.sha256.clone());
++        let sha = match hit {
++            Some(sha) => sha,
++            None => {
++                hashed += 1;
++                sha256_file(&abs)?
++            }
++        };
++        cache.insert(
++            rel.clone(),
++            HashEntry { size, mtime_ns, sha256: sha.clone() },
++        );
++        items.push(AttachmentMeta { rel_path: rel, size, sha256: sha });
++    }
++    // A prune is just "the new map has fewer/other keys", so one comparison
++    // covers both a vanished file and a re-hashed one.
++    let changed = cache != *cached;
++    Ok(AttachmentListing { items, cache, hashed, changed })
+ }
+ 
+-fn walk(vault: &Path, dir: &Path, out: &mut Vec<AttachmentMeta>) -> AppResult<()> {
++/// Collect `(rel_path, abs, size, mtime_ns)` for every non-ignored file under
++/// `dir`. Deliberately reads no contents — hashing is the caller's decision,
++/// because the cache may already know the answer.
++fn walk(vault: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u64, i64)>) -> AppResult<()> {
+     for entry in std::fs::read_dir(dir)? {
+         let entry = entry?;
+         let name = entry.file_name().to_string_lossy().to_string();
+@@ -144,17 +223,25 @@ fn walk(vault: &Path, dir: &Path, out: &mut Vec<AttachmentMeta>) -> AppResult<()
+         if file_type.is_dir() {
+             walk(vault, &path, out)?;
+         } else if file_type.is_file() {
+-            let bytes = std::fs::read(&path)?;
+-            out.push(AttachmentMeta {
+-                rel_path: rel_from(vault, &path),
+-                size: bytes.len() as u64,
+-                sha256: sha256_bytes(&bytes),
+-            });
++            let meta = entry.metadata()?;
++            out.push((rel_from(vault, &path), path, meta.len(), mtime_ns(&meta)));
+         }
+     }
+     Ok(())
+ }
+ 
++/// A file's mtime in nanoseconds since the Unix epoch, or 0 when the OS won't
++/// say. Nanoseconds (not the millis `file_stat` reports) because this is a
++/// change DETECTOR: a rewrite inside the same millisecond is exactly the case
++/// a coarser stamp misses.
++fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
++    meta.modified()
++        .ok()
++        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
++        .map(|d| d.as_nanos() as i64)
++        .unwrap_or(0)
++}
++
+ /// Vault-relative forward-slash path of `abs` under `root`.
+ fn rel_from(root: &Path, abs: &Path) -> String {
+     abs.strip_prefix(root)
+@@ -165,10 +252,279 @@ fn rel_from(root: &Path, abs: &Path) -> String {
+         .join("/")
+ }
+ 
++// ---- Transport: bytes move through Rust, not the webview -------------------
++//
++// The webview can PUT to a presigned URL, but every part of doing so is worse:
++// the bucket then needs CORS for a `tauri://localhost` Origin, the CSP's
++// `connect-src` has to permit whatever plain-http MinIO a self-hoster runs, and
++// a 500 MB video has to exist in the JS heap first. These two commands stream
++// straight from/to disk instead. `lib/api.ts` keeps a webview fallback for the
++// cases where an invoke is not available.
++//
++// AUTH IS THE CALLER'S BUSINESS, deliberately. Upload URLs carry their own
++// credential — an S3 signature, or our own route's `?t=` upload token — and S3
++// REJECTS a request that presents both a presign and an `Authorization` header,
++// so nothing here adds one. The only headers sent are the ones passed in.
++
++/// How long a connection gets to be established before we give up.
++const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
++
++/// Ceiling on ONE transfer. Generous because the whole point is large files on
++/// slow links (500 MB over a hotel wifi is not a pathology), but bounded: a
++/// stalled socket must not hold a reconcile open forever.
++const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
++
++/// Cap on how much of a failed response we quote back to the TS layer.
++const ERROR_BODY_MAX: usize = 2048;
++
++/// One shared client, built once.
++///
++/// `redirect(none)` is a SECURITY setting, not a preference: reqwest forwards
++/// `Authorization` across a redirect, and `GET /api/blobs/:id` answers 302 to a
++/// presigned S3 URL — which rejects a request carrying both a signature and a
++/// bearer. The desktop therefore asks `GET /api/blobs/:id/url` for the target
++/// and fetches THAT; a 3xx arriving here is a bug or a hostile server, and is
++/// surfaced as the status rather than followed.
++static HTTP: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
++    reqwest::Client::builder()
++        .redirect(reqwest::redirect::Policy::none())
++        .connect_timeout(CONNECT_TIMEOUT)
++        .timeout(TRANSFER_TIMEOUT)
++        .build()
++        .map_err(|e| e.to_string())
++});
++
++fn client() -> AppResult<reqwest::Client> {
++    match HTTP.as_ref() {
++        Ok(c) => Ok(c.clone()),
++        Err(e) => Err(AppError::new(format!("HTTP client unavailable: {e}"))),
++    }
++}
++
++/// Half-open byte range `[start, end)` of the file to send — one multipart part.
++#[derive(Debug, Clone, Copy, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ByteRange {
++    pub start: u64,
++    pub end: u64,
++}
++
++/// What an upload PUT answered. The STATUS is returned rather than turned into
++/// an error because the TS flow branches on it (an expired presign is a 403 to
++/// re-mint, a 409 is "retry the PUT", a 5xx is "next pass").
++#[derive(Debug, Clone, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct UploadOutcome {
++    pub status: u16,
++    /// S3's part receipt; `complete` replays it back. Absent on our own route.
++    pub etag: Option<String>,
++    /// A truncated body, only when the status was not 2xx.
++    pub error: Option<String>,
++}
++
++/// What a download wrote. `bytes` is what landed on disk; `sha256` is what it
++/// hashes to, already checked against the expected value when one was given.
++#[derive(Debug, Clone, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct DownloadOutcome {
++    pub status: u16,
++    pub bytes: u64,
++    pub sha256: String,
++}
++
++/// Turn a plain string map into request headers, refusing anything malformed
++/// rather than silently dropping it — a presign that loses its `content-length`
++/// fails in a much more confusing place.
++fn header_map(headers: &HashMap<String, String>) -> AppResult<reqwest::header::HeaderMap> {
++    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
++    let mut out = HeaderMap::with_capacity(headers.len());
++    for (k, v) in headers {
++        let name = HeaderName::from_bytes(k.as_bytes())
++            .map_err(|_| AppError::new(format!("invalid header name: {k}")))?;
++        let value = HeaderValue::from_str(v)
++            .map_err(|_| AppError::new(format!("invalid value for header {k}")))?;
++        out.insert(name, value);
++    }
++    Ok(out)
++}
++
++fn method_of(method: &str) -> AppResult<reqwest::Method> {
++    reqwest::Method::from_bytes(method.as_bytes())
++        .map_err(|_| AppError::new(format!("invalid HTTP method: {method}")))
++}
++
++/// Stream a vault file (or one byte range of it) to `url`.
++///
++/// READ scope is the whole vault, like `read_binary_file` — the sync layer only
++/// ever passes `attachments/…`, but an imported binary living in a note folder
++/// is a legitimate upload source. `resolve_in_vault` is still what bounds it.
++///
++/// The body is a `ReaderStream`, so the file is read in chunks as the socket
++/// drains. `content-length` comes from the caller's headers (the presign SIGNS
++/// it), which is also what keeps hyper from falling back to chunked encoding —
++/// S3 rejects a chunked presigned PUT.
++pub async fn upload_file(
++    vault: &Path,
++    rel: &str,
++    url: &str,
++    method: &str,
++    headers: &HashMap<String, String>,
++    range: Option<ByteRange>,
++) -> AppResult<UploadOutcome> {
++    let abs = resolve_in_vault(vault, rel)?;
++    let meta = std::fs::metadata(&abs)?;
++    if !meta.is_file() {
++        return Err(AppError::new("not a file"));
++    }
++    let (start, len) = match range {
++        Some(r) => {
++            if r.end < r.start || r.end > meta.len() {
++                return Err(AppError::new(format!(
++                    "range {}..{} is outside {rel} ({} bytes)",
++                    r.start,
++                    r.end,
++                    meta.len()
++                )));
++            }
++            (r.start, r.end - r.start)
++        }
++        None => (0, meta.len()),
++    };
++
++    let mut file = tokio::fs::File::open(&abs).await?;
++    if start > 0 {
++        file.seek(std::io::SeekFrom::Start(start)).await?;
++    }
++    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file.take(len)));
++
++    let mut req = client()?
++        .request(method_of(method)?, url)
++        .headers(header_map(headers)?)
++        .body(body);
++    // Belt and braces: if the server's presign did not name a length, supply
++    // the one we are actually sending so the request never goes out chunked.
++    if !headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")) {
++        req = req.header(reqwest::header::CONTENT_LENGTH, len);
++    }
++
++    let res = req
++        .send()
++        .await
++        .map_err(|e| AppError::new(format!("upload failed: {e}")))?;
++    let status = res.status().as_u16();
++    let etag = res
++        .headers()
++        .get(reqwest::header::ETAG)
++        .and_then(|v| v.to_str().ok())
++        .map(|s| s.to_string());
++    let error = if (200..300).contains(&status) {
++        None
++    } else {
++        let mut body = res.text().await.unwrap_or_default();
++        body.truncate(ERROR_BODY_MAX);
++        Some(body)
++    };
++    Ok(UploadOutcome { status, etag, error })
++}
++
++/// Stream `url` into a vault-relative attachment path, atomically.
++///
++/// WRITE scope is `attachments/` only (`ensure_attachment_rel`): the path comes
++/// from the server, so a member who set a blob's `rel_path` to `.context/…` or
++/// to a note must not be able to make every teammate's client overwrite it.
++///
++/// Bytes land in `.<name>.tmp` beside the target and are hashed as they are
++/// written; the rename only happens once the digest matches `expected_sha256`.
++/// A mismatch (or any non-2xx) deletes the temp file and fails — half a file
++/// under the real name would look like a valid attachment to the next diff.
++pub async fn download_file(
++    vault: &Path,
++    rel: &str,
++    url: &str,
++    headers: &HashMap<String, String>,
++    expected_sha256: Option<&str>,
++) -> AppResult<DownloadOutcome> {
++    ensure_attachment_rel(rel)?;
++    let abs = resolve_in_vault(vault, rel)?;
++    let parent = abs
++        .parent()
++        .ok_or_else(|| AppError::new("attachment has no parent directory"))?;
++    std::fs::create_dir_all(parent)?;
++    let file_name = abs
++        .file_name()
++        .and_then(|s| s.to_str())
++        .ok_or_else(|| AppError::new("invalid file name"))?;
++    let tmp = parent.join(format!(".{file_name}.tmp"));
++
++    let mut res = client()?
++        .get(url)
++        .headers(header_map(headers)?)
++        .send()
++        .await
++        .map_err(|e| AppError::new(format!("download failed: {e}")))?;
++    let status = res.status().as_u16();
++    if !(200..300).contains(&status) {
++        let mut body = res.text().await.unwrap_or_default();
++        body.truncate(ERROR_BODY_MAX);
++        // A 3xx lands here too: see `HTTP`'s redirect policy for why we refuse
++        // to follow one rather than leak the bearer to a presigned host.
++        return Err(AppError::new(format!("download failed: HTTP {status} {body}")));
++    }
++
++    let mut file = tokio::fs::File::create(&tmp).await?;
++    let mut hasher = Sha256::new();
++    let mut written: u64 = 0;
++    let outcome: AppResult<()> = async {
++        while let Some(chunk) = res
++            .chunk()
++            .await
++            .map_err(|e| AppError::new(format!("download failed: {e}")))?
++        {
++            hasher.update(&chunk);
++            written += chunk.len() as u64;
++            file.write_all(&chunk).await?;
++        }
++        file.flush().await?;
++        Ok(())
++    }
++    .await;
++    drop(file);
++    if let Err(e) = outcome {
++        let _ = std::fs::remove_file(&tmp);
++        return Err(e);
++    }
++
++    let digest = hasher.finalize();
++    let mut sha256 = String::with_capacity(64);
++    for b in digest {
++        sha256.push_str(&format!("{b:02x}"));
++    }
++    if let Some(expected) = expected_sha256 {
++        if !expected.is_empty() && !expected.eq_ignore_ascii_case(&sha256) {
++            let _ = std::fs::remove_file(&tmp);
++            return Err(AppError::new(format!(
++                "downloaded bytes hash to {sha256}, expected {expected}"
++            )));
++        }
++    }
++    std::fs::rename(&tmp, &abs)?;
++    Ok(DownloadOutcome { status, bytes: written, sha256 })
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    /// Run one future to completion. A hand-rolled `#[tokio::test]`, so the
++    /// test build does not pull a proc-macro crate for two async cases.
++    fn block_on<F: std::future::Future>(f: F) -> F::Output {
++        tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .unwrap()
++            .block_on(f)
++    }
++
+     #[test]
+     fn write_read_roundtrip_is_byte_identical() {
+         let tmp = tempfile::tempdir().unwrap();
+@@ -237,6 +593,142 @@ mod tests {
+         assert!(file_stat(tmp.path(), "attachments/missing.png").is_err());
+     }
+ 
++    /// Walk once, then walk again with the cache the first walk produced —
++    /// with a DELIBERATELY WRONG sha in it. Getting the wrong sha back proves
++    /// the second walk trusted the cache instead of re-reading the file.
++    #[test]
++    fn cached_hash_is_reused_when_size_and_mtime_match() {
++        let tmp = tempfile::tempdir().unwrap();
++        write_binary_file(tmp.path(), "attachments/a.png", &[1, 2, 3]).unwrap();
++
++        let first = list_attachments_cached(tmp.path(), &HashMap::new()).unwrap();
++        assert_eq!(first.hashed, 1);
++        assert!(first.changed);
++
++        let mut poisoned = first.cache.clone();
++        poisoned.get_mut("attachments/a.png").unwrap().sha256 = "cafebabe".into();
++        let second = list_attachments_cached(tmp.path(), &poisoned).unwrap();
++        assert_eq!(second.hashed, 0, "unchanged file must not be re-hashed");
++        assert_eq!(second.items[0].sha256, "cafebabe");
++
++        // A clean second pass agrees with the first and has nothing to write.
++        let third = list_attachments_cached(tmp.path(), &first.cache).unwrap();
++        assert_eq!(third.hashed, 0);
++        assert!(!third.changed);
++        assert_eq!(third.items[0].sha256, first.items[0].sha256);
++    }
++
++    #[test]
++    fn a_changed_file_is_re_hashed() {
++        let tmp = tempfile::tempdir().unwrap();
++        write_binary_file(tmp.path(), "attachments/a.png", &[1, 2, 3]).unwrap();
++        let first = list_attachments_cached(tmp.path(), &HashMap::new()).unwrap();
++
++        // Same path, different bytes AND a different mtime — the pair is the
++        // validity key, and a rewrite moves both.
++        std::thread::sleep(std::time::Duration::from_millis(10));
++        write_binary_file(tmp.path(), "attachments/a.png", &[9, 9, 9, 9]).unwrap();
++        let second = list_attachments_cached(tmp.path(), &first.cache).unwrap();
++        assert_eq!(second.hashed, 1);
++        assert!(second.changed);
++        assert_eq!(second.items[0].sha256, sha256_bytes(&[9, 9, 9, 9]));
++    }
++
++    #[test]
++    fn cache_prunes_paths_that_vanished() {
++        let tmp = tempfile::tempdir().unwrap();
++        write_binary_file(tmp.path(), "attachments/a.png", &[1]).unwrap();
++        write_binary_file(tmp.path(), "attachments/b.pdf", &[2]).unwrap();
++        let first = list_attachments_cached(tmp.path(), &HashMap::new()).unwrap();
++        assert_eq!(first.cache.len(), 2);
++
++        std::fs::remove_file(tmp.path().join("attachments/b.pdf")).unwrap();
++        let second = list_attachments_cached(tmp.path(), &first.cache).unwrap();
++        assert!(second.changed);
++        assert_eq!(second.items.len(), 1);
++        // The map handed back IS the new cache, so writing it back is the prune.
++        assert!(!second.cache.contains_key("attachments/b.pdf"));
++        assert!(second.cache.contains_key("attachments/a.png"));
++    }
++
++    /// The hash cache round-trips through the index the way the command uses
++    /// it: read → walk → write back, with the write doubling as the prune.
++    #[test]
++    fn index_round_trips_and_prunes_the_hash_cache() {
++        let tmp = tempfile::tempdir().unwrap();
++        write_binary_file(tmp.path(), "attachments/a.png", &[1]).unwrap();
++        write_binary_file(tmp.path(), "attachments/b.pdf", &[2]).unwrap();
++        let index = crate::index::Index::open_in_memory().unwrap();
++        assert!(index.attachment_hash_cache().unwrap().is_empty());
++
++        let first = list_attachments_cached(tmp.path(), &HashMap::new()).unwrap();
++        index.save_attachment_hash_cache(&first.cache).unwrap();
++        let stored = index.attachment_hash_cache().unwrap();
++        assert_eq!(stored, first.cache);
++
++        std::fs::remove_file(tmp.path().join("attachments/b.pdf")).unwrap();
++        let second = list_attachments_cached(tmp.path(), &stored).unwrap();
++        assert_eq!(second.hashed, 0, "the surviving file was already cached");
++        index.save_attachment_hash_cache(&second.cache).unwrap();
++        let after = index.attachment_hash_cache().unwrap();
++        assert_eq!(after.len(), 1);
++        assert!(!after.contains_key("attachments/b.pdf"));
++    }
++
++    /// The download side is the one that takes a SERVER-supplied path, so it
++    /// refuses anything outside `attachments/` before it opens a socket.
++    #[test]
++    fn download_refuses_paths_outside_attachments() {
++        let tmp = tempfile::tempdir().unwrap();
++        let headers = HashMap::new();
++        for rel in [
++            ".context/index.sqlite",
++            "Team Plans.md",
++            "attachments/../escape.bin",
++            "attachments/.hidden",
++            "attachments",
++        ] {
++            let err = block_on(download_file(
++                tmp.path(),
++                rel,
++                "http://127.0.0.1:9/never-reached",
++                &headers,
++                None,
++            ));
++            assert!(err.is_err(), "{rel} must be refused");
++        }
++        // Nothing was created on the way to those refusals.
++        assert!(!tmp.path().join("attachments").exists());
++    }
++
++    /// A part upload names a byte range; one outside the file is a bug in the
++    /// caller's arithmetic, not something to send a truncated part for.
++    #[test]
++    fn upload_refuses_a_range_past_the_end_of_the_file() {
++        let tmp = tempfile::tempdir().unwrap();
++        write_binary_file(tmp.path(), "attachments/clip.mp4", &[7u8; 64]).unwrap();
++        let headers = HashMap::new();
++        let err = block_on(upload_file(
++            tmp.path(),
++            "attachments/clip.mp4",
++            "http://127.0.0.1:9/never-reached",
++            "PUT",
++            &headers,
++            Some(ByteRange { start: 0, end: 65 }),
++        ));
++        assert!(err.is_err());
++        // An escaping read path is refused by `resolve_in_vault` just the same.
++        assert!(block_on(upload_file(
++            tmp.path(),
++            "../../etc/passwd",
++            "http://127.0.0.1:9/never-reached",
++            "PUT",
++            &headers,
++            None,
++        ))
++        .is_err());
++    }
++
+     #[test]
+     fn list_is_empty_without_attachments_dir() {
+         let tmp = tempfile::tempdir().unwrap();
+diff --git a/app/apps/desktop/src-tauri/src/commands.rs b/app/apps/desktop/src-tauri/src/commands.rs
+index 4e50db5f..77b6981d 100644
+--- a/app/apps/desktop/src-tauri/src/commands.rs
++++ b/app/apps/desktop/src-tauri/src/commands.rs
+@@ -16,6 +16,7 @@ use crate::stats::{self, VaultStats};
+ use crate::tree::{self, TreeNode};
+ use crate::{vault, watcher};
+ use serde::{Deserialize, Serialize};
++use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ use tauri::{AppHandle, Emitter, Manager, State};
+@@ -1891,13 +1892,86 @@ pub fn write_binary_file(
+     attachments::write_binary_file(&vault, &meta.rel_path, &bytes)
+ }
+ 
++/// The attachment listing the sync diff runs on — path, size and sha256 for
++/// every file under `attachments/`.
++///
++/// Hashes come from the index's `attachment_hashes` cache whenever the file's
++/// `(size, mtime)` is unchanged, so a reconcile triggered by an unrelated
++/// watcher event costs a `stat` per file instead of re-reading every byte in
++/// the store. The lock is taken twice and briefly — read the cache, walk and
++/// hash outside it, write back only when something moved — because hashing a
++/// large video while holding the index lock would stall every other query.
+ #[tauri::command]
+ pub async fn list_attachments(
+     state: State<'_, AppState>,
+     expected_epoch: Option<u64>,
+ ) -> AppResult<Vec<AttachmentMeta>> {
++    let (vault, index) = require_vault_at(&state, expected_epoch)?;
++    let cached = {
++        let guard = index.lock().unwrap();
++        // A cache read that fails is not a reason to fail the listing: the
++        // worst case is that we hash everything, which is what we did before.
++        guard.attachment_hash_cache().unwrap_or_default()
++    };
++    let listing = attachments::list_attachments_cached(&vault, &cached)?;
++    if listing.changed {
++        let guard = index.lock().unwrap();
++        if let Err(e) = guard.save_attachment_hash_cache(&listing.cache) {
++            log::warn!("[attachments] hash cache write failed: {e}");
++        }
++    }
++    Ok(listing.items)
++}
++
++/// Stream one attachment (or one multipart part of it) to a presigned URL.
++///
++/// See `attachments.rs` for why the bytes go through Rust instead of the
++/// webview, and why NOTHING here adds an `Authorization` header: the URL
++/// carries its own credential, and S3 rejects a request that has both.
++#[tauri::command]
++pub async fn upload_attachment(
++    state: State<'_, AppState>,
++    rel_path: String,
++    url: String,
++    method: Option<String>,
++    headers: Option<HashMap<String, String>>,
++    range: Option<attachments::ByteRange>,
++    expected_epoch: Option<u64>,
++) -> AppResult<attachments::UploadOutcome> {
++    let (vault, _) = require_vault_at(&state, expected_epoch)?;
++    attachments::upload_file(
++        &vault,
++        &rel_path,
++        &url,
++        method.as_deref().unwrap_or("PUT"),
++        &headers.unwrap_or_default(),
++        range,
++    )
++    .await
++}
++
++/// Stream a URL into `attachments/<…>`, verifying the sha256 before the rename.
++///
++/// Epoch-pinned like every other vault-relative write: a download that started
++/// before a vault switch must not land in the vault the user moved to.
++#[tauri::command]
++pub async fn download_attachment(
++    state: State<'_, AppState>,
++    url: String,
++    rel_path: String,
++    headers: Option<HashMap<String, String>>,
++    expected_sha256: Option<String>,
++    expected_epoch: Option<u64>,
++) -> AppResult<attachments::DownloadOutcome> {
+     let (vault, _) = require_vault_at(&state, expected_epoch)?;
+-    attachments::list_attachments(&vault)
++    attachments::download_file(
++        &vault,
++        &rel_path,
++        &url,
++        &headers.unwrap_or_default(),
++        expected_sha256.as_deref(),
++    )
++    .await
+ }
+ 
+ /// A one-shot census of the open vault for Vault Settings → Health: what is in
+diff --git a/app/apps/desktop/src-tauri/src/index.rs b/app/apps/desktop/src-tauri/src/index.rs
+index 3d389d60..df3465d3 100644
+--- a/app/apps/desktop/src-tauri/src/index.rs
++++ b/app/apps/desktop/src-tauri/src/index.rs
+@@ -7,6 +7,7 @@
+ //! forks a note's identity. On rename we update the path column by id, so
+ //! inbound links (which store `dst_note_id`) never break.
+ 
++use crate::attachments::HashEntry;
+ use crate::error::{io_ctx, AppError, AppResult};
+ use crate::extract::kind_for;
+ use crate::notefile::sha256_hex;
+@@ -406,11 +407,87 @@ impl Index {
+             );
+ 
+             CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256);
++
++            -- sha256 cache for the vault-root `attachments/` store.
++            --
++            -- A separate table from `files` and not a bug: attachments are
++            -- deliberately OUTSIDE the file index (`vault::INDEX_ATTACHMENTS`
++            -- is false, because a search hit on `attachments/<16hex>.png`
++            -- names something the user cannot see or open), so there are no
++            -- `files` rows to hang these hashes off. What this feeds is the
++            -- attachment SYNC diff, which is by content hash: without it every
++            -- watcher-driven reconcile re-reads every byte under
++            -- `attachments/` to recompute hashes that did not change.
++            --
++            -- Fully derived from disk — safe to drop, and `rebuild()` does not
++            -- touch it either way. `mtime_ns` pairs with `size` as the validity
++            -- key (see `attachments.rs HashEntry`).
++            CREATE TABLE IF NOT EXISTS attachment_hashes (
++                path     TEXT PRIMARY KEY,
++                size     INTEGER NOT NULL,
++                mtime_ns INTEGER NOT NULL,
++                sha256   TEXT NOT NULL
++            );
+             "#,
+         )?;
+         Ok(())
+     }
+ 
++    // ---- Attachment hash cache -------------------------------------------
++
++    /// Every cached attachment hash, keyed by vault-relative path.
++    ///
++    /// Read in one go rather than queried per file: the whole point is to avoid
++    /// per-file work, and the table has one row per attachment (hundreds, not
++    /// millions). The caller holds it for the duration of ONE walk and hands
++    /// back the map to persist, so the index lock is never held while a 500 MB
++    /// file is being hashed.
++    pub fn attachment_hash_cache(&self) -> AppResult<HashMap<String, HashEntry>> {
++        let mut stmt = self
++            .conn
++            .prepare("SELECT path, size, mtime_ns, sha256 FROM attachment_hashes")?;
++        let rows = stmt.query_map([], |r| {
++            Ok((
++                r.get::<_, String>(0)?,
++                HashEntry {
++                    size: r.get::<_, i64>(1)? as u64,
++                    mtime_ns: r.get::<_, i64>(2)?,
++                    sha256: r.get::<_, String>(3)?,
++                },
++            ))
++        })?;
++        let mut out = HashMap::new();
++        for row in rows {
++            let (path, entry) = row?;
++            out.insert(path, entry);
++        }
++        Ok(out)
++    }
++
++    /// Replace the cache with exactly what the last walk saw.
++    ///
++    /// Replace, not merge: the walk's map IS the set of files that exist, so
++    /// wiping first is also how a deleted attachment's row is pruned — one
++    /// transaction, no separate sweep to forget.
++    pub fn save_attachment_hash_cache(
++        &self,
++        cache: &HashMap<String, HashEntry>,
++    ) -> AppResult<()> {
++        let tx = self.conn.unchecked_transaction()?;
++        tx.execute("DELETE FROM attachment_hashes", [])?;
++        {
++            let mut stmt = tx.prepare(
++                "INSERT INTO attachment_hashes (path, size, mtime_ns, sha256)
++                 VALUES (?1, ?2, ?3, ?4)",
++            )?;
++            for (path, e) in cache {
++                stmt.execute(params![path, e.size as i64, e.mtime_ns, e.sha256])?;
++            }
++        }
++        tx.commit()?;
++        Ok(())
++    }
++
+     // ---- Write path -------------------------------------------------------
+ 
+     /// Reconcile the index with the `.md` files on disk, re-parsing only what
+diff --git a/app/apps/desktop/src-tauri/src/lib.rs b/app/apps/desktop/src-tauri/src/lib.rs
+index 600581ec..c7c6c177 100644
+--- a/app/apps/desktop/src-tauri/src/lib.rs
++++ b/app/apps/desktop/src-tauri/src/lib.rs
+@@ -223,6 +223,8 @@ pub fn run() {
+             commands::file_stat,
+             commands::write_binary_file,
+             commands::list_attachments,
++            commands::upload_attachment,
++            commands::download_attachment,
+             commands::vault_stats,
+             commands::vault_checks,
+             commands::empty_trash,
+diff --git a/app/apps/desktop/src/lib/api.ts b/app/apps/desktop/src/lib/api.ts
+index 37240ed9..2cf9457c 100644
+--- a/app/apps/desktop/src/lib/api.ts
++++ b/app/apps/desktop/src/lib/api.ts
+@@ -323,6 +323,88 @@ export interface BlobMeta {
+   filename?: string | null;
+   /** True when the upload deduped to an existing row (server-set). */
+   deduped?: boolean;
++  /** `pending` until the bytes land (intent → PUT → complete); `ready` after.
++   *  Absent on servers that predate the transport. */
++  status?: "pending" | "ready";
++  /** Which store holds the bytes — `postgres` or `s3`. Informational: every
++   *  read path asks the SERVER, never this field, which store to talk to. */
++  storageProvider?: string | null;
++}
++
++/**
++ * The upload an intent hands back — the one shape both storage providers speak.
++ *
++ * `direct` is the whole security story: `true` means the URL is a third-party
++ * presign (S3/R2/MinIO) and MUST NOT carry our bearer; `false` means it is our
++ * own server and the `?t=` query IS the auth, so it must not carry the bearer
++ * either. Nothing in this flow ever sends `Authorization` to an upload URL —
++ * see {@link ApiClient.uploadBytesTo}.
++ */
++export interface BlobUploadSingle {
++  kind: "single";
++  method: string;
++  url: string;
++  /** Sent VERBATIM (content-type + content-length); the presign signs them. */
++  headers: Record<string, string>;
++  /** Epoch millis after which the URL is dead. */
++  expiresAt: number;
++  direct: boolean;
++}
++
++/** One presigned `UploadPart` URL. `partNumber` is 1-based, like S3's. */
++export interface BlobUploadPart {
++  partNumber: number;
++  url: string;
++}
++
++export interface BlobUploadMultipart {
++  kind: "multipart";
++  method: string;
++  uploadId: string;
++  /** Slice size: part n covers `[(n-1)*partBytes, n*partBytes)`. */
++  partBytes: number;
++  parts: BlobUploadPart[];
++  headers: Record<string, string>;
++  expiresAt: number;
++  direct: boolean;
++  /** Carried inside `partsUrl` too; kept for callers that rebuild the URL. */
++  token?: string;
++  /** Absolute; POST `{partNumbers}` here for fresh URLs when one expires. */
++  partsUrl: string;
++}
++
++export type BlobUpload = BlobUploadSingle | BlobUploadMultipart;
++
++/** The server already holds these bytes — send nothing. */
++export interface BlobIntentDeduped {
++  deduped: true;
++  blob: BlobMeta;
++}
++
++/** The server wants the bytes, and this is where to PUT them. */
++export interface BlobIntentUpload {
++  deduped?: false;
++  blobId: string;
++  upload: BlobUpload;
++  /** Absolute URL to POST once every byte is in (bearer REQUIRED — ours). */
++  completeUrl: string;
++}
++
++export type BlobIntent = BlobIntentDeduped | BlobIntentUpload;
++
++/** Body of `POST {completeUrl}`: `{}` for single, parts + id for multipart. */
++export interface BlobCompleteBody {
++  uploadId?: string;
++  parts?: Array<{ partNumber: number; etag: string }>;
++}
++
++/** Where to GET an attachment's bytes right now. */
++export interface BlobDownloadTarget {
++  url: string;
++  /** Epoch millis, or null when the URL does not expire (our own route). */
++  expiresAt: number | null;
++  /** `true` = a third-party presign: fetch it with NO `Authorization` at all. */
++  direct: boolean;
+ }
+ 
+ // ---- Versioning (per-note history + vault checkpoints) --------------------
+@@ -504,6 +586,47 @@ export class ApiError extends Error {
+   }
+ }
+ 
++/**
++ * A blob-transport call the server refused, carrying the machine-readable
++ * `code` the flow branches on (`storage_limit_reached`, `attachment_too_large`,
++ * `upload_incomplete`, …) next to the status.
++ *
++ * An `ApiError` subclass so every existing `catch (e) { if (e instanceof
++ * ApiError) }` keeps working — the code is the only thing added, and it is read
++ * through {@link blobErrorCode} so a plain `ApiError` from an older path still
++ * answers.
++ */
++export class BlobTransportError extends ApiError {
++  constructor(
++    status: number,
++    public code: string | null,
++    message: string,
++    body?: unknown,
++  ) {
++    super(status, message, body);
++    this.name = "BlobTransportError";
++  }
++}
++
++/**
++ * The server's error code for a failed blob call, or null when it named none.
++ * Reads `code` first and `error` second, which is how the server's JSON bodies
++ * spell it in the two generations of these routes.
++ */
++export function blobErrorCode(e: unknown): string | null {
++  if (e instanceof BlobTransportError) return e.code;
++  if (e instanceof ApiError) return errorCodeOf(e.body);
++  return null;
++}
++
++function errorCodeOf(body: unknown): string | null {
++  if (!body || typeof body !== "object") return null;
++  const b = body as { code?: unknown; error?: unknown };
++  if (typeof b.code === "string") return b.code;
++  if (typeof b.error === "string") return b.error;
++  return null;
++}
++
+ /**
+  * A server address didn't check out. Thrown by {@link ApiClient.health}, which
+  * is the one probe in this file that must NOT fail closed.
+@@ -587,6 +710,19 @@ export class ApiClient {
+   private token: string | null;
+   private readonly fetchImpl: FetchLike;
+   private readonly clientId: string;
++  /**
++   * Does THIS server speak the intent → PUT → complete upload flow?
++   *
++   * Tri-state on purpose: `null` = not asked yet (try it), `true` = yes,
++   * `false` = it answered 404, so every later upload goes straight to the
++   * legacy `POST /api/vaults/:id/blobs` without paying for a 404 first. The
++   * answer belongs to ONE server, so {@link setBaseUrl} clears it — a user who
++   * switches from the managed instance to a self-host they run from last
++   * spring must not inherit the managed instance's capabilities.
++   */
++  private blobIntentSupported: boolean | null = null;
++  /** Same tri-state for `GET /api/blobs/:id/url` (presigned download). */
++  private blobUrlSupported: boolean | null = null;
+ 
+   constructor(opts: ApiClientOptions = {}) {
+     this.baseUrl = stripTrailingSlash(opts.baseUrl ?? DEFAULT_SERVER_URL);
+@@ -613,7 +749,13 @@ export class ApiClient {
+     return this.baseUrl;
+   }
+   setBaseUrl(url: string): void {
+-    this.baseUrl = stripTrailingSlash(url);
++    const next = stripTrailingSlash(url);
++    if (next !== this.baseUrl) {
++      // Capabilities are per server (see `blobIntentSupported`).
++      this.blobIntentSupported = null;
++      this.blobUrlSupported = null;
++    }
++    this.baseUrl = next;
+   }
+   getToken(): string | null {
+     return this.token;
+@@ -1809,6 +1951,203 @@ export class ApiClient {
+     return parsed as unknown as BlobMeta;
+   }
+ 
++  /**
++   * Headers that prove who we are on a blob route we host ourselves.
++   *
++   * Public because the attachment sync has to decide, per download, whether the
++   * URL it was handed is ours (bearer REQUIRED) or a third-party presign
++   * (bearer FORBIDDEN — S3 rejects a request that carries both a signature and
++   * an `Authorization` header). The decision lives in `sync/attachments.ts`
++   * where it is tested; this just supplies the header when the answer is "ours".
++   */
++  authHeaders(): Record<string, string> {
++    return this.token ? { Authorization: `Bearer ${this.token}` } : {};
++  }
++
++  /** Whether this server is known to speak the intent flow (null = unasked). */
++  supportsBlobIntent(): boolean | null {
++    return this.blobIntentSupported;
++  }
++
++  /**
++   * Announce an upload: what the bytes are, where they belong, how big.
++   *
++   * The server answers either "already have them" (`deduped`, zero bytes move —
++   * which is the whole reason this exists: the legacy route learned that only
++   * AFTER a new device re-uploaded every attachment in full) or a URL to PUT
++   * them to, for BOTH storage providers. A 404 means this server predates the
++   * flow: remembered per server URL so exactly one upload pays for the probe.
++   */
++  async createBlobIntent(
++    vaultId: string,
++    meta: {
++      sha256: string;
++      size: number;
++      mime: string;
++      relPath: string;
++      filename?: string | null;
++    },
++  ): Promise<BlobIntent> {
++    if (this.blobIntentSupported === false) {
++      // Known-legacy server: answer the way it would, without the round trip.
++      throw new BlobTransportError(404, "not_found", "server has no blob intent route");
++    }
++    try {
++      const { data } = await this.request<BlobIntent>(
++        "POST",
++        `/api/vaults/${encodeURIComponent(vaultId)}/blobs/intent`,
++        { body: meta },
++      );
++      this.blobIntentSupported = true;
++      return data;
++    } catch (e) {
++      if (e instanceof ApiError && e.status === 404) this.blobIntentSupported = false;
++      throw asBlobError(e);
++    }
++  }
++
++  /**
++   * Finish an upload: the server checks what landed and promotes the row to
++   * `ready`. Idempotent, so a retry after a dropped response is safe.
++   *
++   * `completeUrl` comes from the intent and is absolute — the server owns the
++   * path, and a multipart flow may point it elsewhere entirely.
++   */
++  async completeBlob(completeUrl: string, body: BlobCompleteBody = {}): Promise<BlobMeta> {
++    return (await this.requestAbsolute<BlobMeta>("POST", completeUrl, body)) ?? ({} as BlobMeta);
++  }
++
++  /** Fresh presigned URLs for parts whose own presign expired mid-upload. */
++  async requestBlobParts(
++    partsUrl: string,
++    partNumbers: number[],
++  ): Promise<{ parts: BlobUploadPart[]; expiresAt?: number }> {
++    const data = await this.requestAbsolute<{ parts: BlobUploadPart[]; expiresAt?: number }>(
++      "POST",
++      partsUrl,
++      { partNumbers },
++    );
++    return { parts: data?.parts ?? [], expiresAt: data?.expiresAt };
++  }
++
++  /**
++   * Where to GET this blob's bytes right now.
++   *
++   * A JSON URL rather than following `GET /api/blobs/:id`'s 302: reqwest
++   * forwards `Authorization` across a redirect and S3 rejects a presign that
++   * arrives with one, so the desktop asks first and then fetches with a client
++   * that carries exactly the headers `direct` calls for. 404 = a server that
++   * predates this; the caller falls back to {@link downloadBlob}.
++   */
++  async blobDownloadUrl(blobId: string): Promise<BlobDownloadTarget> {
++    if (this.blobUrlSupported === false) {
++      throw new BlobTransportError(404, "not_found", "server has no blob url route");
++    }
++    try {
++      const { data } = await this.request<BlobDownloadTarget>(
++        "GET",
++        `/api/blobs/${encodeURIComponent(blobId)}/url`,
++      );
++      this.blobUrlSupported = true;
++      return data;
++    } catch (e) {
++      if (e instanceof ApiError && e.status === 404) this.blobUrlSupported = false;
++      throw asBlobError(e);
++    }
++  }
++
++  /**
++   * PUT raw bytes at a presigned URL from the WEBVIEW — the fallback for when
++   * the Rust streaming command is unavailable (tests, or a build without it).
++   *
++   * Sends `headers` and nothing else. No bearer, ever: `direct: true` is a
++   * third-party presign that rejects one, and `direct: false` is our own route
++   * whose `?t=` query IS the credential. Note the webview's own limits — the
++   * body lives in the JS heap and the bucket needs CORS — which is exactly why
++   * Rust is the primary path.
++   */
++  async uploadBytesTo(input: {
++    url: string;
++    method?: string;
++    headers?: Record<string, string>;
++    bytes: Uint8Array;
++  }): Promise<{ status: number; etag: string | null }> {
++    const res = await this.fetchImpl(input.url, {
++      method: input.method ?? "PUT",
++      headers: { ...(input.headers ?? {}) },
++      body: input.bytes.slice().buffer,
++    });
++    if (!res.ok) {
++      const text = await res.text().catch(() => "");
++      throw new BlobTransportError(res.status, null, text || `HTTP ${res.status}`);
++    }
++    return { status: res.status, etag: res.headers.get("etag") };
++  }
++
++  /** GET bytes from an arbitrary (possibly presigned) URL — webview fallback. */
++  async downloadBytesFrom(
++    url: string,
++    headers: Record<string, string> = {},
++  ): Promise<Uint8Array> {
++    const res = await this.fetchImpl(url, { method: "GET", headers: { ...headers } });
++    if (!res.ok) {
++      const text = await res.text().catch(() => "");
++      throw new BlobTransportError(res.status, null, text || `HTTP ${res.status}`);
++    }
++    return new Uint8Array(await res.arrayBuffer());
++  }
++
++  /**
++   * JSON round trip to an ABSOLUTE url the server handed us (complete, parts).
++   *
++   * The bearer goes only to our own origin; a `completeUrl` pointing anywhere
++   * else gets the body and nothing to replay. Same-origin is the test because
++   * these URLs are minted by the server we are already authenticated to.
++   */
++  private async requestAbsolute<T>(
++    method: string,
++    url: string,
++    body: unknown,
++  ): Promise<T | null> {
++    const headers: Record<string, string> = {
++      Accept: "application/json",
++      "Content-Type": "application/json",
++      [ORIGIN_HEADER]: this.clientId,
++    };
++    if (this.isOwnOrigin(url)) {
++      try {
++        headers.Origin = new URL(this.baseUrl).origin;
++      } catch {
++        /* leave unset */
++      }
++      if (this.token) headers.Authorization = `Bearer ${this.token}`;
++    }
++    const res = await this.fetchImpl(url, { method, headers, body: JSON.stringify(body) });
++    const text = await res.text();
++    let parsed: unknown = undefined;
++    if (text) {
++      try {
++        parsed = JSON.parse(text);
++      } catch {
++        parsed = text;
++      }
++    }
++    if (!res.ok) {
++      const code = errorCodeOf(parsed);
++      throw new BlobTransportError(res.status, code, code ?? `HTTP ${res.status}`, parsed);
++    }
++    return (parsed ?? null) as T | null;
++  }
++
++  /** Is this absolute URL served by the server we hold a session for? */
++  private isOwnOrigin(url: string): boolean {
++    try {
++      return new URL(url).origin === new URL(this.baseUrl).origin;
++    } catch {
++      return false;
++    }
++  }
++
+   /** Download an attachment's bytes by blob id. */
+   async downloadBlob(id: string): Promise<Uint8Array> {
+     const res = await this.fetchImpl(`${this.baseUrl}/api/blobs/${encodeURIComponent(id)}`, {
+@@ -1823,6 +2162,15 @@ export class ApiClient {
+   }
+ }
+ 
++/** Re-type a failed blob call so callers can branch on the server's `code`. */
++function asBlobError(e: unknown): unknown {
++  if (e instanceof BlobTransportError) return e;
++  if (e instanceof ApiError) {
++    return new BlobTransportError(e.status, errorCodeOf(e.body), e.message, e.body);
++  }
++  return e;
++}
++
+ function stripTrailingSlash(url: string): string {
+   return url.replace(/\/+$/, "");
+ }
+diff --git a/app/apps/desktop/src/lib/ipc.ts b/app/apps/desktop/src/lib/ipc.ts
+index 54be2285..dee5d94b 100644
+--- a/app/apps/desktop/src/lib/ipc.ts
++++ b/app/apps/desktop/src/lib/ipc.ts
+@@ -222,6 +222,29 @@ export interface AttachmentMeta {
+   sha256: string;
+ }
+ 
++/** Half-open byte range `[start, end)` — one multipart part of a file. */
++export interface ByteRange {
++  start: number;
++  end: number;
++}
++
++/** What a streamed upload PUT answered (mirrors the Rust `UploadOutcome`). */
++export interface AttachmentUploadResult {
++  status: number;
++  /** S3's part receipt, replayed back at `complete`. Null on our own route. */
++  etag: string | null;
++  /** A truncated response body, present only when the status was not 2xx. */
++  error: string | null;
++}
++
++/** What a streamed download wrote (mirrors the Rust `DownloadOutcome`). */
++export interface AttachmentDownloadResult {
++  status: number;
++  bytes: number;
++  /** sha256 of what landed — already checked against `expectedSha256`. */
++  sha256: string;
++}
++
+ /** One file's size + mtime (mirrors the Rust `FileStat`). */
+ export interface FileStat {
+   size: number;
+@@ -603,6 +626,60 @@ export const writeBinaryFile = (
+ export const listAttachments = (expectedEpoch?: VaultEpoch) =>
+   invoke<AttachmentMeta[]>("list_attachments", { expectedEpoch: expectedEpoch ?? null });
+ 
++/**
++ * Stream an attachment (or one byte range of it) to a presigned URL from RUST.
++ *
++ * Not a webview `fetch` on purpose: the bucket would need CORS for a
++ * `tauri://localhost` Origin, the CSP would have to permit whatever plain-http
++ * MinIO a self-hoster runs, and a 500 MB video would have to exist in the JS
++ * heap first. `headers` goes out verbatim and is the ONLY auth — an upload URL
++ * carries its own credential (an S3 signature, or our route's `?t=` token), and
++ * S3 rejects a request that also presents a bearer.
++ */
++export const uploadAttachment = (
++  input: {
++    relPath: string;
++    url: string;
++    method?: string;
++    headers?: Record<string, string>;
++    range?: ByteRange;
++  },
++  expectedEpoch?: VaultEpoch,
++) =>
++  invoke<AttachmentUploadResult>("upload_attachment", {
++    relPath: input.relPath,
++    url: input.url,
++    method: input.method ?? "PUT",
++    headers: input.headers ?? {},
++    range: input.range ?? null,
++    expectedEpoch: expectedEpoch ?? null,
++  });
++
++/**
++ * Stream a URL into `attachments/<…>`, atomically and hash-verified.
++ *
++ * Rust writes to `.<name>.tmp`, hashes as it writes, and renames only when the
++ * digest matches `expectedSha256` — so a truncated transfer never appears under
++ * the real name for the next diff to accept. Redirects are NOT followed (see
++ * `attachments.rs`): the bearer must never reach a presigned host.
++ */
++export const downloadAttachment = (
++  input: {
++    url: string;
++    relPath: string;
++    headers?: Record<string, string>;
++    expectedSha256?: string | null;
++  },
++  expectedEpoch?: VaultEpoch,
++) =>
++  invoke<AttachmentDownloadResult>("download_attachment", {
++    url: input.url,
++    relPath: input.relPath,
++    headers: input.headers ?? {},
++    expectedSha256: input.expectedSha256 ?? null,
++    expectedEpoch: expectedEpoch ?? null,
++  });
++
+ /**
+  * A one-shot census of the open vault for Vault Settings → Health: counts and
+  * bytes for notes/folders/attachments/other files, the biggest of each, the
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/attachments.test.ts b/app/apps/desktop/src/lib/sync/__tests__/attachments.test.ts
+index 107b4ab3..3b4a0e33 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/attachments.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/attachments.test.ts
+@@ -95,7 +95,11 @@ function makeDeps(
+ 
+   const deps: AttachmentSyncDeps = {
+     listLocal: async () =>
+-      [...local.entries()].map(([relPath, bytes]) => ({ relPath, sha256: sha(bytes) })),
++      [...local.entries()].map(([relPath, bytes]) => ({
++        relPath,
++        sha256: sha(bytes),
++        size: bytes.byteLength,
++      })),
+     readLocal: async (relPath) => local.get(relPath)!,
+     writeLocal: async (relPath, bytes) => {
+       local.set(relPath, bytes);
+@@ -247,3 +251,433 @@ describe("AttachmentSync vault scoping", () => {
+     await expect(offline.reconcile()).resolves.toEqual({ uploaded: 0, downloaded: 0 });
+   });
+ });
++
++// ---- intent → PUT → complete -----------------------------------------------
++//
++// The transport the desktop actually uses against a current server. Everything
++// is injected, so these exercise the real decision-making — which step runs,
++// what headers go out, what is retried and what is given up on — without Tauri,
++// a webview or a live server.
++
++/** An error shaped like the api client's `BlobTransportError`. */
++function serverError(status: number, code?: string) {
++  return Object.assign(new Error(code ?? `HTTP ${status}`), { status, code });
++}
++
++interface TransportLog {
++  intents: Array<{ relPath: string; sha256: string; size: number }>;
++  puts: Array<{
++    url: string;
++    method: string;
++    headers: Record<string, string>;
++    range?: { start: number; end: number };
++    bytes: number;
++    via: "rust" | "webview";
++  }>;
++  completes: Array<{ url: string; body: unknown }>;
++  partRequests: Array<{ url: string; partNumbers: number[] }>;
++  downloadUrls: string[];
++  fetches: Array<{ url: string; headers: Record<string, string> }>;
++  legacyUploads: string[];
++  legacyDownloads: string[];
++  reads: string[];
++  toasts: string[];
++}
++
++/**
++ * Deps wired to a fake server that speaks the intent flow. `respond` decides
++ * what the intent answers (or throws) per file, which is how each case below
++ * picks its scenario.
++ */
++function makeTransport(
++  files: Array<{ relPath: string; bytes: Uint8Array }>,
++  respond: (input: { relPath: string; sha256: string; size: number }) => unknown,
++  extra: Partial<AttachmentSyncDeps> = {},
++) {
++  const log: TransportLog = {
++    intents: [],
++    puts: [],
++    completes: [],
++    partRequests: [],
++    downloadUrls: [],
++    fetches: [],
++    legacyUploads: [],
++    legacyDownloads: [],
++    reads: [],
++    toasts: [],
++  };
++  const local = new Map(files.map((f) => [f.relPath, f.bytes]));
++  const deps: AttachmentSyncDeps = {
++    listLocal: async () =>
++      [...local.entries()].map(([relPath, bytes]) => ({
++        relPath,
++        sha256: `sha-${relPath}`,
++        size: bytes.byteLength,
++      })),
++    readLocal: async (relPath) => {
++      log.reads.push(relPath);
++      return local.get(relPath)!;
++    },
++    writeLocal: async (relPath, bytes) => {
++      local.set(relPath, bytes);
++    },
++    listServer: async () => [],
++    uploadServer: async (relPath) => {
++      log.legacyUploads.push(relPath);
++    },
++    downloadServer: async (id) => {
++      log.legacyDownloads.push(id);
++      return new Uint8Array([0]);
++    },
++    createIntent: async (input) => {
++      log.intents.push({ relPath: input.relPath, sha256: input.sha256, size: input.size });
++      const answer = respond(input);
++      if (answer instanceof Error) throw answer;
++      return answer as never;
++    },
++    completeUpload: async (url, body) => {
++      log.completes.push({ url, body });
++    },
++    requestParts: async (url, partNumbers) => {
++      log.partRequests.push({ url, partNumbers });
++      return { parts: partNumbers.map((n) => ({ partNumber: n, url: `https://s3/fresh/${n}` })) };
++    },
++    // The Rust path: it is handed a PATH, never bytes — that is the point.
++    putFile: async (input) => {
++      const whole = local.get(input.relPath)!;
++      const len = input.range ? input.range.end - input.range.start : whole.byteLength;
++      log.puts.push({
++        url: input.url,
++        method: input.method,
++        headers: input.headers,
++        range: input.range,
++        bytes: len,
++        via: "rust",
++      });
++      return { status: 204, etag: `"etag-${log.puts.length}"` };
++    },
++    putBytes: async (input) => {
++      log.puts.push({
++        url: input.url,
++        method: input.method,
++        headers: input.headers,
++        bytes: input.bytes.byteLength,
++        via: "webview",
++      });
++      return { status: 204, etag: null };
++    },
++    authHeaders: () => ({ Authorization: "Bearer session-token" }),
++    notify: (text) => {
++      log.toasts.push(text);
++    },
++    ...extra,
++  };
++  return { deps, log, local };
++}
++
++const SINGLE_INTENT = {
++  blobId: "blob-1",
++  completeUrl: "https://api.test/api/blobs/blob-1/complete",
++  upload: {
++    kind: "single" as const,
++    method: "PUT",
++    url: "https://s3.test/bucket/key?X-Amz-Signature=abc",
++    headers: { "content-type": "image/png", "content-length": "3" },
++    expiresAt: Date.now() + 60_000,
++    direct: true,
++  },
++};
++
++describe("AttachmentSync upload transport (intent → PUT → complete)", () => {
++  it("PUTs to the intent's URL with exactly its headers, then completes", async () => {
++    const { deps, log } = makeTransport(
++      [{ relPath: "attachments/a.png", bytes: new Uint8Array([1, 2, 3]) }],
++      () => SINGLE_INTENT,
++    );
++    const res = await new AttachmentSync(deps).reconcile();
++
++    expect(res.uploaded).toBe(1);
++    expect(log.intents).toEqual([
++      { relPath: "attachments/a.png", sha256: "sha-attachments/a.png", size: 3 },
++    ]);
++    expect(log.puts).toHaveLength(1);
++    expect(log.puts[0].url).toBe(SINGLE_INTENT.upload.url);
++    expect(log.puts[0].via).toBe("rust");
++    // Exactly the presigned headers — a bearer here is what S3 rejects.
++    expect(log.puts[0].headers).toEqual(SINGLE_INTENT.upload.headers);
++    expect(Object.keys(log.puts[0].headers)).not.toContain("Authorization");
++    expect(log.completes).toEqual([{ url: SINGLE_INTENT.completeUrl, body: {} }]);
++    // Streaming from Rust means the bytes never passed through JS.
++    expect(log.reads).toEqual([]);
++    expect(log.legacyUploads).toEqual([]);
++  });
++
++  it("a deduped intent moves zero bytes and never opens the file", async () => {
++    const { deps, log } = makeTransport(
++      [{ relPath: "attachments/dupe.png", bytes: new Uint8Array([7, 7]) }],
++      () => ({ deduped: true, blob: { id: "b", sha256: "s", size: 2, mime: null, relPath: null } }),
++    );
++    const res = await new AttachmentSync(deps).reconcile();
++
++    expect(res.uploaded).toBe(1); // the server has it, which is what counts
++    expect(log.reads).toEqual([]); // no readLocal
++    expect(log.puts).toEqual([]); // no bytes
++    expect(log.completes).toEqual([]);
++  });
++
++  it("splits a multipart upload at partBytes and completes with the ETags", async () => {
++    const bytes = new Uint8Array(25).fill(9);
++    const { deps, log } = makeTransport(
++      [{ relPath: "attachments/clip.mp4", bytes }],
++      () => ({
++        blobId: "blob-mp",
++        completeUrl: "https://api.test/api/blobs/blob-mp/complete",
++        upload: {
++          kind: "multipart" as const,
++          method: "PUT",
++          uploadId: "upload-9",
++          partBytes: 10,
++          parts: [
++            { partNumber: 1, url: "https://s3/p1" },
++            { partNumber: 2, url: "https://s3/p2" },
++            { partNumber: 3, url: "https://s3/p3" },
++          ],
++          headers: {},
++          expiresAt: Date.now() + 60_000,
++          direct: true,
++          partsUrl: "https://api.test/api/blobs/blob-mp/parts?t=tok",
++        },
++      }),
++    );
++    await new AttachmentSync(deps).reconcile();
++
++    expect(log.puts.map((p) => p.range)).toEqual([
++      { start: 0, end: 10 },
++      { start: 10, end: 20 },
++      { start: 20, end: 25 }, // the tail is short, not padded
++    ]);
++    expect(log.puts.map((p) => p.url)).toEqual([
++      "https://s3/p1",
++      "https://s3/p2",
++      "https://s3/p3",
++    ]);
++    expect(log.completes[0].body).toEqual({
++      uploadId: "upload-9",
++      parts: [
++        { partNumber: 1, etag: '"etag-1"' },
++        { partNumber: 2, etag: '"etag-2"' },
++        { partNumber: 3, etag: '"etag-3"' },
++      ],
++    });
++  });
++
++  it("re-mints a part URL whose presign expired, and uses the fresh one", async () => {
++    const bytes = new Uint8Array(15).fill(1);
++    let putCount = 0;
++    const { deps, log } = makeTransport(
++      [{ relPath: "attachments/big.mp4", bytes }],
++      () => ({
++        blobId: "blob-mp",
++        completeUrl: "https://api.test/complete",
++        upload: {
++          kind: "multipart" as const,
++          method: "PUT",
++          uploadId: "u1",
++          partBytes: 10,
++          parts: [{ partNumber: 1, url: "https://s3/stale-1" }], // part 2 missing
++          headers: {},
++          expiresAt: Date.now(),
++          direct: true,
++          partsUrl: "https://api.test/parts?t=tok",
++        },
++      }),
++      {
++        putFile: async (input) => {
++          putCount++;
++          // The first part's presign has died since the intent was minted.
++          const expired = input.url === "https://s3/stale-1";
++          return { status: expired ? 403 : 204, etag: expired ? null : `"e${putCount}"` };
++        },
++      },
++    );
++    await new AttachmentSync(deps).reconcile();
++
++    // Part 1 re-minted after the 403; part 2 re-minted because it was never given.
++    expect(log.partRequests).toEqual([
++      { url: "https://api.test/parts?t=tok", partNumbers: [1] },
++      { url: "https://api.test/parts?t=tok", partNumbers: [2] },
++    ]);
++    expect(log.completes[0].body).toMatchObject({ uploadId: "u1" });
++  });
++
++  it("retries the PUT (not the complete) on upload_incomplete", async () => {
++    let completes = 0;
++    const { deps, log } = makeTransport(
++      [{ relPath: "attachments/a.png", bytes: new Uint8Array([1, 2, 3]) }],
++      () => SINGLE_INTENT,
++      {
++        completeUpload: async () => {
++          completes++;
++          if (completes === 1) throw serverError(409, "upload_incomplete");
++        },
++      },
++    );
++    const res = await new AttachmentSync(deps).reconcile();
++
++    expect(res.uploaded).toBe(1);
++    expect(completes).toBe(2);
++    expect(log.puts).toHaveLength(2); // the bytes were re-sent, then completed
++  });
++
++  it("falls back to the legacy route on 404 and stops probing intent", async () => {
++    const { deps, log } = makeTransport(
++      [
++        { relPath: "attachments/a.png", bytes: new Uint8Array([1]) },
++        { relPath: "attachments/b.png", bytes: new Uint8Array([2]) },
++      ],
++      () => serverError(404, "not_found"),
++    );
++    const sync = new AttachmentSync(deps);
++    const res = await sync.reconcile();
++
++    expect(res.uploaded).toBe(2);
++    expect(log.legacyUploads).toEqual(["attachments/a.png", "attachments/b.png"]);
++    // One probe for the whole server, not one per file — and none on a re-run.
++    expect(log.intents).toHaveLength(1);
++    await sync.reconcile();
++    expect(log.intents).toHaveLength(1);
++  });
++
++  it("aborts the whole pass on 402 and toasts exactly once", async () => {
++    const { deps, log } = makeTransport(
++      [
++        { relPath: "attachments/a.png", bytes: new Uint8Array([1]) },
++        { relPath: "attachments/b.png", bytes: new Uint8Array([2]) },
++      ],
++      () => serverError(402, "storage_limit_reached"),
++    );
++    const sync = new AttachmentSync(deps);
++    expect(await sync.reconcile()).toEqual({ uploaded: 0, downloaded: 0 });
++
++    // The second file is never even announced: the vault is full, not the file.
++    expect(log.intents).toHaveLength(1);
++    expect(log.toasts).toHaveLength(1);
++    expect(log.toasts[0]).toMatch(/storage/i);
++    // A later pass re-tries (the user may have freed space) but never re-toasts.
++    await sync.reconcile();
++    expect(log.intents).toHaveLength(2);
++    expect(log.toasts).toHaveLength(1);
++  });
++
++  it("skips a 413/415 file permanently instead of retrying it every pass", async () => {
++    const { deps, log } = makeTransport(
++      [
++        { relPath: "attachments/huge.mp4", bytes: new Uint8Array([1]) },
++        { relPath: "attachments/ok.png", bytes: new Uint8Array([2]) },
++      ],
++      ({ relPath }) =>
++        relPath === "attachments/huge.mp4"
++          ? serverError(413, "attachment_too_large")
++          : SINGLE_INTENT,
++    );
++    const sync = new AttachmentSync(deps);
++
++    const first = await sync.reconcile();
++    expect(first.uploaded).toBe(1); // only the good one
++    expect(log.intents).toHaveLength(2);
++
++    // Second pass: the refused file is not announced again; the other still is.
++    const second = await sync.reconcile();
++    expect(second.uploaded).toBe(1);
++    expect(log.intents.map((i) => i.relPath)).toEqual([
++      "attachments/huge.mp4",
++      "attachments/ok.png",
++      "attachments/ok.png",
++    ]);
++  });
++});
++
++describe("AttachmentSync download transport (presigned URL)", () => {
++  /** Deps whose server holds one blob and speaks `GET /api/blobs/:id/url`. */
++  function makeDownload(
++    target: unknown,
++    extra: Partial<AttachmentSyncDeps> = {},
++  ): { deps: AttachmentSyncDeps; log: TransportLog } {
++    const { deps, log } = makeTransport([], () => SINGLE_INTENT, {
++      listServer: async () => [
++        { id: "blob-1", relPath: "attachments/remote.png", sha256: "deadbeef" },
++      ],
++      downloadUrl: async (id) => {
++        log.downloadUrls.push(id);
++        if (target instanceof Error) throw target;
++        return target as never;
++      },
++      fetchToFile: async (input) => {
++        log.fetches.push({ url: input.url, headers: input.headers });
++        return { status: 200, bytes: 4 };
++      },
++      ...extra,
++    });
++    return { deps, log };
++  }
++
++  it("fetches a direct (presigned) URL with NO Authorization header", async () => {
++    const { deps, log } = makeDownload({
++      url: "https://s3.test/bucket/key?X-Amz-Signature=abc",
++      expiresAt: Date.now() + 60_000,
++      direct: true,
++    });
++    const res = await new AttachmentSync(deps).reconcile();
++
++    expect(res.downloaded).toBe(1);
++    expect(log.fetches).toHaveLength(1);
++    // The whole point: a presign plus a bearer is rejected by S3, and the
++    // bearer must not leak to a third-party host either way.
++    expect(log.fetches[0].headers).toEqual({});
++    expect(log.legacyDownloads).toEqual([]);
++  });
++
++  it("sends the bearer when the URL is our own route (direct: false)", async () => {
++    const { deps, log } = makeDownload({
++      url: "https://api.test/api/blobs/blob-1",
++      expiresAt: null,
++      direct: false,
++    });
++    await new AttachmentSync(deps).reconcile();
++    expect(log.fetches[0].headers).toEqual({ Authorization: "Bearer session-token" });
++  });
++
++  it("falls back to the legacy download when /url answers 404", async () => {
++    const { deps, log } = makeDownload(serverError(404, "not_found"));
++    const sync = new AttachmentSync(deps);
++    const res = await sync.reconcile();
++
++    expect(res.downloaded).toBe(1);
++    expect(log.fetches).toEqual([]);
++    expect(log.legacyDownloads).toEqual(["blob-1"]);
++    // Remembered per server, like the upload probe.
++    await sync.reconcile();
++    expect(log.downloadUrls).toEqual(["blob-1"]);
++  });
++
++  it("uses the webview fetch when the Rust command is missing, and only then", async () => {
++    const seen: Array<Record<string, string>> = [];
++    const { deps, log } = makeDownload(
++      { url: "https://s3.test/key?sig", expiresAt: null, direct: true },
++      {
++        fetchToFile: async () => {
++          throw new Error("Command download_attachment not found");
++        },
++        fetchBytes: async (url, headers) => {
++          seen.push(headers);
++          expect(url).toBe("https://s3.test/key?sig");
++          return new Uint8Array([4, 4]);
++        },
++      },
++    );
++    const res = await new AttachmentSync(deps).reconcile();
++    expect(res.downloaded).toBe(1);
++    expect(seen).toEqual([{}]); // still no bearer on a presign
++    expect(log.legacyDownloads).toEqual([]);
++  });
++});
+diff --git a/app/apps/desktop/src/lib/sync/attachments.ts b/app/apps/desktop/src/lib/sync/attachments.ts
+index 2adb9107..969941a4 100644
+--- a/app/apps/desktop/src/lib/sync/attachments.ts
++++ b/app/apps/desktop/src/lib/sync/attachments.ts
+@@ -7,8 +7,34 @@
+ // The diff is pure and unit-tested in isolation; the `AttachmentSync` class
+ // wires it to injected I/O (ApiClient + Tauri ipc) and debounces watcher-driven
+ // reconciles so a burst of file events collapses into one pass.
++//
++// ── How bytes actually move ────────────────────────────────────────────────
++// An upload is `intent → PUT → complete`, the SAME three steps whichever store
++// the server keeps blobs in: the intent answers with a URL (our own route with
++// a `?t=` upload token, or an S3/R2 presign) and the client never branches on
++// the provider. Two things fall out of that: dedupe becomes a JSON round trip
++// that moves ZERO bytes (the legacy route only said `deduped: true` AFTER a new
++// device re-uploaded every attachment in full), and quota/MIME/size are
++// answered before anything is sent.
++//
++// AUTHORIZATION IS THE POINT OF THE `direct` FLAG. An upload URL carries its
++// own credential and NEVER gets our bearer — S3 rejects a request presenting
++// both a presign and an `Authorization` header, and our own route's `?t=` query
++// IS the auth. A download is the mirror image: `direct: true` is a presign and
++// must be fetched clean; `direct: false` is our own `/api/blobs/:id`, where the
++// bearer is required. That one rule lives in `downloadOne` below.
++//
++// A server that predates all this answers 404 on the intent; the client falls
++// back to the legacy `POST /api/vaults/:id/blobs` and remembers, so exactly one
++// upload pays for the probe.
+ 
+ import { mimeForPath as mimeForFormat } from "../formats";
++import type {
++  BlobCompleteBody,
++  BlobDownloadTarget,
++  BlobIntent,
++  BlobUploadPart,
++} from "../api";
+ 
+ /** Local attachment metadata (from `ipc.listAttachments`). */
+ export interface LocalAttachment {
+@@ -89,6 +115,85 @@ export function mimeForPath(relPath: string): string {
+   return mimeForFormat(relPath);
+ }
+ 
++/** One byte range of a file: `[start, end)`, one multipart part. */
++export interface AttachmentRange {
++  start: number;
++  end: number;
++}
++
++/** What a PUT answered, whether it went through Rust or the webview. */
++export interface PutResult {
++  status: number;
++  etag?: string | null;
++}
++
++/**
++ * Terminal for the whole pass, not just one file.
++ *
++ * The only member today is the storage quota: once the vault is full, every
++ * remaining upload would fail the same way, and a hundred identical failures is
++ * a hundred pointless round trips plus (without this) a hundred toasts.
++ */
++class AbortPass extends Error {
++  constructor(public readonly reason: string) {
++    super(reason);
++    this.name = "AbortPass";
++  }
++}
++
++/** The HTTP status a thrown API/transport error carries, when it carries one. */
++function errStatus(e: unknown): number | null {
++  if (!e || typeof e !== "object") return null;
++  const s = (e as { status?: unknown }).status;
++  return typeof s === "number" ? s : null;
++}
++
++/**
++ * The server's machine-readable error code, read structurally rather than via
++ * `instanceof`: this module is driven by injected deps in tests, and the shape
++ * (`code`, or `error`/`code` inside `body`) is what both the real
++ * `BlobTransportError` and a test's plain object have in common.
++ */
++function errCode(e: unknown): string | null {
++  if (!e || typeof e !== "object") return null;
++  const direct = (e as { code?: unknown }).code;
++  if (typeof direct === "string") return direct;
++  const body = (e as { body?: unknown }).body;
++  if (body && typeof body === "object") {
++    const b = body as { code?: unknown; error?: unknown };
++    if (typeof b.code === "string") return b.code;
++    if (typeof b.error === "string") return b.error;
++  }
++  return null;
++}
++
++/**
++ * Is this the invoke bridge saying the Rust command isn't there, rather than
++ * the transfer failing?
++ *
++ * Only that answer justifies falling back to the webview — a real network
++ * failure must NOT be retried through a path that has to load the whole file
++ * into the JS heap first.
++ */
++function isMissingCommand(e: unknown): boolean {
++  const msg = e instanceof Error ? e.message : typeof e === "string" ? e : "";
++  return /command .*not (found|allowed)|unknown command|not allowed by the scope/i.test(msg);
++}
++
++/**
++ * Statuses that mean "this presigned URL is no longer good", as opposed to
++ * "the upload failed". S3 answers 403 on an expired signature; our own route
++ * answers 401 on a dead upload token. Either way the fix is a fresh URL, not a
++ * failed file.
++ */
++const EXPIRED_PRESIGN: readonly number[] = [401, 403];
++
++/** `attachments/a/b.png` → `b.png`. */
++function baseName(relPath: string): string {
++  const parts = relPath.split("/");
++  return parts[parts.length - 1] ?? relPath;
++}
++
+ /** Injected I/O so the sync loop is testable without Tauri or a live server. */
+ export interface AttachmentSyncDeps {
+   /**
+@@ -107,10 +212,68 @@ export interface AttachmentSyncDeps {
+   writeLocal: (relPath: string, bytes: Uint8Array) => Promise<void>;
+   /** List the server's blobs for this vault. */
+   listServer: () => Promise<ServerBlob[]>;
+-  /** Upload bytes as an attachment. */
++  /** LEGACY upload: POST the whole body in one shot. The fallback for a server
++   *  with no intent route, and the reason that route stays forever. */
+   uploadServer: (relPath: string, bytes: Uint8Array, mime: string) => Promise<void>;
+-  /** Download a blob's bytes by id. */
++  /** LEGACY download: GET `/api/blobs/:id` and hand back the bytes. */
+   downloadServer: (id: string) => Promise<Uint8Array>;
++
++  // ---- The intent → PUT → complete transport (all optional) ---------------
++  // Every one of these is optional so a caller (or a test) can wire up as much
++  // of the flow as it has; absent means "this server/host can't do that step",
++  // and the legacy pair above is what runs instead.
++
++  /** Announce an upload. Throws 404 on a server that predates the flow. */
++  createIntent?: (input: {
++    relPath: string;
++    sha256: string;
++    size: number;
++    mime: string;
++    filename: string;
++  }) => Promise<BlobIntent>;
++  /** POST the intent's `completeUrl` once every byte is in. Idempotent. */
++  completeUpload?: (completeUrl: string, body: BlobCompleteBody) => Promise<void>;
++  /** Re-mint presigned part URLs whose own presign expired mid-upload. */
++  requestParts?: (
++    partsUrl: string,
++    partNumbers: number[],
++  ) => Promise<{ parts: BlobUploadPart[] }>;
++  /** Stream a file (or one range of it) to a URL from Rust — the fast path. */
++  putFile?: (input: {
++    relPath: string;
++    url: string;
++    method: string;
++    headers: Record<string, string>;
++    range?: AttachmentRange;
++  }) => Promise<PutResult>;
++  /** PUT bytes from the webview — the fallback when Rust can't (tests). */
++  putBytes?: (input: {
++    url: string;
++    method: string;
++    headers: Record<string, string>;
++    bytes: Uint8Array;
++  }) => Promise<PutResult>;
++  /** Ask where a blob's bytes are right now (presign or our own route). */
++  downloadUrl?: (blobId: string) => Promise<BlobDownloadTarget>;
++  /** Stream a URL to disk from Rust, hash-verified and atomic. */
++  fetchToFile?: (input: {
++    url: string;
++    relPath: string;
++    headers: Record<string, string>;
++    expectedSha256?: string | null;
++  }) => Promise<{ status: number; bytes: number }>;
++  /** GET bytes from a (possibly presigned) URL in the webview — fallback. */
++  fetchBytes?: (url: string, headers: Record<string, string>) => Promise<Uint8Array>;
++  /**
++   * Headers proving who we are, for a download URL that is OUR OWN route.
++   *
++   * Never applied to a `direct` (presigned) URL — see the module header. Kept
++   * as a dep rather than read from the api client so the rule is exercised by
++   * the unit tests that assert a presign is fetched clean.
++   */
++  authHeaders?: () => Record<string, string>;
++  /** Tell the user something terminal happened (a full vault). */
++  notify?: (text: string, tone?: "error" | "neutral" | "success") => void;
+ }
+ 
+ export interface ReconcileResult {
+@@ -122,6 +285,30 @@ export class AttachmentSync {
+   private timer: ReturnType<typeof setTimeout> | null = null;
+   private running = false;
+   private rerun = false;
++  /**
++   * Does this server speak the intent flow? `null` = not asked, `false` = it
++   * answered 404 and every later upload goes straight to the legacy route.
++   * Mirrors (and is seeded by) the api client's own per-server tri-state; kept
++   * here too so ONE file pays for the probe even when the deps are hand-wired.
++   */
++  private intentSupported: boolean | null = null;
++  /** Same, for `GET /api/blobs/:id/url`. */
++  private downloadUrlSupported: boolean | null = null;
++  /**
++   * Is the Rust streaming transport available? Flipped once, permanently, when
++   * the invoke bridge says the command isn't there — never on a transfer
++   * failure, which would push a 500 MB file through the JS heap for nothing.
++   */
++  private rustTransport = true;
++  /**
++   * Files the server has PERMANENTLY refused (413 too large, 415 wrong type),
++   * keyed by content hash because that is what identity means here. Retrying
++   * them every pass is a guaranteed failure per pass, forever. Keyed by sha rather
++   * than path so a rename does not resurrect the attempt.
++   */
++  private readonly permanentSkips = new Set<string>();
++  /** The storage-full toast is raised at most once per sync instance. */
++  private storageLimitNotified = false;
+ 
+   constructor(
+     private readonly deps: AttachmentSyncDeps,
+@@ -180,19 +367,25 @@ export class AttachmentSync {
+       // them is a chance for the user to switch vaults. Continuing would upload
+       // the NEW vault's files into the OLD vault's blob store.
+       if (!this.current()) break;
++      // A file the server has already refused for good (too large, wrong type)
++      // is skipped without a round trip — see `permanentSkips`.
++      if (this.permanentSkips.has(a.sha256)) continue;
+       try {
+-        const bytes = await this.deps.readLocal(a.relPath);
+-        await this.deps.uploadServer(a.relPath, bytes, mimeForPath(a.relPath));
+-        uploaded++;
++        if (await this.uploadOne(a)) uploaded++;
+       } catch (e) {
++        if (e instanceof AbortPass) {
++          // Nothing else in this pass can succeed either. Downloads are skipped
++          // too: the vault is full, and the next pass will find the same state.
++          console.warn("[attachments] pass aborted:", e.reason);
++          return { uploaded, downloaded };
++        }
+         console.error("[attachments] upload failed", a.relPath, e);
+       }
+     }
+     for (const b of toDownload) {
+       if (!this.current()) break;
+       try {
+-        const bytes = await this.deps.downloadServer(b.id);
+-        await this.deps.writeLocal(b.relPath as string, bytes);
++        await this.downloadOne(b);
+         downloaded++;
+       } catch (e) {
+         console.error("[attachments] download failed", b.relPath, e);
+@@ -201,6 +394,284 @@ export class AttachmentSync {
+     return { uploaded, downloaded };
+   }
+ 
++  // ---- Upload ------------------------------------------------------------
++
++  /**
++   * Move one local-only attachment to the server. Returns whether it counts as
++   * uploaded (a dedupe does — the server has the bytes, which is the point).
++   *
++   * Throws {@link AbortPass} when the failure is the vault's, not the file's.
++   */
++  private async uploadOne(a: LocalAttachment): Promise<boolean> {
++    const mime = mimeForPath(a.relPath);
++    // Read lazily and at most once: the deduped path must move NO bytes and
++    // must not even open the file, which is what makes a second device's first
++    // sync a few JSON round trips instead of re-uploading the whole store.
++    let cached: Uint8Array | null = null;
++    const loadBytes = async (): Promise<Uint8Array> => {
++      if (!cached) cached = await this.deps.readLocal(a.relPath);
++      return cached;
++    };
++
++    if (!this.deps.createIntent || this.intentSupported === false) {
++      await this.deps.uploadServer(a.relPath, await loadBytes(), mime);
++      return true;
++    }
++
++    let intent: BlobIntent;
++    try {
++      intent = await this.deps.createIntent({
++        relPath: a.relPath,
++        sha256: a.sha256,
++        size: a.size ?? (await loadBytes()).byteLength,
++        mime,
++        filename: baseName(a.relPath),
++      });
++      this.intentSupported = true;
++    } catch (e) {
++      const status = errStatus(e);
++      if (status === 404) {
++        // A server from before this flow. Remembered, so the NEXT file skips
++        // the probe entirely rather than paying a 404 each time.
++        this.intentSupported = false;
++        await this.deps.uploadServer(a.relPath, await loadBytes(), mime);
++        return true;
++      }
++      if (status === 402) {
++        this.notifyStorageLimit();
++        throw new AbortPass(errCode(e) ?? "storage_limit_reached");
++      }
++      if (status === 413 || status === 415) {
++        // Permanent for these bytes: the file is over the cap or of a type the
++        // server refuses. Retrying it every pass is a guaranteed failure every
++        // pass — mark it and move on.
++        this.permanentSkips.add(a.sha256);
++        console.warn(
++          `[attachments] ${a.relPath} refused permanently (${status} ${errCode(e) ?? "?"}) — skipping`,
++        );
++        return false;
++      }
++      throw e;
++    }
++
++    if ("deduped" in intent && intent.deduped) return true; // zero bytes moved
++    if (!("upload" in intent)) throw new Error("intent answered with no upload target");
++    const { upload, completeUrl } = intent;
++
++    if (upload.kind === "single") {
++      const put = () =>
++        this.putOnce(a, {
++          url: upload.url,
++          method: upload.method ?? "PUT",
++          headers: upload.headers ?? {},
++          loadBytes,
++        });
++      await put();
++      await this.completeUpload(completeUrl, () => ({}), put);
++      return true;
++    }
++
++    // Multipart: part n is `[(n-1)*partBytes, n*partBytes)`, 1-based like S3.
++    const size = a.size ?? (await loadBytes()).byteLength;
++    const known = new Map(upload.parts.map((p) => [p.partNumber, p.url]));
++    let parts: Array<{ partNumber: number; etag: string }> = [];
++    const runParts = async () => {
++      const out: Array<{ partNumber: number; etag: string }> = [];
++      const count = Math.max(1, Math.ceil(size / upload.partBytes));
++      for (let n = 1; n <= count; n++) {
++        if (!this.current()) throw new Error("vault changed mid-upload");
++        const range = {
++          start: (n - 1) * upload.partBytes,
++          end: Math.min(n * upload.partBytes, size),
++        };
++        // A part URL we were never given — or one whose presign died while the
++        // earlier parts were in flight — is re-minted rather than failing the
++        // whole file. `partsUrl` carries its own token.
++        let url = known.get(n) ?? (await this.freshPartUrl(upload.partsUrl, n, known));
++        let res = await this.putOnce(a, {
++          url,
++          method: upload.method ?? "PUT",
++          headers: upload.headers ?? {},
++          range,
++          loadBytes,
++          tolerate: EXPIRED_PRESIGN,
++        });
++        if (EXPIRED_PRESIGN.includes(res.status)) {
++          url = await this.freshPartUrl(upload.partsUrl, n, known);
++          res = await this.putOnce(a, {
++            url,
++            method: upload.method ?? "PUT",
++            headers: upload.headers ?? {},
++            range,
++            loadBytes,
++          });
++        }
++        const etag = res.etag;
++        if (!etag) throw new Error(`part ${n} of ${a.relPath} came back without an ETag`);
++        out.push({ partNumber: n, etag });
++      }
++      return out;
++    };
++    parts = await runParts();
++    await this.completeUpload(
++      completeUrl,
++      () => ({ uploadId: upload.uploadId, parts }),
++      async () => {
++        parts = await runParts();
++      },
++    );
++    return true;
++  }
++
++  /**
++   * One PUT, through Rust when it is there and the webview when it is not.
++   *
++   * No `Authorization` is ever added here: `headers` came from the intent and
++   * is the complete set the presign signed (see the module header).
++   */
++  private async putOnce(
++    a: LocalAttachment,
++    t: {
++      url: string;
++      method: string;
++      headers: Record<string, string>;
++      range?: AttachmentRange;
++      loadBytes: () => Promise<Uint8Array>;
++      /** Statuses to hand back instead of throwing (an expired presign). */
++      tolerate?: readonly number[];
++    },
++  ): Promise<PutResult> {
++    let res: PutResult | null = null;
++    if (this.deps.putFile && this.rustTransport) {
++      try {
++        res = await this.deps.putFile({
++          relPath: a.relPath,
++          url: t.url,
++          method: t.method,
++          headers: t.headers,
++          range: t.range,
++        });
++      } catch (e) {
++        if (!isMissingCommand(e) || !this.deps.putBytes) throw e;
++        // Only "the command isn't there" earns the fallback, and only once.
++        this.rustTransport = false;
++        console.warn("[attachments] Rust transport unavailable — using the webview", e);
++      }
++    }
++    if (!res) {
++      if (!this.deps.putBytes) throw new Error("no attachment upload transport available");
++      const bytes = await t.loadBytes();
++      res = await this.deps.putBytes({
++        url: t.url,
++        method: t.method,
++        headers: t.headers,
++        bytes: t.range ? bytes.subarray(t.range.start, t.range.end) : bytes,
++      });
++    }
++    const ok = res.status >= 200 && res.status < 300;
++    if (!ok && !(t.tolerate ?? []).includes(res.status)) {
++      throw Object.assign(new Error(`upload PUT failed: HTTP ${res.status}`), {
++        status: res.status,
++      });
++    }
++    return res;
++  }
++
++  /** Fresh presigned URL for one part, remembered for a retry of the same part. */
++  private async freshPartUrl(
++    partsUrl: string,
++    partNumber: number,
++    known: Map<number, string>,
++  ): Promise<string> {
++    if (!this.deps.requestParts) throw new Error(`no URL for part ${partNumber}`);
++    const { parts } = await this.deps.requestParts(partsUrl, [partNumber]);
++    for (const p of parts) known.set(p.partNumber, p.url);
++    const url = known.get(partNumber);
++    if (!url) throw new Error(`server returned no URL for part ${partNumber}`);
++    return url;
++  }
++
++  /**
++   * Finish the upload. `upload_incomplete` means the server cannot see every
++   * byte yet — the PUT is what to retry, not the complete.
++   */
++  private async completeUpload(
++    completeUrl: string,
++    body: () => BlobCompleteBody,
++    retryPut: () => Promise<unknown>,
++  ): Promise<void> {
++    const complete = this.deps.completeUpload;
++    if (!complete) throw new Error("no way to complete an upload");
++    try {
++      await complete(completeUrl, body());
++    } catch (e) {
++      if (errCode(e) !== "upload_incomplete") throw e;
++      await retryPut();
++      await complete(completeUrl, body());
++    }
++  }
++
++  /** One toast per sync instance — a full vault is one fact, not one per file. */
++  private notifyStorageLimit(): void {
++    if (this.storageLimitNotified) return;
++    this.storageLimitNotified = true;
++    this.deps.notify?.(
++      "This vault is out of attachment storage — new files won't sync until you free space or upgrade.",
++      "error",
++    );
++  }
++
++  // ---- Download ----------------------------------------------------------
++
++  /**
++   * Bring one server-only attachment down.
++   *
++   * The URL is asked for rather than followed from a 302, because reqwest
++   * forwards `Authorization` across a redirect and a presigned S3 URL rejects a
++   * request that carries one. `direct` then decides the headers, and that is the
++   * whole rule: presign ⇒ nothing, our own route ⇒ the bearer.
++   */
++  private async downloadOne(b: ServerBlob): Promise<void> {
++    const relPath = b.relPath as string;
++    let target: BlobDownloadTarget | null = null;
++    if (this.deps.downloadUrl && this.downloadUrlSupported !== false) {
++      try {
++        target = await this.deps.downloadUrl(b.id);
++        this.downloadUrlSupported = true;
++      } catch (e) {
++        if (errStatus(e) !== 404) throw e;
++        // A server that predates the presigned download: legacy from here on.
++        this.downloadUrlSupported = false;
++      }
++    }
++
++    if (target) {
++      const headers = target.direct ? {} : (this.deps.authHeaders?.() ?? {});
++      if (this.deps.fetchToFile && this.rustTransport) {
++        try {
++          await this.deps.fetchToFile({
++            url: target.url,
++            relPath,
++            headers,
++            expectedSha256: b.sha256,
++          });
++          return;
++        } catch (e) {
++          if (!isMissingCommand(e)) throw e;
++          this.rustTransport = false;
++          console.warn("[attachments] Rust transport unavailable — using the webview", e);
++        }
++      }
++      if (this.deps.fetchBytes) {
++        await this.deps.writeLocal(relPath, await this.deps.fetchBytes(target.url, headers));
++        return;
++      }
++    }
++
++    // Legacy: the server proxies the bytes on `/api/blobs/:id`.
++    await this.deps.writeLocal(relPath, await this.deps.downloadServer(b.id));
++  }
++
+   /** Debounced reconcile — collapses a burst of watcher events into one pass. */
+   scheduleReconcile(): void {
+     if (this.timer) this.clearTimeoutImpl(this.timer);
+diff --git a/app/apps/desktop/src/lib/sync/docSession.ts b/app/apps/desktop/src/lib/sync/docSession.ts
+index 42aa6788..996700fb 100644
+--- a/app/apps/desktop/src/lib/sync/docSession.ts
++++ b/app/apps/desktop/src/lib/sync/docSession.ts
+@@ -3370,11 +3370,46 @@ export class SyncManager implements InboundHost {
+       readLocal: (relPath) => ipc.readBinaryFile(relPath, epoch),
+       writeLocal: (relPath, bytes) => ipc.writeBinaryFile(relPath, bytes, epoch),
+       listServer: () => api.listVaultBlobs(vaultId),
++      // The legacy pair: still the whole flow for a server that predates the
++      // intent route, and the fallback the client drops to on its 404.
+       uploadServer: (relPath, bytes, mime) =>
+         api
+           .uploadBlob({ vaultId, relPath, bytes, mime, fileName: baseName(relPath) })
+           .then(() => undefined),
+       downloadServer: (id) => api.downloadBlob(id),
++      // intent → PUT → complete. Bytes go through Rust (epoch-pinned, streamed
++      // from/to disk); the webview `fetch` pair behind it is only reached when
++      // the invoke bridge says the command isn't there.
++      createIntent: (input) =>
++        api.createBlobIntent(vaultId, {
++          sha256: input.sha256,
++          size: input.size,
++          mime: input.mime,
++          relPath: input.relPath,
++          filename: input.filename,
++        }),
++      completeUpload: (completeUrl, body) =>
++        api.completeBlob(completeUrl, body).then(() => undefined),
++      requestParts: (partsUrl, partNumbers) => api.requestBlobParts(partsUrl, partNumbers),
++      putFile: (input) =>
++        ipc.uploadAttachment(
++          {
++            relPath: input.relPath,
++            url: input.url,
++            method: input.method,
++            headers: input.headers,
++            range: input.range,
++          },
++          epoch,
++        ),
++      putBytes: (input) => api.uploadBytesTo(input),
++      downloadUrl: (blobId) => api.blobDownloadUrl(blobId),
++      fetchToFile: (input) => ipc.downloadAttachment(input, epoch),
++      fetchBytes: (url, headers) => api.downloadBytesFrom(url, headers),
++      // Only ever applied to a download URL the SERVER serves; a presigned one
++      // is fetched clean (see `sync/attachments.ts`).
++      authHeaders: () => api.authHeaders(),
++      notify: (text, tone) => toast(text, tone ?? "error"),
+     });
+   }
+ 
+diff --git a/docs/RELEASE_NOTES.md b/docs/RELEASE_NOTES.md
+index a3aa6d1d..5617761d 100644
+--- a/docs/RELEASE_NOTES.md
++++ b/docs/RELEASE_NOTES.md
+@@ -20,6 +20,7 @@
+ 
+ ## 0.1.62
+ 
++- Attachments now upload and download through a streaming path that keeps large files out of memory, skips files the server already holds without sending a byte, and sends very large files in parts so a dropped connection does not start over.
+ - Search now looks inside Word, Excel, PowerPoint, CSV, code and zip files in your vault, not just notes. Hits show a file badge and open the right viewer, and the Health page reports how much extracted text the index holds.
+ - More kinds of files open inside Baalda: Word documents, spreadsheets, CSV, audio, video, code and JSON files, with PowerPoint and zip files showing a card with "Open externally". Plain-text and Markdown-variant notes that used to do nothing when clicked now open in the editor and appear in search.
+ - Dropping or pasting a file into a note embeds it: video and audio play inline, CSV shows as a table, other files become a chip you can click. Files too large to sync are refused with a message instead of silently never reaching teammates.

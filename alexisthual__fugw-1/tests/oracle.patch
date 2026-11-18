@@ -1,0 +1,1814 @@
+diff --git a/src/fugw/fugw.py b/src/fugw/fugw.py
+index 42be15ca..b856239b 100644
+--- a/src/fugw/fugw.py
++++ b/src/fugw/fugw.py
+@@ -10,19 +10,31 @@
+ class FUGW(BaseModel):
+     def __init__(
+         self,
+-        rho=(10, 10, 1, 1),
+-        eps=1e-4,
+-        alpha=0.95,
+-        mode="independent",
++        px=None,
++        py=None,
++        alpha=1,
++        rho=20, 
++        eps=1e-2,
++        uot_solver="sinkhorn",
++        reg_mode="joint",
++        init_plan=None,
++        init_duals=None,
+         verbose=False,
++        early_stopping_threshold=1e-6,
+         **kwargs,
+     ):
+         # Save model arguments
++        self.px = px
++        self.py = py
++        self.alpha = alpha
+         self.rho = rho
+         self.eps = eps
+-        self.alpha = alpha
+-        self.mode = mode
++        self.uot_solver = uot_solver
++        self.reg_mode = reg_mode
++        self.init_plan = init_plan
++        self.init_duals = init_duals
+         self.verbose = verbose
++        self.early_stopping_threshold = early_stopping_threshold
+ 
+     def fit(
+         self,
+@@ -62,6 +74,13 @@ def fit(
+         use_cuda = torch.cuda.is_available()
+         dtype = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
+ 
++        if isinstance(self.rho, float) or isinstance(self.rho, int):
++            rho_x, rho_y = self.rho
++        elif isinstance(self.rho, tuple) and len(self.rho) == 2:
++            rho_x, rho_y = self.rho
++        else:
++            raise ValueError("Invalid value of rho. Must be either a scalar or a tuple of two scalars.")
++
+         Fs = torch.from_numpy(source_data.T).type(dtype)
+         Ft = torch.from_numpy(target_data.T).type(dtype)
+         K = torch.cdist(Fs, Ft, p=2)
+@@ -78,27 +97,28 @@ def fit(
+ 
+         # Compute transport plan
+         res = model.solver(
+-            Gs,
+-            Gt,
+-            K,
+-            rho=self.rho,
+-            eps=self.eps,
++            X=Gs,
++            Y=Gt,
++            px=self.px,
++            py=self.py,
++            D=K,
+             alpha=self.alpha,
+-            reg_mode=self.mode,
+-            log=self.verbose,
++            rho_x=rho_x,
++            rho_y=rho_y,
++            eps=self.eps,
++            uot_solver=self.uot_solver,
++            reg_mode=self.reg_mode,
++            init_plan=self.init_plan,
++            init_duals=self.init_duals,
++            log=False,
+             verbose=self.verbose,
+-            save_freq=1,
++            early_stopping_threshold=self.early_stopping_threshold,
+         )
+ 
+-        if self.verbose:
+-            pi, gamma, _, _ = res
+-        else:
+-            pi, gamma = res
+-
+-        self.pi = pi.detach().cpu().numpy()
++        self.pi = res[0].detach().cpu().numpy()
+ 
+         # Free allocated GPU memory
+-        del Fs, Ft, K, Gs, Gt, gamma
++        del Fs, Ft, K, Gs, Gt
+         if use_cuda:
+             torch.cuda.empty_cache()
+ 
+diff --git a/src/fugw/solvers/fugw.py b/src/fugw/solvers/fugw.py
+index 4328b9ea..5e4b0f39 100644
+--- a/src/fugw/solvers/fugw.py
++++ b/src/fugw/solvers/fugw.py
+@@ -1,103 +1,56 @@
+ import torch
+-import numpy as np
++from .utils import *
++from functools import partial
+ 
++from ot.gromov import fused_gromov_wasserstein as fgw
++from ot.gromov import gromov_wasserstein as gw
++
++# require POT >= 0.8.2
+ # require torch >= 1.9
+ 
+ """
+ Code adapted from: https://github.com/thibsej/unbalanced_gromov_wasserstein
++Solve
++    alpha * GW + (1 - alpha) * W + rho_1 * KL() + rho_2 * KL()
+ """
+ 
+-
+ class FUGWSolver:
+     def __init__(
+         self,
+-        nits=50,
+-        nits_sinkhorn=1000,
+-        tol=1e-7,
+-        tol_sinkhorn=1e-7,
+-        **kwargs
++        nits_bcd=50,
++        nits_uot=1000,
++        tol_bcd=1e-7,
++        tol_uot=1e-7,
++        eval_bcd=2,
++        eval_uot=10
+     ):
+-        self.nits = nits
+-        self.nits_sinkhorn = nits_sinkhorn
+-        self.tol = tol
+-        self.tol_sinkhorn = tol_sinkhorn
+-
+-    def sinkhorn(self, T, u, v, tuple_ab, rho1, rho2, eps):
+-
+-        a, b, ab = tuple_ab
+-        tau1 = 1 if torch.isinf(rho1) else rho1 / (rho1 + eps)
+-        tau2 = 1 if torch.isinf(rho2) else rho2 / (rho2 + eps)
+-
+-        for _ in range(self.nits_sinkhorn):
+-            u_prev = u.detach().clone()
+-            if rho2 == 0:
+-                v = torch.zeros_like(v)
+-            else:
+-                v = -tau2 * ((u + a.log())[:, None] - T / eps).logsumexp(dim=0)
+-
+-            if rho1 == 0:
+-                u = torch.zeros_like(u)
+-            else:
+-                u = -tau1 * ((v + b.log())[None, :] - T / eps).logsumexp(dim=1)
+-
+-            if (u - u_prev).abs().max().item() < self.tol_sinkhorn:
+-                break
+-
+-        pi = ab * (u[:, None] + v[None, :] - T / eps).exp()
+-
+-        return u, v, pi
+-
+-    def approx_kl(self, p, q):
+-        # By convention: 0 log 0 = 0
+-        return torch.nan_to_num(
+-            p * (p / q).log(), nan=0.0, posinf=0.0, neginf=0.0
+-        ).sum()
+-
+-    def kl(self, p, q):
+-        return self.approx_kl(p, q) - p.sum() + q.sum()
+-
+-    def quad_kl(self, mu, nu, alpha, beta):
+         """
+-        Calculate the KL divergence between two product measures:
+-        KL(mu otimes nu, alpha otimes beta) =
+-        m_mu * KL(nu, beta)
+-        + m_nu * KL(mu, alpha)
+-        + (m_mu - m_alpha) * (m_nu - m_beta)
+-
+-        Parameters
+-        ----------
+-        mu: vector or matrix
+-        nu: vector or matrix
+-        alpha: vector or matrix with the same size as mu
+-        beta: vector or matrix with the same size as nu
+-
+-        Returns
+-        ----------
+-        KL divergence between two product measures
++        write me
+         """
+ 
+-        m_mu = mu.sum()
+-        m_nu = nu.sum()
+-        m_alpha = alpha.sum()
+-        m_beta = beta.sum()
+-        const = (m_mu - m_alpha) * (m_nu - m_beta)
+-        kl = m_nu * self.kl(mu, alpha) + m_mu * self.kl(nu, beta) + const
+-
+-        return kl
++        self.nits_bcd = nits_bcd
++        self.nits_uot = nits_uot
++        self.tol_bcd = tol_bcd
++        self.tol_uot = tol_uot
++        self.eval_bcd = eval_bcd
++        self.eval_uot = eval_uot
+ 
+-    def compute_local_cost(self, data_const, pi, tuple_ab, hyperparams):
+-        """ """
++    def local_cost(self, pi, transpose, data_const, tuple_p, hyperparams):
++        """ 
++        write me
++        """
+ 
+-        rho, eps, alpha = hyperparams
+-        rho1, rho2, rho3, rho4 = rho
+-        a, b, ab = tuple_ab
++        rho_x, rho_y, eps, alpha, reg_mode = hyperparams
++        px, py, pxy = tuple_p
+         X_sqr, Y_sqr, X, Y, D = data_const
++        if transpose:
++            X_sqr, Y_sqr, X, Y = X_sqr.T, Y_sqr.T, X.T, Y.T
+ 
+         pi1, pi2 = pi.sum(1), pi.sum(0)
+ 
+         cost = 0
+-        if self.reg_mode == "joint":
+-            cost = cost + eps * self.approx_kl(pi, ab)
++        if reg_mode == "joint":
++            cost = cost + eps * compute_approx_kl(pi, pxy)
+ 
+         # avoid unnecessary calculation of UGW when alpha = 0
+         if alpha != 1 and D is not None:
+@@ -112,20 +65,20 @@ def compute_local_cost(self, data_const, pi, tuple_ab, hyperparams):
+             cost = cost + alpha * gw_cost
+ 
+         # or when cost is balanced
+-        if rho1 != np.inf and rho1 != 0:
+-            cost += rho1 * self.approx_kl(pi1, a)
+-        if rho2 != np.inf and rho2 != 0:
+-            cost += rho2 * self.approx_kl(pi2, b)
++        if rho_x != float("inf") and rho_x != 0:
++            cost = cost + rho_x * compute_approx_kl(pi1, px)
++        if rho_y != float("inf") and rho_y != 0:
++            cost = cost + rho_y * compute_approx_kl(pi2, py)
+ 
+         return cost
+ 
+-    def ucoot_cost(
+-        self, data_const, tuple_ab1, tuple_ab2, pi, gamma, hyperparams
+-    ):
+-        rho, eps, alpha = hyperparams
+-        rho1, rho2, rho3, rho4 = rho
+-        a1, b1, ab1 = tuple_ab1
+-        a2, b2, ab2 = tuple_ab2
++    def fugw_cost(self, pi, gamma, data_const, tuple_p, hyperparams):
++        """
++        Write me
++        """
++
++        rho_x, rho_y, eps, alpha, reg_mode = hyperparams
++        px, py, pxy = tuple_p
+         X_sqr, Y_sqr, X, Y, D = data_const
+ 
+         pi1, pi2 = pi.sum(1), pi.sum(0)
+@@ -133,99 +86,107 @@ def ucoot_cost(
+ 
+         cost = 0
+ 
+-        if alpha != 1:
+-            uot_cost = 0
+-            if D is not None:
+-                uot_cost += (D * pi).sum() + (D * gamma).sum()
+-            # if rho3 != np.inf and rho3 != 0:
+-            #     uot_cost += rho3 * self.kl(pi1, a1) + rho3 * self.kl(
+-            #         gamma1, a2
+-            #     )
+-            # if rho4 != np.inf and rho4 != 0:
+-            #     uot_cost += rho4 * self.kl(pi2, b1) + rho4 * self.kl(
+-            #         gamma2, b2
+-            #     )
+-
+-            cost = cost + (1 - alpha) * uot_cost / 2
++        if alpha != 1 and D is not None:
++            w_cost = (D * pi).sum() + (D * gamma).sum()
++            cost = cost + (1 - alpha) * w_cost / 2
+ 
+         if alpha != 0:
+             A = (X_sqr @ gamma1).dot(pi1)
+             B = (Y_sqr @ gamma2).dot(pi2)
+             C = (X @ gamma @ Y.T) * pi
+             gw_cost = A + B - 2 * C.sum()
+-
+             cost = cost + alpha * gw_cost
+ 
+-        if rho1 != np.inf and rho1 != 0:
+-            cost += rho1 * self.quad_kl(pi1, gamma1, a1, a2)
+-        if rho2 != np.inf and rho2 != 0:
+-            cost += rho2 * self.quad_kl(pi2, gamma2, b1, b2)
++        if rho_x != float("inf") and rho_x != 0:
++            cost = cost + rho_x * compute_quad_kl(pi1, gamma1, px, px)
++        if rho_y != float("inf") and rho_y != 0:
++            cost = cost + rho_y * compute_quad_kl(pi2, gamma2, py, py)
+ 
+-        if self.reg_mode == "joint":
+-            ent_cost = cost + eps * self.quad_kl(pi, gamma, ab1, ab2)
+-        elif self.reg_mode == "independent":
++        if reg_mode == "joint":
++            ent_cost = cost + eps * compute_quad_kl(pi, gamma, pxy, pxy)
++        elif reg_mode == "independent":
+             ent_cost = (
+-                cost + eps * self.kl(pi, ab1) + eps * self.kl(gamma, ab2)
++                cost + eps * compute_kl(pi, pxy) + eps * compute_kl(gamma, pxy)
+             )
+ 
+-        return cost, ent_cost
++        return cost.item(), ent_cost.item()
+ 
+-    def get_barycentre(self, Xt, sample_coupling):
++    def project_on_target_domain(self, Xt, pi):
+         """
+-        Calculate the barycentre by the following formula:
+-        diag(1 / P1_{n_2}) P Xt
+-        (need to be typed in latex).
++        Project the SOURCE data on the TARGET space via the formula:
++        proj = diag(1 / P_{# 1}) P Xt (need to be typed in latex).
+ 
+         Parameters
+         ----------
+-        Xt: target data of size n2 x d2,
++        Xt: target data of size nt x dt,
+             NOT to be confused with the target distance matrix.
+-        sample_coupling: optimal plan of size n1 x n2.
++        pi: optimal plan of size ns x nt.
+ 
+         Returns
+         -------
+-        Barycentre of size n1 x d2
++        Projection of size ns x dt
+         """
+ 
+-        barycentre = (
+-            sample_coupling @ Xt / sample_coupling.sum(1).reshape(-1, 1)
+-        )
++        projection = pi @ Xt / pi.sum(1).reshape(-1, 1)
+ 
+-        return barycentre
++        return projection
+ 
+-    def solver(
++    def project_on_source_domain(self, Xs, pi):
++        """
++        Project the TARGET data on the SOURCE space via the formula:
++        proj = diag(1 / P1_{# 2}) P.T Xs (need to be typed in latex).
++
++        Parameters
++        ----------
++        Xs: source data of size ns x ds,
++            NOT to be confused with the source distance matrix.
++        pi: optimal plan of size ns x nt.
++
++        Returns
++        -------
++        Projection of size nt x ds
++        """
++
++        projection = pi.T @ Xs / pi.sum(0).reshape(-1, 1)
++
++        return projection
++
++    def solver_fugw(
+         self,
+         X,
+         Y,
++        px=None,
++        py=None,
+         D=None,
+-        px=(None, None),
+-        py=(None, None),
+-        rho=(float("inf"), float("inf"), 0, 0),
+-        eps=1e-2,
+         alpha=1,
++        rho_x=float("inf"), 
++        rho_y=float("inf"),
++        eps=1e-2,
++        uot_solver="sinkhorn",
+         reg_mode="joint",
+-        init_n=None,
++        init_plan=None,
++        init_duals=None,
+         log=False,
+         verbose=False,
+         early_stopping_threshold=1e-6,
+-        save_freq=10,
++        eps_base=1,
+     ):
+         """
+         Parameters for mode:
+-        - Ent-LB-UGW: alpha = 1, mode = "joint", rho1 != infty, rho2 != infty.
++        - Ent-LB-UGW: alpha = 1, mode = "joint", rho_x != infty, rho_y != infty.
+             No need to care about rho3 and rho4.
+-        - EGW: alpha = 1, mode = "independent", rho1 = rho2 = infty.
++        - EGW: alpha = 1, mode = "independent", rho_x = rho_y = infty.
+             No need to care about rho3 and rho4.
+         - Ent-FGW: 0 < alpha < 1, D != None, mode = "independent",
+-            rho1 = rho2 = infty (so rho3 = rho4 = infty)
++            rho_x = rho_y = infty (so rho3 = rho4 = infty)
+         - Ent-semi-relaxed GW: alpha = 1, mode = "independent",
+-            (rho1 = 0, rho2 = infty), or (rho1 = infty, rho2 = 0).
++            (rho_x = 0, rho_y = infty), or (rho_x = infty, rho_y = 0).
+             No need to care about rho3 and rho4.
+         - Ent-semi-relaxed FGW: 0 < alpha < 1, mode = "independent",
+-            (rho1 = rho3 = 0, rho2 = rho4 = infty),
+-            or (rho1 = rho3 = infty, rho2 = rho4 = 0).
++            (rho_x = rho3 = 0, rho_y = rho4 = infty),
++            or (rho_x = rho3 = infty, rho_y = rho4 = 0).
+         - Ent-UOT: alpha = 0, mode = "independent", D != None,
+-            rho1 != infty, rho2 != infty, rho3 != infty, rho4 != infty.
++            rho_x != infty, rho_y != infty, rho3 != infty, rho4 != infty.
+ 
+         Parameters
+         ----------
+@@ -246,9 +207,6 @@ def solver(
+             Initialisation matrix for sample coupling.
+         log: True if the loss is recorded, False otherwise.
+         verbose: if True then print the recorded loss.
+-        save_freq: The multiplier of iteration at which the loss is calculated.
+-            For example, if save_freq = 10, then the
+-            loss is calculated at iteration 10, 20, 30, etc...
+ 
+         Returns
+         -------
+@@ -259,196 +217,201 @@ def solver(
+         log_ent_cost: if log is True, return a list of entropic loss.
+         """
+ 
+-        self.reg_mode = reg_mode
++        # sanity check
++        if uot_solver == "mm" and (rho_x == float("inf") or rho_y == float("inf")):
++            uot_solver = "dc"
++        if uot_solver == "sinkhorn" and eps == 0:
++            uot_solver = "dc"
+ 
+-        n1, d1 = X.shape
+-        n2, d2 = Y.shape
++        nx, ny = X.shape[0], Y.shape[0]
+         device, dtype = X.device, X.dtype
+ 
+-        # hyper-parameters
+-        rho1, rho2, rho3, rho4 = rho
++        # constant data variables
++        X_sqr = X**2
++        Y_sqr = Y**2
++
++        if alpha == 1 or D is None:
++            alpha, D = 1, None
+ 
+-        if rho3 == np.inf or rho1 == np.inf:
+-            rho1, rho3 = np.inf, np.inf
+-        if rho4 == np.inf or rho2 == np.inf:
+-            rho2, rho4 = np.inf, np.inf
++        # measures on rows and columns
++        if px is None:
++            px = torch.ones(nx).to(device).to(dtype) / nx
++        if py is None:
++            py = torch.ones(ny).to(device).to(dtype) / ny
++        pxy = px[:, None] * py[None, :]
+ 
+-        rho = (rho1, rho2, rho3, rho4)
+-        hyperparams = (rho, eps, alpha)
++        # initialise coupling and dual vectors
++        pi = pxy if init_plan is None else init_plan # size n1 x n2
++        gamma = pi
+ 
+-        # const1 = alpha * rho1
+-        # const2 = alpha * rho2
+-        const1 = rho1
+-        const2 = rho2
+-        # const3 = (1 - alpha) * rho3 / 2
+-        # const4 = (1 - alpha) * rho4 / 2
++        if uot_solver == "sinkhorn":
++            if init_duals is None:
++                duals_p = (torch.zeros_like(px), torch.zeros_like(py))  # shape n1, n2
++            else:
++                duals_p = init_duals
++            duals_g = duals_p
++        elif uot_solver == "mm":
++            duals_p, duals_g = None, None
++        elif uot_solver == "dc":
++            if init_duals is None:
++                duals_p = (torch.ones_like(px), torch.ones_like(py))  # shape n1, n2
++            else:
++                duals_p = init_duals
++            duals_g = duals_p
+ 
+-        # measures on rows and columns
+-        a1, a2 = px
+-        b1, b2 = py
+-
+-        if a1 is None:
+-            a1 = torch.ones(n1).to(device).to(dtype) / n1
+-        if a2 is None:
+-            a2 = torch.ones(d1).to(device).to(dtype) / d1
+-        if b1 is None:
+-            b1 = torch.ones(n2).to(device).to(dtype) / n2
+-        if b2 is None:
+-            b2 = torch.ones(d2).to(device).to(dtype) / d2
+-        ab1 = a1[:, None] * b1[None, :]
+-        ab2 = a2[:, None] * b2[None, :]
+-
+-        tuple_ab1 = (a1, b1, ab1)
+-        tuple_ab2 = (a2, b2, ab2)
++        compute_local_cost = partial(self.local_cost, 
++            data_const = (X_sqr, Y_sqr, X, Y, D), 
++            tuple_p = (px, py, pxy), 
++            hyperparams = (rho_x, rho_y, eps, alpha, reg_mode))
+ 
+-        # constant data variables
+-        X_sqr = X**2
+-        Y_sqr = Y**2
+-        data_const = (X_sqr, Y_sqr, X, Y, D)
+-        data_const_T = (X_sqr.T, Y_sqr.T, X.T, Y.T, D)
++        compute_fugw_cost = partial(self.fugw_cost, 
++            data_const = (X_sqr, Y_sqr, X, Y, D), 
++            tuple_p = (px, py, pxy), 
++            hyperparams = (rho_x, rho_y, eps, alpha, reg_mode))
+ 
+-        # initialise coupling and dual vectors
+-        if init_n is None:
+-            pi = a1[:, None] * b1[None, :]  # size n1 x n2
+-        else:
+-            pi = init_n
++        self_solver_scaling = partial(solver_scaling, 
++            tuple_pxy = (px.log(), py.log(), pxy), 
++            train_params = (self.nits_uot, self.tol_uot, self.eval_uot))
++
++        self_solver_mm = partial(solver_mm, 
++            tuple_pxy = (px, py),
++            train_params = (self.nits_uot, self.tol_uot, self.eval_uot))
+ 
+-        up, vp = torch.zeros_like(a1), torch.zeros_like(b1)  # shape n1, n2
+-        ug, vg = torch.zeros_like(a2), torch.zeros_like(b2)  # shape d1, d2
++        self_solver_dc = partial(solver_dc, 
++            tuple_pxy = (px, py, pxy),
++            train_params = (self.nits_uot, self.tol_uot, self.eval_uot), 
++            eps_base = eps_base, verbose = verbose)
+ 
+         # initialise log
+         log_cost = []
+-        log_ent_cost = []
+-        i = 1
+-        err = self.tol + 1e-3
++        log_ent_cost = [float("inf")]
++        idx = 0
++        err = self.tol_bcd + 1e-3
+ 
+-        while (err > self.tol) and (i <= self.nits):
++        while (err > self.tol_bcd) and (idx <= self.nits_bcd):
+             pi_prev = pi.detach().clone()
+ 
+             # Update gamma (feature coupling)
+             mp = pi.sum()
+-            # r13 = const1 * mp + const3
+-            # r24 = const2 * mp + const4
+-            r13 = const1 * mp
+-            r24 = const2 * mp
++            new_rho_x = rho_x * mp
++            new_rho_y = rho_y * mp
+             new_eps = mp * eps if reg_mode == "joint" else eps
+-
+-            Tg = self.compute_local_cost(
+-                data_const_T, pi, tuple_ab1, hyperparams
+-            )  # size d1 x d2
+-            ug, vg, gamma = self.sinkhorn(
+-                Tg, ug, vg, tuple_ab2, r13, r24, new_eps
+-            )
++            uot_params = (new_rho_x, new_rho_y, new_eps)
++
++            Tg = compute_local_cost(pi, transpose=True)  # size d1 x d2
++            if uot_solver == "sinkhorn":
++                duals_g, gamma = self_solver_scaling(Tg, duals_g, uot_params)
++            elif uot_solver == "mm":
++                gamma = self_solver_mm(Tg, gamma, uot_params)
++            if uot_solver == "dc":
++                duals_g, gamma = self_solver_dc(Tg, gamma, duals_g, uot_params)
+             gamma = (mp / gamma.sum()).sqrt() * gamma  # shape d1 x d2
+ 
+             # Update pi (sample coupling)
+             mg = gamma.sum()
+-            # r13 = const1 * mg + const3
+-            # r24 = const2 * mg + const4
+-            r13 = const1 * mg
+-            r24 = const2 * mg
++            new_rho_x = rho_x * mg
++            new_rho_y = rho_y * mg
+             new_eps = mp * eps if reg_mode == "joint" else eps
+-
+-            Tp = self.compute_local_cost(
+-                data_const, gamma, tuple_ab2, hyperparams
+-            )  # size n1 x n2
+-            up, vp, pi = self.sinkhorn(
+-                Tp, up, vp, tuple_ab1, r13, r24, new_eps
+-            )
++            uot_params = (new_rho_x, new_rho_y, new_eps)
++
++            Tp = compute_local_cost(gamma, transpose=False)  # size n1 x n2
++            if uot_solver == "sinkhorn":
++                duals_p, pi = self_solver_scaling(Tp, duals_p, uot_params)
++            elif uot_solver == "mm":
++                pi = self_solver_mm(Tp, pi, uot_params)
++            elif uot_solver == "dc":
++                duals_p, pi = self_solver_scaling(Tp, pi, duals_p, uot_params)
+             pi = (mg / pi.sum()).sqrt() * pi  # shape n1 x n2
+ 
+             # Update error
+             err = (pi - pi_prev).abs().sum().item()
+-            if log and (i % save_freq == 0):
+-                cost, ent_cost = self.ucoot_cost(
+-                    data_const, tuple_ab1, tuple_ab2, pi, gamma, hyperparams
+-                )
+-
+-                log_cost.append(cost.item())
+-                log_ent_cost.append(ent_cost.item())
+-                if (
+-                    len(log_ent_cost) >= 2
+-                    and abs(log_ent_cost[-2] - log_ent_cost[-1])
+-                    < early_stopping_threshold
+-                ):
+-                    break
++            if idx % self.eval_bcd == 0:
++                cost, ent_cost = compute_fugw_cost(pi, gamma)
++
++                log_cost.append(cost)
++                log_ent_cost.append(ent_cost)
+ 
+                 if verbose:
+-                    print("Cost at iteration {}: {}".format(i, cost.item()))
++                    print("Cost at iteration {}: {}".format(idx+1, ent_cost))
++
++                if abs(log_ent_cost[-2] - log_ent_cost[-1]) < early_stopping_threshold:
++                    break
+ 
+-            i += 1
++            idx += 1
+ 
+         if pi.isnan().any() or gamma.isnan().any():
+             print("There is NaN in coupling")
+ 
+         if log:
+-            return pi, gamma, log_cost, log_ent_cost
++            return pi, gamma, duals_p, duals_g, log_cost, log_ent_cost
+         else:
+             return pi, gamma
+ 
+-    def faster_solver(
++    def solver_fgw(
+         self,
+         X,
+         Y,
++        px=None,
++        py=None,
++        D=None,
++        alpha=1,
++        init_plan=None,
++        verbose=True,
++        **kwargs
++    ):
++        nx, ny = X.shape[0], Y.shape[0]
++        device, dtype = X.device, X.dtype
++
++        # measures on rows and columns
++        if px is None:
++            px = torch.ones(nx).to(device).to(dtype) / nx
++        if py is None:
++            py = torch.ones(ny).to(device).to(dtype) / ny
++
++        if alpha == 1 or D is None:
++            pi, dict_log = gw(C1=X, C2=Y, p=px, q=py, log=True, G0=init_plan, 
++                            verbose=verbose, **kwargs)
++            loss = dict_log["gw_dist"]
++        else:
++            pi, dict_log = fgw(M=D, C1=X, C2=Y, p=px, q=py, alpha=alpha, G0=init_plan, log=True, 
++                            verbose=verbose, **kwargs)
++            loss = dict_log["fgw_dist"]
++
++        duals = (dict_log["u"], dict_log["v"])
++
++        return pi, duals, loss
++
++    def solver(
++        self,
++        X,
++        Y,
++        px=None,
++        py=None,
+         D=None,
+-        px=(None, None),
+-        py=(None, None),
+-        rho=(1e-1, None, None, None),
+-        eps=1e-2,
+         alpha=1,
++        rho_x=float("inf"), 
++        rho_y=float("inf"),
++        eps=1e-2,
++        uot_solver="sinkhorn",
+         reg_mode="joint",
+-        init_n=None,
++        init_plan=None,
++        init_duals=None,
+         log=False,
+         verbose=False,
+         early_stopping_threshold=1e-6,
+-        save_freq=10,
+-        eps_step=10,
+-        init_eps=1,
++        **gw_kwargs
+     ):
+-        """
+-        Solver with warm start for small epsilon.
+-        """
++        if rho_x == float("inf") and rho_y == float("inf") and eps == 0:
++            pi, duals, loss = self.solver_fgw(X, Y, px, py, D, alpha, init_plan, verbose, **gw_kwargs)
++            if log:
++                return pi, pi, duals, duals, loss, loss
++            else:
++                return pi, pi
+ 
+-        if eps < init_eps:
+-
+-            nits = self.nits
+-            nits_sinkhorn = self.nits_sinkhorn
+-
+-            self.nits = 10
+-            self.nits_sinkhorn = 10
+-
+-            while init_eps > eps:
+-                init_n, _ = self.solver(
+-                    X,
+-                    Y,
+-                    D,
+-                    px,
+-                    py,
+-                    rho,
+-                    init_eps,
+-                    alpha,
+-                    reg_mode,
+-                    init_n,
+-                    log=False,
+-                )
+-                init_eps /= eps_step
+-
+-            self.nits = nits
+-            self.nits_sinkhorn = nits_sinkhorn
+-
+-        return self.solver(
+-            X,
+-            Y,
+-            D,
+-            px,
+-            py,
+-            rho,
+-            eps,
+-            alpha,
+-            reg_mode,
+-            init_n,
+-            log,
+-            verbose,
+-            early_stopping_threshold,
+-            save_freq,
+-        )
++        elif eps == 0 and ((rho_x == 0 and rho_y == float("inf")) or (rho_x == 0 and rho_y == float("inf"))):
++            raise ValueError("Invalid rho and eps. Unregularized semi-relaxed GW is not supported.")
++
++        else:
++            return self.solver_fugw(X, Y, px, py, D, alpha, rho_x, rho_y, eps, uot_solver, 
++                                    reg_mode, init_plan, init_duals, log, verbose, 
++                                    early_stopping_threshold)
+\ No newline at end of file
+diff --git a/src/fugw/solvers/fugw_batch.py b/src/fugw/solvers/fugw_batch.py
+deleted file mode 100644
+index 85d7072c..00000000
+--- a/src/fugw/solvers/fugw_batch.py
++++ /dev/null
+@@ -1,817 +0,0 @@
+-import torch
+-import numpy as np
+-from tqdm import tqdm
+-from functools import partial
+-
+-
+-class BatchFUGWSolver:
+-    def __init__(
+-        self, nits=100, nits_sinkhorn=100, tol=1e-7, tol_sinkhorn=1e-7
+-    ):
+-        self.nits = nits
+-        self.nits_sinkhorn = nits_sinkhorn
+-        self.tol = tol
+-        self.tol_sinkhorn = tol_sinkhorn
+-
+-    @staticmethod
+-    def get_factored_distance(X, Y):
+-        """
+-        Write square Euclidean distance matrix as product of two low rank matrices.
+-        """
+-        device, dtype = X.device, X.dtype
+-        nx, ny = X.shape[0], Y.shape[0]
+-
+-        Vx = (X ** 2).sum(1, keepdim=True)  # shape nx x 1
+-        Vy = (Y ** 2).sum(1, keepdim=True)  # shape ny x 1
+-        ones_x = torch.ones(nx, 1).to(device).to(dtype)  # shape nx x 1
+-        ones_y = torch.ones(ny, 1).to(device).to(dtype)  # shape ny x 1
+-
+-        D1 = torch.cat(
+-            [Vx, ones_x, -(2 ** 0.5) * X], dim=1
+-        )  # shape nx x (d+2)
+-        D2 = torch.cat([ones_y, Vy, 2 ** 0.5 * Y], dim=1)  # shape ny x (d+2)
+-
+-        return (D1, D2)
+-
+-    @staticmethod
+-    def get_tensor_cost(
+-        local_ugw_cost, data_const, alpha, position, idx, batch_size
+-    ):
+-        Cx_vec, Cy_vec, bary_centre, scalar = local_ugw_cost
+-        A1, _, B1, _, D1, D2 = data_const
+-
+-        if position == 1:  # shape batchsize1 x ny
+-            if alpha == 0:
+-                cost = 0.5 * D1[idx : idx + batch_size, :] @ D2.T
+-            elif alpha == 1:
+-                cost = (
+-                    Cx_vec[idx : idx + batch_size, None]
+-                    + Cy_vec[None, :]
+-                    - 2 * A1[idx : idx + batch_size, :] @ bary_centre @ B1.T
+-                )
+-            else:
+-                cost = (
+-                    alpha
+-                    * (
+-                        Cx_vec[idx : idx + batch_size, None]
+-                        + Cy_vec[None, :]
+-                        - 2
+-                        * A1[idx : idx + batch_size, :]
+-                        @ bary_centre
+-                        @ B1.T
+-                    )
+-                    + (1 - alpha) / 2 * D1[idx : idx + batch_size, :] @ D2.T
+-                )
+-
+-        elif position == 2:  # shape nx x batchsize2
+-            if alpha == 0:
+-                cost = 0.5 * D1 @ D2[idx : idx + batch_size, :].T
+-            elif alpha == 1:
+-                cost = (
+-                    Cx_vec[:, None]
+-                    + Cy_vec[None, idx : idx + batch_size]
+-                    - 2 * A1 @ bary_centre @ B1[idx : idx + batch_size, :].T
+-                )
+-            else:
+-                cost = (
+-                    alpha
+-                    * (
+-                        Cx_vec[:, None]
+-                        + Cy_vec[None, idx : idx + batch_size]
+-                        - 2
+-                        * A1
+-                        @ bary_centre
+-                        @ B1[idx : idx + batch_size, :].T
+-                    )
+-                    + (1 - alpha) / 2 * D1 @ D2[idx : idx + batch_size, :].T
+-                )
+-
+-        cost += scalar
+-
+-        return cost
+-
+-    def get_kl_of_vector(self, p, log_q, mode_kl):
+-        """
+-        Calculate the KL between two vectors.
+-        """
+-        kl = torch.nan_to_num(
+-            p * (p.log() - log_q), nan=0.0, posinf=0.0, neginf=0.0
+-        ).sum()
+-        if mode_kl == "exact":
+-            kl += log_q.exp().sum() - p.sum()
+-        return kl
+-
+-    def get_kl_of_coupling(
+-        self, dict_plan, eps, log_p, data_const, alpha, mode_kl
+-    ):
+-        """
+-        Calculate the KL between two matrices.
+-        """
+-        marg_1, marg_2 = dict_plan["marginals"]
+-        u, v = dict_plan["new_duals"]
+-        local_ugw_cost = dict_plan["local_ugw_cost"]
+-
+-        log_a, log_b = log_p
+-        bs1, r1 = self.sample_batch[0]
+-
+-        s1 = u + log_a
+-        s2 = v + log_b
+-        kl = -(marg_1 * log_a).sum() - (marg_2 * log_b).sum()
+-        for i in r1:
+-            cost = self.get_tensor_cost(
+-                local_ugw_cost, data_const, alpha, 1, i, bs1
+-            )  # shape bs1 x ny
+-            log_plan = s1[i : i + bs1, None] + s2[None, :] - cost / eps
+-            kl += (log_plan * log_plan.exp()).sum()  # entropy
+-
+-        if mode_kl == "exact":
+-            mass_ab = log_a.exp().sum() * log_b.exp().sum()
+-            mass = marg_1.sum()
+-            kl += mass_ab - mass
+-
+-        return kl
+-
+-    def sinkhorn(self, dict_plan, rho1, rho2, eps, log_p, data_const, alpha):
+-        tau1 = (
+-            1
+-            if (torch.isnan(rho1) or torch.isinf(rho1))
+-            else rho1 / (rho1 + eps)
+-        )
+-        tau2 = (
+-            1
+-            if (torch.isnan(rho2) or torch.isinf(rho2))
+-            else rho2 / (rho2 + eps)
+-        )
+-
+-        log_a, log_b = log_p
+-        u, v = dict_plan["duals"]
+-        local_ugw_cost = dict_plan["local_ugw_cost"]
+-
+-        (bs1, r1), (bs2, r2) = self.sample_batch
+-
+-        def get_lse(dual, pos, idx, bs):
+-            with torch.no_grad():
+-                cost = self.get_tensor_cost(
+-                    local_ugw_cost, data_const, alpha, pos, idx, bs
+-                )
+-                if pos == 2:
+-                    lse = torch.logsumexp(
+-                        (dual + log_a)[:, None] - cost / eps, dim=0
+-                    )
+-                elif pos == 1:
+-                    lse = torch.logsumexp(
+-                        (dual + log_b)[None, :] - cost / eps, dim=1
+-                    )
+-
+-            return lse
+-
+-        for _ in tqdm(range(self.nits_sinkhorn)):
+-            u_prev = u.clone()
+-            if rho2 == 0:  # semi-relaxed
+-                v = torch.zeros_like(v)
+-            else:
+-                v = -tau2 * torch.cat(tuple(get_lse(u, 2, j, bs2) for j in r2))
+-                # for j in r2:
+-                #     cost = self.get_tensor_cost(
+-                #         local_ugw_cost, data_const, alpha, 2, j, bs2
+-                #     )  # shape nx x bs2
+-                #     v[j: j + bs2] = -tau2 * torch.logsumexp(
+-                #         (u + log_a)[:, None] - cost / eps, dim=0
+-                #     )
+-
+-            if rho1 == 0:  # semi-relaxed
+-                u = torch.zeros_like(u)
+-            else:
+-                u = -tau1 * torch.cat(tuple(get_lse(v, 1, i, bs1) for i in r1))
+-
+-                # for i in r1:
+-                #     cost = self.get_tensor_cost(
+-                #         local_ugw_cost, data_const, alpha, 1, i, bs1
+-                #     )  # shape bs1 x ny
+-                #     u[i: i + bs1] = -tau1 * torch.logsumexp(
+-                #         (v + log_b)[None, :] - cost / eps, dim=1
+-                #     )
+-
+-            if (u - u_prev).abs().max().item() < self.tol_sinkhorn:
+-                break
+-
+-        s1 = u + log_a
+-        s2 = v + log_b
+-
+-        marg_1 = torch.zeros_like(u)
+-        for i in r1:
+-            cost = self.get_tensor_cost(
+-                local_ugw_cost, data_const, alpha, 1, i, bs1
+-            )  # shape bs1 x ny
+-            marg_1[i : i + bs1] = (
+-                (s1[i : i + bs1, None] + s2[None, :] - cost / eps)
+-                .exp()
+-                .sum(dim=1)
+-            )
+-
+-        marg_2 = torch.zeros_like(v)
+-        for j in r2:
+-            cost = self.get_tensor_cost(
+-                local_ugw_cost, data_const, alpha, 2, j, bs2
+-            )  # size nx x bs2
+-            marg_2[j : j + bs2] = (
+-                (s1[:, None] + s2[None, j : j + bs2] - cost / eps)
+-                .exp()
+-                .sum(dim=0)
+-            )
+-
+-        dict_plan["duals"] = (u, v)
+-        dict_plan["marginals"] = (marg_1, marg_2)
+-
+-        return dict_plan
+-
+-    def _get_coupling(self, dict_plan, log_p, data_const, eps, alpha):
+-
+-        u, v = dict_plan["new_duals"]
+-        local_ugw_cost = dict_plan["local_ugw_cost"]
+-        log_a, log_b = log_p
+-        bs1, r1 = self.sample_batch[0]
+-
+-        device, dtype = u.device, u.dtype
+-        coupling = torch.zeros((u.shape[0], v.shape[0])).to(device).to(dtype)
+-
+-        s1 = u + log_a
+-        s2 = v + log_b
+-        for i in r1:
+-            cost = self.get_tensor_cost(
+-                local_ugw_cost, data_const, alpha, 1, i, bs1
+-            )
+-            log_plan = s1[i : i + bs1, None] + s2[None, :] - cost / eps
+-            coupling[i : i + bs1, :] = log_plan.exp()
+-
+-        return coupling
+-
+-    #######################################
+-    # Begin calculation of local_ugw_cost #
+-
+-    def get_loss_scalar(
+-        self, dict_plan, rho1, rho2, eps, log_p, data_const, alpha, reg_mode
+-    ):
+-        marg_1, marg_2 = dict_plan["marginals"]
+-        log_a, log_b = log_p
+-
+-        scalar = 0.0
+-        if alpha != 0:
+-            if rho1 != np.inf and rho1 != 0:
+-                scalar += (
+-                    rho1
+-                    * alpha
+-                    * self.get_kl_of_vector(marg_1, log_a, "approx")
+-                )  # approx KL term
+-            if rho2 != np.inf and rho2 != 0:
+-                scalar += (
+-                    rho2
+-                    * alpha
+-                    * self.get_kl_of_vector(marg_2, log_b, "approx")
+-                )  # approx KL term
+-
+-        if reg_mode == "joint":
+-            scalar += eps * self.get_kl_of_coupling(
+-                dict_plan, eps, log_p, data_const, alpha, "exact"
+-            )
+-
+-        return scalar
+-
+-    def get_C_vec(self, marginals, data_const):
+-        marg_1, marg_2 = marginals
+-        A1, A2, B1, B2, _, _ = data_const
+-        (bs1, r1), (bs2, r2) = self.sample_batch
+-
+-        Cx_vec = torch.zeros_like(marg_1)
+-        for i in r1:
+-            Cx_vec[i : i + bs1] = (A1[i : i + bs1, :] @ A2.T) ** 2 @ marg_1
+-
+-        Cy_vec = torch.zeros_like(marg_2)
+-        for j in r2:
+-            Cy_vec[j : j + bs2] = (B1[j : j + bs2, :] @ B2.T) ** 2 @ marg_2
+-
+-        return Cx_vec, Cy_vec
+-
+-    def get_bary_centre_intermediate(
+-        self, duals, log_p, local_ugw_cost, data_const, eps, alpha
+-    ):
+-        u, v = duals
+-        log_a, log_b = log_p
+-        bs1, r1 = self.sample_batch[0]
+-
+-        _, A2, _, B2, _, _ = data_const
+-        na, db = A2.shape[0], B2.shape[1]
+-        device, dtype = A2.device, A2.dtype
+-        bary_centre = (
+-            torch.zeros((na, db)).to(device).to(dtype)
+-        )  # shape na x db
+-
+-        s1 = u + log_a
+-        s2 = v + log_b
+-        for i in r1:
+-            cost = self.get_tensor_cost(
+-                local_ugw_cost, data_const, alpha, 1, i, bs1
+-            )
+-            log_plan = s1[i : i + bs1, None] + s2[None, :] - cost / eps
+-            bary_centre[i : i + bs1, :] = log_plan.exp() @ B2
+-
+-        bary_centre = A2.T @ bary_centre  # shape da x db
+-
+-        return bary_centre
+-
+-    def get_local_ugw_cost(
+-        self, dict_plan, data_const, alpha, log_p, rho1, rho2, eps, reg_mode
+-    ):
+-        if alpha == 0:
+-            Cx_vec, Cy_vec, bary_centre = 0.0, 0.0, 0.0
+-        else:
+-            marginals = dict_plan["marginals"]
+-            duals = dict_plan["new_duals"]
+-            local_ugw_cost = dict_plan["local_ugw_cost"]
+-            Cx_vec, Cy_vec = self.get_C_vec(marginals, data_const)
+-            bary_centre = self.get_bary_centre_intermediate(
+-                duals, log_p, local_ugw_cost, data_const, eps, alpha
+-            )
+-
+-        scalar = self.get_loss_scalar(
+-            dict_plan, rho1, rho2, eps, log_p, data_const, alpha, reg_mode
+-        )
+-        local_ugw_cost = (Cx_vec, Cy_vec, bary_centre, scalar)
+-
+-        return local_ugw_cost
+-
+-    # End calculation of local_ugw_cost #
+-    ######################################
+-
+-    def get_fugw_cost(
+-        self, dict_pi, dict_gamma, data_const, log_p, rho, alpha, eps, reg_mode
+-    ):
+-        """
+-        Calculate the objective function of FUGW.
+-        """
+-
+-        def f(mass, marg, axis):
+-            if axis == 1:
+-                value = (
+-                    alpha * rho1 * mass + (1 - alpha) / 2 * rho3
+-                ) * self.get_kl_of_vector(marg, log_a, "exact")
+-            elif axis == 2:
+-                value = (
+-                    alpha * rho2 * mass + (1 - alpha) / 2 * rho4
+-                ) * self.get_kl_of_vector(marg, log_b, "exact")
+-            return value
+-
+-        log_a, log_b = log_p
+-        rho1, rho2, rho3, rho4 = rho
+-        (bs1, r1) = self.sample_batch[0]
+-
+-        ug, vg = dict_gamma["new_duals"]
+-        local_ugw_cost_gamma = dict_gamma["local_ugw_cost"]
+-        s1_gamma = ug + log_a
+-        s2_gamma = vg + log_b
+-
+-        if alpha != 1:
+-            _, _, _, _, D1, D2 = data_const
+-            up, vp = dict_pi["new_duals"]
+-            local_ugw_cost_pi = dict_pi["local_ugw_cost"]
+-            s1_pi = up + log_a
+-            s2_pi = vp + log_b
+-
+-        # gw and OT terms
+-        fugw_cost = 0.0
+-        for i in r1:
+-            cost_gamma = self.get_tensor_cost(
+-                local_ugw_cost_gamma, data_const, alpha, 1, i, bs1
+-            )
+-            log_gamma = (
+-                s1_gamma[i : i + bs1, None]
+-                + s2_gamma[None, :]
+-                - cost_gamma / eps
+-            )
+-            true_cost = (
+-                cost_gamma - local_ugw_cost_gamma[-1]
+-            )  # Need to remove scalar term
+-            fugw_cost += (true_cost * log_gamma.exp()).sum()
+-
+-            if alpha != 1:
+-                cost_pi = self.get_tensor_cost(
+-                    local_ugw_cost_pi, data_const, alpha, 1, i, bs1
+-                )
+-                log_pi = (
+-                    s1_pi[i : i + bs1, None] + s2_pi[None, :] - cost_pi / eps
+-                )
+-                fugw_cost += (
+-                    (1 - alpha)
+-                    / 2
+-                    * ((D1[i : i + bs1, :] @ D2.T) * log_pi.exp()).sum()
+-                )
+-
+-        # KL terms
+-        marginal_pi = dict_pi["marginals"]
+-        marginal_gamma = dict_gamma["marginals"]
+-        mass_pi = marginal_pi[0].sum()
+-        mass_gamma = marginal_gamma[0].sum()
+-
+-        if rho1 != np.inf and rho3 != np.inf:
+-            fugw_cost += (
+-                f(mass_gamma, marginal_pi[0], 1)
+-                + f(mass_pi, marginal_gamma[0], 1)
+-                + alpha
+-                * rho1
+-                * (mass_pi - log_a.exp().sum())
+-                * (mass_gamma - log_a.exp().sum())
+-            )
+-        if rho2 != np.inf and rho4 != np.inf:
+-            fugw_cost += (
+-                f(mass_gamma, marginal_pi[1], 2)
+-                + f(mass_pi, marginal_gamma[1], 2)
+-                + alpha
+-                * rho2
+-                * (mass_pi - log_b.exp().sum())
+-                * (mass_gamma - log_b.exp().sum())
+-            )
+-
+-        # entropic term
+-        ent_fugw_cost = fugw_cost.detach().clone()
+-        kl_pi = self.get_kl_of_coupling(
+-            dict_pi, eps, log_p, data_const, alpha, "exact"
+-        )
+-        kl_gamma = self.get_kl_of_coupling(
+-            dict_gamma, eps, log_p, data_const, alpha, "exact"
+-        )
+-
+-        if reg_mode == "joint":
+-            mass_ab = log_a.exp().sum() * log_b.exp().sum()
+-            ent_fugw_cost += eps * (
+-                mass_pi * kl_gamma
+-                + mass_gamma * kl_pi
+-                + (mass_pi - mass_ab) * (mass_gamma - mass_ab)
+-            )
+-        elif reg_mode == "independent":
+-            ent_fugw_cost += eps * (kl_pi + kl_gamma)
+-
+-        return fugw_cost, ent_fugw_cost
+-
+-    def _get_barycentre(
+-        self, data_target, dict_plan, log_p, data_const, eps, alpha
+-    ):
+-        """
+-        Calculate the barycentre corresponding to the target data.
+-        """
+-        u, v = dict_plan["new_duals"]
+-        local_ugw_cost = dict_plan["local_ugw_cost"]
+-        marg_1 = dict_plan["marginals"][0]
+-        log_a, log_b = log_p
+-        bs1, r1 = self.sample_batch[0]
+-
+-        device, dtype = u.device, u.dtype
+-        barycentre = (
+-            torch.zeros((u.shape[0], data_target.shape[1]))
+-            .to(device)
+-            .to(dtype)
+-        )  # shape n1 x d2
+-
+-        s1 = u + log_a
+-        s2 = v + log_b
+-        for i in r1:
+-            cost = self.get_tensor_cost(
+-                local_ugw_cost, data_const, alpha, 1, i, bs1
+-            )
+-            log_plan = s1[i : i + bs1, None] + s2[None, :] - cost / eps
+-            barycentre[i : i + bs1, :] = log_plan.exp() @ data_target
+-
+-        barycentre = barycentre / marg_1.reshape(-1, 1)
+-
+-        return barycentre
+-
+-    def solver(
+-        self,
+-        X,
+-        Y,
+-        D,
+-        px=None,
+-        py=None,
+-        rho=(1e-1, None, None, None),
+-        eps=1e-2,
+-        alpha=1,
+-        reg_mode="joint",
+-        verbose=False,
+-        verbose_ot=False,
+-        save_freq=1,
+-        max_tensor_size=1e9,
+-        return_coupling=False,
+-    ):
+-        """
+-        To recover:
+-        - Ent-LB-UGW: alpha = 1, mode = "joint", rho1 != infty, rho2 != infty. No need to care about rho3 and rho4.
+-        - EGW: alpha = 1, mode = "independent", rho1 = rho2 = infty. No need to care about rho3 and rho4.
+-        - Ent-FGW: 0 < alpha < 1, D != None, mode = "independent", rho1 = rho2 = infty (so rho3 = rho4 = infty)
+-        - Ent-semi-relaxed GW: alpha = 1, mode = "independent", (rho1 = 0, rho2 = infty), or (rho1 = infty, rho2 = 0).
+-        No need to care about rho3 and rho4.
+-        - Ent-semi-relaxed FGW: 0 < alpha < 1, mode = "independent", (rho1 = rho3 = 0, rho2 = rho4 = infty),
+-        or (rho1 = rho3 = infty, rho2 = rho4 = 0).
+-        - Ent-UOT: alpha = 0, mode = "independent", D != None, rho1 != infty, rho2 != infty, rho3 != infty, rho4 != infty.
+-
+-        Parameters
+-        ----------
+-        X: source matrix of size nx x dx
+-        Y: target matrix of size ny x dy
+-        D: tuple of attribute matrices (attr_X, attr_Y) of size (nx x d) and (ny x d)
+-        px: tuple of 2 vectors of length (n1, d1). Measures assigned on rows and columns of X.
+-        py: tuple of 2 vectors of length (n2, d2). Measures assigned on rows and columns of Y.
+-        rho: tuple of 4 relaxation parameters for UGW and UOT.
+-        eps: regularisation parameter for entropic approximation.
+-        alpha: between 0 and 1. Interpolation parameter for fused UGW.
+-        reg_mode:
+-            reg_mode = "joint": use UGW-like regularisation term
+-            reg_mode = "independent": use COOT-like regularisation
+-        init_n: matrix of size n1 x n2 if not None. Initialisation matrix for sample coupling.
+-        log: True if the loss is recorded, False otherwise.
+-        verbose: if True then print the recorded loss.
+-        save_freq: The multiplier of iteration at which the loss is calculated. For example, if save_freq = 10, then the
+-                    loss is calculated at iteration 10, 20, 30, etc...
+-
+-        Returns
+-        ----------
+-        pi: matrix of size n1 x n2. Sample matrix.
+-        gamma: matrix of size d1 x d2. Feature matrix.
+-        log_cost: if log is True, return a list of loss (without taking into account the regularisation term).
+-        log_ent_cost: if log is True, return a list of entropic loss.
+-        """
+-
+-        attr_X, attr_Y = D
+-
+-        # Adjust rho in some settings.
+-        rho1, rho2, rho3, rho4 = rho
+-        if rho1 is None:
+-            rho1 = np.inf
+-        if rho2 is None:
+-            rho2 = np.inf
+-
+-        if attr_X is None or attr_Y is None or alpha == 1:
+-            print("NO fused")
+-            rho3, rho4 = 0, 0
+-            alpha = 1
+-        else:
+-            print("Fused")
+-            if rho3 is None:
+-                rho3 = rho1
+-            if rho4 is None:
+-                rho4 = rho2
+-            if rho3 == np.inf or rho1 == np.inf:
+-                rho1, rho3 = np.inf, np.inf
+-            if rho4 == np.inf or rho2 == np.inf:
+-                rho2, rho4 = np.inf, np.inf
+-        rho = (rho1, rho2, rho3, rho4)  # update rho
+-
+-        nx, ny = X.shape[0], Y.shape[0]
+-        device, dtype = X.device, X.dtype
+-
+-        batch_size_x, batch_size_y = (
+-            min(int(max_tensor_size / ny), nx),
+-            min(int(max_tensor_size / nx), ny),
+-        )
+-        range_x, range_y = (
+-            range(0, nx, batch_size_x),
+-            range(0, ny, batch_size_y),
+-        )
+-        range_x = tqdm(range_x) if verbose_ot else range_x
+-        range_y = tqdm(range_y) if verbose_ot else range_y
+-        self.sample_batch = ((batch_size_x, range_x), (batch_size_y, range_y))
+-
+-        if px is None:
+-            px = torch.ones(nx).to(device).to(dtype) / nx
+-        if py is None:
+-            py = torch.ones(ny).to(device).to(dtype) / ny
+-
+-        log_p = (px.log(), py.log())
+-
+-        if alpha == 0:
+-            A1, A2, B1, B2 = 0.0, 0.0, 0.0, 0.0
+-        else:
+-            A1, A2 = self.get_factored_distance(X, X)
+-            B1, B2 = self.get_factored_distance(Y, Y)
+-
+-        if alpha == 1:
+-            D1, D2 = 0.0, 0.0
+-        else:
+-            D1, D2 = self.get_factored_distance(attr_X, attr_Y)
+-
+-        data_const = (A1, A2, B1, B2, D1, D2)
+-
+-        # must have equal mass because they are marginals
+-        init_marginals = (
+-            px * (py.sum() / px.sum()).sqrt(),
+-            py * (px.sum() / py.sum()).sqrt(),
+-        )
+-
+-        if alpha == 0:
+-            Cx_vec, Cy_vec, bary_centre = 0.0, 0.0, 0.0
+-        else:
+-            na, db = A2.shape[0], B2.shape[1]
+-            bary_centre = (
+-                torch.zeros((na, db)).to(device).to(dtype)
+-            )  # shape na x db
+-            for i in range_x:
+-                # shape batchsize x db
+-                bary_centre[i : i + batch_size_x, :] = (
+-                    px[i : i + batch_size_x, None]
+-                    * py[None, :]
+-                    / (px.sum() * py.sum()).sqrt()
+-                ) @ B2
+-            bary_centre = A2.T @ bary_centre  # shape da x db
+-            Cx_vec, Cy_vec = self.get_C_vec(init_marginals, data_const)
+-
+-        dict_pi = {
+-            "local_ugw_cost": (Cx_vec, Cy_vec, bary_centre, 0.0),
+-            "duals": (torch.zeros_like(px), torch.zeros_like(py)),
+-            "marginals": init_marginals,
+-            "new_duals": (torch.zeros_like(px), torch.zeros_like(py)),
+-        }
+-
+-        dict_gamma = {
+-            "local_ugw_cost": (Cx_vec, Cy_vec, bary_centre, 0.0),
+-            "duals": (torch.zeros_like(px), torch.zeros_like(py)),
+-            "marginals": init_marginals,
+-            "new_duals": (torch.zeros_like(px), torch.zeros_like(py)),
+-        }
+-
+-        mass_gamma = (px.sum() * py.sum()).sqrt()
+-
+-        const1 = alpha * rho1
+-        const2 = alpha * rho2
+-        const3 = (1 - alpha) * rho3 / 2
+-        const4 = (1 - alpha) * rho4 / 2
+-
+-        log_cost = [np.inf]
+-        log_ent_cost = [np.inf]
+-        i = 1
+-        err = np.inf
+-
+-        while (err > self.tol) and (i <= self.nits):
+-
+-            # Update pi
+-            dict_pi["local_ugw_cost"] = self.get_local_ugw_cost(
+-                dict_gamma, data_const, alpha, log_p, rho1, rho2, eps, reg_mode
+-            )
+-
+-            r13 = const1 * mass_gamma + const3
+-            r24 = const2 * mass_gamma + const4
+-            new_eps = mass_gamma * eps if reg_mode == "joint" else eps
+-            dict_pi = self.sinkhorn(
+-                dict_pi, r13, r24, new_eps, log_p, data_const, alpha
+-            )
+-
+-            # rescale pi: marginals, duals, mass
+-            mass_pi = dict_pi["marginals"][0].sum()
+-
+-            rescale_const = (mass_gamma / mass_pi).sqrt()
+-            dict_pi["marginals"] = (
+-                dict_pi["marginals"][0] * rescale_const,
+-                dict_pi["marginals"][1] * rescale_const,
+-            )
+-            dict_pi["new_duals"] = (
+-                dict_pi["duals"][0] + rescale_const.log(),
+-                dict_pi["duals"][1],
+-            )
+-            mass_pi *= rescale_const
+-
+-            # Update gamma
+-            dict_gamma["local_ugw_cost"] = self.get_local_ugw_cost(
+-                dict_pi, data_const, alpha, log_p, rho1, rho2, eps, reg_mode
+-            )
+-            r13 = const1 * mass_pi + const3
+-            r24 = const2 * mass_pi + const4
+-            new_eps = mass_pi * eps if reg_mode == "joint" else eps
+-            dict_gamma = self.sinkhorn(
+-                dict_gamma, r13, r24, new_eps, log_p, data_const, alpha
+-            )
+-
+-            # rescale gamma: marginals, duals, mass
+-            mass_gamma = dict_gamma["marginals"][0].sum()
+-            rescale_const = (mass_pi / mass_gamma).sqrt()
+-
+-            dict_gamma["marginals"] = (
+-                dict_gamma["marginals"][0] * rescale_const,
+-                dict_gamma["marginals"][1] * rescale_const,
+-            )
+-            dict_gamma["new_duals"] = (
+-                dict_gamma["duals"][0] + rescale_const.log(),
+-                dict_gamma["duals"][1],
+-            )
+-            mass_gamma *= rescale_const
+-
+-            # UPDATE ERROR
+-            if i % save_freq == 0:
+-                cost, ent_cost = self.get_fugw_cost(
+-                    dict_pi,
+-                    dict_gamma,
+-                    data_const,
+-                    log_p,
+-                    rho,
+-                    alpha,
+-                    eps,
+-                    reg_mode,
+-                )
+-                log_cost.append(cost.item())
+-                log_ent_cost.append(ent_cost.item())
+-                err = abs(log_ent_cost[-2] - log_ent_cost[-1])
+-
+-                if verbose:
+-                    print("Cost at iteration {}: {}".format(i, cost.item()))
+-
+-            i += 1
+-
+-        if return_coupling:
+-            self.get_coupling = partial(
+-                self._get_coupling,
+-                log_p=log_p,
+-                data_const=data_const,
+-                eps=eps,
+-                alpha=alpha,
+-            )
+-        self.get_barycentre = partial(
+-            self._get_barycentre,
+-            dict_plan=dict_pi,
+-            log_p=log_p,
+-            data_const=data_const,
+-            eps=eps,
+-            alpha=alpha,
+-        )
+-
+-        return dict_pi, dict_gamma, log_cost[1:], log_ent_cost[1:]
+-
+-    # def faster_solver(self, X, Y, D, px=(None, None), py=(None, None), rho=(1e-1, None, None, None), eps=1e-2, alpha=1, reg_mode="joint",
+-    #                   init_n=None, eps_step=10, init_eps=1, verbose=False, save_freq=10):
+-
+-    #     if eps >= init_eps:
+-    #         return self.solver(X, Y, D, px, py, rho, eps, alpha, reg_mode, init_n, verbose, save_freq)
+-
+-    #     else:
+-    #         pi_init = init_n
+-
+-    #         nits = self.nits
+-    #         nits_sinkhorn = self.nits_sinkhorn
+-
+-    #         self.nits = 10
+-    #         self.nits_sinkhorn = 10
+-
+-    #         while (init_eps > eps):
+-    #             pi_init, _ = self.solver(
+-    #                 X, Y, D, px, py, rho, init_eps, alpha, reg_mode, pi_init)
+-    #             init_eps /= eps_step
+-
+-    #         self.nits = nits
+-    #         self.nits_sinkhorn = nits_sinkhorn
+-
+-    #         return self.solver(X, Y, D, px, py, rho, eps, alpha, reg_mode, pi_init, verbose, save_freq)
+-
+-
+-# if __name__ == "__main__":
+-
+-#     use_cuda = torch.cuda.is_available()
+-#     device = torch.device("cuda:0" if use_cuda else "cpu")
+-#     torch.backends.cudnn.benchmark = True
+-
+-#     nx = 2087
+-#     dx = 3
+-#     ny = 1561
+-#     dy = 2
+-#     d = 5
+-
+-#     x = torch.rand(nx, dx).to(device)
+-#     y = torch.rand(ny, dy).to(device)
+-#     attr_X = torch.rand(nx, d).to(device)
+-#     attr_Y = torch.rand(ny, d).to(device)
+-
+-#     rho1 = 1e-4
+-#     rho2 = 1e-5
+-#     rho3 = 1e-2
+-#     rho4 = 1e-3
+-#     mode = "independent"  # only support for this mode only, DO NOT try mode="joint"
+-#     rho = (rho1, rho2, rho3, rho4)
+-#     eps = 1e-3
+-#     alpha = 0.2
+-
+-#     fugw_batch = BatchFUGW(
+-#         nits=100, nits_sinkhorn=200, tol=1e-5, tol_sinkhorn=1e-7
+-#     )
+-#     (
+-#         dict_pi,
+-#         dict_gamma,
+-#         log_cost_batch,
+-#         log_ent_cost_batch,
+-#     ) = fugw_batch.solver(
+-#         X=x,
+-#         Y=y,
+-#         D=(attr_X, attr_Y),
+-#         rho=rho,
+-#         eps=eps,
+-#         alpha=alpha,
+-#         reg_mode=mode,
+-#         verbose=True,
+-#         verbose_ot=False,
+-#         save_freq=1,
+-#         max_tensor_size=1e5,
+-#         return_coupling=True,
+-#     )
+diff --git a/src/fugw/solvers/test_solver.py b/src/fugw/solvers/test_solver.py
+new file mode 100644
+index 00000000..d3d872a5
+--- /dev/null
++++ b/src/fugw/solvers/test_solver.py
+@@ -0,0 +1,48 @@
++from .fugw import FUGWSolver
++import torch
++
++use_cuda = torch.cuda.is_available()
++device = torch.device("cuda:0" if use_cuda else "cpu")
++torch.backends.cudnn.benchmark = True
++
++nx = 104
++dx = 3
++ny = 151
++dy = 7
++
++x = torch.rand(nx, dx).to(device)
++y = torch.rand(ny, dy).to(device)
++
++# # if test with permutation
++# idx = torch.randperm(x.nelement())
++# y = x.view(-1)[idx].view(x.size())
++# ny = nx
++
++Cx = torch.cdist(x, x)
++Cy = torch.cdist(y, y)
++D = torch.rand(nx, ny)
++
++fugw = FUGWSolver(
++    nits_bcd=100,
++    nits_uot=1000,
++    tol_bcd=1e-7,
++    tol_uot=1e-7,
++    eval_bcd=2,
++    eval_uot=10
++)
++
++pi, gamma = fugw.solver(
++    X=Cx,
++    Y=Cy,
++    D=D,
++    alpha=0.8,
++    rho_x=2, 
++    rho_y=3,
++    eps=0.02,
++    uot_solver="mm",
++    reg_mode="independent",
++    init_plan=None,
++    log=False,
++    verbose=True,
++    early_stopping_threshold=1e-6
++)
+\ No newline at end of file
+diff --git a/src/fugw/solvers/utils.py b/src/fugw/solvers/utils.py
+new file mode 100644
+index 00000000..69783780
+--- /dev/null
++++ b/src/fugw/solvers/utils.py
+@@ -0,0 +1,145 @@
++import torch
++from tqdm import tqdm
++
++def solver_scaling(cost, init_duals, uot_params, tuple_pxy, train_params):
++    """
++    Scaling algorithm.
++    """
++
++    log_px, log_py, pxy = tuple_pxy
++    vx, vy = init_duals
++    rho_x, rho_y, eps = uot_params
++    niters, tol, eval_freq = train_params
++
++    tau_x = 1 if torch.isinf(rho_x) else rho_x / (rho_x + eps)
++    tau_y = 1 if torch.isinf(rho_y) else rho_y / (rho_y + eps)
++
++    for idx in range(niters):
++        vx_prev, vy_prev = vx.detach().clone(), vy.detach().clone()
++        if rho_y == 0:
++            vy = torch.zeros_like(vy)
++        else:
++            vy = -tau_y * ((vx + log_px)[:, None] - cost / eps).logsumexp(dim=0)
++
++        if rho_x == 0:
++            vx = torch.zeros_like(vx)
++        else:
++            vx = -tau_x * ((vy + log_py)[None, :] - cost / eps).logsumexp(dim=1)
++
++        if idx % eval_freq == 0 and max((vx - vx_prev).abs().max(), (vy - vy_prev).abs().max()) < tol:
++            break
++
++    pi = pxy * (vx[:, None] + vy[None, :] - cost / eps).exp()
++
++    return (vx, vy), pi
++
++def solver_mm(cost, init_pi, uot_params, tuple_pxy, train_params):
++    """
++    Solve (entropic) UOT using the majorization-minimization algorithm.
++
++    Allow epsilon to be 0 but rho_x and rho_y can't be infinity.
++
++    Note that if the parameters are small so that numerically, the exponential of 
++    negative cost will contain zeros and this serves as sparsification of the optimal plan. 
++
++    If the parameters are large, then the resulting optimal plan is more dense than the one 
++    obtained from scaling algorithm. 
++    But all parameters should not be too small, otherwise the kernel will contain too many zeros. 
++    Consequently, the optimal plan will contain NaN (because the Kronecker sum of two marginals 
++    will eventually contain zeros, and divided by zero will result in undesirable coupling).
++    """
++
++    niters, tol, eval_freq = train_params
++    px, py = tuple_pxy
++    rho_x, rho_y, eps = uot_params
++
++    sum_param = rho_x + rho_y + eps
++    tau_x, tau_y, r = rho_x / sum_param, rho_y / sum_param, eps / sum_param
++    K = px[:,None]**(tau_x + r) * py[None,:]**(tau_y + r) * (- cost / sum_param).exp()
++
++    pi1, pi2, pi = init_pi.sum(1), init_pi.sum(0), init_pi
++
++    for idx in range(niters):
++        pi1_old, pi2_old = pi1.detach().clone(), pi2.detach().clone()
++        pi = pi**(tau_x + tau_y) / (pi1[:,None]**tau_x * pi2[None,:]**tau_y) * K
++        pi1, pi2 = pi.sum(1), pi.sum(0)
++
++        if (idx % eval_freq == 0) and max((pi1 - pi1_old).abs().max(), (pi2 - pi2_old).abs().max()) < tol:
++            break
++    
++    return pi
++
++def solver_dc(cost, init_pi, init_duals, uot_params, tuple_pxy, train_params, eps_base=1, verbose=True):
++
++    niters, tol, eval_freq = train_params
++    rho1, rho2, eps = uot_params
++    px, py, pxy = tuple_pxy
++    u, v = init_duals
++    m1, pi = init_pi.sum(1), init_pi
++
++    sum_eps = eps_base + eps
++    tau1 = 1 if rho1 == float("inf") else rho1 / (rho1 + sum_eps)
++    tau2 = 1 if rho2 == float("inf") else rho2 / (rho2 + sum_eps)
++
++    K = torch.exp(-cost / sum_eps)
++    range_niters = tqdm(range(niters)) if verbose else range(niters) 
++
++    for idx in range_niters:
++        m1_prev = m1.detach().clone()
++
++        # IPOT
++        G = K * pi if (eps_base / sum_eps) == 1 else K * pi**(eps_base / sum_eps)
++        v = (G.T @ (u * px))**(-tau2) if rho2 != 0 else torch.ones_like(v)
++        u = (G @ (v * py))**(-tau1) if rho1 != 0 else torch.ones_like(u)
++        pi = u[:, None ] * G * v[None, :]
++
++        # Check stopping criterion
++        if idx % eval_freq == 0:
++            m1 = pi.sum(1)
++            if m1.isnan().any() or m1.isinf().any():
++                raise ValueError("There is NaN in coupling. Please increase eps_base.")
++
++            error = (m1 - m1_prev).abs().max().item()
++            if error < tol:
++                break
++
++    pi = pi * pxy # renormalize couplings
++
++    return (u, v), pi
++
++def compute_approx_kl(p, q):
++    # By convention: 0 log 0 = 0
++    entropy = torch.nan_to_num(p * (p / q).log(), nan=0.0, posinf=0.0, neginf=0.0).sum()
++    return entropy
++
++def compute_kl(p, q):
++    return compute_approx_kl(p, q) - p.sum() + q.sum()
++
++def compute_quad_kl(mu, nu, alpha, beta):
++    """
++    Calculate the KL divergence between two product measures:
++    KL(mu otimes nu, alpha otimes beta) =
++    m_mu * KL(nu, beta)
++    + m_nu * KL(mu, alpha)
++    + (m_mu - m_alpha) * (m_nu - m_beta)
++
++    Parameters
++    ----------
++    mu: vector or matrix
++    nu: vector or matrix
++    alpha: vector or matrix with the same size as mu
++    beta: vector or matrix with the same size as nu
++
++    Returns
++    ----------
++    KL divergence between two product measures
++    """
++
++    m_mu = mu.sum()
++    m_nu = nu.sum()
++    m_alpha = alpha.sum()
++    m_beta = beta.sum()
++    const = (m_mu - m_alpha) * (m_nu - m_beta)
++    kl = m_nu * compute_kl(mu, alpha) + m_mu * compute_kl(nu, beta) + const
++
++    return kl
+\ No newline at end of file

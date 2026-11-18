@@ -1,0 +1,20 @@
+# Issue
+
+**Title:** Ignore folders generated from setup.py
+
+## Description
+
+<!-- This is an auto-generated comment: release notes by coderabbit.ai -->
+
+## Summary by CodeRabbit
+
+* **Chores**
+  * Updated project configuration to better manage build artifacts and generated files during version control tracking.
+
+<sub>✏️ Tip: You can customize this high-level summary in your review settings.</sub>
+
+<!-- end of auto-generated comment: release notes by coderabbit.ai -->
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `12d4035f7556`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,246 @@
+diff --git a/docs/capi.rst b/docs/capi.rst
+index 808e07f1b0..38764e9fac 100644
+--- a/docs/capi.rst
++++ b/docs/capi.rst
+@@ -2255,7 +2255,8 @@ Miscellaneous
+ 
+     Works for ``Matrix.x``, ``Vector.x``, ``Pointer.val`` and point-process
+     variables (scalars and one-dimensional arrays). Errors are reported in
+-    ``error_msg``, not raised, and leave the interpreter stack unchanged.
++    ``error_msg``, not raised or printed, and leave the interpreter stack
++    unchanged.
+ 
+     :param obj: Pointer to the object.
+     :param name: Name of the variable, such as ``"x"``.
+@@ -2268,8 +2269,10 @@ Miscellaneous
+     :param error_msg_size: Size of ``error_msg``.
+     :returns: 0 on success, nonzero on failure: unknown name, a method rather than
+         a variable, the wrong number of indices, an index out of range, a
+-        point-process ``POINTER`` that is not set, or a ``Pointer`` whose target was
+-        freed.
++        point process that is not located in a section, a point-process
++        ``POINTER`` that is not set, a ``Pointer`` whose target was freed, or a
++        variable of a point process defined with ``make_pointprocess`` from a
++        HOC template, which is not supported.
+ 
+     The pointer stays valid until the object's storage changes (for example a
+     ``Vector`` is resized or a ``Matrix`` is reallocated) or the object is destroyed.
+diff --git a/src/nrniv/neuronapi.cpp b/src/nrniv/neuronapi.cpp
+index 63ec04a60b..461ade2e5e 100644
+--- a/src/nrniv/neuronapi.cpp
++++ b/src/nrniv/neuronapi.cpp
+@@ -17,6 +17,7 @@
+ #include <cstdio>
+ #include <limits>
+ #include <string>
++#include <utility>
+ 
+ /// A public face of hoc_Item
+ struct nrn_Item: public hoc_Item {};
+@@ -46,6 +47,7 @@ struct SymbolTableIterator {
+ extern int nrn_nobanner_;
+ extern int diam_changed;
+ extern int nrn_try_catch_nest_depth;
++extern int hoc_execerror_messages;
+ extern "C" void nrnpy_set_pr_etal(int (*cbpr_stdoe)(int, char*), int (*cbpass)());
+ int ivocmain_session(int, const char**, const char**, int start_session);
+ void simpleconnectsection();
+@@ -1300,6 +1302,22 @@ void* steer_element(void* request, void*) {
+     r->result = hoc_pxpop();
+     return nullptr;
+ }
++
++// OcJump::fpycall with HOC error messages and the MPI abort on error turned
++// off, as hoc_execute1 does, so an error the caller reports itself is neither
++// printed nor fatal on more than one rank. Both flags are restored, also after
++// an error (hoc_execerror sets hoc_execerror_messages to 1).
++void* quiet_fpycall(void* (*f)(void*, void*), void* a) {
++    struct restore {
++        int messages = std::exchange(hoc_execerror_messages, 0);
++        int mpiabort = std::exchange(nrn_mpiabort_on_error_, 0);
++        ~restore() {
++            hoc_execerror_messages = messages;
++            nrn_mpiabort_on_error_ = mpiabort;
++        }
++    } const saved{};
++    return OcJump::fpycall(f, a, nullptr);
++}
+ }  // namespace
+ 
+ int nrn_property_element_ptr(Object* obj,
+@@ -1332,6 +1350,14 @@ int nrn_property_element_ptr(Object* obj,
+     }
+     int const nsub = sym->arayinfo ? sym->arayinfo->nsub : 0;
+     if (obj->ctemplate->is_point_) {
++        // point_process_pointer reads sym->u.rng, which only a RANGEVAR has.
++        if (sym->type != RANGEVAR) {
++            // A make_pointprocess template keeps its variables in the HOC
++            // dataspace, which this function does not reach.
++            return fail(is_hoc_template(obj)
++                            ? "variables of a make_pointprocess template are not supported"
++                            : "not a variable of a point process or of Vector, Matrix or Pointer");
++        }
+         // Point-process arrays are one-dimensional; a scalar takes no index.
+         if (nindex != nsub || nsub > 1) {
+             return fail("wrong number of indices");
+@@ -1340,7 +1366,12 @@ int nrn_property_element_ptr(Object* obj,
+         if (i < 0 || (nsub && i >= sym->arayinfo->sub[0])) {
+             return fail("index out of range");
+         }
+-        auto handle = point_process_pointer(ob2pntproc_0(obj), sym, i);
++        // Checked here because point_process_pointer raises a HOC error for it.
++        auto* const pnt = ob2pntproc_0(obj);
++        if (!pnt || !pnt->prop) {
++            return fail("point process not located in a section");
++        }
++        auto handle = point_process_pointer(pnt, sym, i);
+         if (!handle) {
+             return fail("no data for this property (POINTER not set?)");
+         }
+@@ -1357,7 +1388,7 @@ int nrn_property_element_ptr(Object* obj,
+     // fpycall restores the interpreter state, including the stack, and rethrows.
+     steer_request request{obj, sym, indices, nindex, nullptr};
+     try {
+-        OcJump::fpycall(steer_element, &request, nullptr);
++        quiet_fpycall(steer_element, &request);
+     } catch (const std::exception& e) {
+         return fail(e.what());
+     } catch (...) {
+diff --git a/test/api/property_element_ptr.cpp b/test/api/property_element_ptr.cpp
+index 61cfa04aa2..e8c52c4ea3 100644
+--- a/test/api/property_element_ptr.cpp
++++ b/test/api/property_element_ptr.cpp
+@@ -3,9 +3,11 @@
+ // variable, given every index: Matrix.x[i][j], Vector.x[i], Pointer.val and
+ // point-process variables (scalars and arrays). Errors are reported, not thrown.
+ #include <array>
++#include <cstdio>
+ #include <cstring>
+ #include <iostream>
+ #include <string>
++#include <unistd.h>
+ #include "neuronapi.h"
+ 
+ using std::cerr;
+@@ -13,6 +15,13 @@ using std::endl;
+ 
+ extern "C" void modl_reg() {}
+ 
++// make_pointprocess registers a mechanism for the rest of the process, and LeakSanitizer reports
++// that registration (common_register in hocmech.cpp) as leaked at exit. Only an ASan build reads
++// this hook.
++extern "C" const char* __lsan_default_suppressions() {
++    return "leak:make_pointprocess\n";
++}
++
+ static bool check(bool cond, const char* msg) {
+     if (!cond) {
+         cerr << "FAIL: " << msg << endl;
+@@ -20,6 +29,29 @@ static bool check(bool cond, const char* msg) {
+     return cond;
+ }
+ 
++// What f writes to stderr (fd 2), which is restored before returning.
++template <class F>
++static std::string stderr_of(F f) {
++    std::fflush(stderr);
++    FILE* const sink = std::tmpfile();
++    int const saved = dup(STDERR_FILENO);
++    if (!sink || saved == -1 || dup2(fileno(sink), STDERR_FILENO) == -1) {
++        std::perror("redirect stderr");
++        std::exit(1);
++    }
++    f();
++    std::fflush(stderr);
++    dup2(saved, STDERR_FILENO);
++    close(saved);
++    std::string text;
++    std::rewind(sink);
++    for (int c; (c = std::fgetc(sink)) != EOF;) {
++        text += static_cast<char>(c);
++    }
++    std::fclose(sink);
++    return text;
++}
++
+ static Object* object(const char* name) {
+     return nrn_symbol_object_get(nrn_symbol(name));
+ }
+@@ -49,7 +81,19 @@ int main(void) {
+         "soma ic = new IClamp(0.5)\n"
+         "soma vc = new VClamp(0.5)\n"
+         "ic.amp = 0.25\n"
+-        "vc.amp[1] = -20\n");
++        "vc.amp[1] = -20\n"
++        "objref ic_unlocated, ic_deleted\n"
++        "ic_unlocated = new IClamp()\n"
++        "create dend\n"
++        "dend ic_deleted = new IClamp(0.5)\n"
++        "dend delete_section()\n"
++        "begintemplate HocPnt\n"
++        "public a, b\n"
++        "proc init() { a = 3  b = 5 }\n"
++        "endtemplate HocPnt\n"
++        "make_pointprocess(\"HocPnt\")\n"
++        "objref hocpnt\n"
++        "soma hocpnt = new HocPnt(0.5)\n");
+ 
+     bool ok = true;
+     char err[256]{};
+@@ -115,6 +159,34 @@ int main(void) {
+     ok &= check(nrn_property_element_ptr(vec, "size", nullptr, 0, &p, err, sizeof(err)) != 0,
+                 "a method is not a variable");
+ 
++    // A point process with no section has no data. This is reported, not raised
++    // as the HOC error "point process not located in a section".
++    nrn_double_push(-7.0);
++    ok &= check(nrn_property_element_ptr(
++                    object("ic_unlocated"), "amp", nullptr, 0, &p, err, sizeof(err)) != 0 &&
++                    p == nullptr && std::strstr(err, "not located in a section") != nullptr,
++                "unlocated point process is reported");
++    ok &= check(nrn_property_element_ptr(
++                    object("ic_deleted"), "amp", nullptr, 0, &p, err, sizeof(err)) != 0 &&
++                    p == nullptr && std::strstr(err, "not located in a section") != nullptr,
++                "point process of a deleted section is reported");
++    ok &= check(nrn_double_pop() == -7.0, "unlocated point process leaves the stack alone");
++
++    // A point-process method is not a variable either.
++    for (const char* method: {"loc", "get_loc", "has_loc"}) {
++        ok &= check(
++            nrn_property_element_ptr(object("ic"), method, nullptr, 0, &p, err, sizeof(err)) != 0 &&
++                p == nullptr && std::strstr(err, "not a variable") != nullptr,
++            method);
++    }
++
++    // A make_pointprocess template keeps its variables in the HOC dataspace,
++    // which this function does not reach; it must not return another variable.
++    ok &= check(nrn_property_element_ptr(object("hocpnt"), "b", nullptr, 0, &p, err, sizeof(err)) !=
++                        0 &&
++                    p == nullptr && std::strstr(err, "make_pointprocess") != nullptr,
++                "make_pointprocess variable is reported");
++
+     // Failures leave the stack alone.
+     nrn_double_push(-7.0);
+     ij = {0, 9};
+@@ -123,5 +195,21 @@ int main(void) {
+     nrn_property_element_ptr(vec, "x", &i, 1, &p, err, sizeof(err));
+     ok &= check(nrn_double_pop() == -7.0, "failures leave the stack alone");
+ 
++    // A steer error goes only to error_msg: HOC prints nothing, and HOC errors
++    // print again afterwards.
++    std::string const printed = stderr_of([&] {
++        ij = {3, 0};
++        nrn_property_element_ptr(mat, "x", ij.data(), 2, &p, err, sizeof(err));
++        i = 5;
++        nrn_property_element_ptr(vec, "x", &i, 1, &p, err, sizeof(err));
++    });
++    ok &= check(printed.empty(), "a steer error prints nothing");
++    if (!printed.empty()) {
++        cerr << printed;
++    }
++    ok &= check(std::strstr(err, "out of range") != nullptr, "the steer error is still reported");
++    ok &= check(!stderr_of([] { nrn_hoc_call("mat.x[9][9] = 1\n"); }).empty(),
++                "HOC error messages are restored");
++
+     return ok ? 0 : 1;
+ }

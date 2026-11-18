@@ -1,0 +1,14 @@
+# Issue
+
+**Title:** Toolbox Paper
+
+## Description
+
+Changes:
+- Added info regarding the toolbox paper preprint.
+- Added new wrappers.
+- Updated examples.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ca678b251475`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

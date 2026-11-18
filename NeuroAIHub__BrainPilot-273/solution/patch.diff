@@ -1,0 +1,750 @@
+diff --git a/packages/runtime/src/__tests__/ask-user.test.ts b/packages/runtime/src/__tests__/ask-user.test.ts
+index 20f69942..e6515637 100644
+--- a/packages/runtime/src/__tests__/ask-user.test.ts
++++ b/packages/runtime/src/__tests__/ask-user.test.ts
+@@ -51,6 +51,36 @@ describe("ask_user (SessionManager)", () => {
+     expect(toolEnd).toBeTruthy();
+   });
+ 
++  it("routes an ordinary message as the answer while an ask_user is pending (#272)", async () => {
++    const session = await m.createSession({ title: "T" });
++    const events: AgUiEvent[] = [];
++    m.subscribe(session.id, (e) => events.push(e));
++
++    // Drive the agent to block on ask_user.
++    await m.sendMessage(session.id, 'decide [[tool:ask_user {"question":"Pick A or B"}]]');
++    await new Promise((r) => setTimeout(r, 20));
++    const req = events.find((e) => e.type === "user_input_request") as any;
++    expect(req).toBeTruthy();
++
++    // Instead of answering via resolveInput, the user sends a plain message.
++    // It must be consumed as the answer (not "already processing"), unblocking
++    // the tool — a user_input_response echo carries the message content.
++    const res = await m.sendMessage(session.id, "A");
++    expect(res.accepted).toBe(true);
++
++    const resp = events.find((e) => e.type === "user_input_response") as any;
++    expect(resp).toBeTruthy();
++    expect(resp.request_id).toBe(req.request_id);
++    expect(resp.answer).toBe("A");
++
++    // The blocked tool resolves with the routed answer.
++    await new Promise((r) => setTimeout(r, 20));
++    const toolEnd = events.find(
++      (e) => e.type === "TOOL_CALL_RESULT" && (e as any).content?.includes("A"),
++    );
++    expect(toolEnd).toBeTruthy();
++  });
++
+   it("resolveInput returns false for unknown request_id", async () => {
+     const session = await m.createSession({ title: "T" });
+     const events: AgUiEvent[] = [];
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index d081dde5..96226330 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -1116,6 +1116,27 @@ export class SessionManager {
+     // file the user just attached. No-op when nothing was staged.
+     await this.drainLocalUploads(sessionId);
+ 
++    // #272: a run blocked on an ask_user (user_input_request) is streaming but
++    // will never settle until the request is answered. If the user types an
++    // ordinary message instead of picking an option, route it as the answer to
++    // the oldest outstanding request rather than returning "already processing"
++    // (which silently drops the message and hangs the session forever). The
++    // frontend now takes over the composer to steer users to the picker, but
++    // this is the defense-in-depth fallback for any path that still sends plain
++    // content (old client, ESC-then-type, direct API caller).
++    const [pendingRequestId] = entry.pendingInputs.keys();
++    if (pendingRequestId !== undefined) {
++      const runId = entry.activeRunId ?? undefined;
++      // Broadcast the user's text as a bubble correlated to the current run, so
++      // SSE replay stays complete (resolveInput emits the user_input_response
++      // echo separately, which resolves the ask_user card).
++      entry.bus.emit(
++        ev.textMessageChunk({ sessionId, agentName, runId }, opts.uuid ?? randomUUID(), content, "user"),
++      );
++      this.resolveInput(sessionId, pendingRequestId, content);
++      return { accepted: true, runId, queued: true };
++    }
++
+     // Concurrent send: the target agent is still streaming its previous run.
+     // A plain prompt() would hit the SDK's "already processing" guard. Queue
+     // the message as a follow-up onto the current run instead — no new runId,
+diff --git a/packages/web/src/__tests__/newUiComponents.test.tsx b/packages/web/src/__tests__/newUiComponents.test.tsx
+index dc73fdb1..ecc4c806 100644
+--- a/packages/web/src/__tests__/newUiComponents.test.tsx
++++ b/packages/web/src/__tests__/newUiComponents.test.tsx
+@@ -13,6 +13,7 @@ vi.mock("../i18n/useT", () => ({
+ import { renderToStaticMarkup } from "react-dom/server";
+ import { SystemMessageBubble } from "../components/chat/SystemMessageBubble";
+ import { AskUserCard } from "../components/chat/AskUserCard";
++import { AskUserComposer } from "../components/chat/AskUserComposer";
+ import { AutoRetryIndicator } from "../components/chat/AutoRetryIndicator";
+ 
+ describe("SystemMessageBubble — 4 levels", () => {
+@@ -49,29 +50,65 @@ describe("SystemMessageBubble — 4 levels", () => {
+ });
+ 
+ describe("AskUserCard — structure", () => {
+-  it("renders option buttons + free-text input when open", () => {
++  it("renders a record (options listed, no live inputs) when open", () => {
++    // #272: the card is a record only; interaction moved to the composer
++    // takeover. Options are listed for context but there are no buttons/inputs.
+     const html = renderToStaticMarkup(
+       <AskUserCard
+         view={{ requestId: "r1", agent: "principal", question: "Pick", options: ["A", "B"], allowFreeText: true }}
+-        onSubmit={() => {}}
+       />,
+     );
+     expect(html).toContain("ask-user");
+     expect(html).toContain('data-request-id="r1"');
+     expect(html).toContain(">A<");
+     expect(html).toContain(">B<");
+-    expect(html).toContain("ask-user__input");
++    // no interactive controls in the stream card anymore
++    expect(html).not.toContain("ask-user__input");
++    expect(html).not.toContain("<button");
++    expect(html).toContain("ask-user__pending");
+   });
+ 
+   it("renders the answered state once resolved", () => {
+     const html = renderToStaticMarkup(
+-      <AskUserCard
+-        view={{ requestId: "r1", agent: "principal", question: "Pick", answer: "A" }}
++      <AskUserCard view={{ requestId: "r1", agent: "principal", question: "Pick", answer: "A" }} />,
++    );
++    expect(html).toContain("ask-user--answered");
++    expect(html).not.toContain("ask-user__option-record");
++  });
++});
++
++describe("AskUserComposer — takeover picker (#272)", () => {
++  it("renders numbered options + submit when options are present", () => {
++    const html = renderToStaticMarkup(
++      <AskUserComposer
++        view={{ requestId: "r1", agent: "principal", question: "Pick", options: ["Walk", "Coffee"] }}
+         onSubmit={() => {}}
+       />,
+     );
+-    expect(html).toContain("ask-user--answered");
+-    expect(html).not.toContain("ask-user__option");
++    expect(html).toContain("ask-user-composer");
++    expect(html).toContain('data-request-id="r1"');
++    expect(html).toContain(">Walk<");
++    expect(html).toContain(">Coffee<");
++    // numbered (1-indexed) + submit control
++    expect(html).toContain(">1<");
++    expect(html).toContain(">2<");
++    expect(html).toContain("ask-user-composer__submit");
++    // #272: no escape hatch — there is no "ignore/dismiss" control.
++    expect(html).not.toContain("ask-user-composer__ignore");
++    // #272: the free-text row is ALWAYS present (Codex-style), even when only
++    // options are given, so the user never has to leave the picker.
++    expect(html).toContain("ask-user-composer__input");
++    expect(html).toContain("ask-user-composer__option--free");
++  });
++
++  it("renders a free-text row when there are no options", () => {
++    const html = renderToStaticMarkup(
++      <AskUserComposer
++        view={{ requestId: "r3", agent: "principal", question: "Free?" }}
++        onSubmit={() => {}}
++      />,
++    );
++    expect(html).toContain("ask-user-composer__input");
+   });
+ });
+ 
+diff --git a/packages/web/src/components/chat/AskUserCard.tsx b/packages/web/src/components/chat/AskUserCard.tsx
+index 8b9cf755..23fecce8 100644
+--- a/packages/web/src/components/chat/AskUserCard.tsx
++++ b/packages/web/src/components/chat/AskUserCard.tsx
+@@ -1,58 +1,24 @@
+-import { useEffect, useMemo, useState } from "react";
+ import { CheckCircle2, HelpCircle } from "lucide-react";
+ import type { AskUserView } from "../../contracts/backend";
+-import { resolveAskUserSubmission } from "../../contexts/newUiEvents";
+ import { useT } from "../../i18n/useT";
+ 
+ interface AskUserCardProps {
+   view: AskUserView;
+-  /** Submit the chosen/typed answer back through the send path. */
+-  onSubmit: (requestId: string, answer: string) => void;
+ }
+ 
+ /**
+- * 修正6 — ask_user interaction card. Renders a `user_input_request` as an
+- * interactive card: option buttons and/or a free-text input. On submit it
+- * fires `onSubmit(requestId, answer)` so the host can post a
+- * user_input_response. Supports an optional countdown when `timeoutSec` is set.
++ * 修正6 / #272 — ask_user transcript record. This renders the `user_input_request`
++ * in the message stream as a *record only*: the pending question (with its
++ * options listed for context) while unanswered, and the resolved answer once
++ * given. The interactive picker now lives in the composer takeover
++ * (AskUserComposer) so there is a single place to answer — the stream card no
++ * longer accepts input, which is what prevented users from ignoring it and
++ * typing into the composer (hanging the session).
+  */
+-export function AskUserCard({ view, onSubmit }: AskUserCardProps) {
++export function AskUserCard({ view }: AskUserCardProps) {
+   const t = useT();
+-  const [freeText, setFreeText] = useState("");
+   const answered = view.answer !== undefined;
+ 
+-  // Optional countdown. Only ticks while unanswered and a timeout is given.
+-  const initialSec = useMemo(
+-    () => (typeof view.timeoutSec === "number" && view.timeoutSec > 0 ? Math.floor(view.timeoutSec) : null),
+-    [view.timeoutSec],
+-  );
+-  const [secondsLeft, setSecondsLeft] = useState<number | null>(initialSec);
+-
+-  useEffect(() => {
+-    if (answered || initialSec === null) return;
+-    setSecondsLeft(initialSec);
+-    const id = window.setInterval(() => {
+-      setSecondsLeft((prev) => {
+-        if (prev === null) return prev;
+-        if (prev <= 1) {
+-          window.clearInterval(id);
+-          return 0;
+-        }
+-        return prev - 1;
+-      });
+-    }, 1000);
+-    return () => window.clearInterval(id);
+-  }, [answered, initialSec]);
+-
+-  const timedOut = secondsLeft === 0;
+-  const disabled = answered || timedOut;
+-
+-  const submit = (answer: string) => {
+-    const resolved = resolveAskUserSubmission(view, answer, { answered, timedOut });
+-    if (!resolved) return;
+-    onSubmit(resolved.requestId, resolved.answer);
+-  };
+-
+   if (answered) {
+     return (
+       <div className="ask-user ask-user--answered" data-testid="ask-user" data-request-id={view.requestId}>
+@@ -72,52 +38,20 @@ export function AskUserCard({ view, onSubmit }: AskUserCardProps) {
+         <HelpCircle size={15} className="ask-user__icon" aria-hidden="true" />
+         <span className="ask-user__title">{t("chat.ask.title")}</span>
+         <span className="ask-user__agent">{view.agent}</span>
+-        {secondsLeft !== null ? (
+-          <span className="ask-user__timer">
+-            {timedOut ? t("chat.ask.timedOut") : t("chat.ask.timeoutLeft", { sec: secondsLeft })}
+-          </span>
+-        ) : null}
+       </div>
+       <p className="ask-user__question">{view.question}</p>
+ 
+       {view.options && view.options.length > 0 ? (
+-        <div className="ask-user__options">
++        <ul className="ask-user__options ask-user__options--record">
+           {view.options.map((option) => (
+-            <button
+-              key={option}
+-              type="button"
+-              className="ask-user__option"
+-              disabled={disabled}
+-              onClick={() => submit(option)}
+-            >
++            <li key={option} className="ask-user__option-record">
+               {option}
+-            </button>
++            </li>
+           ))}
+-        </div>
++        </ul>
+       ) : null}
+ 
+-      {view.allowFreeText || !view.options || view.options.length === 0 ? (
+-        <form
+-          className="ask-user__free"
+-          onSubmit={(e) => {
+-            e.preventDefault();
+-            submit(freeText);
+-          }}
+-        >
+-          <input
+-            className="ask-user__input"
+-            type="text"
+-            value={freeText}
+-            disabled={disabled}
+-            placeholder={t("chat.ask.freeTextPlaceholder")}
+-            onChange={(e) => setFreeText(e.target.value)}
+-            aria-label={view.question}
+-          />
+-          <button type="submit" className="ask-user__submit" disabled={disabled || freeText.trim() === ""}>
+-            {t("chat.ask.submit")}
+-          </button>
+-        </form>
+-      ) : null}
++      <p className="ask-user__pending">{t("chat.ask.pending")}</p>
+     </div>
+   );
+ }
+diff --git a/packages/web/src/components/chat/AskUserComposer.tsx b/packages/web/src/components/chat/AskUserComposer.tsx
+new file mode 100644
+index 00000000..20138404
+--- /dev/null
++++ b/packages/web/src/components/chat/AskUserComposer.tsx
+@@ -0,0 +1,178 @@
++import { useEffect, useMemo, useRef, useState } from "react";
++import type { KeyboardEvent } from "react";
++import { HelpCircle, CornerDownLeft } from "lucide-react";
++import type { AskUserView } from "../../contracts/backend";
++import { resolveAskUserSubmission } from "../../contexts/newUiEvents";
++import { useT } from "../../i18n/useT";
++
++interface AskUserComposerProps {
++  view: AskUserView;
++  /** Submit the chosen/typed answer back through the send path. */
++  onSubmit: (requestId: string, answer: string) => void;
++}
++
++/**
++ * #272 — ask_user composer takeover. While a `user_input_request` is pending,
++ * this replaces the normal composer with a Codex-style option picker so a user
++ * can't just type an ordinary message into the composer and hang the session.
++ *
++ * There is NO escape hatch: the user must pick an option or type a free-text
++ * answer — the picker cannot be dismissed without answering. A free-text row
++ * ("write your own") is ALWAYS offered as the last row, so any answer is
++ * expressible without leaving the picker.
++ *
++ * Keyboard: ↑/↓ move the highlight, number keys (1..9) jump to an option,
++ * Enter submits the highlight (or the free-text value when the free-text row is
++ * active).
++ */
++export function AskUserComposer({ view, onSubmit }: AskUserComposerProps) {
++  const t = useT();
++  const options = useMemo(() => view.options ?? [], [view.options]);
++  // #272 (Codex-style): always offer an inline free-text row as the last row,
++  // so "write your own answer" lives right under the options instead of forcing
++  // the user to ESC back to the composer. It's the last selectable index.
++  const freeTextIndex = options.length;
++  const rowCount = options.length + 1;
++
++  const [active, setActive] = useState(0);
++  const [freeText, setFreeText] = useState("");
++  const rootRef = useRef<HTMLDivElement | null>(null);
++  const inputRef = useRef<HTMLInputElement | null>(null);
++
++  // A fresh request resets the picker state and grabs focus so keyboard nav
++  // works immediately without a click.
++  useEffect(() => {
++    setActive(0);
++    setFreeText("");
++    rootRef.current?.focus();
++  }, [view.requestId]);
++
++  const submit = (answer: string) => {
++    const resolved = resolveAskUserSubmission(view, answer);
++    if (!resolved) return;
++    onSubmit(resolved.requestId, resolved.answer);
++  };
++
++  const submitActive = () => {
++    if (active === freeTextIndex) {
++      submit(freeText);
++      return;
++    }
++    const option = options[active];
++    if (option !== undefined) submit(option);
++  };
++
++  const focusRow = (index: number) => {
++    setActive(index);
++    if (index === freeTextIndex) {
++      inputRef.current?.focus();
++    } else {
++      rootRef.current?.focus();
++    }
++  };
++
++  const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
++    if (e.key === "ArrowDown") {
++      e.preventDefault();
++      focusRow(rowCount === 0 ? 0 : (active + 1) % rowCount);
++      return;
++    }
++    if (e.key === "ArrowUp") {
++      e.preventDefault();
++      focusRow(rowCount === 0 ? 0 : (active - 1 + rowCount) % rowCount);
++      return;
++    }
++    // Number keys jump directly to an option (1-indexed). Ignored while typing
++    // in the free-text input (handled by its own onKeyDown below).
++    if (/^[1-9]$/.test(e.key) && active !== freeTextIndex) {
++      const idx = Number(e.key) - 1;
++      if (idx < options.length) {
++        e.preventDefault();
++        setActive(idx);
++        submit(options[idx]);
++      }
++      return;
++    }
++    if (e.key === "Enter") {
++      e.preventDefault();
++      submitActive();
++    }
++  };
++
++  const canSubmitFree = freeText.trim() !== "";
++
++  return (
++    <div
++      className="ask-user-composer"
++      data-testid="ask-user-composer"
++      data-request-id={view.requestId}
++      tabIndex={-1}
++      ref={rootRef}
++      onKeyDown={handleKeyDown}
++      role="listbox"
++      aria-label={view.question}
++    >
++      <div className="ask-user-composer__head">
++        <HelpCircle size={15} className="ask-user-composer__icon" aria-hidden="true" />
++        <span className="ask-user-composer__question">{view.question}</span>
++      </div>
++
++      <div className="ask-user-composer__options">
++        {options.map((option, idx) => (
++          <button
++            key={option}
++            type="button"
++            role="option"
++            aria-selected={active === idx}
++            className={`ask-user-composer__option ${active === idx ? "is-active" : ""}`}
++            onMouseEnter={() => setActive(idx)}
++            onClick={() => submit(option)}
++          >
++            <span className="ask-user-composer__num">{idx + 1}</span>
++            <span className="ask-user-composer__label">{option}</span>
++          </button>
++        ))}
++
++        <div
++          className={`ask-user-composer__option ask-user-composer__option--free ${
++            active === freeTextIndex ? "is-active" : ""
++          }`}
++          role="option"
++          aria-selected={active === freeTextIndex}
++          onMouseEnter={() => setActive(freeTextIndex)}
++        >
++          <span className="ask-user-composer__num">✎</span>
++          <input
++            ref={inputRef}
++            className="ask-user-composer__input"
++            type="text"
++            value={freeText}
++            placeholder={options.length > 0 ? t("chat.ask.freeTextOption") : t("chat.ask.freeTextPlaceholder")}
++            aria-label={view.question}
++            onFocus={() => setActive(freeTextIndex)}
++            onChange={(e) => setFreeText(e.target.value)}
++            onKeyDown={(e) => {
++              if (e.key === "Enter") {
++                e.preventDefault();
++                submit(freeText);
++              }
++            }}
++          />
++        </div>
++      </div>
++
++      <div className="ask-user-composer__foot">
++        <span className="ask-user-composer__hint">{t("chat.ask.pickHint")}</span>
++        <button
++          type="button"
++          className="ask-user-composer__submit"
++          disabled={active === freeTextIndex && !canSubmitFree}
++          onClick={submitActive}
++        >
++          <span>{t("chat.ask.submit")}</span>
++          <CornerDownLeft size={13} aria-hidden="true" />
++        </button>
++      </div>
++    </div>
++  );
++}
+diff --git a/packages/web/src/components/chat/MessageStream.tsx b/packages/web/src/components/chat/MessageStream.tsx
+index 72b2b7e2..8b537b2e 100644
+--- a/packages/web/src/components/chat/MessageStream.tsx
++++ b/packages/web/src/components/chat/MessageStream.tsx
+@@ -35,8 +35,6 @@ interface MessageStreamProps {
+   turnTiming?: { running: boolean; elapsedMs: number | null; lastDurationMs: number | null };
+   className?: string;
+   ariaLabel?: string;
+-  /** 修正6 — submit an ask_user answer. Omitted in read-only contexts (demo). */
+-  onAskUserSubmit?: (requestId: string, answer: string) => void;
+   /** 修正6 — cancel a pending auto-retry. Omitted in read-only contexts. */
+   onRetryCancel?: () => void;
+   /**
+@@ -83,7 +81,6 @@ function MessageStreamImpl({
+   turnTiming,
+   className,
+   ariaLabel,
+-  onAskUserSubmit,
+   onRetryCancel,
+   runningAgents,
+   groupExpertActivity = false,
+@@ -320,13 +317,9 @@ function MessageStreamImpl({
+       return <SystemMessageBubble key={message.id} view={message.systemMessage} />;
+     }
+     if (message.kind === "ask_user" && message.askUser) {
+-      return (
+-        <AskUserCard
+-          key={message.id}
+-          view={message.askUser}
+-          onSubmit={(requestId, answer) => onAskUserSubmit?.(requestId, answer)}
+-        />
+-      );
++      // #272: the stream card is a record only; answering happens in the
++      // composer takeover (AskUserComposer). See AskUserCard.
++      return <AskUserCard key={message.id} view={message.askUser} />;
+     }
+     if (message.kind === "auto_retry" && message.autoRetry) {
+       return (
+diff --git a/packages/web/src/components/chat/PromptComposer.tsx b/packages/web/src/components/chat/PromptComposer.tsx
+index 304b462d..eac00fd3 100644
+--- a/packages/web/src/components/chat/PromptComposer.tsx
++++ b/packages/web/src/components/chat/PromptComposer.tsx
+@@ -11,6 +11,7 @@ import { useT } from "../../i18n/useT";
+ import { api } from "../../utils/api";
+ import { CustomSelect } from "../primitives/CustomSelect";
+ import { IconButton } from "../primitives/IconButton";
++import { AskUserComposer } from "./AskUserComposer";
+ import { ComposerInput } from "./ComposerInput";
+ import { ComposerSendButton } from "./ComposerSendButton";
+ import { ComposerSendTools } from "./ComposerSendTools";
+@@ -69,6 +70,21 @@ export function PromptComposer() {
+   }, [messages, agentFilters, messageFilters]);
+ 
+   const hasMessages = visibleMessages.length > 0;
++
++  // #272: the latest unanswered ask_user request, if any. While one is pending
++  // the composer is replaced by AskUserComposer (a takeover picker) so a user
++  // can't type an ordinary message and hang the session. There is no escape
++  // hatch — the user must pick an option or type a free-text answer.
++  const askTakeover = useMemo(() => {
++    for (let i = visibleMessages.length - 1; i >= 0; i--) {
++      const m = visibleMessages[i];
++      if (m.kind === "ask_user" && m.askUser && m.askUser.answer === undefined) {
++        return m.askUser;
++      }
++    }
++    return null;
++  }, [visibleMessages]);
++
+   const isAgentRunning = agents.some((a) => a.status === "running");
+   const lastAssistantStreaming = visibleMessages[visibleMessages.length - 1]?.role === "assistant" && visibleMessages[visibleMessages.length - 1]?.streaming;
+   // A bash tool is in flight iff selectActiveScripts finds anything; when it
+@@ -312,7 +328,6 @@ export function PromptComposer() {
+             turnTiming={turnTiming}
+             runningAgents={runningAgents}
+             groupExpertActivity
+-            onAskUserSubmit={(requestId, answer) => void respondToInput(requestId, answer)}
+             onRetryCancel={() => void interruptCurrent()}
+           />
+         ) : null}
+@@ -346,6 +361,12 @@ export function PromptComposer() {
+           onStop={() => void interruptCurrent()}
+         />
+ 
++        {askTakeover ? (
++          <AskUserComposer
++            view={askTakeover}
++            onSubmit={(requestId, answer) => void respondToInput(requestId, answer)}
++          />
++        ) : (
+         <form className="composer" aria-label={t("chat.aria.newPrompt")} onSubmit={handleSubmit}>
+           <ComposerInput
+             sessionId={sessionId}
+@@ -503,6 +524,7 @@ export function PromptComposer() {
+           </div>
+ 
+         </form>
++        )}
+ 
+         {error ? <p className="composer-status composer-status--error">{error}</p> : null}
+         {composerError ? <p className="composer-status composer-status--error">{composerError}</p> : null}
+diff --git a/packages/web/src/components/demo/DemoView.tsx b/packages/web/src/components/demo/DemoView.tsx
+index 46f4fbca..0f005aa5 100644
+--- a/packages/web/src/components/demo/DemoView.tsx
++++ b/packages/web/src/components/demo/DemoView.tsx
+@@ -56,8 +56,8 @@ function basename(path: string): string {
+  * Keep: user prompts; assistant/system plain-text replies from ANY agent;
+  * error and system_message bubbles (the agent-attributed warnings/alerts the
+  * live Chat shows), plus answered ask_user cards (the question + the user's
+- * answer are a user-facing decision point, issue #132 — rendered read-only by
+- * AskUserCard since DemoView passes no onAskUserSubmit). Drop: reasoning, tool
++ * answer are a user-facing decision point, issue #132 — AskUserCard is a
++ * read-only record since #272). Drop: reasoning, tool
+  * calls/results, hook diagnostics, the auto_retry card and UNANSWERED ask_user
+  * prompts (no meaning in a read-only replay), plus NO-RENDER placeholders and
+  * empties.
+diff --git a/packages/web/src/i18n/messages/chat.ts b/packages/web/src/i18n/messages/chat.ts
+index 0c76d9eb..87cedb03 100644
+--- a/packages/web/src/i18n/messages/chat.ts
++++ b/packages/web/src/i18n/messages/chat.ts
+@@ -62,8 +62,11 @@ export default defineMessages(
+     "chat.system.details": "技术详情",
+     "chat.ask.title": "需要你的输入",
+     "chat.ask.freeTextPlaceholder": "输入你的回答…",
++    "chat.ask.freeTextOption": "自己输入 / 告诉它如何调整",
+     "chat.ask.submit": "提交",
+     "chat.ask.answered": "已回答：{answer}",
++    "chat.ask.pending": "请在下方选择一个选项进行回答。",
++    "chat.ask.pickHint": "↑↓ 选择 · 数字键快速跳转 · Enter 提交(必须选择或输入)",
+     "chat.ask.timeoutLeft": "剩余 {sec} 秒",
+     "chat.ask.timedOut": "已超时",
+     "chat.retry.title": "自动重试中",
+@@ -133,8 +136,11 @@ export default defineMessages(
+     "chat.system.details": "Technical details",
+     "chat.ask.title": "Your input is needed",
+     "chat.ask.freeTextPlaceholder": "Type your answer…",
++    "chat.ask.freeTextOption": "Write your own / tell it how to adjust",
+     "chat.ask.submit": "Submit",
+     "chat.ask.answered": "Answered: {answer}",
++    "chat.ask.pending": "Pick an option below to answer.",
++    "chat.ask.pickHint": "↑↓ to move · number keys to jump · Enter to submit (answer required)",
+     "chat.ask.timeoutLeft": "{sec}s left",
+     "chat.ask.timedOut": "Timed out",
+     "chat.retry.title": "Auto-retrying",
+diff --git a/packages/web/src/styles/global.css b/packages/web/src/styles/global.css
+index 321b96d0..6425bbeb 100644
+--- a/packages/web/src/styles/global.css
++++ b/packages/web/src/styles/global.css
+@@ -2718,6 +2718,130 @@ button {
+   font-size: 13px;
+   color: var(--color-success);
+ }
++/* #272 — the stream card is now a record only. Pending options render as a
++   static list (interaction moved to the composer takeover below). */
++.ask-user__options--record {
++  margin: 0;
++  padding: 0;
++  list-style: none;
++  display: flex;
++  flex-wrap: wrap;
++  gap: 6px;
++}
++.ask-user__option-record {
++  padding: 4px 10px;
++  border-radius: var(--radius-sm);
++  border: 1px solid var(--color-border-strong);
++  background: var(--color-surface);
++  color: var(--color-text-muted);
++  font-size: 13px;
++}
++.ask-user__pending {
++  margin: 0;
++  font-size: 12px;
++  color: var(--color-text-muted);
++}
++
++/* ── #272 — ask_user composer takeover (Codex-style picker) ─────────── */
++.ask-user-composer {
++  display: grid;
++  gap: 10px;
++  padding: 12px 14px;
++  border-radius: var(--radius-lg, 12px);
++  border: 1px solid color-mix(in srgb, var(--color-accent) 45%, var(--color-border));
++  background: var(--color-accent-soft);
++  outline: none;
++}
++.ask-user-composer__head {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++.ask-user-composer__icon { flex: none; color: var(--color-accent); }
++.ask-user-composer__question {
++  font-size: 14px;
++  font-weight: 600;
++  line-height: 1.5;
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++  /* #272: a long/verbose question must not push the options off-screen. Cap the
++     visible height and scroll the overflow inside the header. */
++  max-height: 7.5em;
++  overflow-y: auto;
++}
++.ask-user-composer__options {
++  display: grid;
++  gap: 6px;
++}
++.ask-user-composer__option {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  width: 100%;
++  padding: 8px 10px;
++  border-radius: var(--radius-sm);
++  border: 1px solid transparent;
++  background: transparent;
++  color: var(--color-text);
++  font-size: 13px;
++  text-align: left;
++  cursor: pointer;
++  transition: background var(--ease-standard), border-color var(--ease-standard);
++}
++.ask-user-composer__option.is-active {
++  background: var(--color-surface);
++  border-color: var(--color-accent);
++}
++.ask-user-composer__option--free { cursor: text; }
++.ask-user-composer__num {
++  flex: none;
++  width: 20px;
++  height: 20px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  border-radius: var(--radius-sm);
++  background: color-mix(in srgb, var(--color-accent) 20%, var(--color-surface));
++  color: var(--color-text-muted);
++  font-size: 11px;
++  font-family: var(--font-mono);
++}
++.ask-user-composer__label { flex: 1; min-width: 0; }
++.ask-user-composer__input {
++  flex: 1;
++  min-width: 0;
++  padding: 4px 6px;
++  border: none;
++  background: transparent;
++  color: var(--color-text);
++  font-size: 13px;
++  outline: none;
++}
++.ask-user-composer__foot {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++}
++.ask-user-composer__hint {
++  flex: 1;
++  min-width: 0;
++  font-size: 11px;
++  color: var(--color-text-muted);
++}
++.ask-user-composer__submit {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  padding: 6px 12px;
++  border-radius: var(--radius-sm);
++  border: none;
++  background: var(--color-accent);
++  color: var(--color-accent-contrast);
++  font-size: 13px;
++  font-weight: 520;
++  cursor: pointer;
++}
++.ask-user-composer__submit:disabled { opacity: 0.5; cursor: default; }
+ 
+ /* ── 修正6 — auto-retry countdown + cancel ────────────────────────── */
+ .auto-retry {

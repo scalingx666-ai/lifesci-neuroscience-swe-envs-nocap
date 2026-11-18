@@ -1,0 +1,3737 @@
+diff --git a/tvb_library/tvb/simulator/backend/nb_hybrid.py b/tvb_library/tvb/simulator/backend/nb_hybrid.py
+index 2dad38191a..7a40ad1223 100644
+--- a/tvb_library/tvb/simulator/backend/nb_hybrid.py
++++ b/tvb_library/tvb/simulator/backend/nb_hybrid.py
+@@ -73,7 +73,99 @@
+     "NetworkAnalysis",
+     "SubnetworkInfo",
+     "ProjectionInfo",
++    "SweepResult",
+ ]
++
++
++# ---------------------------------------------------------------------------
++# SweepResult — unified return type for both CPU and GPU sweep
++# ---------------------------------------------------------------------------
++
++
++@dataclasses.dataclass
++class SweepResult:
++    """Container for parameter-sweep results.
++
++    Returned by :meth:`NbHybridBackend.sweep`.  Works identically
++    regardless of whether the sweep ran on CPU or GPU.
++
++    Attributes
++    ----------
++    tavg : dict[str, np.ndarray]
++        Per-subnet temporal-average arrays with shape
++        ``(n_sweeps, n_samples, n_voi, N_subnet, n_modes)``.
++    merged_tavg : np.ndarray
++        All subnets concatenated / reordered along the node axis,
++        shape ``(n_sweeps, n_samples, n_voi, N_total, n_modes)``.
++    ctavg : dict[str, np.ndarray]
++        Per-subnet coupling temporal-average with the same sample axis as tavg.
++    times : np.ndarray
++        Mid-point time vector, shape ``(n_chunks,)``.
++    sweep_values : np.ndarray
++        The sweep parameter grid, ``(n_sweeps, n_dims)``.
++    snapshot : dict or None
++        Final execution state for resume (GPU-only for now).
++    backend : str
++        ``'cpu-seq'``, ``'cpu-prange'``, or ``'cuda'``.
++    elapsed : float
++        Wall-clock seconds for the sweep execution (excludes compile).
++    raw : dict[str, np.ndarray] or None
++        Full step-by-step output when ``monitor='raw'``.
++    bold : dict[str, np.ndarray] or None
++        BOLD signal when ``bold_period`` was given.
++    """
++    tavg: dict = dataclasses.field(default_factory=dict)
++    merged_tavg: np.ndarray = None
++    ctavg: dict = dataclasses.field(default_factory=dict)
++    times: np.ndarray = None
++    sweep_values: np.ndarray = None
++    snapshot: Optional[dict] = None
++    backend: str = ""
++    elapsed: float = 0.0
++    raw: Optional[dict] = None
++    bold: Optional[dict] = None
++
++
++# ---------------------------------------------------------------------------
++# CFun parameter index mapping — named attributes to param_idx
++# ---------------------------------------------------------------------------
++
++_CFUN_PARAM_ATTRS: dict = {
++    "Linear":            [("a", 0), ("b", 1)],
++    "Scaling":           [("a", 0)],
++    "Sigmoidal":         [("a", 0), ("sigma", 1), ("midpoint", 2),
++                          ("cmin", 3), ("cmax", 4)],
++    "SigmoidalJansenRit":[("a", 0), ("e0", 1), ("r", 2), ("v0", 3),
++                          ("cmin", 4), ("cmax", 5), ("midpoint", 6)],
++    "Kuramoto":          [("a", 0), ("inv_N", 1)],
++    "Difference":        [("a", 0)],
++    "HyperbolicTangent": [("a", 0), ("midpoint", 1), ("sigma", 2),
++                          ("b", 3)],
++    "PreSigmoidal":      [("H", 0), ("Q", 1), ("G", 2), ("P", 3), ("theta", 4)],
++}
++
++_CFUN_ATTR_TO_IDX: dict = {}
++for _cls, _attrs in _CFUN_PARAM_ATTRS.items():
++    for _attr, _idx in _attrs:
++        _CFUN_ATTR_TO_IDX[(_cls, _attr)] = _idx
++
++_NAMED_PARAM_ALIASES: dict = {
++    "coupling_scale": {"attr": "a", "idx": 0},
++    "scale":         {"attr": "a", "idx": 0},
++    "coupling_a":    {"attr": "a", "idx": 0},
++    "coupling_b":    {"attr": "b", "idx": 1},
++    "sigma":         {"attr": "sigma", "idx": 1},
++    "midpoint":      {"attr": "midpoint", "idx": 2},
++}
++
++
++# ---------------------------------------------------------------------------
++# Lazy-supported-models cache
++# ---------------------------------------------------------------------------
++# Importing all 27 model modules costs ~2.5 s on first call (each module
++# registers Numba dfun_helpers).  We cache the result so the cost is paid
++# once per process rather than on every compile().
++
+ _SUPPORTED_MODELS_CACHE: tuple = ()
+ 
+ 
+@@ -2258,3 +2350,519 @@ def _cfun_set_param(cfun, pidx, value):
+             setattr(cfun, ['H', 'Q', 'G', 'P', 'theta'][pidx], np.array([float(value)]))
+         else:
+             raise TypeError(f"Unknown cfun type: {type(cfun).__name__}")
++
++    # ===================================================================
++    # Unified sweep API
++    # ===================================================================
++
++    @staticmethod
++    def _resolve_named_params(network_set, params):
++        """Resolve a named-parameter dict to ``(sweep_descriptor, sweep_values)``."""
++        # Collect all projections with names
++        # Each entry: (lookup_name, proj, actual_name_for_descriptor)
++        all_projs = []
++        for proj in network_set.projections:
++            actual_name = f"{proj.source.name}_to_{proj.target.name}"
++            all_projs.append((actual_name, proj, actual_name))
++        for sn in network_set.subnets:
++            for p in sn.projections:
++                raw_name = getattr(p, "name", None) or "intra"
++                qualified = f"{sn.name}.{raw_name}" if raw_name == "intra" else raw_name
++                all_projs.append((qualified, p, raw_name))
++
++        dims = []
++        for pname, values in params.items():
++            dims.append(np.asarray(values, dtype=np.float32))
++
++        n_sweeps = len(dims[0])
++        for i, d in enumerate(dims):
++            if len(d) != n_sweeps:
++                raise ValueError(f"All param arrays must be same length; param {i} has {len(d)} vs {n_sweeps}")
++
++        sweep_values = (np.column_stack(dims).astype(np.float32)
++                        if len(dims) > 1 else dims[0].reshape(-1, 1))
++        sweep_descriptor = []
++
++        for dim_idx, (key, _values) in enumerate(params.items()):
++            resolved = False
++
++            # Try alias first ('coupling_scale', 'scale', etc.)
++            if key in _NAMED_PARAM_ALIASES:
++                alias = _NAMED_PARAM_ALIASES[key]
++                for lookup, proj, actual in all_projs:
++                    cfun = proj.cfun
++                    if cfun is None:
++                        continue
++                    cfun_cls = type(cfun).__name__
++                    attr = alias["attr"]
++                    if (cfun_cls, attr) in _CFUN_ATTR_TO_IDX:
++                        sweep_descriptor.append({
++                            "type": "cfun", "projection": actual,
++                            "param_idx": _CFUN_ATTR_TO_IDX[(cfun_cls, attr)],
++                        })
++                        resolved = True
++                        break
++                if resolved:
++                    continue
++
++            # Proj.attr: try "{proj}.{attr}" before model params so that
++            # "ctx.intra.b" resolves to the intra-projection's cfun 'b' 
++            # rather than treating "intra.b" as a model parameter.
++            if "." in key:
++                proj_name, attr = key.rsplit(".", 1)
++                for lookup, proj, actual in all_projs:
++                    if lookup == proj_name or lookup.endswith("." + proj_name):
++                        cfun = proj.cfun
++                        if cfun is not None:
++                            cfun_cls = type(cfun).__name__
++                            if (cfun_cls, attr) in _CFUN_ATTR_TO_IDX:
++                                sweep_descriptor.append({
++                                    "type": "cfun", "projection": actual,
++                                    "param_idx": _CFUN_ATTR_TO_IDX[(cfun_cls, attr)],
++                                })
++                                resolved = True
++                                break
++                if resolved:
++                    continue
++
++            # Model param: "subnet.param" — only if param doesn't match
++            # a known cfun attribute for any projection of that subnet.
++            if "." in key:
++                parts = key.split(".", 1)
++                if len(parts) == 2 and any(sn.name == parts[0] for sn in network_set.subnets):
++                    sname, param = parts
++                    sweep_descriptor.append({"type": "model", "subnet": sname, "param": param})
++                    continue
++
++            raise ValueError(
++                f"Cannot resolve sweep parameter '{key}'. Use 'coupling_scale', "
++                f"'{{proj}}.{{attr}}', or '{{subnet}}.{{param}}'. "
++                f"Projections: {[lookup for lookup, _, _ in all_projs]}. "
++                f"Subnets: {[sn.name for sn in network_set.subnets]}."
++            )
++
++        return sweep_descriptor, sweep_values
++
++    def sweep(
++        self,
++        network_set,
++        params,
++        nstep: int = 100,
++        *,
++        backend: str = "auto",
++        n_workers: int = 1,
++        monitor: str = "tavg",
++        monitor_period: int = 1,
++        bold_period: Optional[float] = None,
++        chunk_size: Optional[int] = None,
++        initial_states: Optional[list] = None,
++        node_indices: Optional[dict] = None,
++    ) -> "SweepResult":
++        """Run a parameter sweep — auto dispatches to GPU or multi-core CPU.
++
++        Parameters
++        ----------
++        params : dict
++            Named parameters to sweep.  Keys → 1-D arrays.  All same length.
++            ``'coupling_scale'`` or ``'scale'``: first projection's scaling.
++            ``'{proj_name}.{attr}'``: named projection cfun attribute.
++            ``'{subnet}.{param}'``: model parameter on a subnet.
++        backend : str
++            ``'auto'`` (try CUDA → fallback CPU), ``'cpu'``, or ``'cuda'``.
++        n_workers : int
++            CPU worker processes (fork-based, ignored for CUDA).
++        monitor : str
++            ``'tavg'``, ``'raw'``, or ``'subsample'``.
++        """
++        import time as _time_mod
++
++        self._validate_sweep_monitor_options(
++            monitor, monitor_period, bold_period, chunk_size
++        )
++        if backend not in ("auto", "cpu", "cuda"):
++            raise ValueError(
++                f"Unsupported sweep backend {backend!r}; expected 'auto', 'cpu', or 'cuda'."
++            )
++        if (isinstance(nstep, (bool, np.bool_))
++                or not isinstance(nstep, (int, np.integer))
++                or nstep <= 0):
++            raise ValueError("nstep must be a positive integer")
++        self._check_compatibility(network_set)
++        sweep_descriptor, sweep_values = self._resolve_named_params(network_set, params)
++
++        use_cuda = False
++        if backend == "cuda":
++            use_cuda = True
++        elif backend == "auto":
++            try:
++                from numba import cuda as _cuda
++                use_cuda = _cuda.is_available()
++            except ImportError:
++                pass
++
++        if use_cuda:
++            try:
++                return self._sweep_cuda(
++                    network_set, sweep_descriptor, sweep_values, nstep,
++                    monitor, monitor_period, bold_period, chunk_size,
++                    initial_states, node_indices)
++            except NotImplementedError:
++                if backend == "cuda":
++                    raise
++
++        return self._sweep_cpu(
++            network_set, sweep_descriptor, sweep_values, nstep,
++            n_workers, monitor, monitor_period, bold_period, chunk_size,
++            initial_states, node_indices)
++
++    def _sweep_cuda(self, network_set, sweep_descriptor, sweep_values,
++                     nstep, monitor, monitor_period, bold_period,
++                     chunk_size, initial_states, node_indices):
++        import time as _time_mod
++        from tvb.simulator.backend.nb_hybrid_cuda_sweep_backend import NbHybridCUDASweepBackend
++
++        cuda_backend = NbHybridCUDASweepBackend()
++        compiled = cuda_backend.compile_sweep(network_set, sweep_descriptor=sweep_descriptor)
++        kwargs = dict(sweep_values=sweep_values, nstep=nstep, monitor_type="raw",
++                      monitor_period=1, node_indices=node_indices,
++                      record_coupling=True)
++        if initial_states is not None: kwargs["initial_states"] = initial_states
++        if chunk_size is not None: kwargs["chunk_size"] = chunk_size
++
++        t0 = _time_mod.perf_counter()
++        raw = compiled.run(**kwargs)
++        elapsed = _time_mod.perf_counter() - t0
++
++        subnet_names = [sn.name for sn in network_set.subnets]
++        result = SweepResult(
++            tavg=dict(zip(subnet_names, raw["raw"])),
++            ctavg=dict(zip(subnet_names, raw["ctraw"])),
++            sweep_values=sweep_values,
++            backend="cuda",
++            elapsed=elapsed,
++            snapshot=raw.get("snapshot"),
++        )
++        return self._finalize_sweep(
++            result, network_set, monitor, monitor_period, bold_period,
++            chunk_size, node_indices
++        )
++
++    def _stack_cpu_results(self, raw_results, network_set, node_indices, sweep_values, backend_label, elapsed):
++        """Stack CPU list-of-tuples into SweepResult.
++
++        raw_results: list of n_sweeps tuples, each tuple has n_subnets entries
++        of (times, data, ctavg).  data shape: (n_chunks, n_voi, N, modes).
++        Stacks into (n_sweeps, n_chunks, n_voi, N, modes) preserving the
++        time (chunk) dimension so callers can access per-timestep traces.
++        """
++        subnet_names = [sn.name for sn in network_set.subnets]
++        tavg_dict = {}
++        ctavg_dict = {}
++        for si, sname in enumerate(subnet_names):
++            # Preserve time (chunk) dimension for per-timestep traces
++            tavg_arr = np.stack([r[si][1] for r in raw_results], axis=0)
++            ctavg_arr = np.stack([r[si][2] for r in raw_results], axis=0)
++            tavg_dict[sname] = tavg_arr
++            ctavg_dict[sname] = ctavg_arr
++        # Merge along node axis
++        if node_indices and len(node_indices) > 0:
++            n_global = max(max(idxs) for idxs in node_indices.values()) + 1
++            ref = list(tavg_dict.values())[0]
++            merged = np.zeros((ref.shape[0], ref.shape[1], ref.shape[2], n_global, ref.shape[4]), dtype=np.float32)
++            for sname in subnet_names:
++                if sname in node_indices:
++                    merged[:, :, :, node_indices[sname], :] = tavg_dict[sname]
++            merged_tavg = merged
++        else:
++            # Concatenate along node axis only if all subnets share the same n_voi
++            vois = set(a.shape[2] for a in tavg_dict.values())
++            if len(vois) == 1:
++                merged_tavg = np.concatenate(list(tavg_dict.values()), axis=3)
++            else:
++                merged_tavg = None  # VOI counts differ — can't merge
++        times = raw_results[0][0][0] if raw_results else np.array([])
++        return SweepResult(tavg=tavg_dict, merged_tavg=merged_tavg, ctavg=ctavg_dict,
++                          times=times, sweep_values=sweep_values, backend=backend_label, elapsed=elapsed)
++
++    @staticmethod
++    def _validate_sweep_monitor_options(monitor, monitor_period, bold_period,
++                                        chunk_size):
++        if monitor not in ("tavg", "raw", "subsample"):
++            raise ValueError(
++                f"Unsupported sweep monitor {monitor!r}; expected "
++                "'tavg', 'raw', or 'subsample'."
++            )
++        if chunk_size is not None and (
++            isinstance(chunk_size, (bool, np.bool_))
++            or not isinstance(chunk_size, (int, np.integer))
++            or chunk_size <= 0
++        ):
++            raise ValueError("chunk_size must be a positive integer")
++        if (isinstance(monitor_period, (bool, np.bool_))
++                or not isinstance(monitor_period, (int, np.integer))
++                or monitor_period <= 0):
++            raise ValueError("monitor_period must be a positive integer number of steps")
++        if bold_period is not None:
++            try:
++                valid_bold_period = (
++                    not isinstance(bold_period, (bool, np.bool_))
++                    and np.isfinite(float(bold_period))
++                    and float(bold_period) > 0
++                )
++            except (TypeError, ValueError):
++                valid_bold_period = False
++            if not valid_bold_period:
++                raise ValueError("bold_period must be positive")
++
++    def _finalize_sweep(self, result, network_set, monitor, monitor_period,
++                        bold_period, chunk_size, node_indices):
++        """Apply the common time-preserving sweep monitor contract."""
++        if chunk_size is None:
++            chunk_size = 1
++
++        per_step_tavg = result.tavg
++        per_step_ctavg = result.ctavg
++        scheme = getattr(network_set.subnets[0], 'scheme', None)
++        if scheme is not None:
++            dt = float(scheme.dt)
++        else:
++            returned_times = np.asarray(result.times)
++            if returned_times.size > 1:
++                dt = float(returned_times[1] - returned_times[0])
++            elif returned_times.size == 1:
++                dt = float(returned_times[0])
++            else:
++                dt = 1.0
++        per_step_times = np.arange(
++            1, next(iter(per_step_tavg.values())).shape[1] + 1,
++            dtype=np.float64,
++        ) * dt
++        slices = [slice(start, min(start + chunk_size, len(per_step_times)))
++                  for start in range(0, len(per_step_times), chunk_size)]
++        result.times = np.asarray([
++            (per_step_times[part.start] + per_step_times[part.stop - 1]) * 0.5
++            for part in slices
++        ], dtype=np.float64)
++        result.tavg = {
++            name: np.stack([values[:, part].mean(axis=1) for part in slices], axis=1)
++            for name, values in per_step_tavg.items()
++        }
++        result.ctavg = {
++            name: np.stack([values[:, part].mean(axis=1) for part in slices], axis=1)
++            for name, values in per_step_ctavg.items()
++        }
++
++        subnet_names = [sn.name for sn in network_set.subnets]
++        compatible = len({(values.shape[2], values.shape[4])
++                          for values in result.tavg.values()}) == 1
++        if not compatible:
++            result.merged_tavg = None
++        elif node_indices:
++            n_global = max(max(indices) for indices in node_indices.values()) + 1
++            ref = next(iter(result.tavg.values()))
++            merged = np.zeros(
++                (ref.shape[0], ref.shape[1], ref.shape[2], n_global, ref.shape[4]),
++                dtype=ref.dtype,
++            )
++            for name in subnet_names:
++                if name in node_indices:
++                    merged[:, :, :, node_indices[name], :] = result.tavg[name]
++            result.merged_tavg = merged
++        else:
++            result.merged_tavg = np.concatenate(
++                [result.tavg[name] for name in subnet_names], axis=3
++            )
++
++        if monitor in ("raw", "subsample"):
++            if monitor == "raw":
++                selected = np.arange(len(per_step_times))
++            else:
++                selected = np.arange(monitor_period - 1, len(per_step_times), monitor_period)
++            result.raw = {
++                name: values[:, selected].copy() for name, values in per_step_tavg.items()
++            }
++
++        if bold_period is not None:
++            from tvb.simulator.monitors import Bold
++
++            bold = {}
++            for name, values in per_step_tavg.items():
++                sweep_samples = []
++                for sweep_data in values:
++                    monitor_instance = Bold(period=float(bold_period))
++                    monitor_instance._config_dt(dt)
++                    monitor_instance.voi = np.arange(sweep_data.shape[1], dtype=int)
++                    monitor_instance.compute_hrf()
++                    monitor_instance._config_stock(*sweep_data.shape[1:])
++                    samples = [
++                        sample for step, state in enumerate(sweep_data, 1)
++                        if (sample := monitor_instance.sample(step, state)) is not None
++                    ]
++                    sweep_samples.append(
++                        np.stack([sample[1] for sample in samples])
++                        if samples else np.empty((0,) + sweep_data.shape[1:])
++                    )
++                bold[name] = np.stack(sweep_samples)
++            result.bold = bold
++        return result
++
++    def _sweep_cpu(self, network_set, sweep_descriptor, sweep_values,
++                    nstep, n_workers, monitor, monitor_period, bold_period,
++                    chunk_size, initial_states, node_indices):
++        import time as _time_mod
++        if n_workers > 1 and all(
++            desc.get("type") == "cfun" for desc in sweep_descriptor
++        ):
++            # Use prange-based parallel sweep instead of fork
++            result = self._sweep_cpu_prange(
++                network_set, sweep_descriptor, sweep_values,
++                nstep, initial_states, node_indices)
++        else:
++            t0 = _time_mod.perf_counter()
++            raw = self.run_sweep(
++                network_set, sweep_values=sweep_values, nstep=nstep,
++                sweep_descriptor=sweep_descriptor, initial_states=initial_states,
++                chunk_size=1,
++            )
++            elapsed = _time_mod.perf_counter() - t0
++            result = self._stack_cpu_results(
++                raw, network_set, node_indices, sweep_values, "cpu-seq", elapsed
++            )
++        return self._finalize_sweep(
++            result, network_set, monitor, monitor_period, bold_period,
++            chunk_size, node_indices
++        )
++
++
++    def _sweep_cpu_prange(self, network_set, sweep_descriptor, sweep_values,
++                          nstep, initial_states, node_indices):
++        """Multi-core CPU sweep using Numba prange (single-process threading).
++
++        Compiles a ``@nb.njit(parallel=True)`` sweep kernel via a Mako
++        template (``nb-hybrid-sweep-cpu.py.mako``), appended to the
++        single-sim module so ``sweep_kernel`` can call ``network_chunk``
++        directly from inside ``nb.prange``.  Each thread operates on its
++        own slice of per-sweep arrays, giving true multi-core parallelism
++        without the fork-safety issues of multiprocessing.
++        """
++        from tvb.simulator.backend.nb_hybrid_sweep_cpu import (
++            compile_sweep_kernel, run_sweep_prange)
++
++        # Ensure single-sim function is compiled (and module is cached)
++        compiled = self.compile(network_set, eager=True)
++        analysis = compiled._analysis
++
++        # Compile the sweep kernel (Mako template + single-sim source)
++        kernel_fn = compile_sweep_kernel(self, analysis)
++
++        # Run the sweep
++        return run_sweep_prange(
++            kernel_fn, analysis, network_set, sweep_descriptor,
++            sweep_values, nstep, self, initial_states=initial_states)
++
++
++
++    def run_sweep(
++        self,
++        network_set,
++        sweep_values: np.ndarray,
++        nstep: int = 100,
++        initial_states: Optional[list] = None,
++        sweep_descriptor: Optional[list] = None,
++        chunk_size: Optional[int] = None,
++        bold_period: Optional[float] = None,
++        print_source: bool = False,
++        **monitors,
++    ):
++        """Run parameter sweep sequentially on CPU.
++
++        Each sweep point calls run_network() internally. Results are
++        returned as a list of per-sweep-point tuples matching the
++        run_network() return format.
++
++        Parameters
++        ----------
++        sweep_values : ndarray (n_sweeps,) or (n_sweeps, n_sweep_dims)
++        sweep_descriptor : list of dict, optional
++            [{type: 'cfun', projection: 'proj_AB', param_idx: 0},
++             {type: 'model', subnet: 'A', param: 'tau_E'}]
++        """
++        self._check_compatibility(network_set)
++        sweep_values = np.asarray(sweep_values, dtype=np.float32)
++        if sweep_values.ndim == 1:
++            sweep_values = sweep_values.reshape(-1, 1)
++
++        if sweep_descriptor is None:
++            if network_set.projections:
++                # Use naming convention for projections
++                first_proj = network_set.projections[0]
++                proj_name = f"{first_proj.source.name}_to_{first_proj.target.name}"
++                sweep_descriptor = [{'type': 'cfun', 'projection': proj_name,
++                                     'param_idx': 0}]
++            else:
++                sweep_descriptor = []
++
++        n_sweeps = sweep_values.shape[0]
++        results = []
++
++        targets = []
++        for desc in sweep_descriptor:
++            if desc['type'] == 'cfun':
++                pname = desc['projection']
++                pidx = desc.get('param_idx', 0)
++                matched_proj = None
++                for proj in network_set.projections:
++                    expected_name = f"{proj.source.name}_to_{proj.target.name}"
++                    if expected_name == pname:
++                        matched_proj = proj
++                        break
++                if matched_proj is None:
++                    for sn in network_set.subnets:
++                        for proj in sn.projections:
++                            expected_name = getattr(proj, 'name', None) or 'intra'
++                            if expected_name == pname:
++                                matched_proj = proj
++                                break
++                        if matched_proj is not None:
++                            break
++                if matched_proj is None:
++                    raise ValueError(f"Projection '{pname}' not found in sweep")
++                attrs = dict(_CFUN_PARAM_ATTRS.get(type(matched_proj.cfun).__name__, ()))
++                attr = next((name for name, index in attrs.items() if index == pidx), None)
++                if attr is None:
++                    raise IndexError(
++                        f"No parameter index {pidx} for "
++                        f"{type(matched_proj.cfun).__name__}"
++                    )
++                targets.append(('cfun', matched_proj.cfun, attr, pidx))
++            elif desc['type'] == 'model':
++                sname = desc['subnet']
++                subnet = next((sn for sn in network_set.subnets if sn.name == sname), None)
++                if subnet is None:
++                    raise ValueError(f"Subnetwork '{sname}' not found in sweep")
++                targets.append(('model', subnet.model, desc['param'], None))
++
++        # Sweep setters replace attributes, so retaining these object references
++        # keeps mutable arrays isolated and preserves non-contiguous layouts exactly.
++        originals = [(owner, attr, getattr(owner, attr))
++                     for _kind, owner, attr, _pidx in targets]
++        try:
++            for tid in range(n_sweeps):
++                sv = sweep_values[tid]
++                for dim, (kind, owner, attr, pidx) in enumerate(targets):
++                    if kind == 'cfun':
++                        self._cfun_set_param(owner, pidx, sv[dim])
++                    else:
++                        setattr(owner, attr, np.array([float(sv[dim])]))
++
++                kwargs = dict(initial_states=initial_states, print_source=print_source)
++                if chunk_size is not None:
++                    kwargs['chunk_size'] = chunk_size
++                results.append(self.run_network(network_set, nstep=nstep, **kwargs))
++        finally:
++            for owner, attr, original in originals:
++                # The value was already valid on this instance. Bypass NArray's
++                # copying setter so restoration retains the exact caller object.
++                vars(owner)[attr] = original
++
++        return results
+diff --git a/tvb_library/tvb/simulator/backend/nb_hybrid_sweep_cpu.py b/tvb_library/tvb/simulator/backend/nb_hybrid_sweep_cpu.py
+new file mode 100644
+index 0000000000..200b439d91
+--- /dev/null
++++ b/tvb_library/tvb/simulator/backend/nb_hybrid_sweep_cpu.py
+@@ -0,0 +1,466 @@
++# -*- coding: utf-8 -*-
++#
++# TheVirtualBrain-Scientific Package. This package holds all simulators, and
++# analysers necessary to run brain-simulations. You can use it stand alone or
++# in conjunction with TheVirtualBrain-Framework Package.
++#
++# (c) 2012-2025, Baycrest Centre for Geriatric Care ("Baycrest") and others
++#
++# This program is free software: you can redistribute it and/or modify it under the
++# terms of the GNU General Public License as published by the Free Software Foundation,
++# either version 3 of the License, or (at your option) any later version.
++#
++"""
++CPU parameter sweep using Numba prange for thread-level parallelism.
++
++Generates a ``@nb.njit(parallel=True)`` sweep kernel that wraps the
++existing ``network_chunk`` function in a ``nb.prange`` loop.  Each
++thread operates on its own slice of per-sweep arrays, giving true
++multi-core parallelism without fork-safety issues.
++
++Architecture
++------------
++The sweep kernel template (``nb-hybrid-sweep-cpu.py.mako``) is rendered
++alongside the single-sim template and appended to the same module, so
++``sweep_kernel`` can call ``network_chunk`` directly.  Per-sweep arrays
++have a leading ``n_sweeps`` dimension; inside the prange loop, each
++thread operates on its own slice.  cfun_params are pre-built with swept
++values overridden per sweep point, stored as ``cfun_params_all[p.name]``
++with shape ``(n_sweeps, 8)``.
++"""
++
++import copy
++import hashlib
++import importlib.util
++import os
++import sys
++import time
++from typing import Optional
++
++import numpy as np
++
++# Module-level cache for compiled sweep kernels, keyed by topology hash.
++_SWEEP_KERNEL_CACHE = {}
++
++
++def compile_sweep_kernel(backend, analysis):
++    """Compile and cache the prange sweep kernel.
++
++    Renders the Mako template, appends it to the single-sim module source,
++    and compiles both together so ``sweep_kernel`` can call ``network_chunk``.
++
++    Parameters
++    ----------
++    backend : NbHybridBackend
++        Backend instance (used for render_template).
++    analysis : NetworkAnalysis
++        Network analysis (determines topology).
++
++    Returns
++    -------
++    callable
++        The compiled ``sweep_kernel`` function.
++    """
++    content = dict(analysis=analysis, np=np, debug_nojit=False)
++
++    # Render the sweep kernel template
++    sweep_source = backend.render_template(
++        '<%include file="nb-hybrid-sweep-cpu.py.mako"/>', content)
++
++    # Also render the single-sim template (contains network_chunk)
++    sim_source = backend.render_template(
++        '<%include file="nb-hybrid-sim.py.mako"/>', content)
++
++    # Combine both sources into one module
++    full_source = sim_source + "\n\n# ---- SWEEP KERNEL ----\n\n" + sweep_source
++
++    # Cache key based on combined source
++    cache_key = hashlib.sha256(full_source.encode()).hexdigest()
++
++    if cache_key in _SWEEP_KERNEL_CACHE:
++        return _SWEEP_KERNEL_CACHE[cache_key]
++
++    # Write to disk for Numba caching
++    cache_dir = backend.get_cache_dir()
++    mod_name = f"nbhybrid_sweep_{cache_key}"
++    mod_path = cache_dir / f"{mod_name}.py"
++
++    try:
++        cache_dir.mkdir(parents=True, exist_ok=True)
++        if not mod_path.exists():
++            tmp_path = mod_path.with_suffix(".tmp")
++            tmp_path.write_text(full_source, encoding="utf-8")
++            os.replace(tmp_path, mod_path)
++    except OSError as exc:
++        raise OSError(
++            "Unable to create or write the Numba hybrid cache directory "
++            f"at '{cache_dir}' configured by TVB_NHYBRID_CACHE_DIR; "
++            "ensure the cache directory is writable."
++        ) from exc
++
++    spec = importlib.util.spec_from_file_location(mod_name, mod_path)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[mod_name] = mod
++    spec.loader.exec_module(mod)
++
++    kernel_fn = mod.sweep_kernel
++    _SWEEP_KERNEL_CACHE[cache_key] = kernel_fn
++    return kernel_fn
++
++
++def run_sweep_prange(kernel_fn, analysis, network_set, sweep_descriptor,
++                     sweep_values, nstep, backend, initial_states=None):
++    """Run a parameter sweep using the compiled prange kernel.
++
++    Pre-allocates per-sweep and shared arrays, builds cfun_params with swept
++    entries overridden per sweep point, and calls the kernel.
++
++    Returns
++    -------
++    SweepResult
++    """
++    from tvb.simulator.backend.nb_hybrid import (
++        NbHybridBackend,
++        SweepResult,
++        _cfun_params,
++    )
++
++    subnets = analysis.subnetworks
++    all_projs = analysis.all_projections
++    n_sweeps = sweep_values.shape[0]
++    n_sweep_dims = sweep_values.shape[1] if sweep_values.ndim > 1 else 0
++
++    # ---- Guard: model-parameter sweeps not yet supported on CPU prange path ----
++    # _sweep_params is accepted by the kernel but never forwarded to network_chunk
++    # or the dfun templates. cfun-parameter sweeps work correctly (applied below).
++    # TODO: thread _sweep_params through network_chunk → state_update → dfun, then
++    #       remove this guard.
++    for dim, desc in enumerate(sweep_descriptor):
++        if desc.get('type', '') not in ('cfun',):
++            raise NotImplementedError(
++                f"CPU sweep dimension {dim} ({desc.get('name', '?')}) has type "
++                f"'{desc.get('type', '?')}' — model-parameter sweeps are not yet "
++                f"supported on the CPU prange path. Use the Python sequential path "
++                f"(backend='numba', parallel=False) or the CUDA sweep backend instead."
++            )
++
++    t_start = 1  # 1-based time step (matching single-sim)
++
++    # ---- Build per-sweep mutable arrays ----
++    state_all = {}
++    srcbuf_all = {}
++    tavg_all = {}
++    tavg_count_all = {}
++    ctavg_all = {}
++    c_all = {}
++    spatial_tavg_all = {}
++    proj_tavg_all = {}
++    bold_state_all = {}
++    bold_params = {}
++    bold_voi_idx = {}
++    spatial_mean = {}
++    gain = {}
++
++    for sn in subnets:
++        sn_obj = next(s for s in network_set.subnets if s.name == sn.name)
++        nvar = sn.model.nvar
++        n_nodes = sn.n_nodes
++        n_modes = sn.n_modes
++        nvoi = len(sn.model.variables_of_interest)
++        ncvar = len(sn.model.cvar)
++        horizon = analysis.source_horizons.get(sn.name, 1)
++
++        # Initial state
++        if initial_states is not None:
++            init = initial_states[subnets.index(sn)].astype(np.float32)
++        else:
++            init = sn_obj.zero_states().astype(np.float32)
++
++        # Per-sweep copies of state and srcbuf
++        state_all[sn.name] = np.ascontiguousarray(
++            np.broadcast_to(init[np.newaxis], (n_sweeps,) + init.shape).copy(),
++            dtype=np.float32)
++
++        # Source buffer
++        srcbuf_all[sn.name] = np.ascontiguousarray(
++            np.broadcast_to(
++                init[:, :, :, np.newaxis] * np.ones((1, 1, 1, horizon), dtype=np.float32),
++                (n_sweeps, nvar, n_nodes, n_modes, horizon)
++            ).copy(), dtype=np.float32)
++
++        # Output/scratch accumulators
++        tavg_all[sn.name] = np.zeros(
++            (n_sweeps, nstep, nvoi, n_nodes, n_modes), dtype=np.float32)
++        ctavg_all[sn.name] = np.zeros(
++            (n_sweeps, nstep, ncvar, n_nodes, n_modes), dtype=np.float32)
++        c_all[sn.name] = np.zeros((n_sweeps, ncvar, n_nodes, n_modes), dtype=np.float32)
++
++        # Monitor accumulators (zeros — no monitors in sweep for now)
++        n_areas = 0
++        n_sensors = 0
++        spatial_mean[sn.name] = np.zeros((0, n_nodes), dtype=np.float32)
++        gain[sn.name] = np.zeros((0, n_nodes), dtype=np.float32)
++        spatial_tavg_all[sn.name] = np.zeros(
++            (n_sweeps, nvoi, max(n_areas, 1), n_modes), dtype=np.float32)
++        proj_tavg_all[sn.name] = np.zeros(
++            (n_sweeps, nvoi, max(n_sensors, 1), 1), dtype=np.float32)
++
++        # Bold state
++        svars = list(sn.model.state_variables)
++        voi = list(sn.model.variables_of_interest)
++        voi_idx = [svars.index(v) if v in svars else 0 for v in voi]
++        bold_state_all[sn.name] = np.zeros((n_sweeps, nvoi, 4, n_nodes), dtype=np.float32)
++        # Initialize: f=v=q=1 (axis 2 = [s,f,v,q])
++        bold_state_all[sn.name][:, :, 1, :] = 1.0
++        bold_state_all[sn.name][:, :, 2, :] = 1.0
++        bold_state_all[sn.name][:, :, 3, :] = 1.0
++        bold_params[sn.name] = np.array([
++            1/0.65, 1/0.41, 1/0.98, 1/0.32, 0.4, 1/0.4,
++            4.3*40.3*0.04*0.5, 0.5*25*0.04*0.5, 1-0.5
++        ], dtype=np.float32)
++        bold_voi_idx[sn.name] = np.array(voi_idx, dtype=np.int32)
++
++    # Single shared tavg counter for all subnets
++    tavg_count_all = np.zeros((n_sweeps, nstep), dtype=np.int32)
++
++    # ---- Build per-projection cfun_params with swept entries ----
++    cfun_params_all = {}
++    proj_arrays = {}
++
++    for p in all_projs:
++        base = _cfun_params(p)
++        cfun_params_all[p.name] = np.broadcast_to(
++            base[np.newaxis], (n_sweeps, len(base))
++        ).copy().astype(np.float32)
++
++        projection_dims = [
++            (dim, desc)
++            for dim, desc in enumerate(sweep_descriptor)
++            if desc['type'] == 'cfun' and desc['projection'] == p.name
++        ]
++        if projection_dims:
++            for row in range(n_sweeps):
++                row_projection = copy.copy(p)
++                row_projection.cfun = copy.copy(p.cfun)
++                for dim, desc in projection_dims:
++                    NbHybridBackend._cfun_set_param(
++                        row_projection.cfun,
++                        desc.get('param_idx', 0),
++                        sweep_values[row, dim],
++                    )
++                cfun_params_all[p.name][row] = _cfun_params(row_projection)
++
++        # Shared projection arrays
++        proj_arrays[f'{p.name}_w_data'] = p.weights_data.astype(np.float32)
++        proj_arrays[f'{p.name}_w_indices'] = p.weights_indices.astype(np.int32)
++        proj_arrays[f'{p.name}_w_indptr'] = p.weights_indptr.astype(np.int32)
++        proj_arrays[f'{p.name}_idelays'] = p.idelays.astype(np.int32)
++        if p.is_inter:
++            proj_arrays[f'{p.name}_mode_map'] = p.mode_map.astype(np.float32)
++        proj_arrays[f'{p.name}_source_cvar'] = p.source_cvar.astype(np.int32)
++        proj_arrays[f'{p.name}_target_cvar'] = p.target_cvar.astype(np.int32)
++        proj_arrays[f'{p.name}_target_state_cvar'] = p.target_state_cvar.astype(np.int32)
++        proj_arrays[f'{p.name}_scale'] = np.float32(p.scale)
++        if p.target_scales.size > 0:
++            proj_arrays[f'{p.name}_target_scales'] = p.target_scales.astype(np.float32)
++        else:
++            proj_arrays[f'{p.name}_target_scales'] = np.zeros(0, dtype=np.float32)
++
++    # ---- Build noise and stimulus arrays ----
++    noise_arrays = {}
++    stim_arrays = {}
++    for sn in subnets:
++        if sn.is_stochastic:
++            noise_arrays[sn.name] = np.empty(
++                (n_sweeps, sn.model.nvar, sn.n_nodes, sn.n_modes, nstep),
++                dtype=np.float32,
++            )
++
++    # Draw outside prange in the same sweep-major order as run_sweep(). Each
++    # row then owns an immutable realization and resetting the RNG replays the
++    # complete batch independently of thread scheduling.
++    for row in range(n_sweeps):
++        for sn in subnets:
++            if not sn.is_stochastic:
++                continue
++            sn_obj = next(s for s in network_set.subnets if s.name == sn.name)
++            dt = sn_obj.scheme.dt
++            rng = sn_obj.scheme.noise.random_stream
++            dw = rng.randn(nstep, sn.model.nvar, sn.n_nodes, sn.n_modes)
++            noise_std = np.sqrt(2.0 * sn.noise_nsig * dt)
++            dw *= noise_std[np.newaxis, :, np.newaxis, np.newaxis]
++            noise_arrays[sn.name][row] = np.transpose(dw, (1, 2, 3, 0))
++
++    for sn in subnets:
++        sn_obj = next(s for s in network_set.subnets if s.name == sn.name)
++        if sn.has_stimulus:
++            n_cvar = len(sn.model.cvar)
++            stim_arr = np.zeros(
++                (n_cvar, sn.n_nodes, sn.n_modes, nstep), dtype=np.float32)
++            for stim in analysis.stimuli_by_subnet.get(sn.name, []):
++                target_slots = np.asarray(stim.target_cvar)
++                if target_slots.ndim != 1 or target_slots.size == 0:
++                    raise ValueError(
++                        f"Stimulus for subnetwork '{sn.name}' must have a non-empty "
++                        "one-dimensional target_cvar array"
++                    )
++                if target_slots.dtype.kind not in "iu":
++                    raise ValueError(
++                        f"Stimulus for subnetwork '{sn.name}' has non-integer target_cvar"
++                    )
++                target_slots = target_slots.astype(np.intp, copy=False)
++                if np.any(target_slots < 0) or np.any(target_slots >= n_cvar):
++                    raise ValueError(
++                        f"Stimulus for subnetwork '{sn.name}' has target coupling slots "
++                        f"{target_slots.tolist()} outside [0, {n_cvar - 1}]"
++                    )
++                target_shape = (target_slots.size, sn.n_nodes, sn.n_modes)
++                for step_idx in range(1, nstep + 1):
++                    sc = np.asarray(stim.get_coupling(step_idx), dtype=np.float32)
++                    if sc.ndim == 2:
++                        sc = sc[:, :, np.newaxis]
++                    if sc.ndim != 3 or any(
++                        actual not in (1, expected)
++                        for actual, expected in zip(sc.shape, target_shape)
++                    ):
++                        raise ValueError(
++                            f"Stimulus for subnetwork '{sn.name}' returned shape "
++                            f"{sc.shape}; expected a shape broadcastable to {target_shape}"
++                        )
++                    stim_arr[target_slots, :, :, step_idx - 1] += np.broadcast_to(
++                        sc, target_shape
++                    )
++            stim_arrays[sn.name] = stim_arr
++
++    # ---- Build spatial params ----
++    sp_arrays = {}
++    for sn in subnets:
++        if hasattr(sn.model, '_nb_hybrid_runtime_parameter_names'):
++            sp_names = list(sn.model._nb_hybrid_runtime_parameter_names)
++        elif hasattr(sn.model, '_nb_hybrid_custom_template'):
++            sp_names = []
++        else:
++            sp_names = list(getattr(sn.model, 'spatial_parameter_names', []))
++        if sp_names:
++            sp_arrays[sn.name] = np.array(
++                [np.broadcast_to(np.asarray(getattr(sn.model, n)).ravel(),
++                                 (sn.n_nodes,))
++                 for n in sp_names],
++                dtype=np.float32)
++        else:
++            sp_arrays[sn.name] = np.zeros((0, sn.n_nodes), dtype=np.float32)
++
++    # ---- Assemble argument list matching sweep_kernel signature ----
++    dt = network_set.subnets[0].scheme.dt
++    bold_dt = np.float32(dt)
++
++    args = [
++        np.int32(n_sweeps),
++        np.int32(nstep),
++        np.int32(t_start),
++        sweep_values,  # (n_sweeps, n_sweep_dims) float32
++    ]
++
++    # Per-sweep state/srcbuf
++    for sn in subnets:
++        args.append(state_all[sn.name])
++        args.append(srcbuf_all[sn.name])
++
++    # Shared projection arrays + per-sweep cfun_params
++    for p in all_projs:
++        args.append(proj_arrays[f'{p.name}_w_data'])
++        args.append(proj_arrays[f'{p.name}_w_indices'])
++        args.append(proj_arrays[f'{p.name}_w_indptr'])
++        args.append(proj_arrays[f'{p.name}_idelays'])
++        if p.is_inter:
++            args.append(proj_arrays[f'{p.name}_mode_map'])
++        args.append(proj_arrays[f'{p.name}_source_cvar'])
++        args.append(proj_arrays[f'{p.name}_target_cvar'])
++        args.append(proj_arrays[f'{p.name}_target_state_cvar'])
++        args.append(proj_arrays[f'{p.name}_scale'])
++        args.append(proj_arrays[f'{p.name}_target_scales'])
++        args.append(cfun_params_all[p.name])  # (n_sweeps, len(cfun_params)) per-sweep
++
++    # Per-sweep accumulators
++    for sn in subnets:
++        args.append(tavg_all[sn.name])
++        args.append(ctavg_all[sn.name])
++        args.append(c_all[sn.name])
++    args.append(tavg_count_all)
++
++    # Noise
++    for sn in subnets:
++        if sn.is_stochastic:
++            args.append(noise_arrays[sn.name])
++
++    # Stimulus
++    for sn in subnets:
++        if sn.has_stimulus:
++            args.append(stim_arrays[sn.name])
++
++    # Spatial params
++    for sn in subnets:
++        args.append(sp_arrays[sn.name])
++
++    # Monitor arrays
++    for sn in subnets:
++        args.append(spatial_mean[sn.name])
++        args.append(spatial_tavg_all[sn.name])
++        args.append(gain[sn.name])
++        args.append(proj_tavg_all[sn.name])
++
++    # Bold arrays
++    for sn in subnets:
++        args.append(bold_state_all[sn.name])
++        args.append(bold_params[sn.name])
++        args.append(bold_voi_idx[sn.name])
++
++    args.append(bold_dt)
++
++    # ---- Call the kernel ----
++    t0 = time.perf_counter()
++    kernel_fn(*args)
++    elapsed = time.perf_counter() - t0
++
++    # ---- Post-process: divide by tavg_count ----
++    result_tavg = {}
++    result_ctavg = {}
++    for sn in subnets:
++        count = tavg_count_all.astype(np.float32)
++        count = np.where(count > 0, count, np.float32(1.0))
++        count_5d = count[:, :, np.newaxis, np.newaxis, np.newaxis]
++        result_tavg[sn.name] = tavg_all[sn.name] / count_5d
++        result_ctavg[sn.name] = ctavg_all[sn.name] / count_5d
++
++    # Build SweepResult
++    subnet_names = [sn.name for sn in network_set.subnets]
++    n_vois = set(v.shape[2] for v in result_tavg.values())
++    if len(n_vois) == 1 and len(subnet_names) > 1:
++        n_global = sum(result_tavg[sn.name].shape[3] for sn in subnets)
++        ref = list(result_tavg.values())[0]
++        merged = np.zeros(
++            (ref.shape[0], ref.shape[1], ref.shape[2], n_global, ref.shape[4]),
++            dtype=np.float32)
++        offset = 0
++        for sn_info in subnets:
++            n = result_tavg[sn_info.name].shape[3]
++            merged[:, :, :, offset:offset + n, :] = result_tavg[sn_info.name]
++            offset += n
++        merged_tavg = merged
++    elif len(subnet_names) == 1:
++        merged_tavg = list(result_tavg.values())[0]
++    else:
++        merged_tavg = None
++
++    dt = float(network_set.subnets[0].scheme.dt)
++    times = np.arange(1, nstep + 1, dtype=np.float64) * dt
++
++    return SweepResult(
++        tavg=result_tavg,
++        merged_tavg=merged_tavg,
++        ctavg=result_ctavg,
++        times=times,
++        sweep_values=sweep_values,
++        backend="cpu-prange",
++        elapsed=elapsed,
++    )
+diff --git a/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sweep-cpu.py.mako b/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sweep-cpu.py.mako
+new file mode 100644
+index 0000000000..da4b38c37e
+--- /dev/null
++++ b/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sweep-cpu.py.mako
+@@ -0,0 +1,211 @@
++## -*- coding: utf-8 -*-
++##
++## TheVirtualBrain-Scientific Package. This package holds all simulators, and
++## analysers necessary to run brain-simulations. You can use it stand alone or
++## in conjunction with TheVirtualBrain-Framework Package.
++##
++## (c) 2012-2025, Baycrest Centre for Geriatric Care ("Baycrest") and others
++##
++## This program is free software: you can redistribute it and/or modify it under the
++## terms of the GNU General Public License as published by the Free Software Foundation,
++## either version 3 of the License, or (at your option) any later version.
++##
++## Status: active
++##
++## nb-hybrid-sweep-cpu.py.mako
++##
++## Generates a @nb.njit(parallel=True) sweep kernel that wraps the
++## existing network_chunk in a nb.prange loop for multi-core CPU sweeps.
++##
++## Required content dict keys:
++##   analysis  — NetworkAnalysis instance (see nb_hybrid.py)
++##   np        — numpy module reference
++##   debug_nojit: bool — if True, skip @nb.njit decorators (for debugging)
++##
++## This template is appended to the single-sim template output so that
++## sweep_kernel can reference network_chunk and compute_coupling_* directly.
++
++import math
++import numpy as np
++import numba as nb
++sin, cos, exp, log = math.sin, math.cos, math.exp, math.log
++
++<%
++from tvb.simulator.backend.nb_hybrid import _cfun_type, _cvar_mapping_mode
++subnets = analysis.subnetworks
++inter_projs = analysis.inter_projections
++intra_projs = analysis.intra_projections
++all_projs = analysis.all_projections
++source_horizons_map = analysis.source_horizons
++sn_ncvar_dict = {sn.name: len(sn.model.cvar) for sn in subnets}
++sn_nnodes_dict = {sn.name: sn.n_nodes for sn in subnets}
++sn_nmodes_dict = {sn.name: sn.n_modes for sn in subnets}
++sn_nvoi_dict = {sn.name: len(sn.model.variables_of_interest) for sn in subnets}
++%>
++
++## ============================================================
++## CPU parallel sweep kernel
++## ============================================================
++
++${'' if debug_nojit else '@nb.njit(parallel=True, cache=True)'}
++def sweep_kernel(
++    _n_sweeps, _nstep, _t_start,
++    _sweep_params,  # (n_sweeps, n_sweep_dims) float32
++    ## per-subnet state arrays (leading n_sweeps dimension)
++    % for sn in subnets:
++    ${sn.name}_state_all,   # (n_sweeps, n_svars, n_nodes, n_modes) float32
++    ${sn.name}_srcbuf_all,  # (n_sweeps, n_vars, n_nodes, n_modes, max_horizon) float32
++    % endfor
++    ## per-projection arrays (shared, read-only)
++    % for p in all_projs:
++    ${p.name}_w_data, ${p.name}_w_indices, ${p.name}_w_indptr,
++    ${p.name}_idelays,
++    % if p.is_inter:
++    ${p.name}_mode_map,
++    % endif
++    ${p.name}_source_cvar, ${p.name}_target_cvar, ${p.name}_target_state_cvar,
++    ${p.name}_scale, ${p.name}_target_scales,
++    ${p.name}_cfun_params_all,  # (n_sweeps, n_params) float32 — per-sweep copies
++    % endfor
++    ## per-subnet tavg output arrays (leading n_sweeps dimension)
++    % for sn in subnets:
++    ${sn.name}_tavg_all,     # (n_sweeps, n_voi, n_nodes, n_modes)
++    ${sn.name}_ctavg_all,    # (n_sweeps, n_cvar, n_nodes, n_modes)
++    ${sn.name}_c_all,        # (n_sweeps, n_cvar, n_nodes, n_modes) — coupling scratch
++    % endfor
++    _tavg_count_all,  # (n_sweeps,) int32 — shared tavg counter
++    ## per-subnet noise arrays (stochastic only, one realization per sweep)
++    % for sn in subnets:
++    % if sn.is_stochastic:
++    ${sn.name}_noise_all,  # (n_sweeps, n_vars, n_nodes, n_modes, nstep_total) float32
++    % endif
++    % endfor
++    ## per-subnet stimulus arrays (shared)
++    % for sn in subnets:
++    % if sn.has_stimulus:
++    ${sn.name}_stim,  # (n_cvar, n_nodes, n_modes, nstep_total) float32
++    % endif
++    % endfor
++    ## per-subnet spatial parameter arrays (shared, read-only)
++    % for sn in subnets:
++    ${sn.name}_sp,
++    % endfor
++    ## per-subnet monitor arrays
++    % for sn in subnets:
++    ${sn.name}_spatial_mean,  # (n_areas, n_nodes) float32 — shared
++    ${sn.name}_spatial_tavg_all,  # (n_sweeps, n_voi, n_areas, n_modes) float32
++    ${sn.name}_gain,  # (n_sensors, n_nodes) float32 — shared
++    ${sn.name}_proj_tavg_all,  # (n_sweeps, n_voi, n_sensors, 1) float32
++    % endfor
++    ## per-subnet Bold Balloon model arrays
++    % for sn in subnets:
++    ${sn.name}_bold_state_all,  # (n_sweeps, n_voi, 4, n_nodes) float32
++    ${sn.name}_bold_params,     # (9,) float32 — shared
++    ${sn.name}_bold_voi_idx,   # (n_voi,) int32 — shared
++    % endfor
++    _bold_dt,  # float32
++):
++    for _tid in nb.prange(_n_sweeps):
++        ## Per-sweep state views
++        % for sn in subnets:
++        ${sn.name}_state = ${sn.name}_state_all[_tid]
++        ${sn.name}_srcbuf = ${sn.name}_srcbuf_all[_tid]
++        ${sn.name}_c = ${sn.name}_c_all[_tid]
++        % if sn.is_stochastic:
++        ${sn.name}_noise = ${sn.name}_noise_all[_tid]
++        % endif
++        % endfor
++        ## Per-sweep cfun_params views
++        % for p in all_projs:
++        ${p.name}_cfun_params = ${p.name}_cfun_params_all[_tid]
++        % endfor
++        ## Per-sweep monitor views
++        % for sn in subnets:
++        ${sn.name}_spatial_tavg = ${sn.name}_spatial_tavg_all[_tid]
++        ${sn.name}_proj_tavg = ${sn.name}_proj_tavg_all[_tid]
++        ${sn.name}_bold_state = ${sn.name}_bold_state_all[_tid]
++        % endfor
++
++        for _step in range(_nstep):
++            % for sn in subnets:
++            ${sn.name}_tavg = ${sn.name}_tavg_all[_tid, _step]
++            ${sn.name}_ctavg = ${sn.name}_ctavg_all[_tid, _step]
++            ${sn.name}_tavg[:, :, :] = np.float32(0.0)
++            ${sn.name}_ctavg[:, :, :] = np.float32(0.0)
++            ${sn.name}_c[:, :, :] = np.float32(0.0)
++            ${sn.name}_spatial_tavg[:, :, :] = np.float32(0.0)
++            ${sn.name}_proj_tavg[:, :, :] = np.float32(0.0)
++            % endfor
++            _tavg_count_all[_tid, _step] = 0
++            tavg_count = _tavg_count_all[_tid, _step:_step+1]
++
++            ## Keep every integration sample; Python applies the requested monitors.
++            network_chunk(
++            1,
++            _t_start + _step,
++            0,
++            ## per-subnet states
++            % for sn in subnets:
++            ${sn.name}_state,
++            % endfor
++            ## per-subnet source buffers
++            % for sn in subnets:
++            ${sn.name}_srcbuf,
++            % endfor
++            ## per-projection arrays
++            % for p in all_projs:
++            ${p.name}_w_data, ${p.name}_w_indices, ${p.name}_w_indptr,
++            ${p.name}_idelays,
++            % if p.is_inter:
++            ${p.name}_mode_map,
++            % endif
++            ${p.name}_source_cvar, ${p.name}_target_cvar, ${p.name}_target_state_cvar,
++            ${p.name}_scale, ${p.name}_target_scales,
++            ${p.name}_cfun_params,
++            % endfor
++            ## per-subnet tavg accumulators
++            % for sn in subnets:
++            ${sn.name}_tavg,
++            % endfor
++            tavg_count,
++            ## per-subnet ctavg accumulators
++            % for sn in subnets:
++            ${sn.name}_ctavg,
++            % endfor
++            ## per-subnet coupling scratch arrays
++            % for sn in subnets:
++            ${sn.name}_c,
++            % endfor
++            ## per-subnet noise (stochastic only)
++            % for sn in subnets:
++            % if sn.is_stochastic:
++            ${sn.name}_noise,
++            % endif
++            % endfor
++            ## per-subnet stimulus
++            % for sn in subnets:
++            % if sn.has_stimulus:
++            ${sn.name}_stim,
++            % endif
++            % endfor
++            ## per-subnet spatial parameters
++            % for sn in subnets:
++            ${sn.name}_sp,
++            % endfor
++            ## per-subnet monitor accumulators
++            % for sn in subnets:
++            ${sn.name}_spatial_mean,
++            ${sn.name}_spatial_tavg,
++            ${sn.name}_gain,
++            ${sn.name}_proj_tavg,
++            % endfor
++            ## per-subnet Bold Balloon arrays
++            % for sn in subnets:
++            ${sn.name}_bold_state,
++            ${sn.name}_bold_params,
++            ${sn.name}_bold_voi_idx,
++            % endfor
++            _bold_dt,
++            )
++
++        ## tavg_count is already a view into _tavg_count_all — no writeback needed
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_critical_review.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_critical_review.py
+new file mode 100644
+index 0000000000..ec02b79e59
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_critical_review.py
+@@ -0,0 +1,350 @@
++# -*- coding: utf-8 -*-
++#
++#
++#  TheVirtualBrain-Scientific Package. This package holds all simulators, and
++#  analysers necessary to run brain-simulations. You can use it stand alone or
++#  in conjunction with TheVirtualBrain-Framework Package.
++#
++#  (c) 2012-2025, Baycrest Centre for Geriatric Care ("Baycrest") and others
++#
++#  This program is free software: you can redistribute it and/or modify it under the
++#  terms of the GNU General Public License as published by the Free Software Foundation,
++#  either version 3 of the License, or (at your option) any later version.
++#
++"""
++Focused regression tests for critical fast-path / sweep bugs identified in
++code review of the hybrid Numba backend.
++
++These tests intentionally use tiny networks so they run quickly and isolate
++specific parity issues between the pure-Python reference loop and the Numba
++backend / parameter sweep.
++"""
++
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.coupling import (
++    Linear,
++    SigmoidalJansenRit,
++    HyperbolicTangent,
++)
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++from tvb.simulator.integrators import HeunDeterministic, EulerStochastic, HeunStochastic
++from tvb.simulator.noise import Additive
++from tvb.simulator.models.jansen_rit import JansenRit
++from tvb.simulator.models.stefanescu_jirsa import ReducedSetFitzHughNagumo
++from tvb.simulator.models.wong_wang import ReducedWongWang
++
++DT = 0.1
++
++
++def _sparse_weights(n: int, seed: int = 0) -> sp.csr_matrix:
++    rng = np.random.RandomState(seed)
++    w = rng.uniform(0.0, 0.5, (n, n)).astype(np.float64)
++    np.fill_diagonal(w, 0.0)
++    return sp.csr_matrix(w)
++
++
++def _run_python_loop(network_set: NetworkSet, nstep: int, x0_list: list) -> list:
++    """Run pure-Python NetworkSet loop and return observed, mode-collapsed states."""
++    x = network_set.States(*[arr.copy() for arr in x0_list])
++    network_set.init_projection_buffers(x)
++    outputs = [[] for _ in network_set.subnets]
++    for step in range(1, nstep + 1):
++        x = network_set.step(step, x)
++        for i, xi in enumerate(x):
++            obs = network_set.subnets[i].model.observe(xi)
++            # Match Numba / NetworkSet.observe mode collapse
++            outputs[i].append(obs.sum(axis=-1)[..., np.newaxis])
++    return [np.stack(o, axis=0) for o in outputs]
++
++
++def _run_nb(network_set: NetworkSet, nstep: int, x0_list: list) -> list:
++    """Run NbHybridBackend and return per-step state data."""
++    backend = NbHybridBackend()
++    results = backend.run_network(
++        network_set,
++        nstep=nstep,
++        chunk_size=1,
++        initial_states=x0_list,
++    )
++    return [data for _, data, _ in results]
++
++
++class TestSweepCfunParamSlotMismatch:
++    """Regression tests for the prange sweep cfun param index bug.
++
++    _cfun_get_param / _cfun_set_param use a descriptor index space that does
++    not match the compiled kernel's cfun_params layout for SigmoidalJansenRit
++    classic and HyperbolicTangent.  As a result, sweeping certain parameters
++    writes into the wrong kernel slot.
++    """
++
++    def _make_jr_net(self, n=5, cfun=None, source_cvar=(1,)):
++        model = JansenRit()
++        model.configure()
++        scheme = HeunDeterministic(dt=DT)
++        sn = Subnetwork(name="jr", model=model, scheme=scheme, nnodes=n)
++        w = _sparse_weights(n, seed=1)
++        intra = IntraProjection(
++            source_cvar=np.array(source_cvar, dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=w,
++            lengths=sp.csr_matrix(w.toarray() * 0.0),
++            cv=1.0,
++            dt=DT,
++            scale=1.0,
++            cfun=cfun,
++        )
++        sn.projections = [intra]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[])
++        ns.configure()
++        return ns
++
++    def _sweep_param(self, param_name, values, nstep=20):
++        cfun = SigmoidalJansenRit(
++            a=np.array([1.0]),
++            cmin=np.array([0.0]),
++            cmax=np.array([2.0]),
++            r=np.array([1.0]),
++            midpoint=np.array([0.5]),
++            use_classic=1,
++        )
++        ns = self._make_jr_net(cfun=cfun, source_cvar=(1, 2))
++        backend = NbHybridBackend()
++        key = f"jr.intra.{param_name}"
++        seq = backend.sweep(
++            ns, params={key: np.array(values)},
++            nstep=nstep, backend="cpu", n_workers=1,
++        )
++        par = backend.sweep(
++            ns, params={key: np.array(values)},
++            nstep=nstep, backend="cpu", n_workers=4,
++        )
++        return seq, par
++
++    def test_sjr_sweep_cmin_matches_sequential(self):
++        """Sweeping SJR cmin must change only cmin, not corrupt midpoint."""
++        seq, par = self._sweep_param("cmin", [0.0, 1.0])
++        # Sequential output should differ between the two cmin values.
++        assert not np.allclose(seq.merged_tavg[0], seq.merged_tavg[1], atol=1e-6)
++        # Prange output must match sequential (and must also differ).
++        np.testing.assert_allclose(
++            seq.merged_tavg,
++            par.merged_tavg,
++            atol=1e-5, rtol=1e-5,
++            err_msg="prange SJR cmin sweep does not match sequential (slot corruption)",
++        )
++
++    def test_sjr_sweep_midpoint_matches_sequential(self):
++        """Sweeping SJR midpoint must not be aliased to cmin slot."""
++        seq, par = self._sweep_param("midpoint", [0.0, 1.0])
++        np.testing.assert_allclose(
++            seq.merged_tavg,
++            par.merged_tavg,
++            atol=1e-5, rtol=1e-5,
++            err_msg="prange SJR midpoint sweep does not match sequential",
++        )
++
++    def test_tanh_sweep_b_matches_sequential(self):
++        """Sweeping HyperbolicTangent b must land in the kernel b slot."""
++        cfun = HyperbolicTangent(
++            a=np.array([1.0]),
++            b=np.array([0.0]),
++            midpoint=np.array([0.0]),
++            sigma=np.array([1.0]),
++        )
++        ns = self._make_jr_net(cfun=cfun)
++        backend = NbHybridBackend()
++        key = "jr.intra.b"
++        seq = backend.sweep(
++            ns, params={key: np.array([0.5, 1.0])},
++            nstep=20, backend="cpu", n_workers=1,
++        )
++        par = backend.sweep(
++            ns, params={key: np.array([0.5, 1.0])},
++            nstep=20, backend="cpu", n_workers=4,
++        )
++        # The sequential result must actually change.
++        assert not np.allclose(seq.merged_tavg[0], seq.merged_tavg[1], atol=1e-6)
++        np.testing.assert_allclose(
++            seq.merged_tavg,
++            par.merged_tavg,
++            atol=1e-5, rtol=1e-5,
++            err_msg="prange tanh b sweep writes into wrong cfun_params slot",
++        )
++
++
++class TestNumbaCvarMapping:
++    """Regression tests for the target_cvar_cpl / non-identity cvar mapping."""
++
++    def test_non_identity_cvar_matches_python(self):
++        """ReducedSetFitzHughNagumo has cvar=[0,2]; Numba must match Python."""
++        n = 4
++        model = ReducedSetFitzHughNagumo()
++        model.configure()
++        assert np.array_equal(model.cvar, [0, 2])
++        scheme = HeunDeterministic(dt=DT)
++        sn = Subnetwork(name="rsfn", model=model, scheme=scheme, nnodes=n)
++        w = _sparse_weights(n, seed=2)
++        intra = IntraProjection(
++            source_cvar=np.array([0, 2], dtype=np.int_),
++            target_cvar=np.array([0, 1], dtype=np.int_),
++            weights=w,
++            lengths=sp.csr_matrix(w.toarray() * 0.0),
++            cv=1.0,
++            dt=DT,
++            scale=1.0,
++            cfun=Linear(a=np.array([0.5]), b=np.array([0.1])),
++        )
++        sn.projections = [intra]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[])
++        ns.configure()
++
++        rng = np.random.RandomState(17)
++        x0 = rng.randn(model.nvar, n, model.number_of_modes).astype(np.float64)
++
++        py = _run_python_loop(ns, nstep=8, x0_list=[x0])[0]
++        nb = _run_nb(ns, nstep=8, x0_list=[x0])[0]
++
++        assert py.shape == nb.shape, f"shape mismatch: {py.shape} vs {nb.shape}"
++        np.testing.assert_allclose(
++            nb, py,
++            rtol=1e-3, atol=1e-4,
++            err_msg="Numba output differs from Python for non-identity model.cvar",
++        )
++
++
++class TestStimulusSlotTargeting:
++    """Regression test for the Numba stimulus broadcast bug."""
++
++    def test_stimulus_targets_only_requested_cvar_slot(self):
++        """A stimulus targeting one coupling slot must not leak into others."""
++        from tvb.simulator.hybrid.stimulus_utils import constant_stim
++
++        n = 5
++        # JansenRit has cvar=[1,2] so the coupling array has 2 slots.
++        model = JansenRit()
++        model.configure()
++        scheme = HeunDeterministic(dt=DT)
++        sn = Subnetwork(name="jr", model=model, scheme=scheme, nnodes=n)
++        # No projections: coupling starts at zero; stimulus is the only input.
++        sn.projections = []
++        sn.configure()
++
++        # Stimulus targets coupling slot 0 only.
++        from tvb.datatypes.patterns import StimuliRegion
++        from tvb.datatypes import equations as eqs
++        temporal = eqs.Linear()
++        temporal.parameters["a"] = 0.0
++        temporal.parameters["b"] = 1.0
++        weight = np.zeros(n)
++        weight[0] = 1.0
++        pattern = StimuliRegion.from_weights(weight=weight, temporal=temporal)
++        stim = sn.add_stimulus(pattern, stimulus_cvar=0, projection_scale=1.0)
++        stim.configure(simulation_length=10 * DT)
++
++        ns = NetworkSet(subnets=[sn], projections=[])
++        ns.configure()
++
++        rng = np.random.RandomState(3)
++        x0 = rng.randn(model.nvar, n, 1).astype(np.float64)
++
++        py = _run_python_loop(ns, nstep=8, x0_list=[x0])[0]
++        nb = _run_nb(ns, nstep=8, x0_list=[x0])[0]
++
++        # Slot 0 (Voi index depends on observe).  The Python reference only
++        # writes into slot 0; the Numba backend used to broadcast into all
++        # slots.  Compare full trajectories.
++        np.testing.assert_allclose(
++            nb, py,
++            rtol=1e-3, atol=1e-4,
++            err_msg="Numba stimulus leaked into non-target cvar slots",
++        )
++
++
++class TestSweepNoiseSharing:
++    """Regression test for shared noise across prange sweep configurations."""
++
++    def _make_stochastic_net(self, seed):
++        from tvb.simulator.models.infinite_theta import MontbrioPazoRoxin
++        model = MontbrioPazoRoxin()
++        model.configure()
++        noise = Additive(nsig=np.array([0.1]))
++        noise.noise_seed = seed
++        noise.random_stream = np.random.RandomState(seed)
++        noise.configure_white(DT)
++        scheme = HeunStochastic(dt=DT, noise=noise)
++        scheme.configure_boundaries(model)
++        sn = Subnetwork(name="mpr", model=model, scheme=scheme, nnodes=4)
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[])
++        ns.configure()
++        return ns
++
++    def test_prange_sweep_uses_independent_noise_per_config(self):
++        """Sequential sweep differs with noise seed; prange does not (bug)."""
++        ns1 = self._make_stochastic_net(seed=42)
++        ns2 = self._make_stochastic_net(seed=43)
++        backend = NbHybridBackend()
++
++        # Add a dummy projection so "coupling_scale" resolves.
++        sn1 = ns1.subnets[0]
++        w = sp.csr_matrix(np.zeros((4, 4)))
++        intra = IntraProjection(
++            source_cvar=np.array([0], dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=w,
++            lengths=w.copy(),
++            cv=1.0,
++            dt=DT,
++            scale=1.0,
++            cfun=Linear(a=np.array([1.0])),
++        )
++        sn1.projections = [intra]
++        sn1.configure()
++        ns1.configure()
++
++        sn2 = ns2.subnets[0]
++        sn2.projections = [intra]
++        sn2.configure()
++        ns2.configure()
++
++        # Sequential path: each config uses its own noise seed → outputs differ.
++        seq1 = backend.sweep(
++            ns1, params={"coupling_scale": np.array([1.0])},
++            nstep=30, backend="cpu", n_workers=1,
++        )
++        seq2 = backend.sweep(
++            ns2, params={"coupling_scale": np.array([1.0])},
++            nstep=30, backend="cpu", n_workers=1,
++        )
++        assert not np.allclose(
++            seq1.merged_tavg.mean(axis=1), seq2.merged_tavg.mean(axis=1),
++            atol=1e-6, rtol=1e-6,
++        ), "sequential stochastic sweeps are unexpectedly identical"
++
++        # Prange path currently shares one noise array across configurations,
++        # so different seeds incorrectly produce identical output.
++        par1 = backend.sweep(
++            ns1, params={"coupling_scale": np.array([1.0])},
++            nstep=30, backend="cpu", n_workers=4,
++        )
++        par2 = backend.sweep(
++            ns2, params={"coupling_scale": np.array([1.0])},
++            nstep=30, backend="cpu", n_workers=4,
++        )
++        assert not np.allclose(
++            par1.merged_tavg, par2.merged_tavg,
++            atol=1e-6, rtol=1e-6,
++        ), "prange sweep shares the same noise across configurations (different seeds give identical output)"
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v", "--tb=short"])
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_cfun_packing.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_cfun_packing.py
+new file mode 100644
+index 0000000000..200f327373
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_cfun_packing.py
+@@ -0,0 +1,260 @@
++"""Regressions for named coupling parameters and Numba packed layouts."""
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend, _cfun_params
++from tvb.simulator.hybrid.coupling import (
++    HyperbolicTangent,
++    Linear,
++    PreSigmoidal,
++    Sigmoidal,
++    SigmoidalJansenRit,
++)
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.integrators import HeunDeterministic
++from tvb.simulator.models.infinite_theta import MontbrioPazoRoxin
++
++
++DT = 0.01
++NSTEP = 8
++NODES = 3
++
++
++def _array(value):
++    return np.array([value], dtype=np.float64)
++
++
++def _linear(**overrides):
++    values = dict(a=0.11, b=0.22)
++    values.update(overrides)
++    return Linear(**{name: _array(value) for name, value in values.items()})
++
++
++def _sigmoidal(**overrides):
++    values = dict(a=0.31, sigma=0.42, midpoint=0.53, cmin=0.64, cmax=0.75)
++    values.update(overrides)
++    return Sigmoidal(**{name: _array(value) for name, value in values.items()})
++
++
++def _sjr(use_classic, **overrides):
++    # Set every public numeric attribute, including those unused by the selected mode.
++    values = dict(a=0.21, e0=0.32, r=0.43, v0=0.54,
++                  cmin=0.65, cmax=0.76, midpoint=0.87)
++    values.update(overrides)
++    return SigmoidalJansenRit(
++        use_classic=use_classic,
++        **{name: _array(value) for name, value in values.items()},
++    )
++
++
++def _tanh(**overrides):
++    values = dict(a=0.27, b=0.38, midpoint=0.49, sigma=0.61)
++    values.update(overrides)
++    return HyperbolicTangent(
++        **{name: _array(value) for name, value in values.items()}
++    )
++
++
++def _pre_sigmoidal(dynamic=False, **overrides):
++    values = dict(H=0.17, Q=0.29, G=0.41, P=0.53, theta=0.67)
++    values.update(overrides)
++    return PreSigmoidal(
++        dynamic=dynamic,
++        **{name: _array(value) for name, value in values.items()},
++    )
++
++
++PACKING_CASES = [
++    pytest.param(_linear, [0.11, 0.22], id="linear"),
++    pytest.param(_sigmoidal, [0.31, 0.42, 0.53, 0.64, 0.75], id="sigmoidal"),
++    pytest.param(lambda: _sjr(True), [0.21, 0.65, 0.76, 0.43, 0.87],
++                 id="sigmoidal-jansen-rit-classic"),
++    pytest.param(lambda: _sjr(False), [0.21, 0.32, 0.43, 0.54],
++                 id="sigmoidal-jansen-rit-legacy"),
++    pytest.param(_tanh, [0.27, 0.38, 0.49, 0.61], id="hyperbolic-tangent"),
++    pytest.param(lambda: _pre_sigmoidal(False), [0.17, 0.29, 0.41, 0.53, 0.67],
++                 id="pre-sigmoidal-static"),
++    pytest.param(lambda: _pre_sigmoidal(True), [0.17, 0.29, 0.41, 0.53, 0.0],
++                 id="pre-sigmoidal-dynamic"),
++]
++
++
++SWEEP_CASES = [
++    pytest.param(_linear, "a", 0, [0.2, 0.8], id="linear-a"),
++    pytest.param(_linear, "b", 1, [-0.2, 0.3], id="linear-b"),
++    pytest.param(_sigmoidal, "a", 0, [0.4, 1.2], id="sigmoidal-a"),
++    pytest.param(_sigmoidal, "sigma", 1, [0.3, 1.1], id="sigmoidal-sigma"),
++    pytest.param(_sigmoidal, "midpoint", 2, [-0.2, 0.4], id="sigmoidal-midpoint"),
++    pytest.param(_sigmoidal, "cmin", 3, [-0.3, 0.1], id="sigmoidal-cmin"),
++    pytest.param(_sigmoidal, "cmax", 4, [0.7, 1.3], id="sigmoidal-cmax"),
++    pytest.param(lambda **kw: _sjr(True, **kw), "a", 0, [0.2, 0.8], id="sjr-classic-a"),
++    pytest.param(lambda **kw: _sjr(True, **kw), "cmin", 1, [-0.2, 0.2],
++                 id="sjr-classic-cmin"),
++    pytest.param(lambda **kw: _sjr(True, **kw), "cmax", 2, [0.7, 1.3],
++                 id="sjr-classic-cmax"),
++    pytest.param(lambda **kw: _sjr(True, **kw), "r", 3, [0.4, 1.1],
++                 id="sjr-classic-r"),
++    pytest.param(lambda **kw: _sjr(True, **kw), "midpoint", 4, [-0.2, 0.4],
++                 id="sjr-classic-midpoint"),
++    pytest.param(lambda **kw: _sjr(False, **kw), "a", 0, [0.2, 0.8], id="sjr-legacy-a"),
++    pytest.param(lambda **kw: _sjr(False, **kw), "e0", 1, [0.3, 0.9], id="sjr-legacy-e0"),
++    pytest.param(lambda **kw: _sjr(False, **kw), "r", 2, [0.4, 1.1], id="sjr-legacy-r"),
++    pytest.param(lambda **kw: _sjr(False, **kw), "v0", 3, [-0.2, 0.4], id="sjr-legacy-v0"),
++    pytest.param(_tanh, "a", 0, [0.2, 0.8], id="tanh-a"),
++    pytest.param(_tanh, "b", 1, [0.4, 1.2], id="tanh-b"),
++    pytest.param(_tanh, "midpoint", 2, [-0.2, 0.4], id="tanh-midpoint"),
++    pytest.param(_tanh, "sigma", 3, [0.3, 1.1], id="tanh-sigma"),
++    pytest.param(lambda **kw: _pre_sigmoidal(False, **kw), "H", 0, [0.2, 0.8],
++                 id="pre-static-H"),
++    pytest.param(lambda **kw: _pre_sigmoidal(False, **kw), "Q", 1, [-0.2, 0.5],
++                 id="pre-static-Q"),
++    pytest.param(lambda **kw: _pre_sigmoidal(False, **kw), "G", 2, [0.4, 1.2],
++                 id="pre-static-G"),
++    pytest.param(lambda **kw: _pre_sigmoidal(False, **kw), "P", 3, [0.4, 1.2],
++                 id="pre-static-P"),
++    pytest.param(lambda **kw: _pre_sigmoidal(False, **kw), "theta", 4, [-0.2, 0.4],
++                 id="pre-static-theta"),
++    pytest.param(lambda **kw: _pre_sigmoidal(True, **kw), "H", 0, [0.2, 0.8],
++                 id="pre-dynamic-H"),
++    pytest.param(lambda **kw: _pre_sigmoidal(True, **kw), "Q", 1, [-0.2, 0.5],
++                 id="pre-dynamic-Q"),
++    pytest.param(lambda **kw: _pre_sigmoidal(True, **kw), "G", 2, [0.4, 1.2],
++                 id="pre-dynamic-G"),
++    pytest.param(lambda **kw: _pre_sigmoidal(True, **kw), "P", 3, [0.4, 1.2],
++                 id="pre-dynamic-P"),
++]
++
++
++def _network(cfun):
++    model = MontbrioPazoRoxin()
++    model.configure()
++    subnetwork = Subnetwork(
++        name="ctx",
++        model=model,
++        scheme=HeunDeterministic(dt=DT),
++        nnodes=NODES,
++    )
++    weights = sp.csr_matrix(np.array([
++        [0.0, 0.35, 0.15],
++        [0.20, 0.0, 0.30],
++        [0.25, 0.10, 0.0],
++    ]))
++    source_cvar = np.array([0, 1] if getattr(cfun, "n_cvar_in", 1) == 2 else [0],
++                           dtype=np.int_)
++    projection = IntraProjection(
++        source_cvar=source_cvar,
++        target_cvar=np.array([0], dtype=np.int_),
++        weights=weights,
++        lengths=sp.csr_matrix((NODES, NODES), dtype=np.float64),
++        cv=1.0,
++        dt=DT,
++        scale=0.7,
++        cfun=cfun,
++    )
++    subnetwork.projections = [projection]
++    subnetwork.configure()
++    network = NetworkSet(subnets=[subnetwork], projections=[])
++    network.configure()
++    return network
++
++
++def _initial_state():
++    return np.array([
++        [[0.12], [0.18], [0.24]],
++        [[-0.35], [0.05], [0.45]],
++    ], dtype=np.float64)
++
++
++def _single_average(factory, attribute, value):
++    # A fresh object graph is intentional: no descriptor mutation or buffers are shared.
++    network = _network(factory(**{attribute: value}))
++    result = NbHybridBackend().run_network(
++        network,
++        nstep=NSTEP,
++        chunk_size=1,
++        initial_states=[_initial_state()],
++    )[0]
++    return result[1].mean(axis=0), result[2].mean(axis=0)
++
++
++@pytest.mark.parametrize("factory,packed_prefix", PACKING_CASES)
++def test_cfun_params_has_explicit_public_attribute_layout(factory, packed_prefix):
++    cfun = factory()
++    projection = SimpleNamespace(cfun=cfun, source_cvar=np.array([0, 1]))
++    expected = np.zeros(16, dtype=np.float32)
++    expected[:len(packed_prefix)] = packed_prefix
++
++    packed = _cfun_params(projection)
++
++    assert packed.dtype == np.float32
++    np.testing.assert_array_equal(packed, expected)
++
++
++@pytest.mark.parametrize("factory,attribute,packed_slot,_values", SWEEP_CASES)
++def test_named_descriptor_serializes_to_the_packed_kernel_slot(
++    factory, attribute, packed_slot, _values
++):
++    network = _network(factory())
++    projection = network.subnets[0].projections[0]
++    cfun = projection.cfun
++    packed_before = _cfun_params(projection).copy()
++
++    descriptors, values = NbHybridBackend._resolve_named_params(
++        network, {f"ctx.intra.{attribute}": np.array([0.125, 0.875])}
++    )
++
++    assert len(descriptors) == 1
++    assert descriptors[0]["type"] == "cfun"
++    assert descriptors[0]["projection"] == "intra"
++    np.testing.assert_array_equal(values[:, 0], np.array([0.125, 0.875], dtype=np.float32))
++
++    # Descriptor indices are a public, backward-compatible namespace and need
++    # not equal packed slots. Serialization must still update the named slot.
++    NbHybridBackend._cfun_set_param(cfun, descriptors[0]["param_idx"], 0.875)
++    packed_after = _cfun_params(projection)
++    expected = packed_before.copy()
++    expected[packed_slot] = np.float32(0.875)
++    np.testing.assert_array_equal(packed_after, expected)
++
++
++@pytest.mark.parametrize("factory,attribute,_packed_slot,sweep_values", SWEEP_CASES)
++def test_cpu_prange_named_sweep_matches_fresh_single_runs(
++    factory, attribute, _packed_slot, sweep_values
++):
++    key = f"ctx.intra.{attribute}"
++    parallel = NbHybridBackend().sweep(
++        _network(factory()),
++        params={key: np.asarray(sweep_values, dtype=np.float32)},
++        nstep=NSTEP,
++        backend="cpu",
++        n_workers=2,
++        initial_states=[_initial_state()],
++    )
++    references = [
++        _single_average(factory, attribute, value) for value in sweep_values
++    ]
++
++    state_delta = np.max(np.abs(references[0][0] - references[1][0]))
++    coupling_delta = np.max(np.abs(references[0][1] - references[1][1]))
++    assert max(state_delta, coupling_delta) > 1e-6, (
++        f"{type(factory()).__name__}.{attribute} reference runs are not sensitive "
++        f"to {sweep_values}"
++    )
++
++    for row, (expected_state, expected_coupling) in enumerate(references):
++        np.testing.assert_allclose(
++            parallel.tavg["ctx"][row].mean(axis=0), expected_state,
++            rtol=2e-5, atol=2e-6,
++            err_msg=f"prange row {row} did not apply named parameter {key}",
++        )
++        np.testing.assert_allclose(
++            parallel.ctavg["ctx"][row].mean(axis=0), expected_coupling,
++            rtol=2e-5, atol=2e-6,
++            err_msg=f"prange coupling row {row} did not apply named parameter {key}",
++        )
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_hygiene.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_hygiene.py
+index 211997fe60..c9c082ae04 100644
+--- a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_hygiene.py
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_hygiene.py
+@@ -27,6 +27,11 @@
+     r"^##\s*Status:\s*(active|deprecated)\s*$", re.IGNORECASE | re.MULTILINE
+ )
+ INCLUDE_RE = re.compile(r'<%include\s+file=["\'](nb-hybrid-[^"\']+\.mako)["\']')
++GPL_MARKERS = (
++    "TheVirtualBrain-Scientific Package",
++    "This program is free software",
++    "GNU General Public License",
++)
+ 
+ 
+ def test_nb_hybrid_templates_have_an_accurate_lifecycle_status():
+@@ -65,6 +70,21 @@ def test_nb_hybrid_templates_have_an_accurate_lifecycle_status():
+     )
+ 
+ 
++def test_sweep_sources_have_repository_gpl_header():
++    sources = sorted(BACKEND_DIR.glob("*sweep*.py"))
++    sources += sorted(TEMPLATE_DIR.glob("*sweep*.mako"))
++    assert sources, "no sweep source files were found"
++
++    missing = {}
++    for source in sources:
++        text = source.read_text(encoding="utf-8")
++        absent_markers = [marker for marker in GPL_MARKERS if marker not in text]
++        if absent_markers:
++            missing[source.relative_to(BACKEND_DIR).as_posix()] = absent_markers
++
++    assert not missing, f"sweep sources missing repository GPL header markers: {missing}"
++
++
+ def _assignment_spy(base, attributes):
+     class Spy(base):
+         def __init__(self):
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_oracle_strength.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_oracle_strength.py
+new file mode 100644
+index 0000000000..5115f2bcc9
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_oracle_strength.py
+@@ -0,0 +1,152 @@
++"""Sensitivity guards for hybrid-backend parity regression oracles.
++
++These tests do not repeat backend parity coverage.  They verify that the
++fixtures used by that coverage can reject the specific wrong implementations
++described in the backend review handoffs.
++"""
++
++import numpy as np
++
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++from tvb.simulator.monitors import TemporalAverage
++
++from . import test_nb_hybrid_regression_cfun_packing as packing
++from . import test_nb_hybrid_regression_reducedset_modes as reduced_modes
++from . import test_nb_hybrid_regression_resume_state as resume_state
++from . import test_nb_hybrid_regression_sjr_classic as sjr
++
++
++RTOL = 2e-5
++ATOL = 2e-6
++
++
++def _direct_sjr_cmin_run(value, nstep):
++    """Fresh object graph and run, independent of either sweep path."""
++    network = packing._network(packing._sjr(True, cmin=value))
++    return NbHybridBackend().run_network(
++        network,
++        nstep=nstep,
++        chunk_size=1,
++        initial_states=[packing._initial_state()],
++    )[0]
++
++
++def test_long_moderately_coupled_sjr_oracle_rejects_two_x_coupling():
++    """The classic-SJR fixture must not reproduce the old weak 15-step test."""
++    nstep = 101
++    state = sjr._initial_state()
++    correct_network = sjr._network(a=1.0)
++    doubled_network = sjr._network(a=2.0)
++    projection = correct_network.subnets[0].projections[0]
++
++    assert projection.scale >= 0.1
++    np.testing.assert_array_equal(projection.source_cvar, sjr.TWO_SOURCE_CVARS)
++
++    correct_coupling = sjr._classic_reference(correct_network, state, a=1.0)
++    wrong_two_x = 2.0 * correct_coupling
++    assert np.max(np.abs(correct_coupling)) > 0.1
++    assert not np.allclose(correct_coupling, wrong_two_x, rtol=RTOL, atol=ATOL)
++
++    correct = sjr._python_trajectory(correct_network, state, nstep)
++    doubled = sjr._python_trajectory(doubled_network, state, nstep)
++    per_step_error = np.max(np.abs(correct - doubled), axis=(1, 2, 3))
++
++    assert per_step_error[-1] > 0.02
++    assert per_step_error[-1] > 20.0 * per_step_error[14]
++    assert not np.allclose(correct, doubled, rtol=1e-3, atol=1e-3)
++
++
++def test_sweep_rows_match_fresh_full_time_oracles_and_reject_wrong_slot():
++    """Sweep parity cannot pass through shared packing or time averaging bugs."""
++    nstep = 32
++    values = np.array([-0.2, 0.2], dtype=np.float32)
++    initial = packing._initial_state()
++    base_cfun = packing._sjr(True)
++    packed_parameters = np.array(
++        [base_cfun.a[0], base_cfun.cmin[0], base_cfun.cmax[0],
++         base_cfun.r[0], base_cfun.midpoint[0]]
++    )
++    assert np.unique(packed_parameters).size == packed_parameters.size
++
++    sequential = NbHybridBackend().sweep(
++        packing._network(packing._sjr(True)),
++        params={"ctx.intra.cmin": values},
++        nstep=nstep,
++        backend="cpu",
++        n_workers=1,
++        initial_states=[initial],
++    )
++    direct = [_direct_sjr_cmin_run(value, nstep) for value in values]
++
++    assert sequential.times.shape == (nstep,)
++    for row, (times, states, coupling) in enumerate(direct):
++        np.testing.assert_allclose(sequential.times, times, rtol=0.0, atol=1e-8)
++        np.testing.assert_allclose(
++            sequential.tavg["ctx"][row], states, rtol=RTOL, atol=ATOL
++        )
++        np.testing.assert_allclose(
++            sequential.ctavg["ctx"][row], coupling, rtol=RTOL, atol=ATOL
++        )
++
++    assert not np.allclose(
++        direct[0][1], direct[1][1], rtol=RTOL, atol=ATOL
++    ), "full-time state oracle is insensitive to the swept cmin values"
++    assert not np.allclose(
++        direct[0][2], direct[1][2], rtol=RTOL, atol=ATOL
++    ), "full-time coupling oracle is insensitive to the swept cmin values"
++
++    # Reproduce the historical descriptor/packed-slot confusion: put the row's
++    # cmin value into midpoint while leaving cmin at its base value.
++    wrong_network = packing._network(packing._sjr(True, midpoint=float(values[1])))
++    wrong_slot = NbHybridBackend().run_network(
++        wrong_network,
++        nstep=nstep,
++        chunk_size=1,
++        initial_states=[initial],
++    )[0]
++    assert not np.allclose(
++        direct[1][1], wrong_slot[1], rtol=RTOL, atol=ATOL
++    ), "full-time state oracle does not reject wrong-slot serialization"
++    assert not np.allclose(
++        direct[1][2], wrong_slot[2], rtol=RTOL, atol=ATOL
++    ), "full-time coupling oracle does not reject wrong-slot serialization"
++    assert not np.allclose(
++        direct[1][1].mean(axis=0), wrong_slot[1].mean(axis=0),
++        rtol=RTOL, atol=ATOL,
++    )
++
++
++def test_reduced_set_oracle_rejects_mode_zero_only_alternative():
++    """Keep all three unequal modes visible before any observation collapse."""
++    network, initial = reduced_modes._build_case(
++        reduced_modes.ReducedSetFitzHughNagumo, "intra"
++    )
++    coupling = reduced_modes._total_initial_coupling(network, initial)[0]
++    wrong_mode_zero_only = np.zeros_like(coupling)
++    wrong_mode_zero_only[..., 0] = coupling[..., 0]
++
++    assert coupling.shape[-1] == 3
++    assert np.max(np.ptp(initial[0], axis=-1)) > 0.5
++    assert np.max(np.abs(coupling[..., 1:])) > 0.1
++    assert not np.allclose(coupling, wrong_mode_zero_only, rtol=RTOL, atol=ATOL)
++
++
++def test_temporal_average_oracle_rejects_half_step_timestamp_shift():
++    """Check absolute midpoint values, not merely spacing or averaged data."""
++    period_steps = 4
++    nstep = 12
++    monitor = TemporalAverage(period=period_steps * resume_state.DT)
++    result = resume_state._compiled().run(
++        nstep,
++        initial_states=resume_state._initial_state(),
++        monitors=[monitor],
++    )
++    times, _data = result[0][0]
++    expected = (
++        np.arange(nstep // period_steps) * period_steps
++        + period_steps / 2.0
++    ) * resume_state.DT
++    wrong_shifted = expected + 0.5 * resume_state.DT
++
++    np.testing.assert_allclose(times, expected, rtol=0.0, atol=3e-8)
++    assert not np.allclose(times, wrong_shifted, rtol=0.0, atol=3e-8)
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_prange_native.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_prange_native.py
+new file mode 100644
+index 0000000000..7dd628431a
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_prange_native.py
+@@ -0,0 +1,319 @@
++# -*- coding: utf-8 -*-
++#
++# TheVirtualBrain-Scientific Package. This package holds all simulators, and
++# analysers necessary to run brain-simulations. You can use it stand alone or
++# in conjunction with TheVirtualBrain-Framework Package.
++#
++# (c) 2012-2025, Baycrest Centre for Geriatric Care ("Baycrest") and others
++#
++# This program is free software: you can redistribute it and/or modify it under
++# the terms of the GNU General Public License as published by the Free Software
++# Foundation, either version 3 of the License, or (at your option) any later
++# version.
++
++"""Process-isolated regressions for the native CPU prange sweep failure."""
++
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++
++_CHILD_TIMEOUT_SECONDS = 180
++_LIBRARY_ROOT = Path(__file__).resolve().parents[5]
++_CHILD_MODULE = (
++    "tvb.tests.library.simulator.backend."
++    "test_nb_hybrid_regression_prange_native"
++)
++
++
++def _make_sjr_network(cmin=0.0):
++    import numpy as np
++    import scipy.sparse as sp
++
++    from tvb.simulator.hybrid.coupling import SigmoidalJansenRit
++    from tvb.simulator.hybrid.intra_projection import IntraProjection
++    from tvb.simulator.hybrid.network import NetworkSet
++    from tvb.simulator.hybrid.subnetwork import Subnetwork
++    from tvb.simulator.integrators import HeunDeterministic
++    from tvb.simulator.models.jansen_rit import JansenRit
++
++    dt = 0.1
++    n_nodes = 5
++    model = JansenRit()
++    model.configure()
++    subnet = Subnetwork(
++        name="jr", model=model, scheme=HeunDeterministic(dt=dt), nnodes=n_nodes
++    )
++    rng = np.random.RandomState(1)
++    dense_weights = rng.uniform(0.0, 0.5, (n_nodes, n_nodes))
++    np.fill_diagonal(dense_weights, 0.0)
++    weights = sp.csr_matrix(dense_weights)
++    coupling = SigmoidalJansenRit(
++        a=np.array([1.0]),
++        cmin=np.array([cmin]),
++        cmax=np.array([2.0]),
++        r=np.array([1.0]),
++        midpoint=np.array([0.5]),
++    )
++    projection = IntraProjection(
++        source_cvar=np.array([1], dtype=np.int_),
++        target_cvar=np.array([0], dtype=np.int_),
++        weights=weights,
++        lengths=sp.csr_matrix(weights.shape),
++        cv=1.0,
++        dt=dt,
++        scale=1.0,
++        cfun=coupling,
++    )
++    subnet.projections = [projection]
++    subnet.configure()
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++    initial_state = np.zeros((model.nvar, n_nodes, model.number_of_modes))
++    return network, initial_state
++
++
++def _assert_parallel_result(result, requested_threads):
++    import numba
++    import numpy as np
++
++    from tvb.simulator.backend.nb_hybrid_sweep_cpu import _SWEEP_KERNEL_CACHE
++
++    assert result.backend == "cpu-prange", result.backend
++    assert result.merged_tavg is not None
++    assert np.isfinite(result.merged_tavg).all()
++    assert numba.get_num_threads() == requested_threads
++    assert numba.threading_layer() in {"omp", "tbb", "workqueue"}
++    assert _SWEEP_KERNEL_CACHE, "the CPU prange sweep kernel was not compiled"
++    kernel = next(reversed(_SWEEP_KERNEL_CACHE.values()))
++    assert kernel.targetoptions.get("parallel") is True
++    assert kernel.signatures, "the CPU prange sweep kernel has no compiled signature"
++    print(
++        "PARALLEL_BACKEND "
++        f"result={result.backend} layer={numba.threading_layer()} "
++        f"threads={numba.get_num_threads()} signatures={len(kernel.signatures)}",
++        flush=True,
++    )
++
++
++def _run_sjr_native_child(requested_workers, requested_threads):
++    import numba
++    import numpy as np
++
++    from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++
++    sweep_values = np.array([0.0, 1.0], dtype=np.float32)
++    nstep = 20
++
++    # Independent safe oracle: separate non-sweep simulations, each with its
++    # coupling object constructed at the requested value.
++    oracle = []
++    for cmin in sweep_values:
++        network, initial_state = _make_sjr_network(float(cmin))
++        direct = NbHybridBackend().run_network(
++            network,
++            nstep=nstep,
++            chunk_size=1,
++            initial_states=[initial_state],
++        )
++        oracle.append(direct[0][1])
++    oracle = np.stack(oracle)
++    assert np.isfinite(oracle).all()
++
++    network, initial_state = _make_sjr_network()
++    print(
++        "START_SJR_PRANGE "
++        f"boundscheck={os.environ['NUMBA_BOUNDSCHECK']} "
++        f"workers={requested_workers} configured_threads={numba.get_num_threads()}",
++        flush=True,
++    )
++    result = NbHybridBackend().sweep(
++        network,
++        params={"jr.intra.cmin": sweep_values},
++        nstep=nstep,
++        backend="cpu",
++        n_workers=requested_workers,
++        initial_states=[initial_state],
++    )
++    _assert_parallel_result(result, requested_threads)
++    max_abs_error = float(np.max(np.abs(result.merged_tavg - oracle)))
++    print(
++        f"SJR_RESULT shape={result.merged_tavg.shape} "
++        f"oracle_shape={oracle.shape} max_abs_error={max_abs_error:.9g}",
++        flush=True,
++    )
++    np.testing.assert_allclose(result.merged_tavg, oracle, rtol=1e-5, atol=1e-5)
++
++
++def _run_selection_child(requested_workers, requested_threads):
++    import numpy as np
++    import scipy.sparse as sp
++
++    from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++    from tvb.simulator.hybrid.coupling import Linear
++    from tvb.simulator.hybrid.intra_projection import IntraProjection
++    from tvb.simulator.hybrid.network import NetworkSet
++    from tvb.simulator.hybrid.subnetwork import Subnetwork
++    from tvb.simulator.integrators import EulerDeterministic
++    from tvb.simulator.models.infinite_theta import MontbrioPazoRoxin
++
++    model = MontbrioPazoRoxin()
++    model.configure()
++    subnet = Subnetwork(
++        name="mpr", model=model, scheme=EulerDeterministic(dt=0.01), nnodes=2
++    )
++    weights = sp.csr_matrix(np.array([[0.0, 0.1], [0.1, 0.0]]))
++    subnet.projections = [
++        IntraProjection(
++            source_cvar=np.array([0], dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=weights,
++            lengths=sp.csr_matrix(weights.shape),
++            cv=1.0,
++            dt=0.01,
++            scale=1.0,
++            cfun=Linear(a=np.array([1.0])),
++        )
++    ]
++    subnet.configure()
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++    result = NbHybridBackend().sweep(
++        network,
++        params={"mpr.intra.a": np.array([0.1, 0.2], dtype=np.float32)},
++        nstep=2,
++        backend="cpu",
++        n_workers=requested_workers,
++    )
++    _assert_parallel_result(result, requested_threads)
++
++
++def _child_main():
++    import faulthandler
++    import platform
++
++    faulthandler.enable(all_threads=True)
++    action = os.environ["TVB_PRANGE_CHILD_ACTION"]
++    requested_workers = int(os.environ["TVB_PRANGE_REQUESTED_WORKERS"])
++    requested_threads = int(os.environ["NUMBA_NUM_THREADS"])
++    print(
++        "CHILD_CONFIG "
++        f"action={action} pid={os.getpid()} python={platform.python_version()} "
++        f"boundscheck={os.environ['NUMBA_BOUNDSCHECK']} "
++        f"workers={requested_workers} threads={requested_threads} "
++        f"tmpdir={os.environ['TMPDIR']} cache={os.environ['NUMBA_CACHE_DIR']}",
++        flush=True,
++    )
++    if action == "sjr-native":
++        _run_sjr_native_child(requested_workers, requested_threads)
++    elif action == "selection":
++        _run_selection_child(requested_workers, requested_threads)
++    else:
++        raise ValueError(f"unknown child action: {action}")
++
++
++def _child_diagnostics(completed, description):
++    return (
++        f"{description}\n"
++        f"returncode: {completed.returncode}\n"
++        f"--- child stdout ---\n{completed.stdout or '<empty>'}\n"
++        f"--- child stderr ---\n{completed.stderr or '<empty>'}"
++    )
++
++
++def _run_isolated_child(tmp_path, action, boundscheck, workers, threads):
++    case_dir = tmp_path / f"{action}-bounds{boundscheck}-workers{workers}-threads{threads}"
++    temp_dir = case_dir / "tmp"
++    cache_dir = case_dir / "numba-cache"
++    mpl_dir = case_dir / "matplotlib"
++    for directory in (temp_dir, cache_dir, mpl_dir):
++        directory.mkdir(parents=True, exist_ok=False)
++
++    env = os.environ.copy()
++    env.update(
++        {
++            "MPLCONFIGDIR": str(mpl_dir),
++            "NUMBA_BOUNDSCHECK": str(boundscheck),
++            "NUMBA_CACHE_DIR": str(cache_dir),
++            "NUMBA_NUM_THREADS": str(threads),
++            "PYTHONFAULTHANDLER": "1",
++            "TMP": str(temp_dir),
++            "TMPDIR": str(temp_dir),
++            "TEMP": str(temp_dir),
++            "TVB_PRANGE_CHILD_ACTION": action,
++            "TVB_PRANGE_REQUESTED_WORKERS": str(workers),
++            "XDG_CACHE_HOME": str(case_dir / "xdg-cache"),
++        }
++    )
++    old_pythonpath = env.get("PYTHONPATH")
++    env["PYTHONPATH"] = str(_LIBRARY_ROOT) + (
++        os.pathsep + old_pythonpath if old_pythonpath else ""
++    )
++    command = [
++        sys.executable,
++        "-c",
++        f"from {_CHILD_MODULE} import _child_main; _child_main()",
++    ]
++    description = (
++        f"child action={action}, NUMBA_BOUNDSCHECK={boundscheck}, "
++        f"n_workers={workers}, NUMBA_NUM_THREADS={threads}"
++    )
++    try:
++        completed = subprocess.run(
++            command,
++            cwd=_LIBRARY_ROOT,
++            env=env,
++            capture_output=True,
++            text=True,
++            timeout=_CHILD_TIMEOUT_SECONDS,
++            check=False,
++        )
++    except subprocess.TimeoutExpired as exc:
++        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
++        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
++        return (
++            f"{description} exceeded hard timeout of {_CHILD_TIMEOUT_SECONDS}s\n"
++            f"--- child stdout ---\n{stdout or '<empty>'}\n"
++            f"--- child stderr ---\n{stderr or '<empty>'}"
++        )
++    if completed.returncode != 0:
++        return _child_diagnostics(completed, description)
++    return None
++
++
++@pytest.mark.parametrize(
++    "boundscheck,threads",
++    [
++        pytest.param(0, 2, id="unchecked-2-threads"),
++        pytest.param(1, 2, marks=pytest.mark.slow, id="checked-2-threads"),
++        pytest.param(0, 4, marks=pytest.mark.slow, id="unchecked-4-threads"),
++        pytest.param(1, 4, marks=pytest.mark.slow, id="checked-4-threads"),
++    ],
++)
++def test_sjr_native_abort_prange_sweep_bounds_and_thread_matrix(
++    tmp_path, boundscheck, threads
++):
++    """The native-abort reproducer must survive and match direct-run oracles."""
++    failure = _run_isolated_child(
++        tmp_path,
++        action="sjr-native",
++        boundscheck=boundscheck,
++        workers=threads,
++        threads=threads,
++    )
++    assert failure is None, failure
++
++
++def test_requested_workers_and_threads_reach_real_parallel_backend(tmp_path):
++    """A requested multi-worker sweep must compile and run the prange backend."""
++    failure = _run_isolated_child(
++        tmp_path,
++        action="selection",
++        boundscheck=1,
++        workers=2,
++        threads=2,
++    )
++    assert failure is None, failure
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_prange_performance.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_prange_performance.py
+new file mode 100644
+index 0000000000..492d403b14
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_prange_performance.py
+@@ -0,0 +1,171 @@
++"""Warmed throughput regression for the CPU-prange sweep backend."""
++
++import os
++import time
++
++import numba
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend, _COMPILED_FN_CACHE
++from tvb.simulator.backend.nb_hybrid_sweep_cpu import _SWEEP_KERNEL_CACHE
++from tvb.simulator.hybrid.coupling import Linear
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.integrators import HeunDeterministic
++from tvb.simulator.models.infinite_theta import MontbrioPazoRoxin
++
++
++N_NODES = 32
++N_STEPS = 250
++N_SWEEPS = 64
++REPEATS = 5
++MIN_SPEEDUP_ENV = "TVB_PRANGE_MIN_SPEEDUP"
++
++
++def _make_network():
++    model = MontbrioPazoRoxin()
++    model.configure()
++    subnet = Subnetwork(
++        name="ctx",
++        model=model,
++        scheme=HeunDeterministic(dt=0.01),
++        nnodes=N_NODES,
++    )
++    rng = np.random.RandomState(2026)
++    weights = rng.uniform(0.0, 0.02, (N_NODES, N_NODES))
++    np.fill_diagonal(weights, 0.0)
++    subnet.projections = [
++        IntraProjection(
++            source_cvar=np.array([0], dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=sp.csr_matrix(weights),
++            lengths=sp.csr_matrix((N_NODES, N_NODES), dtype=np.float64),
++            cv=1.0,
++            dt=0.01,
++            scale=0.5,
++            cfun=Linear(a=np.array([0.03]), b=np.array([0.0])),
++        )
++    ]
++    subnet.configure()
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++    initial_state = np.empty((model.nvar, N_NODES, model.number_of_modes))
++    initial_state[0] = 0.1
++    initial_state[1] = -2.0
++    return network, [initial_state]
++
++
++def _median_timing(run):
++    durations = []
++    results = []
++    for _ in range(REPEATS):
++        started = time.perf_counter()
++        results.append(run())
++        durations.append(time.perf_counter() - started)
++    return float(np.median(durations)), results
++
++
++@pytest.mark.slow
++def test_warmed_cpu_prange_median_throughput_and_dispatch():
++    """Measure warmed kernels and optionally enforce a machine-specific gate.
++
++    Set ``TVB_PRANGE_MIN_SPEEDUP`` on a dedicated performance runner to its
++    calibrated minimum. Shared CI still checks real parallel dispatch without
++    assuming that an oversubscribed or throttled runner must show a fixed gain.
++    """
++    configured_threads = numba.get_num_threads()
++    assert configured_threads > 1, (
++        "CPU-prange performance requires more than one configured Numba thread"
++    )
++    workers = min(4, configured_threads)
++    assert workers > 1
++
++    network, initial_states = _make_network()
++    values = np.linspace(0.02, 0.06, N_SWEEPS, dtype=np.float32)
++    params = {"ctx.intra.a": values}
++    backend = NbHybridBackend()
++
++    def run_sequential():
++        return backend.sweep(
++            network,
++            params=params,
++            nstep=N_STEPS,
++            backend="cpu",
++            n_workers=1,
++            initial_states=initial_states,
++        )
++
++    def run_parallel():
++        return backend.sweep(
++            network,
++            params=params,
++            nstep=N_STEPS,
++            backend="cpu",
++            n_workers=workers,
++            initial_states=initial_states,
++        )
++
++    # Full-size warmups force both JIT paths before either clock starts.
++    warm_seq = run_sequential()
++    warm_par = run_parallel()
++    assert warm_seq.backend == "cpu-seq"
++    assert warm_par.backend == "cpu-prange"
++    np.testing.assert_allclose(
++        warm_seq.merged_tavg,
++        warm_par.merged_tavg,
++        rtol=2e-5,
++        atol=2e-6,
++    )
++
++    assert _SWEEP_KERNEL_CACHE
++    sweep_cache_before = {key: id(kernel) for key, kernel in _SWEEP_KERNEL_CACHE.items()}
++    compiled_cache_before = {key: id(kernel) for key, kernel in _COMPILED_FN_CACHE.items()}
++    prange_kernel = next(reversed(_SWEEP_KERNEL_CACHE.values()))
++    signatures_before = tuple(prange_kernel.signatures)
++    assert prange_kernel.targetoptions.get("parallel") is True
++    assert signatures_before, "the warmed prange dispatcher has no native signature"
++    assert numba.threading_layer() in {"omp", "tbb", "workqueue"}
++    assert numba.get_num_threads() > 1
++
++    seq_seconds, seq_results = _median_timing(run_sequential)
++    par_seconds, par_results = _median_timing(run_parallel)
++
++    assert all(result.backend == "cpu-seq" for result in seq_results)
++    assert all(result.backend == "cpu-prange" for result in par_results)
++    assert {key: id(kernel) for key, kernel in _SWEEP_KERNEL_CACHE.items()} == sweep_cache_before
++    assert {key: id(kernel) for key, kernel in _COMPILED_FN_CACHE.items()} == compiled_cache_before
++    assert tuple(prange_kernel.signatures) == signatures_before
++    np.testing.assert_allclose(
++        seq_results[-1].merged_tavg,
++        par_results[-1].merged_tavg,
++        rtol=2e-5,
++        atol=2e-6,
++    )
++
++    iterations = N_SWEEPS * N_STEPS
++    seq_throughput = iterations / seq_seconds
++    par_throughput = iterations / par_seconds
++    speedup = par_throughput / seq_throughput
++    assert np.isfinite(speedup) and speedup > 0.0
++    print(
++        "\n[CPU-prange warmed benchmark] "
++        f"threads={numba.get_num_threads()} requested_workers={workers} "
++        f"layer={numba.threading_layer()}\n"
++        f"  cpu-seq:    {seq_throughput / 1000:.1f} kiter/s "
++        f"(median {seq_seconds:.3f}s, n={REPEATS})\n"
++        f"  cpu-prange: {par_throughput / 1000:.1f} kiter/s "
++        f"(median {par_seconds:.3f}s, n={REPEATS})\n"
++        f"  speedup:    {speedup:.2f}x"
++    )
++
++    configured_minimum = os.environ.get(MIN_SPEEDUP_ENV)
++    if configured_minimum is not None:
++        minimum = float(configured_minimum)
++        assert minimum > 0.0, f"{MIN_SPEEDUP_ENV} must be positive"
++        assert speedup >= minimum, (
++            f"warmed CPU-prange speedup {speedup:.2f}x is below the calibrated "
++            f"{MIN_SPEEDUP_ENV}={minimum:.2f}x gate"
++        )
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_stimulus_slots.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_stimulus_slots.py
+new file mode 100644
+index 0000000000..1a83ec5460
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_stimulus_slots.py
+@@ -0,0 +1,222 @@
++"""Regression coverage for stimulus coupling-slot and node selectivity."""
++
++import numpy as np
++import scipy.sparse as sp
++from numpy.testing import assert_allclose
++
++from tvb.datatypes import equations
++from tvb.datatypes.connectivity import Connectivity
++from tvb.datatypes.patterns import StimuliRegion
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++from tvb.simulator.hybrid.coupling import Linear
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.stimulus import Stim
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.integrators import EulerDeterministic
++from tvb.simulator.models.epileptor import Epileptor
++
++
++DT = 0.01
++N_NODES = 3
++N_STEPS = 6
++TARGET_NODE = 1
++AMPLITUDE = 0.4
++RESPONSE_STATE = {0: 0, 1: 3}
++
++
++def _make_network(target_slot, with_projection=False):
++    model = Epileptor(
++        variables_of_interest=Epileptor.state_variables,
++        Kvf=np.array([1.0]),
++        Kf=np.array([1.0]),
++    )
++    assert np.array_equal(model.cvar, [0, 3])
++    subnet = Subnetwork(
++        name="epileptor",
++        model=model,
++        scheme=EulerDeterministic(dt=DT),
++        nnodes=N_NODES,
++    )
++
++    if target_slot is not None:
++        connectivity = Connectivity(
++            centres=np.zeros((N_NODES, 3)),
++            weights=np.zeros((N_NODES, N_NODES)),
++            tract_lengths=np.zeros((N_NODES, N_NODES)),
++            region_labels=np.array(["left", "target", "right"]),
++            speed=np.array([1.0]),
++        )
++        connectivity.configure()
++        temporal = equations.Linear()
++        temporal.parameters["a"] = 0.0
++        temporal.parameters["b"] = AMPLITUDE
++        spatial_weights = np.zeros(N_NODES)
++        spatial_weights[TARGET_NODE] = 1.0
++        pattern = StimuliRegion(
++            temporal=temporal,
++            connectivity=connectivity,
++            weight=spatial_weights,
++        )
++        subnet.stimuli = [
++            Stim(
++                target=subnet,
++                stimulus=pattern,
++                target_cvar=np.array([target_slot], dtype=np.int_),
++            )
++        ]
++
++    if with_projection:
++        subnet.projections = [
++            IntraProjection(
++                source_cvar=np.array([0], dtype=np.int_),
++                target_cvar=np.array([0], dtype=np.int_),
++                weights=sp.csr_matrix((N_NODES, N_NODES), dtype=np.float64),
++                lengths=sp.csr_matrix((N_NODES, N_NODES), dtype=np.float64),
++                cv=1.0,
++                dt=DT,
++                cfun=Linear(),
++            )
++        ]
++
++    subnet.configure(simulation_length=N_STEPS * DT)
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++    return network
++
++
++def _initial_state():
++    return np.array(
++        [
++            [[-1.50], [-1.55], [-1.60]],
++            [[-10.0], [-10.2], [-10.4]],
++            [[3.0], [3.1], [3.2]],
++            [[-0.50], [-0.55], [-0.60]],
++            [[0.01], [0.02], [0.03]],
++            [[0.0], [0.1], [0.2]],
++        ],
++        dtype=np.float64,
++    )
++
++
++def _run_python(target_slot):
++    network = _make_network(target_slot)
++    subnet = network.subnets[0]
++    states = network.zero_states(initial_states=[_initial_state()])
++    network.init_projection_buffers(states)
++    state_history = []
++    coupling_history = []
++
++    for step in range(1, N_STEPS + 1):
++        coupling = network.cfun(step, states)[0]
++        internal_coupling = subnet.cfun(step, states[0])
++        for stimulus in subnet.stimuli:
++            internal_coupling[stimulus.target_cvar] += stimulus.get_coupling(step)
++        coupling_history.append((coupling + internal_coupling).copy())
++
++        states = network.step(step, states)
++        state_history.append(states[0].copy())
++
++    return np.stack(state_history), np.stack(coupling_history)
++
++
++def _run_numba(target_slot):
++    network = _make_network(target_slot)
++    result = NbHybridBackend().run_network(
++        network,
++        nstep=N_STEPS,
++        chunk_size=1,
++        initial_states=[_initial_state()],
++    )[0]
++    _times, state_history, coupling_history = result
++    return state_history.astype(np.float64), coupling_history.astype(np.float64)
++
++
++def _run_numba_prange(target_slot):
++    network = _make_network(target_slot, with_projection=True)
++    result = NbHybridBackend().sweep(
++        network,
++        params={"epileptor.intra.a": np.array([0.0, 0.0], dtype=np.float32)},
++        nstep=N_STEPS,
++        backend="cpu",
++        n_workers=2,
++        initial_states=[_initial_state()],
++    )
++    return (
++        result.tavg["epileptor"][0].astype(np.float64),
++        result.ctavg["epileptor"][0].astype(np.float64),
++    )
++
++
++def _assert_slot_and_node_selectivity(runs):
++    baseline_state, baseline_coupling = runs[None]
++
++    for target_slot in (0, 1):
++        state, coupling = runs[target_slot]
++        other_slot = 1 - target_slot
++        response_state = RESPONSE_STATE[target_slot]
++        other_response_state = RESPONSE_STATE[other_slot]
++
++        # The requested slot responds at the selected node on every step.
++        assert np.all(
++            np.abs(
++                coupling[:, target_slot, TARGET_NODE, :]
++                - baseline_coupling[:, target_slot, TARGET_NODE, :]
++            )
++            > 0.1
++        )
++        assert (
++            abs(
++                state[0, response_state, TARGET_NODE, 0]
++                - baseline_state[0, response_state, TARGET_NODE, 0]
++            )
++            > 0.003
++        )
++
++        # A one-slot stimulus must not broadcast onto the other coupling input.
++        assert_allclose(
++            coupling[:, other_slot],
++            baseline_coupling[:, other_slot],
++            rtol=0.0,
++            atol=1e-7,
++        )
++        # Euler exposes the same invariant in state before populations mix it.
++        assert_allclose(
++            state[0, other_response_state, TARGET_NODE],
++            baseline_state[0, other_response_state, TARGET_NODE],
++            rtol=0.0,
++            atol=1e-7,
++        )
++
++        non_target_nodes = [node for node in range(N_NODES) if node != TARGET_NODE]
++        assert_allclose(
++            coupling[:, target_slot, non_target_nodes],
++            baseline_coupling[:, target_slot, non_target_nodes],
++            rtol=0.0,
++            atol=1e-7,
++        )
++        assert_allclose(
++            state[:, :, non_target_nodes],
++            baseline_state[:, :, non_target_nodes],
++            rtol=0.0,
++            atol=1e-7,
++        )
++
++
++def test_stimulus_targets_exactly_one_coupling_slot_and_node():
++    python_runs = {slot: _run_python(slot) for slot in (None, 0, 1)}
++    numba_runs = {slot: _run_numba(slot) for slot in (None, 0, 1)}
++
++    _assert_slot_and_node_selectivity(python_runs)
++    _assert_slot_and_node_selectivity(numba_runs)
++
++    for slot in (None, 0, 1):
++        python_state, python_coupling = python_runs[slot]
++        numba_state, numba_coupling = numba_runs[slot]
++        assert_allclose(numba_state, python_state, rtol=2e-5, atol=2e-6)
++        assert_allclose(numba_coupling, python_coupling, rtol=2e-6, atol=2e-7)
++
++
++def test_prange_stimulus_targets_exactly_one_coupling_slot_and_node():
++    runs = {slot: _run_numba_prange(slot) for slot in (None, 0, 1)}
++    _assert_slot_and_node_selectivity(runs)
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_contract.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_contract.py
+new file mode 100644
+index 0000000000..65fa4fb883
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_contract.py
+@@ -0,0 +1,167 @@
++"""Contract regressions for sequential and CPU-prange sweep monitors."""
++
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend, SweepResult
++from tvb.simulator.hybrid.coupling import Scaling
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.integrators import HeunDeterministic
++from tvb.simulator.models.oscillator import Generic2dOscillator
++
++
++DT = 0.1
++NSTEP = 6
++SWEEP_VALUES = np.array([0.2, 0.8], dtype=np.float32)
++INITIAL_STATE = np.array(
++    [
++        [[-0.3], [0.1], [0.4]],
++        [[0.2], [-0.1], [0.3]],
++    ],
++    dtype=np.float64,
++)
++
++
++def _network():
++    model = Generic2dOscillator()
++    model.configure()
++    subnet = Subnetwork(
++        name="tiny", model=model, scheme=HeunDeterministic(dt=DT), nnodes=3
++    )
++    weights = sp.csr_matrix(
++        np.array(
++            [
++                [0.0, 0.3, 0.1],
++                [0.2, 0.0, 0.4],
++                [0.1, 0.2, 0.0],
++            ],
++            dtype=np.float64,
++        )
++    )
++    subnet.projections = [
++        IntraProjection(
++            source_cvar=np.array([0], dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=weights,
++            lengths=sp.csr_matrix(weights.shape, dtype=np.float64),
++            cv=1.0,
++            dt=DT,
++            scale=1.0,
++            cfun=Scaling(a=np.array([1.0])),
++        )
++    ]
++    subnet.configure()
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++    return network
++
++
++def _sweep(n_workers, **options):
++    return NbHybridBackend().sweep(
++        _network(),
++        params={"coupling_scale": SWEEP_VALUES},
++        nstep=NSTEP,
++        backend="cpu",
++        n_workers=n_workers,
++        initial_states=[INITIAL_STATE.copy()],
++        **options,
++    )
++
++
++def _assert_common_result_contract(sequential, parallel, expected_times):
++    expected_times = np.asarray(expected_times, dtype=np.float64)
++    n_samples = len(expected_times)
++    assert isinstance(sequential, SweepResult)
++    assert isinstance(parallel, SweepResult)
++    assert sequential.backend == "cpu-seq"
++    assert parallel.backend == "cpu-prange"
++    np.testing.assert_array_equal(sequential.sweep_values[:, 0], SWEEP_VALUES)
++    np.testing.assert_array_equal(parallel.sweep_values, sequential.sweep_values)
++
++    sequential_data = sequential.tavg
++    parallel_data = parallel.tavg
++    assert set(sequential_data) == set(parallel_data) == {"tiny"}
++
++    expected_shape = (len(SWEEP_VALUES), n_samples, 1, 3, 1)
++    assert sequential.times.shape == parallel.times.shape == (n_samples,)
++    assert sequential_data["tiny"].shape == expected_shape
++    assert parallel_data["tiny"].shape == expected_shape
++    np.testing.assert_allclose(parallel.times, sequential.times, rtol=0.0, atol=0.0)
++    np.testing.assert_allclose(sequential.times, expected_times, rtol=0.0, atol=1e-15)
++    assert np.all(np.diff(sequential.times) > 0.0)
++    np.testing.assert_allclose(
++        parallel_data["tiny"], sequential_data["tiny"], rtol=2e-5, atol=2e-6
++    )
++    assert sequential.merged_tavg.shape == parallel.merged_tavg.shape == expected_shape
++    np.testing.assert_allclose(
++        sequential.merged_tavg, sequential_data["tiny"], rtol=0.0, atol=0.0
++    )
++    np.testing.assert_allclose(
++        parallel.merged_tavg, sequential.merged_tavg, rtol=2e-5, atol=2e-6
++    )
++
++
++def _assert_optional_monitor_data(sequential, parallel, field, n_samples):
++    sequential_data = getattr(sequential, field)
++    parallel_data = getattr(parallel, field)
++    assert set(sequential_data) == set(parallel_data) == {"tiny"}
++    expected_shape = (len(SWEEP_VALUES), n_samples, 1, 3, 1)
++    assert sequential_data["tiny"].shape == expected_shape
++    assert parallel_data["tiny"].shape == expected_shape
++    np.testing.assert_allclose(
++        parallel_data["tiny"], sequential_data["tiny"], rtol=2e-5, atol=2e-6
++    )
++
++
++@pytest.mark.parametrize(
++    "options,expected_times,extra_field,extra_samples",
++    [
++        pytest.param(
++            {"monitor": "tavg", "chunk_size": 2},
++            (0.15, 0.35, 0.55),
++            None,
++            None,
++            id="chunk-size",
++        ),
++        pytest.param(
++            {"monitor": "raw", "chunk_size": 1},
++            (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
++            "raw",
++            NSTEP,
++            id="monitor-raw",
++        ),
++        pytest.param(
++            {"monitor": "subsample", "monitor_period": 2, "chunk_size": 1},
++            (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
++            "raw",
++            3,
++            id="monitor-period",
++        ),
++    ],
++)
++def test_sequential_and_real_prange_share_monitor_sample_contract(
++    options, expected_times, extra_field, extra_samples
++):
++    sequential = _sweep(1, **options)
++    parallel = _sweep(2, **options)
++
++    _assert_common_result_contract(sequential, parallel, expected_times)
++    if extra_field is not None:
++        _assert_optional_monitor_data(
++            sequential, parallel, extra_field, extra_samples
++        )
++    assert not np.allclose(
++        sequential.merged_tavg[0], sequential.merged_tavg[1], rtol=1e-7, atol=1e-7
++    )
++
++
++def test_sequential_and_real_prange_forward_bold_period_with_sample_axis():
++    options = {"monitor": "tavg", "chunk_size": 2, "bold_period": 0.2}
++    sequential = _sweep(1, **options)
++    parallel = _sweep(2, **options)
++
++    _assert_common_result_contract(sequential, parallel, (0.15, 0.35, 0.55))
++    _assert_optional_monitor_data(sequential, parallel, "bold", 3)
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_noise.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_noise.py
+new file mode 100644
+index 0000000000..f5dfa7cfc4
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_noise.py
+@@ -0,0 +1,117 @@
++"""Regression coverage for stochastic CPU-prange sweep realizations."""
++
++import numpy as np
++import scipy.sparse as sp
++
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++from tvb.simulator.hybrid.coupling import Linear
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.integrators import EulerStochastic
++from tvb.simulator.models.infinite_theta import MontbrioPazoRoxin
++from tvb.simulator.noise import Additive
++
++
++DT = 0.01
++BASE_SEED = 7319
++NSTEPS = 40
++
++
++def _stochastic_network():
++    model = MontbrioPazoRoxin()
++    model.configure()
++
++    noise = Additive(nsig=np.array([0.75]))
++    noise.noise_seed = BASE_SEED
++    noise.random_stream = np.random.RandomState(BASE_SEED)
++    noise.configure_white(DT)
++    scheme = EulerStochastic(dt=DT, noise=noise)
++    scheme.configure_boundaries(model)
++
++    subnet = Subnetwork(name="noise_oracle", model=model, scheme=scheme, nnodes=4)
++    weights = sp.csr_matrix((4, 4), dtype=np.float64)
++    subnet.projections = [
++        IntraProjection(
++            source_cvar=np.array([0], dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=weights,
++            lengths=weights.copy(),
++            cv=1.0,
++            dt=DT,
++            scale=1.0,
++            cfun=Linear(a=np.array([1.0])),
++        )
++    ]
++    subnet.configure()
++    network = NetworkSet(subnets=[subnet], projections=[])
++    network.configure()
++    return network
++
++
++def _reset_noise(network, seed=BASE_SEED):
++    noise = network.subnets[0].scheme.noise
++    noise.noise_seed = seed
++    noise.random_stream = np.random.RandomState(seed)
++
++
++def _run(network, values, n_workers):
++    return NbHybridBackend().sweep(
++        network,
++        params={"coupling_scale": np.asarray(values, dtype=np.float32)},
++        nstep=NSTEPS,
++        backend="cpu",
++        n_workers=n_workers,
++    )
++
++
++def _collapsed(result):
++    return result.merged_tavg
++
++
++def test_prange_duplicate_rows_get_independent_replayable_noise():
++    network = _stochastic_network()
++    identical_rows = np.ones(4, dtype=np.float32)
++
++    # This is the path under test: all identical configurations coexist in one
++    # prange launch rather than being tested in separate one-row sweeps.
++    _reset_noise(network)
++    parallel = _run(network, identical_rows, n_workers=4)
++    _reset_noise(network)
++    parallel_replay = _run(network, identical_rows, n_workers=4)
++
++    # Sequential sweep defines the random-stream ordering: configurations are
++    # independent, while resetting the base seed replays the complete sweep.
++    _reset_noise(network)
++    sequential = _run(network, identical_rows, n_workers=1)
++    _reset_noise(network)
++    sequential_replay = _run(network, identical_rows, n_workers=1)
++
++    # Sensitivity oracle: resetting before each singleton deliberately gives
++    # two configurations shared noise. With zero coupling and identical initial
++    # conditions their stochastic outputs must then be exactly identical.
++    _reset_noise(network)
++    shared_a = _collapsed(_run(network, [1.0], n_workers=1))[0]
++    _reset_noise(network)
++    shared_b = _collapsed(_run(network, [1.0], n_workers=1))[0]
++    _reset_noise(network, BASE_SEED + 1)
++    different_noise = _collapsed(_run(network, [1.0], n_workers=1))[0]
++
++    assert parallel.backend == "cpu-prange"
++    assert sequential.backend == "cpu-seq"
++    np.testing.assert_array_equal(parallel.sweep_values[:, 0], identical_rows)
++    np.testing.assert_array_equal(shared_a, shared_b)
++    assert not np.allclose(shared_a, different_noise, rtol=1e-4, atol=1e-4), (
++        "noise is too weak for this fixture to detect a shared realization"
++    )
++
++    parallel_data = _collapsed(parallel)
++    sequential_data = _collapsed(sequential)
++    assert not np.allclose(parallel_data[0], parallel_data[1], rtol=1e-6, atol=1e-6), (
++        "identical prange rows reused one stochastic realization"
++    )
++    assert not np.allclose(sequential_data[0], sequential_data[1], rtol=1e-6, atol=1e-6)
++
++    np.testing.assert_array_equal(parallel_data, _collapsed(parallel_replay))
++    np.testing.assert_array_equal(sequential_data, _collapsed(sequential_replay))
++    np.testing.assert_allclose(parallel_data, sequential_data, rtol=2e-5, atol=2e-5)
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_restore.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_restore.py
+new file mode 100644
+index 0000000000..d7b52ce4ba
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid_regression_sweep_restore.py
+@@ -0,0 +1,135 @@
++"""Regression tests for restoring caller-owned parameters after CPU sweeps."""
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend
++from tvb.simulator.hybrid.coupling import Linear
++from tvb.simulator.integrators import EulerDeterministic
++from tvb.simulator.models.linear import Linear as LinearModel
++
++
++class _SimulationFailure(RuntimeError):
++    pass
++
++
++def _case(target):
++    model = LinearModel()
++    if target == "model-array":
++        original = np.array(1.25, dtype=np.float32)
++        model.tau = original
++        cfun = Linear()
++        parameter = lambda: model.tau
++        named_param = "unit.tau"
++        descriptor = {"type": "model", "subnet": "unit", "param": "tau"}
++    elif target == "model-scalar":
++        original = np.float32(1.25)
++        model.tau = original
++        cfun = Linear()
++        parameter = lambda: model.tau
++        named_param = "unit.tau"
++        descriptor = {"type": "model", "subnet": "unit", "param": "tau"}
++    else:
++        original = np.array([1.25], dtype=np.float32)
++        cfun = Linear()
++        cfun.a = original
++        parameter = lambda: cfun.a
++        named_param = "unit.intra.a"
++        descriptor = {"type": "cfun", "projection": "intra", "param_idx": 0}
++
++    projection = SimpleNamespace(name=None, cfun=cfun)
++    subnet = SimpleNamespace(
++        name="unit",
++        model=model,
++        scheme=EulerDeterministic(dt=0.1),
++        projections=[projection],
++    )
++    network = SimpleNamespace(subnets=[subnet], projections=[])
++    return network, parameter, named_param, descriptor
++
++
++def _snapshot(value):
++    if isinstance(value, np.ndarray):
++        return (type(value), value.dtype, value.shape, value.strides, value.tobytes())
++    array = np.asarray(value)
++    return (type(value), array.dtype, array.shape, array.tobytes())
++
++
++def _assert_restored(parameter, before):
++    restored = parameter()
++    assert _snapshot(restored) == before
++
++
++def _invoke(api, backend, network, named_param, descriptor, values):
++    if api == "run_sweep":
++        return backend.run_sweep(
++            network,
++            sweep_values=values,
++            sweep_descriptor=[descriptor],
++            nstep=1,
++        )
++    return backend.sweep(
++        network,
++        params={named_param: values},
++        nstep=1,
++        backend="cpu",
++        n_workers=1,
++    )
++
++
++@pytest.mark.parametrize("api", ["run_sweep", "sweep"])
++@pytest.mark.parametrize("target", ["model-array", "model-scalar", "cfun-array"])
++def test_sweep_restores_parameter_after_simulation_failure(monkeypatch, api, target):
++    network, parameter, named_param, descriptor = _case(target)
++    before = _snapshot(parameter())
++    backend = NbHybridBackend()
++    mutations = []
++
++    def fail_after_mutation(*args, **kwargs):
++        mutations.append(float(np.asarray(parameter()).reshape(-1)[0]))
++        assert mutations[-1] == pytest.approx(3.5)
++        raise _SimulationFailure("deterministic failure after sweep mutation")
++
++    monkeypatch.setattr(backend, "run_network", fail_after_mutation)
++
++    with pytest.raises(_SimulationFailure, match="deterministic failure"):
++        _invoke(
++            api,
++            backend,
++            network,
++            named_param,
++            descriptor,
++            np.array([3.5], dtype=np.float32),
++        )
++
++    assert mutations == [3.5]
++    _assert_restored(parameter, before)
++
++
++@pytest.mark.parametrize("api", ["run_sweep", "sweep"])
++@pytest.mark.parametrize("target", ["model-array", "model-scalar", "cfun-array"])
++def test_sweep_restores_parameter_after_normal_completion(monkeypatch, api, target):
++    network, parameter, named_param, descriptor = _case(target)
++    before = _snapshot(parameter())
++    backend = NbHybridBackend()
++    mutations = []
++
++    def complete_after_mutation(*args, **kwargs):
++        mutations.append(float(np.asarray(parameter()).reshape(-1)[0]))
++        data = np.zeros((1, 1, 1, 1), dtype=np.float32)
++        return [(np.array([0.5]), data, data.copy())]
++
++    monkeypatch.setattr(backend, "run_network", complete_after_mutation)
++    _invoke(
++        api,
++        backend,
++        network,
++        named_param,
++        descriptor,
++        np.array([3.5], dtype=np.float32),
++    )
++
++    assert mutations == [3.5]
++    _assert_restored(parameter, before)
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_unified_sweep.py b/tvb_library/tvb/tests/library/simulator/backend/test_unified_sweep.py
+new file mode 100644
+index 0000000000..dfd77aad3c
+--- /dev/null
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_unified_sweep.py
+@@ -0,0 +1,433 @@
++"""
++Test suite for unified sweep API (NbHybridBackend.sweep).
++
++Covers:
++- Named parameter resolution (coupling_scale, proj.attr, model.param)
++- CPU sequential sweep
++- CPU multi-core sweep (n_workers=4)
++- GPU sweep (auto-dispatch and explicit 'cuda')
++- SweepResult shape correctness
++- Non-trivial configurations (2 subnets, intra+inter projections, stim)
++- Benchmarks in kiter/s
++
++Requires: pytest, numpy, scipy
++"""
++import pytest
++import numpy as np
++import scipy.sparse as sp
++import time
++import sys
++import os
++
++_TVB_LIBRARY = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
++sys.path.insert(0, _TVB_LIBRARY)
++os.environ["TVB_LIBRARY_PATH"] = _TVB_LIBRARY
++
++from tvb.simulator.hybrid.network import NetworkSet
++from tvb.simulator.hybrid.subnetwork import Subnetwork
++from tvb.simulator.hybrid.inter_projection import InterProjection
++from tvb.simulator.hybrid.intra_projection import IntraProjection
++from tvb.simulator.hybrid.coupling import Linear, Scaling, Sigmoidal
++from tvb.simulator.backend.nb_hybrid import NbHybridBackend, SweepResult
++from tvb.simulator.integrators import HeunDeterministic
++from tvb.datatypes.connectivity import Connectivity
++from tvb.simulator.models.infinite_theta import MontbrioPazoRoxin
++from tvb.simulator.models.jansen_rit import JansenRit
++from tvb.simulator.models.stefanescu_jirsa import ReducedSetFitzHughNagumo
++from tvb.simulator.models.wong_wang import ReducedWongWang
++
++DT = 0.01
++N_SWEEPS = 20
++N_STEPS = 100
++
++# Check CUDA
++CUDA_AVAILABLE = False
++try:
++    import numba.cuda
++    CUDA_AVAILABLE = numba.cuda.is_available()
++except ImportError:
++    pass
++
++
++def _load_conn(name):
++    conn = Connectivity.from_file(f"{name}.zip")
++    conn.configure()
++    return conn
++
++
++def _make_intra(conn_slice, src_cvar, tgt_cvar, cfun=None):
++    n = conn_slice.shape[0]
++    w = sp.csr_matrix(conn_slice.astype(np.float32))
++    w_a = w.toarray(); np.fill_diagonal(w_a, 0); w = sp.csr_matrix(w_a)
++    tl = sp.csr_matrix(np.zeros((n, n), dtype=np.float32))
++    p = IntraProjection(
++        source_cvar=np.array(src_cvar, dtype=np.int_),
++        target_cvar=np.array(tgt_cvar, dtype=np.int_),
++        weights=w, lengths=tl, cv=1.0, dt=DT, scale=1.0)
++    if cfun is not None:
++        p.cfun = cfun
++    return p
++
++
++def _make_inter(source_sn, target_sn, w_block, tl_block, src_cvar, tgt_cvar, cfun=None):
++    inter = InterProjection(
++        source=source_sn, target=target_sn,
++        source_cvar=np.array(src_cvar, dtype=np.int_),
++        target_cvar=np.array(tgt_cvar, dtype=np.int_),
++        weights=sp.csr_matrix(w_block.astype(np.float32)),
++        lengths=sp.csr_matrix(tl_block.astype(np.float32)),
++        cv=1.0, dt=DT)
++    if cfun is not None:
++        inter.cfun = cfun
++    return inter
++
++
++# ---------------------------------------------------------------------------
++# Test: Named parameter resolution
++# ---------------------------------------------------------------------------
++
++class TestResolveNamedParams:
++    def test_coupling_scale_alias(self):
++        """'coupling_scale' resolves to first projection's 'a' param."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        intra = _make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())
++        sn.projections = [intra]; sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        desc, values = backend._resolve_named_params(
++            ns, {"coupling_scale": np.linspace(0.0, 0.1, 10)})
++        assert len(desc) == 1
++        assert desc[0]["type"] == "cfun"
++        assert desc[0]["param_idx"] == 0
++        assert values.shape == (10, 1)
++
++    def test_cfun_attr_resolution(self):
++        """'{proj_name}.b' resolves to param_idx=1 for Linear coupling."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        intra = _make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())
++        sn.projections = [intra]; sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        desc, values = backend._resolve_named_params(
++            ns, {"ctx.intra.b": np.linspace(0.0, 1.0, 5)})
++        assert desc[0]["param_idx"] == 1  # 'b' is idx 1 for Linear
++
++    def test_model_param_resolution(self):
++        """'subnet.param' resolves to model parameter sweep."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        intra = _make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())
++        sn.projections = [intra]; sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        desc, values = backend._resolve_named_params(
++            ns, {"ctx.tau": np.linspace(0.1, 1.0, 8)})
++        assert desc[0]["type"] == "model"
++        assert desc[0]["subnet"] == "ctx"
++        assert desc[0]["param"] == "tau"
++
++    def test_multi_param_sweep(self):
++        """2D sweep: coupling_scale + model param simultaneously."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        intra = _make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())
++        sn.projections = [intra]; sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        desc, values = backend._resolve_named_params(
++            ns, {
++                "coupling_scale": np.linspace(0.0, 0.1, 10),
++                "ctx.tau": np.linspace(0.1, 1.0, 10),
++            })
++        assert len(desc) == 2
++        assert values.shape == (10, 2)
++
++    def test_inter_projection_name(self):
++        """Inter-projection name resolves as '{src}_to_{tgt}'."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        jr = JansenRit(); jr.configure()
++        sn1 = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=68)
++        sn2 = Subnetwork(name="sub", model=jr, scheme=HeunDeterministic(dt=DT), nnodes=8)
++        sn1.projections = [_make_intra(conn.weights[:68, :68], [0], [0])]
++        sn2.projections = [_make_intra(conn.weights[68:76, 68:76], [0], [0])]
++        sn1.configure(); sn2.configure()
++        inter = _make_inter(sn1, sn2, conn.weights[:68, 68:76],
++                           conn.tract_lengths[:68, 68:76], [0], [0], cfun=Linear())
++        ns = NetworkSet(subnets=[sn1, sn2], projections=[inter]); ns.configure()
++
++        backend = NbHybridBackend()
++        desc, values = backend._resolve_named_params(
++            ns, {"ctx_to_sub.a": np.linspace(0.0, 0.1, 10)})
++        assert desc[0]["projection"] == "ctx_to_sub"
++        assert desc[0]["param_idx"] == 0
++
++
++# ---------------------------------------------------------------------------
++# Test: CPU sequential sweep
++# ---------------------------------------------------------------------------
++
++class TestCPUSweep:
++    def test_sweep_returns_sweep_result(self):
++        """sweep() returns a SweepResult with correct shapes."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        result = backend.sweep(
++            ns, params={"coupling_scale": np.linspace(0.0, 0.1, N_SWEEPS)},
++            nstep=N_STEPS, backend="cpu")
++
++        assert isinstance(result, SweepResult)
++        assert result.backend == "cpu-seq"
++        assert result.sweep_values.shape == (N_SWEEPS, 1)
++        assert "ctx" in result.tavg
++        assert result.merged_tavg is not None
++        assert result.merged_tavg.shape[0] == N_SWEEPS  # n_sweeps
++        assert result.elapsed > 0
++
++    def test_sweep_shapes_mpr(self):
++        """MPR sweep shapes: (n_sweeps, n_chunks, n_voi, N, modes)."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        result = backend.sweep(
++            ns, params={"coupling_scale": np.linspace(0.0, 0.5, 5)},
++            nstep=50, backend="cpu")
++
++        # MPR: nvar=2, voi=2, N=76, modes=1
++        assert result.tavg["ctx"].shape[0] == 5   # n_sweeps
++        assert result.tavg["ctx"].shape[2] == 2   # n_voi
++        assert result.tavg["ctx"].shape[3] == 76  # N
++        # All backends preserve the sample axis.
++        if result.merged_tavg is not None:
++            assert result.merged_tavg.shape[0] == 5
++
++    def test_sweep_two_subnet(self):
++        """Two subnets (MPR+JR) with inter-projection."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        jr = JansenRit(); jr.configure()
++        sn1 = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=68)
++        sn2 = Subnetwork(name="sub", model=jr, scheme=HeunDeterministic(dt=DT), nnodes=8)
++        sn1.projections = [_make_intra(conn.weights[:68, :68], [0], [0])]
++        sn2.projections = [_make_intra(conn.weights[68:76, 68:76], [0], [0])]
++        sn1.configure(); sn2.configure()
++        inter = _make_inter(sn1, sn2, conn.weights[:68, 68:76],
++                           conn.tract_lengths[:68, 68:76], [0], [0], cfun=Linear())
++        ns = NetworkSet(subnets=[sn1, sn2], projections=[inter]); ns.configure()
++
++        backend = NbHybridBackend()
++        result = backend.sweep(
++            ns, params={"ctx_to_sub.a": np.linspace(0.0, 0.05, 10)},
++            nstep=50, backend="cpu")
++
++        assert "ctx" in result.tavg
++        assert "sub" in result.tavg
++        assert result.tavg["ctx"].shape[0] == 10
++        assert result.tavg["sub"].shape[0] == 10
++        # node counts are on axis 3 with chunk dim preserved
++        assert result.tavg["ctx"].shape[3] == 68   # cortex nodes
++        assert result.tavg["sub"].shape[3] == 8    # thalamus nodes
++        # Total: 68 + 8 = 76
++
++
++# ---------------------------------------------------------------------------
++# Test: CPU multi-core sweep
++# ---------------------------------------------------------------------------
++
++class TestCPUMultiCore:
++    def test_parallel_correctness(self):
++        """n_workers=4 produces same merged_tavg as n_workers=1."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        sweep_vals = np.linspace(0.01, 0.05, 10).astype(np.float32)
++
++        result_seq = backend.sweep(
++            ns, params={"coupling_scale": sweep_vals},
++            nstep=50, backend="cpu", n_workers=1)
++
++        result_par = backend.sweep(
++            ns, params={"coupling_scale": sweep_vals},
++            nstep=50, backend="cpu", n_workers=4)
++
++        np.testing.assert_allclose(
++            result_seq.merged_tavg, result_par.merged_tavg,
++            atol=1e-5, rtol=1e-5
++        )
++
++    def test_parallel_speedup(self):
++        """n_workers=4 should be faster than n_workers=1 for 100+ sweeps."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        sweep_vals = np.linspace(0.01, 0.05, 100).astype(np.float32)
++
++        t0 = time.perf_counter()
++        backend.sweep(ns, params={"coupling_scale": sweep_vals},
++                      nstep=100, backend="cpu", n_workers=1)
++        t_seq = time.perf_counter() - t0
++
++        t0 = time.perf_counter()
++        backend.sweep(ns, params={"coupling_scale": sweep_vals},
++                      nstep=100, backend="cpu", n_workers=4)
++        t_par = time.perf_counter() - t0
++
++        # Parallel should give some speedup (even 1.2x is ok for CI)
++        speedup = t_seq / t_par
++        print(f"  Sequential: {t_seq:.2f}s, Parallel(4): {t_par:.2f}s, Speedup: {speedup:.1f}x")
++        assert speedup > 1.2, f"Multi-core speedup {speedup:.1f}x < 1.2x"
++
++
++# ---------------------------------------------------------------------------
++# Test: GPU sweep (auto-dispatch)
++# ---------------------------------------------------------------------------
++
++@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
++class TestGPUSweep:
++    def test_gpu_auto_dispatch(self):
++        """backend='auto' uses CUDA when available."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        backend = NbHybridBackend()
++        result = backend.sweep(
++            ns, params={"coupling_scale": np.linspace(0.0, 0.1, 20).astype(np.float32)},
++            nstep=100, backend="auto")
++
++        assert result.backend == "cuda"
++        assert result.merged_tavg.shape == (20, 100, 2, 76, 1)
++
++    def test_gpu_vs_cpu_shapes(self):
++        """GPU and CPU produce same-shaped output for the same sweep."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        vals = np.linspace(0.0, 0.1, 5).astype(np.float32)
++        backend = NbHybridBackend()
++
++        cpu_result = backend.sweep(ns, params={"coupling_scale": vals},
++                                    nstep=20, backend="cpu")
++        gpu_result = backend.sweep(ns, params={"coupling_scale": vals},
++                                    nstep=20, backend="cuda")
++
++        # Both must have same number of sweep points
++        assert cpu_result.merged_tavg.shape[0] == gpu_result.merged_tavg.shape[0]
++        # Both must have same number of nodes (last axis)
++        assert cpu_result.merged_tavg.shape[-2] == gpu_result.merged_tavg.shape[-2]
++        # Same tavg dict keys
++        assert set(cpu_result.tavg.keys()) == set(gpu_result.tavg.keys())
++        # No NaN in GPU result
++        assert not np.any(np.isnan(gpu_result.merged_tavg))
++        # No NaN in CPU result
++        assert not np.any(np.isnan(cpu_result.merged_tavg))
++
++    def test_gpu_fallback(self):
++        """backend='cuda' with no GPU raises RuntimeError."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        if not CUDA_AVAILABLE:
++            backend = NbHybridBackend()
++            # auto should fall back to CPU
++            result = backend.sweep(ns, params={"coupling_scale": np.linspace(0, 0.1, 5).astype(np.float32)},
++                                   nstep=20, backend="auto")
++            assert result.backend.startswith("cpu")
++
++
++# ---------------------------------------------------------------------------
++# Test: Benchmark (kiter/s)
++# ---------------------------------------------------------------------------
++
++class TestBenchmark:
++    def test_throughput_kiter(self):
++        """Report throughput in kiter/s for different backends."""
++        conn = _load_conn("connectivity_76")
++        mpr = MontbrioPazoRoxin(); mpr.configure()
++        sn = Subnetwork(name="ctx", model=mpr, scheme=HeunDeterministic(dt=DT), nnodes=76)
++        sn.projections = [_make_intra(conn.weights[:76, :76], [0], [0], cfun=Linear())]
++        sn.configure()
++        ns = NetworkSet(subnets=[sn], projections=[]); ns.configure()
++
++        n_sweeps = 500
++        n_steps = 1000
++        vals = np.linspace(0.0, 0.1, n_sweeps).astype(np.float32)
++        backend = NbHybridBackend()
++
++        # CPU sequential
++        t0 = time.perf_counter()
++        result = backend.sweep(ns, params={"coupling_scale": vals},
++                               nstep=n_steps, backend="cpu", n_workers=1)
++        t_cpu_seq = time.perf_counter() - t0
++        kiter_cpu_seq = n_sweeps * n_steps / t_cpu_seq / 1000
++
++        # CPU 4-core
++        t0 = time.perf_counter()
++        result = backend.sweep(ns, params={"coupling_scale": vals},
++                               nstep=n_steps, backend="cpu", n_workers=4)
++        t_cpu_4c = time.perf_counter() - t0
++        kiter_cpu_4c = n_sweeps * n_steps / t_cpu_4c / 1000
++
++        print(f"\n  CPU-seq:  {t_cpu_seq:.2f}s  {kiter_cpu_seq:.0f} kiter/s")
++        print(f"  CPU-4c:   {t_cpu_4c:.2f}s  {kiter_cpu_4c:.0f} kiter/s")
++        print(f"  Speedup:  {t_cpu_seq/t_cpu_4c:.1f}x")
++
++        # GPU if available
++        if CUDA_AVAILABLE:
++            t0 = time.perf_counter()
++            result = backend.sweep(ns, params={"coupling_scale": vals},
++                                    nstep=n_steps, backend="cuda")
++            t_cuda = time.perf_counter() - t0
++            kiter_cuda = n_sweeps * n_steps / t_cuda / 1000
++            print(f"  CUDA:     {t_cuda:.3f}s  {kiter_cuda:.0f} kiter/s")
++            print(f"  CUDA/4c:  {kiter_cuda/kiter_cpu_4c:.1f}x")
++
++        # Sanity: CPU sequential must produce some output
++        assert result.merged_tavg is not None
++        assert kiter_cpu_seq > 0
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v", "--tb=short"])

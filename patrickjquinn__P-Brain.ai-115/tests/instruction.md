@@ -1,0 +1,63 @@
+# Issue
+
+**Title:** Bump trim-off-newlines from 1.0.1 to 1.0.3
+
+## Description
+
+Bumps [trim-off-newlines](https://github.com/stevemao/trim-off-newlines) from 1.0.1 to 1.0.3.
+<details>
+<summary>Commits</summary>
+<ul>
+<li><a href=""><code>c3b28d3</code></a> 1.0.3</li>
+<li><a href=""><code>6226c95</code></a> Merge pull request <a href="https://github-redirect.dependabot.com/stevemao/trim-off-newlines/issues/4">#4</a> from Trott/fix-it-again</li>
+<li><a href=""><code>c77691d</code></a> fix: remediate ReDOS further</li>
+<li><a href=""><code>76ca93c</code></a> chore: pin mocha to version that works with 0.10.x</li>
+<li><a href=""><code>8cd3f73</code></a> 1.0.2</li>
+<li><a href=""><code>fcbb73d</code></a> Merge pull request <a href="https://github-redirect.dependabot.com/stevemao/trim-off-newlines/issues/3">#3</a> from Trott/patch-1</li>
+<li><a href=""><code>6d89476</code></a> fix: update regular expression to remove ReDOS</li>
+<li><a href=""><code>0cd87f5</code></a> chore: pin xo to latest version that works with current code</li>
+<li>See full diff in <a href="https://github.com/stevemao/trim-off-newlines/compare/v1.0.1...v1.0.3">compare view</a></li>
+</ul>
+</details>
+<details>
+<summary>Maintainer changes</summary>
+<p>This version was pushed to npm by <a href="https://www.npmjs.com/~trott">trott</a>, a new releaser for trim-off-newlines since your current version.</p>
+</details>
+<br />
+
+[![Dependabot compatibility score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=trim-off-newlines&package-manager=npm_and_yarn&previous-version=1.0.1&new-version=1.0.3)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)
+
+Dependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+---
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it
+- `@dependabot merge` will merge this PR after your CI passes on it
+- `@dependabot squash and merge` will squash and merge this PR after your CI passes on it
+- `@dependabot cancel merge` will cancel a previously requested merge and block automerging
+- `@dependabot reopen` will reopen this PR if it is closed
+- `@dependabot close` will close this PR and stop Dependabot recreating it. You can achieve the same result by closing it manually
+- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)
+- `@dependabot use these labels` will set the current labels as the default for future PRs for this repo and language
+- `@dependabot use these reviewers` will set the current reviewers as the default for future PRs for this repo and language
+- `@dependabot use these assignees` will set the current assignees as the default for future PRs for this repo and language
+- `@dependabot use this milestone` will set the current milestone as the default for future PRs for this repo and language
+
+You can disable automated security fix PRs for this repo from the [Security Alerts page](https://github.com/patrickjquinn/P-Brain.ai/network/alerts).
+
+</details>
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `56c9b471d92b`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

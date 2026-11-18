@@ -1,0 +1,215 @@
+diff --git a/datatype/imageblk/write.go b/datatype/imageblk/write.go
+index 39114269..b7e4ce97 100644
+--- a/datatype/imageblk/write.go
++++ b/datatype/imageblk/write.go
+@@ -161,6 +161,17 @@ func (d *Data) PutVoxels(v dvid.VersionID, vox *Voxels, roiname dvid.InstanceNam
+ 		extentChanged = true
+ 	}
+ 
++	// extract buffer interface if it exists
++	var putbuffer storage.RequestBuffer
++	store, err := storage.MutableStore()
++	if err != nil {
++		return fmt.Errorf("Data type imageblk had error initializing store: %v\n", err)
++	}
++	if req, ok := store.(storage.KeyValueRequester); ok {
++		ctx := datastore.NewVersionedCtx(d, v)
++		putbuffer = req.NewBuffer(ctx)
++	}
++
+ 	// Iterate through index space for this data.
+ 	for it, err := vox.IndexIterator(d.BlockSize()); err == nil && it.Valid(); it.NextSpan() {
+ 		i0, i1, err := it.IndexSpan()
+@@ -192,11 +203,17 @@ func (d *Data) PutVoxels(v dvid.VersionID, vox *Voxels, roiname dvid.InstanceNam
+ 			kv := &storage.TKeyValue{K: NewTKey(&curIndex)}
+ 			putOp := &putOperation{vox, curIndex, v, mutate}
+ 			op := &storage.ChunkOp{putOp, wg}
+-			d.PutChunk(&storage.Chunk{op, kv})
++			d.PutChunk(&storage.Chunk{op, kv}, putbuffer)
+ 		}
+ 	}
+ 
+ 	wg.Wait()
++
++	// if a bufferable op, flush
++	if putbuffer != nil {
++		putbuffer.Flush()
++	}
++
+ 	return nil
+ }
+ 
+@@ -282,13 +299,13 @@ func (d *Data) PutBlocks(v dvid.VersionID, start dvid.ChunkPoint3d, span int, da
+ // PutChunk puts a chunk of data as part of a mapped operation.
+ // Only some multiple of the # of CPU cores can be used for chunk handling before
+ // it waits for chunk processing to abate via the buffered server.HandlerToken channel.
+-func (d *Data) PutChunk(chunk *storage.Chunk) error {
++func (d *Data) PutChunk(chunk *storage.Chunk, putbuffer storage.RequestBuffer) error {
+ 	<-server.HandlerToken
+-	go d.putChunk(chunk)
++	go d.putChunk(chunk, putbuffer)
+ 	return nil
+ }
+ 
+-func (d *Data) putChunk(chunk *storage.Chunk) {
++func (d *Data) putChunk(chunk *storage.Chunk, putbuffer storage.RequestBuffer) {
+ 	defer func() {
+ 		// After processing a chunk, return the token.
+ 		server.HandlerToken <- 1
+@@ -355,26 +372,36 @@ func (d *Data) putChunk(chunk *storage.Chunk) {
+ 		dvid.Errorf("Data type imageblk had error initializing store: %v\n", err)
+ 		return
+ 	}
+-	ctx := datastore.NewVersionedCtx(d, op.version)
+-	if err := store.Put(ctx, chunk.K, serialization); err != nil {
+-		dvid.Errorf("Unable to PUT voxel data for key %v: %v\n", chunk.K, err)
+-		return
++
++	callback := func() {
++		// Notify any subscribers that you've changed block.
++		var event string
++		var delta interface{}
++		if op.mutate {
++			event = MutateBlockEvent
++			delta = MutatedBlock{&op.indexZYX, oldBlock, block.V}
++		} else {
++			event = IngestBlockEvent
++			delta = Block{&op.indexZYX, block.V}
++		}
++		evt := datastore.SyncEvent{d.DataName(), event}
++		msg := datastore.SyncMessage{op.version, delta}
++		if err := datastore.NotifySubscribers(evt, msg); err != nil {
++			dvid.Errorf("Unable to notify subscribers of event %s in %s\n", event, d.DataName())
++		}
+ 	}
+ 
+-	// Notify any subscribers that you've changed block.
+-	var event string
+-	var delta interface{}
+-	if op.mutate {
+-		event = MutateBlockEvent
+-		delta = MutatedBlock{&op.indexZYX, oldBlock, block.V}
++	// put data -- use buffer if available
++	ctx := datastore.NewVersionedCtx(d, op.version)
++	if putbuffer != nil {
++		putbuffer.PutCallback(ctx, chunk.K, serialization, callback)
+ 	} else {
+-		event = IngestBlockEvent
+-		delta = Block{&op.indexZYX, block.V}
+-	}
+-	evt := datastore.SyncEvent{d.DataName(), event}
+-	msg := datastore.SyncMessage{op.version, delta}
+-	if err := datastore.NotifySubscribers(evt, msg); err != nil {
+-		dvid.Errorf("Unable to notify subscribers of event %s in %s\n", event, d.DataName())
++		if err := store.Put(ctx, chunk.K, serialization); err != nil {
++			dvid.Errorf("Unable to PUT voxel data for key %v: %v\n", chunk.K, err)
++			return
++		}
++
++		callback()
+ 	}
+ }
+ 
+diff --git a/storage/gbucket/gbucket.go b/storage/gbucket/gbucket.go
+index 17d1e86d..c667f3d1 100644
+--- a/storage/gbucket/gbucket.go
++++ b/storage/gbucket/gbucket.go
+@@ -785,6 +785,7 @@ const (
+ 	delOpIgnoreExists
+ 	delRangeOp
+ 	putOp
++	putOpCallback
+ 	getOp
+ )
+ 
+@@ -797,6 +798,7 @@ type dbOp struct {
+ 	tkEnd     storage.TKey
+ 	chunkop   *storage.ChunkOp
+ 	chunkfunc storage.ChunkFunc
++	callback  func()
+ }
+ 
+ // goBuffer allow operations to be submitted in parallel
+@@ -830,7 +832,7 @@ func (db *goBuffer) ProcessRange(ctx storage.Context, TkBeg, TkEnd storage.TKey,
+ 		return fmt.Errorf("Received nil context in GetRange()")
+ 	}
+ 
+-	db.ops = append(db.ops, dbOp{getOp, nil, nil, TkBeg, TkEnd, op, f})
++	db.ops = append(db.ops, dbOp{getOp, nil, nil, TkBeg, TkEnd, op, f, nil})
+ 
+ 	return nil
+ }
+@@ -867,6 +869,38 @@ func (db *goBuffer) Put(ctx storage.Context, tkey storage.TKey, value []byte) er
+ 
+ }
+ 
++// PutCallback writes a value with given key in a possibly versioned context and call the callback.
++func (db *goBuffer) PutCallback(ctx storage.Context, tkey storage.TKey, value []byte, callback func()) error {
++	if db == nil {
++		return fmt.Errorf("Can't call Put() on nil Google Bucket")
++	}
++	if ctx == nil {
++		return fmt.Errorf("Received nil context in Put()")
++	}
++
++	var err error
++	err = nil
++	key := ctx.ConstructKey(tkey)
++	if !ctx.Versioned() {
++		db.ops = append(db.ops, dbOp{op: putOpCallback, key: key, value: value, callback: callback})
++	} else {
++		vctx, ok := ctx.(storage.VersionedCtx)
++		if !ok {
++			return fmt.Errorf("Non-versioned context that says it's versioned received in Put(): %v", ctx)
++		}
++		tombstoneKey := vctx.TombstoneKey(tkey)
++		db.ops = append(db.ops, dbOp{op: delOpIgnoreExists, key: tombstoneKey})
++		db.ops = append(db.ops, dbOp{op: putOpCallback, key: key, value: value, callback: callback})
++		if err != nil {
++			dvid.Criticalf("Error on data put: %v\n", err)
++			err = fmt.Errorf("Error on data put: %v", err)
++		}
++	}
++
++	return err
++
++}
++
+ // RawPut is a low-level function that puts a key-value pair using full keys.
+ // This can be used in conjunction with RawRangeQuery.
+ func (db *goBuffer) RawPut(k storage.Key, v []byte) error {
+@@ -938,7 +972,7 @@ func (db *goBuffer) DeleteRange(ctx storage.Context, TkBeg, TkEnd storage.TKey)
+ 	if ctx == nil {
+ 		return fmt.Errorf("Received nil context in DeleteRange()")
+ 	}
+-	db.ops = append(db.ops, dbOp{delRangeOp, nil, nil, TkBeg, TkEnd, nil, nil})
++	db.ops = append(db.ops, dbOp{delRangeOp, nil, nil, TkBeg, TkEnd, nil, nil, nil})
+ 
+ 	return nil
+ }
+@@ -967,6 +1001,11 @@ func (buffer *goBuffer) Flush() error {
+ 				err = buffer.db.putV(opdata.key, opdata.value)
+ 				storage.StoreKeyBytesWritten <- len(opdata.key)
+ 				storage.StoreValueBytesWritten <- len(opdata.value)
++			} else if opdata.op == putOpCallback {
++				err = buffer.db.putV(opdata.key, opdata.value)
++				storage.StoreKeyBytesWritten <- len(opdata.key)
++				storage.StoreValueBytesWritten <- len(opdata.value)
++				opdata.callback()
+ 			} else if opdata.op == getOp {
+ 				err = buffer.processRangeLocal(buffer.ctx, opdata.tkBeg, opdata.tkEnd, opdata.chunkop, opdata.chunkfunc, workQueue)
+ 			} else {
+diff --git a/storage/storage.go b/storage/storage.go
+index 50cd0ad7..9d2c3178 100644
+--- a/storage/storage.go
++++ b/storage/storage.go
+@@ -458,6 +458,9 @@ type BufferableOps interface {
+ type RequestBuffer interface {
+ 	BufferableOps
+ 
++	// PutCallback writes a value with given key in a possibly versioned context and calls the call back when finished.
++	PutCallback(Context, TKey, []byte, func()) error
++
+ 	// Flush processes all the queued jobs
+ 	Flush() error
+ }

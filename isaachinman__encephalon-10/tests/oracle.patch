@@ -1,0 +1,503 @@
+diff --git a/src/records.ts b/src/records.ts
+index d179e4e..282f785 100644
+--- a/src/records.ts
++++ b/src/records.ts
+@@ -1,19 +1,22 @@
+ import { randomUUID } from 'node:crypto'
++import type { Stats } from 'node:fs'
+ import {
+   closeSync,
+   constants,
+   existsSync,
++  fstatSync,
+   fsyncSync,
+   linkSync,
+   lstatSync,
+   mkdirSync,
+   openSync,
+   readdirSync,
+-  readFileSync,
++  readSync,
+   rmSync,
+   writeFileSync,
+ } from 'node:fs'
+ import { basename, join, relative, resolve } from 'node:path'
++import { TextDecoder } from 'node:util'
+ import { hydrateResolvedRepository } from './cache.ts'
+ import { EncephalonError, fail, wrapIo } from './errors.ts'
+ import { withOperationLock } from './lock.ts'
+@@ -33,6 +36,11 @@ type RecordScan = {
+   errors: ValidationIssue[]
+ }
+ 
++type FileIdentity = {
++  dev: number
++  ino: number
++}
++
+ type RecordWriteFault =
+   | 'after-publication'
+   | 'before-publication'
+@@ -45,15 +53,26 @@ type RecordWriteHooks = {
+   fault?: (point: RecordWriteFault) => void
+ }
+ 
++type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
++
++type RecordReadHooks = {
++  fault?: (point: RecordReadFault, path: string) => void
++}
++
+ type AddRecordOptions = {
+   hooks?: RecordWriteHooks
+   hydrate?: boolean
+ }
+ 
++type ValidateRecordsOptions = {
++  hooks?: RecordReadHooks
++}
++
+ const STAGING_DIRECTORY = '_staging'
+ const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
+ const directoryFlag = constants.O_DIRECTORY ?? 0
+ const noFollowFlag = constants.O_NOFOLLOW ?? 0
++const decoder = new TextDecoder('utf-8', { fatal: true })
+ 
+ const posixRelative = (root: string, path: string) => relative(root, path).replaceAll('\\', '/')
+ 
+@@ -66,6 +85,21 @@ const issue = (code: string, message: string, path?: string, recordId?: string):
+ 
+ const fault = (hooks: RecordWriteHooks | undefined, point: RecordWriteFault) => hooks?.fault?.(point)
+ 
++const readFault = (hooks: RecordReadHooks | undefined, point: RecordReadFault, path: string) => {
++  hooks?.fault?.(point, path)
++}
++
++const identityFor = (metadata: Stats): FileIdentity => ({ dev: metadata.dev, ino: metadata.ino })
++
++const sameIdentity = (first: FileIdentity, second: FileIdentity) => first.dev === second.dev && first.ino === second.ino
++
++const sameStableMetadata = (first: Stats, second: Stats) =>
++  sameIdentity(identityFor(first), identityFor(second)) &&
++  first.size === second.size &&
++  first.mode === second.mode &&
++  first.mtimeMs === second.mtimeMs &&
++  first.ctimeMs === second.ctimeMs
++
+ const assertRealDirectory = (root: string, path: string) => {
+   const metadata = lstatSync(path)
+   if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+@@ -121,20 +155,105 @@ const cleanupStagingDirectory = (root: string, hooks?: RecordWriteHooks) => {
+   }
+ }
+ 
+-const readRecord = (root: string, path: string): BrainRecord => {
+-  const relativePath = posixRelative(root, path)
++const assertParentIdentity = (root: string, path: string, expected: FileIdentity) => {
+   const metadata = lstatSync(path)
+-  if (metadata.size > MAX_RECORD_BYTES) {
+-    return fail('INVALID_ARGUMENT', 'Record file exceeds the 1 MiB limit.', {
++  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameIdentity(identityFor(metadata), expected)) {
++    return fail('INVALID_ARGUMENT', 'Record parent directory changed while canonical records were being read.', {
++      path: posixRelative(root, path),
++    })
++  }
++}
++
++const readBoundedDescriptor = (descriptor: number, size: number) => {
++  const buffer = Buffer.alloc(size)
++  let offset = 0
++  while (offset < size) {
++    const bytesRead = readSync(descriptor, buffer, offset, size - offset, offset)
++    if (bytesRead === 0) {
++      return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
++    }
++    offset += bytesRead
++  }
++  const extra = Buffer.alloc(1)
++  if (readSync(descriptor, extra, 0, 1, size) > 0) {
++    return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
++  }
++  return buffer
++}
++
++const decodeRecordBytes = (bytes: Buffer) => {
++  try {
++    return decoder.decode(bytes)
++  } catch {
++    return fail('INVALID_ARGUMENT', 'Record file is not valid UTF-8.')
++  }
++}
++
++const parseRecordJson = (content: string) => {
++  try {
++    return JSON.parse(content) as unknown
++  } catch {
++    return fail('INVALID_ARGUMENT', 'Record file contains invalid JSON.')
++  }
++}
++
++const readRecord = (
++  root: string,
++  path: string,
++  kindPath: string,
++  kindIdentity: FileIdentity,
++  hooks?: RecordReadHooks,
++): BrainRecord => {
++  const relativePath = posixRelative(root, path)
++  const pathMetadata = lstatSync(path)
++  readFault(hooks, 'after-record-lstat', path)
++  let descriptor: number | undefined
++  try {
++    descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
++    readFault(hooks, 'after-record-open', path)
++    const metadata = fstatSync(descriptor)
++    assertParentIdentity(root, kindPath, kindIdentity)
++    if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink() || !metadata.isFile()) {
++      return fail('INVALID_ARGUMENT', 'Record file must be a regular non-symlink JSON file.', {
++        path: relativePath,
++      })
++    }
++    if (!sameIdentity(identityFor(pathMetadata), identityFor(metadata))) {
++      return fail('INVALID_ARGUMENT', 'Record file changed while canonical records were being read.', {
++        path: relativePath,
++      })
++    }
++    if (metadata.size > MAX_RECORD_BYTES) {
++      return fail('INVALID_ARGUMENT', 'Record file exceeds the 1 MiB limit.', {
++        path: relativePath,
++      })
++    }
++    readFault(hooks, 'after-record-fstat', path)
++    const bytes = readBoundedDescriptor(descriptor, metadata.size)
++    const finalMetadata = fstatSync(descriptor)
++    if (!sameStableMetadata(metadata, finalMetadata)) {
++      return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.', {
++        path: relativePath,
++      })
++    }
++    const parsed = parseRecordJson(decodeRecordBytes(bytes))
++    const record = parseRecordFile(parsed)
++    return { ...record, path: relativePath }
++  } catch (error) {
++    if (error instanceof EncephalonError) {
++      throw error
++    }
++    return fail('INVALID_ARGUMENT', 'Record file must be a readable regular non-symlink JSON file.', {
+       path: relativePath,
+     })
++  } finally {
++    if (descriptor !== undefined) {
++      closeSync(descriptor)
++    }
+   }
+-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown
+-  const record = parseRecordFile(parsed)
+-  return { ...record, path: relativePath }
+ }
+ 
+-const scanCanonicalRecords = (root: string): RecordScan => {
++const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}): RecordScan => {
+   const brainDirectory = resolve(root, 'encephalon')
+   if (existsSync(brainDirectory)) {
+     const rootMetadata = lstatSync(brainDirectory)
+@@ -166,6 +285,21 @@ const scanCanonicalRecords = (root: string): RecordScan => {
+           }
+           const kindPath = join(brainDirectory, kindEntry.name)
+           if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
++            const kindMetadata = lstatSync(kindPath)
++            if (!kindMetadata.isDirectory() || kindMetadata.isSymbolicLink()) {
++              return {
++                errors: [
++                  ...result.errors,
++                  issue(
++                    'INVALID_RECORD_LAYOUT',
++                    'The brain root may contain only kind directories and reserved internal directories.',
++                    posixRelative(root, kindPath),
++                  ),
++                ],
++                records: result.records,
++              }
++            }
++            const kindIdentity = identityFor(kindMetadata)
+             return readdirSync(kindPath, { withFileTypes: true })
+               .sort((first, second) => first.name.localeCompare(second.name))
+               .reduce<RecordScan>((kindResult, recordEntry) => {
+@@ -173,7 +307,7 @@ const scanCanonicalRecords = (root: string): RecordScan => {
+                 const relativePath = posixRelative(root, recordPath)
+                 if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
+                   try {
+-                    const record = readRecord(root, recordPath)
++                    const record = readRecord(root, recordPath, kindPath, kindIdentity, options.hooks)
+                     const expectedName = `${record.id}.json`
+                     const pathErrors = [
+                       ...(recordEntry.name === expectedName && record.kind === kindEntry.name
+@@ -365,10 +499,9 @@ const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
+   }
+ }
+ 
+-export const validateRecords = (input: RootInput = {}): ValidateResult => {
+-  const root = resolveRepository(input)
++export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
+   try {
+-    return validateScanned(root, scanCanonicalRecords(root))
++    return validateScanned(root, scanCanonicalRecords(root, options))
+   } catch (error) {
+     if (error instanceof EncephalonError) {
+       throw error
+@@ -377,6 +510,11 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
+   }
+ }
+ 
++export const validateRecords = (input: RootInput = {}): ValidateResult => {
++  const root = resolveRepository(input)
++  return validateRecordsResolved(root)
++}
++
+ export const readRecords = (input: RootInput = {}) => {
+   const root = resolveRepository(input)
+   const scan = scanCanonicalRecords(root)
+diff --git a/test/records.test.ts b/test/records.test.ts
+index 0eb7880..55c9fdd 100644
+--- a/test/records.test.ts
++++ b/test/records.test.ts
+@@ -1,4 +1,5 @@
+ import assert from 'node:assert/strict'
++import { execFileSync } from 'node:child_process'
+ import {
+   existsSync,
+   linkSync,
+@@ -13,8 +14,9 @@ import {
+ import { join } from 'node:path'
+ import { afterEach, describe, test } from 'node:test'
+ import * as api from '../src/index.ts'
+-import { addRecordResolved } from '../src/records.ts'
++import { addRecordResolved, validateRecordsResolved } from '../src/records.ts'
+ import { discoverRepository } from '../src/repository.ts'
++import type { ValidateResult } from '../src/types.ts'
+ import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
+ 
+ const roots: string[] = []
+@@ -32,6 +34,14 @@ const assertErrorCode = (operation: () => unknown, code: string) => {
+   })
+ }
+ 
++const assertInvalidRecord = (result: ValidateResult, path?: string) => {
++  assert.equal(result.valid, false)
++  assert.equal(
++    result.errors.some(error => error.code === 'INVALID_RECORD' && (path === undefined || error.path === path)),
++    true,
++  )
++}
++
+ afterEach(() => {
+   roots.splice(0).forEach(removeTestRepository)
+ })
+@@ -549,6 +559,207 @@ describe('canonical records', () => {
+     assert.equal(readFileSync(path, 'utf8'), original)
+   })
+ 
++  test('rejects a record replaced by a symlink between enumeration and open', {
++    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
++  }, () => {
++    const root = createRoot()
++    const record = api.addRecord({
++      id: 'record-symlink-race',
++      kind: 'decision',
++      payload: {},
++      root,
++      source: 'agent',
++      subject: 'record.symlink-race',
++    })
++    const path = join(root, record.path)
++    const target = join(root, 'outside-record.json')
++    writeFileSync(target, '{}')
++    let replaced = false
++
++    const result = validateRecordsResolved(root, {
++      hooks: {
++        fault: point => {
++          if (point === 'after-record-lstat' && !replaced) {
++            replaced = true
++            rmSync(path)
++            symlinkSync(target, path)
++          }
++        },
++      },
++    })
++
++    assertInvalidRecord(result, record.path)
++  })
++
++  test('rejects a record when its parent kind directory is replaced during read', () => {
++    const root = createRoot()
++    const record = api.addRecord({
++      id: 'parent-replaced',
++      kind: 'decision',
++      payload: { summary: 'Original' },
++      root,
++      source: 'agent',
++      subject: 'record.parent-race',
++    })
++    const kindPath = join(root, 'encephalon', 'decision')
++    const recordPath = join(root, record.path)
++    let replaced = false
++
++    const result = validateRecordsResolved(root, {
++      hooks: {
++        fault: point => {
++          if (point === 'after-record-lstat' && !replaced) {
++            replaced = true
++            rmSync(kindPath, { recursive: true })
++            mkdirSync(kindPath)
++            writeFileSync(
++              recordPath,
++              JSON.stringify({
++                createdAt: record.createdAt,
++                id: record.id,
++                kind: record.kind,
++                payload: { summary: 'Replacement' },
++                source: record.source,
++                subject: record.subject,
++              }),
++            )
++          }
++        },
++      },
++    })
++
++    assertInvalidRecord(result, record.path)
++  })
++
++  test('rejects a symlink record whose target exceeds the byte limit', {
++    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
++  }, () => {
++    const root = createRoot()
++    const record = api.addRecord({
++      id: 'oversized-symlink-target',
++      kind: 'decision',
++      payload: {},
++      root,
++      source: 'agent',
++      subject: 'record.oversized-symlink',
++    })
++    const path = join(root, record.path)
++    const target = join(root, 'oversized-target.json')
++    writeFileSync(target, 'x'.repeat(1024 * 1024 + 1))
++    let replaced = false
++
++    const result = validateRecordsResolved(root, {
++      hooks: {
++        fault: point => {
++          if (point === 'after-record-lstat' && !replaced) {
++            replaced = true
++            rmSync(path)
++            symlinkSync(target, path)
++          }
++        },
++      },
++    })
++
++    assertInvalidRecord(result, record.path)
++  })
++
++  test('rejects non-regular canonical record entries where supported', {
++    skip: process.platform === 'win32' ? 'Windows runners do not provide mkfifo.' : false,
++  }, () => {
++    const root = createRoot()
++    const path = join(root, 'encephalon', 'decision', 'fifo-record.json')
++    ensureParent(path)
++    execFileSync('mkfifo', [path])
++
++    const result = api.validateRecords({ root })
++
++    assert.equal(result.valid, false)
++    assert.equal(
++      result.errors.some(
++        error => error.code === 'INVALID_RECORD_LAYOUT' && error.path === 'encephalon/decision/fifo-record.json',
++      ),
++      true,
++    )
++  })
++
++  test('rejects invalid UTF-8 record bytes', () => {
++    const root = createRoot()
++    const record = api.addRecord({
++      id: 'invalid-utf8',
++      kind: 'decision',
++      payload: {},
++      root,
++      source: 'agent',
++      subject: 'record.invalid-utf8',
++    })
++    writeFileSync(join(root, record.path), Buffer.from([0xff, 0xfe, 0xfd]))
++
++    const result = api.validateRecords({ root })
++
++    assertInvalidRecord(result, record.path)
++    assert.equal(
++      result.errors.some(error => error.message === 'Record file is not valid UTF-8.'),
++      true,
++    )
++  })
++
++  test('rejects a record changed after descriptor verification but before read', () => {
++    const root = createRoot()
++    const record = api.addRecord({
++      id: 'changed-after-open',
++      kind: 'decision',
++      payload: { summary: 'Original' },
++      root,
++      source: 'agent',
++      subject: 'record.changed-after-open',
++    })
++    const path = join(root, record.path)
++    let changed = false
++
++    const result = validateRecordsResolved(root, {
++      hooks: {
++        fault: point => {
++          if (point === 'after-record-fstat' && !changed) {
++            changed = true
++            writeFileSync(path, '{"changed":true}')
++          }
++        },
++      },
++    })
++
++    assertInvalidRecord(result, record.path)
++    assert.equal(
++      result.errors.some(error => error.message === 'Record file changed while it was being read.'),
++      true,
++    )
++  })
++
++  test('reports malformed JSON without echoing source content', () => {
++    const root = createRoot()
++    const record = api.addRecord({
++      id: 'malformed-json',
++      kind: 'decision',
++      payload: {},
++      root,
++      source: 'agent',
++      subject: 'record.malformed-json',
++    })
++    const secret = 'SECRET_TOKEN_SHOULD_NOT_APPEAR'
++    writeFileSync(join(root, record.path), `{"payload":"${secret}",`)
++
++    const result = api.validateRecords({ root })
++
++    assertInvalidRecord(result, record.path)
++    assert.equal(
++      result.errors.some(error => error.message === 'Record file contains invalid JSON.'),
++      true,
++    )
++    assert.equal(
++      result.errors.some(error => error.message.includes(secret)),
++      false,
++    )
++  })
++
+   test('discovers a worktree-style git root and rejects an invalid explicit root', () => {
+     const root = createRoot()
+     const nested = join(root, 'packages', 'app')

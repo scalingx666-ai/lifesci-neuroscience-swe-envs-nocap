@@ -1,0 +1,1510 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 542ff44e..63cbf836 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -53,6 +53,45 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+   builds now use thin LTO, one codegen unit and a stripped binary.
+ 
+ ### Fixed
++- **Linux re-indexed an idle vault forever (#155, reported and diagnosed by
++  @cjpatten).** `notify`'s inotify backend subscribes with `WatchMask::OPEN`
++  next to CREATE/MODIFY/DELETE, so every *read* of a file or directory produces
++  an `EventKind::Access` event. `watcher.rs` forwarded every event's paths to
++  the drain thread and `plan_batch` classifies any existing `.md` as `modified`
++  (it only asks whether the path exists) — and indexing a batch reads the notes
++  in it, which emitted a fresh round of Access events, which re-indexed them. An
++  untouched 503-note vault ran `index_notes` 264–335 times a minute and wrote
++  ~32 MB/s into `.context/index.sqlite`. The watcher callback now drops an event
++  iff it is `EventKind::Access(_)`, is not `Access(Close(AccessMode::Write))` and
++  carries no Rescan flag (`watcher.rs should_forward`). `Close(Write)` is kept
++  because on inotify it is the reliable end-of-write signal for editors that
++  write in place; a Rescan-flagged event is kept because it means the backend's
++  queue overflowed and the batch must still be re-indexed. macOS/FSEvents and
++  Windows never emit Access, so their behaviour is unchanged. Three unit tests
++  in `watcher.rs` pin the three groups.
++- **An unchanged file is no longer re-indexed or re-synced (#155, defence in
++  depth).** The incremental index path had no content check: every path handed
++  to `Index::index_notes` was read, parsed and rewritten across `notes`,
++  `notes_fts`, `note_tags` and `links`, then included in the scoped
++  `resolve_links` pass — even when the bytes were byte-for-byte what was already
++  indexed. `rebuild` has always skipped unchanged files (by mtime); only the
++  incremental path paid. `index_one` now hashes the file it just read and
++  compares it against the `sha256` the row already holds for that same path: a
++  match writes nothing at all, refreshing only `notes.mtime` (single-column
++  UPDATE, so `rebuild`'s mtime skip still fires) and returning
++  `IndexedNote::Unchanged`, which keeps the doc out of `touched` — a batch of
++  untouched files runs no link pass. A NULL `sha256`, a row at a different path
++  and a file with no row are all treated as changed. `index_notes` returns an
++  `IndexOutcome { failures, unchanged }`, the watcher forwards the unchanged
++  paths as `unchanged: true` on the matching `modified` entries of
++  `files-changed` (entries are never dropped: the TS side needs exactly one echo
++  per materialised path, and a `modified` is what cancels a pending disk
++  delete), and the `index_notes` log line now reports the unchanged count. The
++  event source behind #155 is fixed at the watcher; this makes any other
++  spurious source — a backup, git or cloud-sync tool rewriting identical bytes,
++  or Windows reporting an attribute change as `Modify(Metadata)` — cost one read
++  and one hash instead of the whole index. Six tests in `index.rs` and two in
++  `watcher.rs`.
+ - **"Syncing" on note open, third cause — the provider handshake.** Hocuspocus
+   reports `onUnsyncedChanges` for the sync-step/awareness messages it queues
+   while the socket comes up, and `DocSync` turned any count > 0 into
+diff --git a/app/apps/desktop/src-tauri/src/commands.rs b/app/apps/desktop/src-tauri/src/commands.rs
+index 8a870290..e9bf4d51 100644
+--- a/app/apps/desktop/src-tauri/src/commands.rs
++++ b/app/apps/desktop/src-tauri/src/commands.rs
+@@ -845,7 +845,7 @@ pub async fn import_paths(
+         }
+     }
+     let guard = index.lock().unwrap();
+-    for (path, err) in guard.index_notes(&vault, &md_paths)? {
++    for (path, err) in guard.index_notes(&vault, &md_paths)?.failures {
+         eprintln!("[import] index failed for {}: {err}", path.display());
+     }
+     Ok(summary)
+diff --git a/app/apps/desktop/src-tauri/src/index.rs b/app/apps/desktop/src-tauri/src/index.rs
+index 6e811fcc..b3b4cfee 100644
+--- a/app/apps/desktop/src-tauri/src/index.rs
++++ b/app/apps/desktop/src-tauri/src/index.rs
+@@ -39,6 +39,32 @@ pub enum LinkScope<'a> {
+     Touched(&'a [String]),
+ }
+ 
++/// What one `index_one` call did with a file.
++///
++/// The distinction is the point of the hash gate: an `Unchanged` file cost one
++/// read and one sha256 and wrote nothing, so it must not join the link pass and
++/// the UI must not be told to act on it.
++enum IndexedNote {
++    /// The note's rows were (re)written. Carries the doc_id.
++    Indexed(String),
++    /// The bytes on disk already hash to the `notes.sha256` stored for this
++    /// path: nothing was rewritten (at most `mtime` was refreshed). No id,
++    /// because the only thing a caller can do with this file is leave it alone —
++    /// it is out of the link pass by construction.
++    Unchanged,
++}
++
++/// What a batch [`Index::index_notes`] did, per path.
++///
++/// `failures` are per-path and non-fatal (one unreadable file must not cost the
++/// rest of the batch); `unchanged` are the paths the hash gate skipped, which
++/// the watcher forwards to the UI as `unchanged: true`.
++#[derive(Debug, Default)]
++pub struct IndexOutcome {
++    pub failures: Vec<(PathBuf, AppError)>,
++    pub unchanged: Vec<PathBuf>,
++}
++
+ pub struct Index {
+     conn: Connection,
+     /// Test-only: how many times `resolve_links` has run. The entire point of
+@@ -410,11 +436,17 @@ impl Index {
+             match indexed.get(&rel) {
+                 // Unchanged since the last index — skip the read + parse.
+                 Some((_, mtime, _)) if *mtime == disk_mtime => {}
+-                // Changed — re-index in place, preserving the doc_id.
++                // Changed — re-index in place, preserving the doc_id. A file
++                // whose mtime moved but whose bytes did not comes back
++                // `Unchanged` from the hash gate, and then it has touched no
++                // link answer either.
+                 Some((id, _, _)) => {
+-                    self.index_one(&tx, vault, abs, Some(id.clone()))?;
+-                    touched += 1;
+-                    notes_changed = true;
++                    if let IndexedNote::Indexed(_) =
++                        self.index_one(&tx, vault, abs, Some(id.clone()))?
++                    {
++                        touched += 1;
++                        notes_changed = true;
++                    }
+                 }
+                 // New file.
+                 None => {
+@@ -481,25 +513,30 @@ impl Index {
+     /// 1000-file drop must not cost the other 999 their index rows. A file whose
+     /// read fails has written nothing to the transaction yet (`index_one` reads
+     /// and parses before it touches SQL), so skipping it leaves no partial row.
+-    pub fn index_notes(
+-        &self,
+-        vault: &Path,
+-        abs_paths: &[PathBuf],
+-    ) -> AppResult<Vec<(PathBuf, AppError)>> {
++    ///
++    /// Paths whose bytes are already indexed come back in
++    /// [`IndexOutcome::unchanged`]: they wrote nothing and are excluded from the
++    /// link pass (see `index_one`'s hash gate). The caller passes that on to the
++    /// UI so it can skip its own work.
++    pub fn index_notes(&self, vault: &Path, abs_paths: &[PathBuf]) -> AppResult<IndexOutcome> {
+         if abs_paths.is_empty() {
+-            return Ok(Vec::new());
++            return Ok(IndexOutcome::default());
+         }
+         let started = Instant::now();
+         let tx = self.conn.unchecked_transaction()?;
+-        let mut failures: Vec<(PathBuf, AppError)> = Vec::new();
++        let mut out = IndexOutcome::default();
+         let mut touched: Vec<String> = Vec::with_capacity(abs_paths.len());
+         for abs in abs_paths {
+             let outcome = rel_from_abs(vault, abs)
+                 .and_then(|rel| self.id_for_path(&tx, &rel))
+                 .and_then(|reuse_id| self.index_one(&tx, vault, abs, reuse_id));
+             match outcome {
+-                Ok(id) => touched.push(id),
+-                Err(e) => failures.push((abs.clone(), e)),
++                Ok(IndexedNote::Indexed(id)) => touched.push(id),
++                // Nothing was rewritten, so no link answer can have changed:
++                // keeping it out of `touched` is what makes a batch of untouched
++                // files cost no link pass at all.
++                Ok(IndexedNote::Unchanged) => out.unchanged.push(abs.clone()),
++                Err(e) => out.failures.push((abs.clone(), e)),
+             }
+         }
+         // The single pass the whole batch shares, narrowed to the notes it wrote.
+@@ -507,15 +544,15 @@ impl Index {
+             self.resolve_links(&tx, LinkScope::Touched(&touched))?;
+         }
+         tx.commit()?;
+-        log_batch("index_notes", abs_paths.len(), started);
+-        Ok(failures)
++        log_batch("index_notes", abs_paths.len(), out.unchanged.len(), started);
++        Ok(out)
+     }
+ 
+     /// Incrementally (re)index a single note by absolute path — a one-element
+     /// [`Index::index_notes`], so the two paths can never drift.
+     pub fn index_note(&self, vault: &Path, abs: &Path) -> AppResult<()> {
+-        let mut failures = self.index_notes(vault, &[abs.to_path_buf()])?;
+-        match failures.pop() {
++        let mut out = self.index_notes(vault, &[abs.to_path_buf()])?;
++        match out.failures.pop() {
+             Some((_, e)) => Err(e),
+             None => Ok(()),
+         }
+@@ -709,7 +746,7 @@ impl Index {
+         stem: &str,
+         mtime: i64,
+         reuse_id: Option<String>,
+-    ) -> AppResult<String> {
++    ) -> AppResult<IndexedNote> {
+         let id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+         tx.execute(
+             "INSERT INTO notes (id, path, title, mtime, sha256, frontmatter)
+@@ -730,18 +767,47 @@ impl Index {
+         )?;
+         tx.execute("DELETE FROM note_tags WHERE note_id = ?1", params![id])?;
+         tx.execute("DELETE FROM links WHERE src_note_id = ?1", params![id])?;
+-        Ok(id)
++        // Deliberately never `Unchanged`: the oversized path has no sha to gate
++        // on (it stores NULL), so it keeps rewriting its cheap title-only rows.
++        Ok(IndexedNote::Indexed(id))
+     }
+ 
+-    /// Returns the note id it wrote, so a batch can tell `resolve_links` exactly
+-    /// which notes it touched (see `LinkScope`).
++    /// Returns the note id it wrote and whether it wrote anything, so a batch can
++    /// tell `resolve_links` exactly which notes it touched (see `LinkScope`) and
++    /// the UI which paths it can ignore.
++    ///
++    /// ## The hash gate
++    ///
++    /// A path whose bytes already hash to the `sha256` stored for it is
++    /// UNCHANGED: the parse, the `notes`/`notes_fts`/`note_tags`/`links` rewrite
++    /// and the link pass are all skipped, and the file costs exactly one read and
++    /// one sha256. `rebuild` has always had a cheaper version of this (it skips
++    /// by mtime, without even reading); the incremental path was the odd one out,
++    /// so any source of spurious watcher events wrote the whole index again per
++    /// event — ~32 MB/s into `.context/index.sqlite` on an idle vault (#155,
++    /// Linux inotify read events). That source is fixed at the watcher; this is
++    /// the defence in depth, because a backup/git/cloud-sync tool rewriting
++    /// identical bytes, or a platform that reports an attribute change as a
++    /// modification, produces the same storm.
++    ///
++    /// Three things deliberately do NOT qualify as unchanged:
++    /// - a row whose `path` differs from this file's (`reuse_id` comes from
++    ///   `id_for_path`, so this only bites if a row moved mid-transaction);
++    /// - a row with `sha256 IS NULL` (an oversized note, or a pre-hash row) —
++    ///   there is nothing to compare, so re-index;
++    /// - a new file with no row at all (`reuse_id` is `None`), even when some
++    ///   OTHER note has the same bytes: identity is per path here, and a copy
++    ///   needs its own row.
++    ///
++    /// Only `mtime` is refreshed when it drifted, as a single-column UPDATE, so
++    /// the next `rebuild`'s mtime skip still fires instead of re-reading the file.
+     fn index_one(
+         &self,
+         tx: &Connection,
+         vault: &Path,
+         abs: &Path,
+         reuse_id: Option<String>,
+-    ) -> AppResult<String> {
++    ) -> AppResult<IndexedNote> {
+         let rel = rel_from_abs(vault, abs)?;
+         let stem = abs
+             .file_stem()
+@@ -774,9 +840,26 @@ impl Index {
+         }
+ 
+         let content = std::fs::read_to_string(abs)?;
+-        let parsed = parse_note(&content, stem);
+         let sha = sha256_hex(&content);
+ 
++        // The hash gate (see the doc comment). Before the parse, so an unchanged
++        // file costs the read and the hash and nothing more.
++        if let Some(id) = reuse_id.as_deref() {
++            if let Some((row_path, row_sha, row_mtime)) = self.row_state(tx, id)? {
++                if row_path == rel && row_sha.as_deref() == Some(sha.as_str()) {
++                    if row_mtime != mtime {
++                        tx.execute(
++                            "UPDATE notes SET mtime = ?1 WHERE id = ?2",
++                            params![mtime, id],
++                        )?;
++                    }
++                    return Ok(IndexedNote::Unchanged);
++                }
++            }
++        }
++
++        let parsed = parse_note(&content, stem);
++
+         let id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+ 
+         // Upsert the note row (by id — path is UNIQUE and may already differ).
+@@ -828,7 +911,29 @@ impl Index {
+             )?;
+         }
+ 
+-        Ok(id)
++        Ok(IndexedNote::Indexed(id))
++    }
++
++    /// The `(path, sha256, mtime)` the index currently holds for a doc_id — the
++    /// three columns the hash gate compares against the file on disk.
++    fn row_state(
++        &self,
++        tx: &Connection,
++        id: &str,
++    ) -> AppResult<Option<(String, Option<String>, i64)>> {
++        Ok(tx
++            .query_row(
++                "SELECT path, sha256, mtime FROM notes WHERE id = ?1",
++                params![id],
++                |r| {
++                    Ok((
++                        r.get::<_, String>(0)?,
++                        r.get::<_, Option<String>>(1)?,
++                        r.get::<_, i64>(2)?,
++                    ))
++                },
++            )
++            .optional()?)
+     }
+ 
+     fn upsert_folder(&self, tx: &Connection, vault: &Path, abs: &Path) -> AppResult<()> {
+@@ -1813,13 +1918,16 @@ fn file_mtime(abs: &Path) -> i64 {
+ /// single-note save logs nothing; a cold `rebuild` or a bulk file drop — the two
+ /// places where the old one-link-pass-per-file behaviour showed up as seconds of
+ /// stall — reports how long it took.
+-fn log_batch(label: &str, files: usize, started: Instant) {
++fn log_batch(label: &str, files: usize, unchanged: usize, started: Instant) {
+     if files < BATCH_LOG_MIN {
+         return;
+     }
+     let ms = started.elapsed().as_millis();
++    // `unchanged` is the number that makes a suspicious line readable: this is
++    // the log the #155 reporter counted, and "128 files (128 unchanged)" says
++    // "something is generating events" rather than "the index is thrashing".
+     log::info!(
+-        "[index] {label}: {files} files in {ms} ms ({:.2} ms/file)",
++        "[index] {label}: {files} files ({unchanged} unchanged) in {ms} ms ({:.2} ms/file)",
+         ms as f64 / files as f64
+     );
+ }
+@@ -2281,7 +2389,7 @@ mod tests {
+ 
+         let (_tmp_b, vb, abs_b) = seed_batch_vault();
+         let idx_b = Index::open(&vb).unwrap();
+-        assert!(idx_b.index_notes(&vb, &abs_b).unwrap().is_empty());
++        assert!(idx_b.index_notes(&vb, &abs_b).unwrap().failures.is_empty());
+ 
+         assert_eq!(file_derived_snapshot(&idx_a), file_derived_snapshot(&idx_b));
+ 
+@@ -2435,8 +2543,20 @@ mod tests {
+             "5 files must cost ONE whole-vault link pass"
+         );
+ 
+-        // The old shape, for contrast: one pass per file.
++        // Re-offering the identical files costs NOTHING: the hash gate takes all
++        // five, so the batch has nothing to resolve.
++        idx.index_notes(&v, &abs).unwrap();
++        assert_eq!(
++            idx.resolve_call_count(),
++            1,
++            "a batch of unchanged files must not run a link pass"
++        );
++
++        // The old shape, for contrast: one pass per file — with real edits, so
++        // the gate lets each one through.
+         for one in &abs {
++            let edited = format!("{}\n\nedited", std::fs::read_to_string(one).unwrap());
++            std::fs::write(one, edited).unwrap();
+             idx.index_note(&v, one).unwrap();
+         }
+         assert_eq!(idx.resolve_call_count(), 1 + abs.len());
+@@ -2447,7 +2567,7 @@ mod tests {
+ 
+         // An empty batch does no work at all (no transaction, no pass).
+         let before = idx.resolve_call_count();
+-        assert!(idx.index_notes(&v, &[]).unwrap().is_empty());
++        assert!(idx.index_notes(&v, &[]).unwrap().failures.is_empty());
+         assert!(idx.remove_notes(&v, &[]).unwrap().is_empty());
+         assert_eq!(idx.resolve_call_count(), before);
+     }
+@@ -2466,7 +2586,7 @@ mod tests {
+         abs.insert(2, missing.clone());
+         abs.push(outside.clone());
+ 
+-        let failures = idx.index_notes(&v, &abs).unwrap();
++        let failures = idx.index_notes(&v, &abs).unwrap().failures;
+         let failed: Vec<&PathBuf> = failures.iter().map(|(p, _)| p).collect();
+         assert_eq!(failures.len(), 2, "reported: {failed:?}");
+         assert!(failed.contains(&&missing));
+@@ -2480,6 +2600,221 @@ mod tests {
+         assert_eq!(idx.resolve_call_count(), 1);
+     }
+ 
++    // ---- the hash gate (#155) --------------------------------------------
++    //
++    // An event for a file whose bytes did not change must cost one read and one
++    // sha256 and nothing else. These pin that by asserting on the rows directly:
++    // a rewrite is invisible to any public getter (same values go back in), so
++    // only the tables can tell "skipped" from "rewritten identically".
++
++    /// Row counts + the columns `index_one` would rewrite, for one path.
++    fn row_fingerprint(idx: &Index, rel: &str) -> (String, Option<String>, i64, i64, i64, i64) {
++        let (id, rowid, title, sha, mtime): (String, i64, String, Option<String>, i64) = idx
++            .conn
++            .query_row(
++                "SELECT id, rowid, title, sha256, mtime FROM notes WHERE path = ?1",
++                params![rel],
++                |r| {
++                    Ok((
++                        r.get(0)?,
++                        r.get(1)?,
++                        r.get(2)?,
++                        r.get::<_, Option<String>>(3)?,
++                        r.get(4)?,
++                    ))
++                },
++            )
++            .unwrap();
++        let count = |sql: &str, p: &dyn rusqlite::ToSql| -> i64 {
++            idx.conn.query_row(sql, params![p], |r| r.get(0)).unwrap()
++        };
++        (
++            title,
++            sha,
++            mtime,
++            count("SELECT COUNT(*) FROM notes_fts WHERE rowid = ?1", &rowid),
++            count("SELECT COUNT(*) FROM note_tags WHERE note_id = ?1", &id),
++            count("SELECT COUNT(*) FROM links WHERE src_note_id = ?1", &id),
++        )
++    }
++
++    #[test]
++    fn reindexing_identical_bytes_changes_nothing_and_runs_no_link_pass() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        write_note(&v, "Alpha.md", "# Alpha\n\n#tag see [[Beta]]").unwrap();
++        write_note(&v, "Beta.md", "# Beta").unwrap();
++        let idx = Index::open(&v).unwrap();
++        idx.index_notes(&v, &[v.join("Alpha.md"), v.join("Beta.md")])
++            .unwrap();
++        let before = row_fingerprint(&idx, "Alpha.md");
++        assert_eq!((before.3, before.4, before.5), (1, 1, 1), "precondition");
++        let passes = idx.resolve_call_count();
++
++        // The whole batch is byte-identical to what is indexed.
++        let out = idx
++            .index_notes(&v, &[v.join("Alpha.md"), v.join("Beta.md")])
++            .unwrap();
++
++        assert!(out.failures.is_empty());
++        assert_eq!(
++            out.unchanged,
++            vec![v.join("Alpha.md"), v.join("Beta.md")],
++            "both paths must come back as unchanged"
++        );
++        assert_eq!(row_fingerprint(&idx, "Alpha.md"), before);
++        assert_eq!(
++            idx.resolve_call_count(),
++            passes,
++            "nothing was touched, so the batch must run NO link pass"
++        );
++    }
++
++    #[test]
++    fn identical_bytes_with_a_moved_mtime_refresh_only_the_mtime() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        write_note(&v, "Alpha.md", "# Alpha\n\n#tag see [[Beta]]").unwrap();
++        let idx = Index::open(&v).unwrap();
++        idx.index_notes(&v, &[v.join("Alpha.md")]).unwrap();
++        // Pretend the row's mtime drifted from the file's (a touch, a restore).
++        idx.conn
++            .execute("UPDATE notes SET mtime = 0 WHERE path = 'Alpha.md'", [])
++            .unwrap();
++        let before = row_fingerprint(&idx, "Alpha.md");
++        assert_eq!(before.2, 0);
++
++        let out = idx.index_notes(&v, &[v.join("Alpha.md")]).unwrap();
++
++        assert_eq!(out.unchanged, vec![v.join("Alpha.md")]);
++        let after = row_fingerprint(&idx, "Alpha.md");
++        assert_eq!(
++            after.2,
++            file_mtime(&v.join("Alpha.md")),
++            "mtime must be refreshed, or `rebuild`'s mtime skip re-reads this file forever"
++        );
++        assert_ne!(after.2, before.2);
++        // Everything else is untouched.
++        assert_eq!(
++            (after.0, after.1, after.3, after.4, after.5),
++            (before.0, before.1, before.3, before.4, before.5)
++        );
++    }
++
++    #[test]
++    fn changed_bytes_are_reindexed() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        write_note(&v, "Alpha.md", "# Alpha\n\nold body").unwrap();
++        let idx = Index::open(&v).unwrap();
++        idx.index_notes(&v, &[v.join("Alpha.md")]).unwrap();
++        let before = row_fingerprint(&idx, "Alpha.md");
++
++        write_note(&v, "Alpha.md", "# Renamed\n\n#fresh new body [[Beta]]").unwrap();
++        let out = idx.index_notes(&v, &[v.join("Alpha.md")]).unwrap();
++
++        assert!(out.unchanged.is_empty(), "the bytes changed");
++        let after = row_fingerprint(&idx, "Alpha.md");
++        assert_eq!(after.0, "Renamed", "title re-derived");
++        assert_ne!(after.1, before.1, "sha256 rewritten");
++        assert_eq!((after.4, after.5), (1, 1), "the new tag and link landed");
++        let body: String = idx
++            .conn
++            .query_row(
++                "SELECT body FROM notes_fts WHERE rowid =
++                   (SELECT rowid FROM notes WHERE path = 'Alpha.md')",
++                [],
++                |r| r.get(0),
++            )
++            .unwrap();
++        assert!(body.contains("new body"), "FTS rewritten: {body:?}");
++    }
++
++    /// A NULL sha is "we don't know what is in this file" — an oversized note, or
++    /// a row written before hashing existed. It must never gate anything out.
++    #[test]
++    fn a_row_with_a_null_sha_is_treated_as_changed() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        write_note(&v, "Alpha.md", "# Alpha\n\nbody").unwrap();
++        let idx = Index::open(&v).unwrap();
++        idx.index_notes(&v, &[v.join("Alpha.md")]).unwrap();
++        idx.conn
++            .execute("UPDATE notes SET sha256 = NULL WHERE path = 'Alpha.md'", [])
++            .unwrap();
++
++        let out = idx.index_notes(&v, &[v.join("Alpha.md")]).unwrap();
++
++        assert!(out.unchanged.is_empty(), "a NULL sha counts as changed");
++        assert!(
++            row_fingerprint(&idx, "Alpha.md").1.is_some(),
++            "and the re-index restores it"
++        );
++    }
++
++    /// The gate is per PATH, not per content: a copy (or an external rename into
++    /// a new name) has no row of its own, so it is indexed even though some other
++    /// note holds exactly the same bytes.
++    #[test]
++    fn identical_bytes_at_a_new_path_are_indexed_not_unchanged() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        let body = "# Alpha\n\nidentical bytes";
++        write_note(&v, "Alpha.md", body).unwrap();
++        let idx = Index::open(&v).unwrap();
++        idx.index_notes(&v, &[v.join("Alpha.md")]).unwrap();
++
++        write_note(&v, "Copy.md", body).unwrap();
++        let out = idx.index_notes(&v, &[v.join("Copy.md")]).unwrap();
++
++        assert!(
++            out.unchanged.is_empty(),
++            "a path with no row is never gated"
++        );
++        let ids: Vec<String> = idx
++            .conn
++            .prepare("SELECT id FROM notes ORDER BY path")
++            .unwrap()
++            .query_map([], |r| r.get(0))
++            .unwrap()
++            .map(|r| r.unwrap())
++            .collect();
++        assert_eq!(ids.len(), 2);
++        assert_ne!(ids[0], ids[1], "the copy gets its own doc_id");
++    }
++
++    #[test]
++    fn a_mixed_batch_reports_exactly_the_unchanged_paths() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        for rel in ["Same.md", "Edited.md", "Touched.md"] {
++            write_note(&v, rel, &format!("# {rel}\n\nbody")).unwrap();
++        }
++        let idx = Index::open(&v).unwrap();
++        let known: Vec<PathBuf> = ["Same.md", "Edited.md", "Touched.md"]
++            .iter()
++            .map(|r| v.join(r))
++            .collect();
++        idx.index_notes(&v, &known).unwrap();
++
++        // Same: nothing. Edited: new bytes. Touched: same bytes, stale mtime.
++        // New: never seen before.
++        write_note(&v, "Edited.md", "# Edited.md\n\ndifferent body").unwrap();
++        idx.conn
++            .execute("UPDATE notes SET mtime = 0 WHERE path = 'Touched.md'", [])
++            .unwrap();
++        write_note(&v, "New.md", "# New\n\nbody").unwrap();
++
++        let batch: Vec<PathBuf> = ["Same.md", "Edited.md", "Touched.md", "New.md"]
++            .iter()
++            .map(|r| v.join(r))
++            .collect();
++        let out = idx.index_notes(&v, &batch).unwrap();
++
++        assert!(out.failures.is_empty());
++        assert_eq!(out.unchanged, vec![v.join("Same.md"), v.join("Touched.md")]);
++    }
++
+     /// A folder delete arrives as several watcher paths; batching removals must
+     /// prune the subtree exactly as the per-path loop did.
+     #[test]
+diff --git a/app/apps/desktop/src-tauri/src/watcher.rs b/app/apps/desktop/src-tauri/src/watcher.rs
+index 33a301eb..3e0365f6 100644
+--- a/app/apps/desktop/src-tauri/src/watcher.rs
++++ b/app/apps/desktop/src-tauri/src/watcher.rs
+@@ -10,10 +10,25 @@
+ //!
+ //! `.context/` and dotfolders are ignored so the app's own state dir never
+ //! feeds the note pipeline (spec 02 §2 hard rule).
++//!
++//! Read-only events are dropped at the source ([`should_forward`]): on Linux
++//! `notify`'s inotify backend reports every open/read/close-after-read, and
++//! indexing a note is itself a read, so forwarding those made the watcher feed
++//! itself forever.
++//!
++//! Whatever still gets through is priced by content, not by the event: the index
++//! compares each file's sha256 against the row it already holds, and a path whose
++//! bytes did not change is reported back as `unchanged` and forwarded to the UI
++//! as `unchanged: true` on its [`FileChanged`] entry. The entry is NOT dropped —
++//! the TS side counts on exactly one watcher echo per path it materialises
++//! (`registry.consumeMaterialized`) and on a `modified` cancelling a pending disk
++//! delete — it just lets the UI and the sync layer skip the expensive half
++//! (re-reading the note, diffing it into the CRDT, re-uploading it).
+ 
+ use crate::index::Index;
+ use crate::vault::{rel_from_abs, rel_path_is_ignored};
+-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
++use notify::event::{AccessKind, AccessMode};
++use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+ use serde::Serialize;
+ use std::collections::HashSet;
+ use std::path::{Path, PathBuf};
+@@ -37,6 +52,19 @@ pub struct FileChanged {
+     pub path: String,
+     /// "modified" | "removed" | "tree" (folder/structure change).
+     pub kind: String,
++    /// The index re-read this file and its bytes were identical to what it had
++    /// already indexed, so nothing was rewritten — the event fired for something
++    /// that is not a content change (a metadata/attribute touch, a backup or
++    /// cloud-sync tool rewriting the same bytes, our own echo).
++    ///
++    /// Always `false` for `removed` and `tree`, which have no content to compare.
++    ///
++    /// The entry is still emitted rather than filtered out, because the TS side
++    /// treats the echo itself as meaningful: `registry.consumeMaterialized`
++    /// expects exactly one per path it wrote, and a `modified` inside the
++    /// `DISK_DELETE_GRACE_MS` window is what cancels a pending disk delete. The
++    /// flag only tells it to skip the work that would have no effect.
++    pub unchanged: bool,
+ }
+ 
+ /// Payload of the single `files-changed` event emitted per batch.
+@@ -109,6 +137,40 @@ impl Drop for VaultWatcher {
+     }
+ }
+ 
++/// Should this raw `notify` event reach the drain thread at all?
++///
++/// Everything is forwarded EXCEPT a pure read: `Access(_)` in every shape
++/// (open, read, close-after-read) other than `Access(Close(Write))`.
++///
++/// Why. Linux is the only platform that reports reads. `notify`'s inotify
++/// backend subscribes with `WatchMask::OPEN` alongside CREATE/MODIFY/DELETE, so
++/// merely *reading* a file — or a directory — produces `EventKind::Access`
++/// events. Indexing a batch reads every note in it, which produced a fresh
++/// round of Access events, which `plan_batch` classified as `modified` (it only
++/// asks whether the path exists), which re-indexed them: a vault that nobody
++/// touched re-indexed itself 264–335 times a minute and wrote ~32 MB/s into
++/// `.context/index.sqlite` (#155). macOS/FSEvents and Windows
++/// `ReadDirectoryChangesW` never emit Access, so their behaviour is unchanged.
++///
++/// Two deliberate exceptions:
++/// - `Access(Close(Write))` is KEPT. On inotify that is `IN_CLOSE_WRITE`, the
++///   reliable "the writer is done" signal for editors that write a file in
++///   place (no temp+rename, so no Create/Rename to lean on). It follows a write,
++///   never a read, so it cannot feed the loop.
++/// - An event carrying the Rescan flag is KEPT whatever its kind: that flag
++///   means the backend's queue overflowed and state may have been missed, so it
++///   must still reach the drain thread and re-index the batch.
++pub(crate) fn should_forward(event: &notify::Event) -> bool {
++    if event.need_rescan() {
++        return true;
++    }
++    match event.kind {
++        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
++        EventKind::Access(_) => false,
++        _ => true,
++    }
++}
++
+ /// Start watching `vault`. Returns a handle that must be kept alive.
+ pub fn start(
+     vault: PathBuf,
+@@ -119,6 +181,9 @@ pub fn start(
+ 
+     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+         if let Ok(event) = res {
++            if !should_forward(&event) {
++                return;
++            }
+             // Forward the event's paths; the drain thread decides what to do.
+             let _ = tx.send(event.paths);
+         }
+@@ -267,6 +332,7 @@ fn process_batch(
+     // held for the whole batch. A UI command only ever waits for the chunk in
+     // flight. See `CHUNK`.
+     let mut chunks = 0usize;
++    let mut unchanged: HashSet<PathBuf> = HashSet::new();
+     for slice in plan.modified.chunks(CHUNK) {
+         if stop.load(Ordering::Relaxed) {
+             return;
+@@ -277,10 +343,11 @@ fn process_batch(
+         chunks += 1;
+         {
+             let guard = index.lock().unwrap();
+-            if let Ok(failures) = guard.index_notes(vault, slice) {
+-                for (path, err) in failures {
++            if let Ok(outcome) = guard.index_notes(vault, slice) {
++                for (path, err) in outcome.failures {
+                     eprintln!("[watcher] index failed for {}: {err}", path.display());
+                 }
++                unchanged.extend(outcome.unchanged);
+             }
+         }
+     }
+@@ -307,18 +374,32 @@ fn process_batch(
+     let _ = app.emit(
+         "files-changed",
+         FilesChanged {
+-            changes: plan
+-                .changes
+-                .into_iter()
+-                .map(|c| FileChanged {
+-                    path: c.rel,
+-                    kind: c.kind.to_string(),
+-                })
+-                .collect(),
++            changes: mark_unchanged(plan.changes, &unchanged),
+         },
+     );
+ }
+ 
++/// Turn the plan into the emitted payload, flagging the `modified` entries the
++/// index reported as byte-identical.
++///
++/// Split out so the flag can be tested without an `AppHandle`. Matching is by
++/// absolute path, which is exactly what `index_notes` was handed and hands back.
++/// `removed` and `tree` entries are always `unchanged: false` — there is no
++/// content comparison behind them.
++pub(crate) fn mark_unchanged(
++    changes: Vec<PlannedChange>,
++    unchanged: &HashSet<PathBuf>,
++) -> Vec<FileChanged> {
++    changes
++        .into_iter()
++        .map(|c| FileChanged {
++            unchanged: c.kind == "modified" && unchanged.contains(&c.abs),
++            path: c.rel,
++            kind: c.kind.to_string(),
++        })
++        .collect()
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -468,7 +549,11 @@ mod tests {
+             .into_iter()
+             .collect();
+         let plan = plan_batch(&v, batch);
+-        assert!(idx.index_notes(&v, &plan.modified).unwrap().is_empty());
++        assert!(idx
++            .index_notes(&v, &plan.modified)
++            .unwrap()
++            .failures
++            .is_empty());
+         assert!(idx.remove_notes(&v, &plan.removed).unwrap().is_empty());
+ 
+         let paths: Vec<String> = idx
+@@ -479,4 +564,157 @@ mod tests {
+             .collect();
+         assert_eq!(paths, vec!["Alpha.md".to_string()]);
+     }
++
++    /// The flag the UI reads: only `modified` entries the index reported as
++    /// byte-identical carry it, and nothing is ever dropped from the event.
++    #[test]
++    fn mark_unchanged_flags_only_the_matching_modified_entries() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        write_note(&v, "Same.md", "# Same").unwrap();
++        write_note(&v, "Edited.md", "# Edited").unwrap();
++        std::fs::create_dir_all(v.join("folder")).unwrap();
++
++        let batch: HashSet<PathBuf> = [
++            v.join("Same.md"),
++            v.join("Edited.md"),
++            v.join("Gone.md"),
++            v.join("folder"),
++        ]
++        .into_iter()
++        .collect();
++        let plan = plan_batch(&v, batch);
++
++        // The index saw Same.md as byte-identical. `Gone.md` is named too, to
++        // pin that a non-`modified` entry can never pick the flag up.
++        let unchanged: HashSet<PathBuf> =
++            [v.join("Same.md"), v.join("Gone.md")].into_iter().collect();
++        let changes = mark_unchanged(plan.changes, &unchanged);
++
++        assert_eq!(
++            changes,
++            vec![
++                FileChanged {
++                    path: "Edited.md".into(),
++                    kind: "modified".into(),
++                    unchanged: false,
++                },
++                FileChanged {
++                    path: "Gone.md".into(),
++                    kind: "removed".into(),
++                    unchanged: false,
++                },
++                FileChanged {
++                    path: "Same.md".into(),
++                    kind: "modified".into(),
++                    unchanged: true,
++                },
++                FileChanged {
++                    path: "folder".into(),
++                    kind: "tree".into(),
++                    unchanged: false,
++                },
++            ],
++            "every path is still reported; only the modified match is flagged"
++        );
++    }
++
++    /// The flag is derived from what the index actually did, not from the event:
++    /// re-indexing the same bytes must produce `unchanged: true` end to end.
++    #[test]
++    fn a_no_op_rewrite_reaches_the_event_as_unchanged() {
++        let tmp = tempfile::tempdir().unwrap();
++        let v = tmp.path().to_path_buf();
++        write_note(&v, "Alpha.md", "# Alpha\n\nbody").unwrap();
++        let idx = Index::open(&v).unwrap();
++        let plan = plan_batch(&v, [v.join("Alpha.md")]);
++        assert!(
++            idx.index_notes(&v, &plan.modified)
++                .unwrap()
++                .unchanged
++                .is_empty(),
++            "first pass indexes it"
++        );
++
++        // A second watcher event for a file nobody edited.
++        let plan = plan_batch(&v, [v.join("Alpha.md")]);
++        let out = idx.index_notes(&v, &plan.modified).unwrap();
++        let changes = mark_unchanged(plan.changes, &out.unchanged.into_iter().collect());
++        assert_eq!(
++            changes,
++            vec![FileChanged {
++                path: "Alpha.md".into(),
++                kind: "modified".into(),
++                unchanged: true,
++            }]
++        );
++    }
++
++    /// Linux-only feedback loop (#155). Every read-shaped inotify event must die
++    /// in the callback, or indexing (which reads the notes) re-dirties them.
++    #[test]
++    fn read_only_access_events_are_dropped() {
++        use notify::event::{AccessKind, AccessMode};
++        use notify::{Event, EventKind};
++
++        let read_kinds = [
++            EventKind::Access(AccessKind::Any),
++            EventKind::Access(AccessKind::Read),
++            EventKind::Access(AccessKind::Open(AccessMode::Any)),
++            EventKind::Access(AccessKind::Open(AccessMode::Read)),
++            EventKind::Access(AccessKind::Close(AccessMode::Any)),
++            EventKind::Access(AccessKind::Close(AccessMode::Read)),
++            EventKind::Access(AccessKind::Other),
++        ];
++        for kind in read_kinds {
++            let event = Event::new(kind).add_path(PathBuf::from("/vault/Note.md"));
++            assert!(
++                !should_forward(&event),
++                "{kind:?} is a read and must not reach the drain thread"
++            );
++        }
++    }
++
++    /// Everything that can mean "the bytes on disk changed" still gets through —
++    /// including `Close(Write)`, the in-place editor's end-of-write signal.
++    #[test]
++    fn writes_renames_and_deletes_are_forwarded() {
++        use notify::event::{
++            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
++            RenameMode,
++        };
++        use notify::{Event, EventKind};
++
++        let write_kinds = [
++            EventKind::Create(CreateKind::Any),
++            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
++            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
++            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
++            EventKind::Remove(RemoveKind::Any),
++            EventKind::Access(AccessKind::Close(AccessMode::Write)),
++            EventKind::Any,
++            EventKind::Other,
++        ];
++        for kind in write_kinds {
++            let event = Event::new(kind).add_path(PathBuf::from("/vault/Note.md"));
++            assert!(
++                should_forward(&event),
++                "{kind:?} may have changed the file and must be forwarded"
++            );
++        }
++    }
++
++    /// The Rescan flag means the backend's queue overflowed, so its kind is not
++    /// to be trusted — forward it even though it claims to be a read.
++    #[test]
++    fn a_rescan_flagged_access_event_is_forwarded() {
++        use notify::event::{AccessKind, Flag};
++        use notify::{Event, EventKind};
++
++        let event = Event::new(EventKind::Access(AccessKind::Read))
++            .add_path(PathBuf::from("/vault/Note.md"))
++            .set_flag(Flag::Rescan);
++        assert!(event.need_rescan());
++        assert!(should_forward(&event));
++    }
+ }
+diff --git a/app/apps/desktop/src-tauri/tests/data_volume_bench.rs b/app/apps/desktop/src-tauri/tests/data_volume_bench.rs
+index e65ace45..d87d1caa 100644
+--- a/app/apps/desktop/src-tauri/tests/data_volume_bench.rs
++++ b/app/apps/desktop/src-tauri/tests/data_volume_bench.rs
+@@ -249,12 +249,20 @@ fn data_volume_bench() {
+         .collect();
+ 
+     let t = Instant::now();
+-    let failures = idx.index_notes(&vault, &batch).unwrap();
++    let outcome = idx.index_notes(&vault, &batch).unwrap();
+     let batched_ms = t.elapsed().as_millis();
+-    assert!(failures.is_empty(), "batch reported failures: {failures:?}");
++    assert!(
++        outcome.failures.is_empty(),
++        "batch reported failures: {:?}",
++        outcome.failures
++    );
++    // Every file in this batch is byte-identical to what is already indexed, so
++    // the hash gate should take all of them: this times the cheap path (one read
++    // + one sha256 per file, no link pass), which is the one an idle vault pays.
+     println!(
+-        "index_notes({batch_n}):  {batched_ms:>6} ms  ({:.2} ms/note, 1 link pass)",
+-        batched_ms as f64 / batch_n as f64
++        "index_notes({batch_n}):  {batched_ms:>6} ms  ({:.2} ms/note, {} unchanged)",
++        batched_ms as f64 / batch_n as f64,
++        outcome.unchanged.len()
+     );
+ 
+     // The same work the old way: one call, one transaction, one link pass each.
+@@ -285,9 +293,17 @@ fn data_volume_bench() {
+         dropped.push(vault.join(&rel));
+     }
+     let t = Instant::now();
+-    let failures = idx.index_notes(&vault, &dropped).unwrap();
++    let outcome = idx.index_notes(&vault, &dropped).unwrap();
+     let drop_ms = t.elapsed().as_millis();
+-    assert!(failures.is_empty(), "drop reported failures: {failures:?}");
++    assert!(
++        outcome.failures.is_empty(),
++        "drop reported failures: {:?}",
++        outcome.failures
++    );
++    assert!(
++        outcome.unchanged.is_empty(),
++        "every dropped file is new, so none can be unchanged"
++    );
+     println!(
+         "drop {drop_n} + index:  {drop_ms:>6} ms  ({:.2} ms/note)",
+         drop_ms as f64 / drop_n as f64
+diff --git a/app/apps/desktop/src/App.tsx b/app/apps/desktop/src/App.tsx
+index 24a8271f..76afda83 100644
+--- a/app/apps/desktop/src/App.tsx
++++ b/app/apps/desktop/src/App.tsx
+@@ -23,7 +23,7 @@ import { bridgeManager } from "./lib/bridge";
+ import { BRAND_NAME } from "./lib/brand";
+ import * as ipc from "./lib/ipc";
+ import * as perf from "./lib/perf";
+-import { implicatedFolders } from "./lib/tree/lazyTree";
++import { implicatedFolders, refreshWorthy } from "./lib/tree/lazyTree";
+ import { syncManager } from "./lib/sync/docSession";
+ import {
+   backgroundUpdateCheck,
+@@ -862,7 +862,13 @@ export default function App() {
+     let pendingFolders: Set<string> | null = new Set();
+     // The file changes themselves (last kind per path), for the titles patch.
+     let pendingChanges = new Map<string, "modified" | "removed">();
+-    const scheduleRefresh = (changes: ipc.FileChanged[]) => {
++    const scheduleRefresh = (batch: ipc.FileChanged[]) => {
++      // Entries whose bytes did not move (#155) change nothing the sidebar, the
++      // titles or the backlinks render, so they neither implicate a folder nor
++      // arm the timer. An all-unchanged batch — an idle vault under a cloud-sync
++      // agent, or Linux's read events — must cost exactly one `filter`.
++      const changes = refreshWorthy(batch);
++      if (changes.length === 0) return;
+       if (pendingFolders) {
+         const dirs = implicatedFolders(changes);
+         if (dirs) for (const d of dirs) pendingFolders.add(d);
+@@ -907,6 +913,15 @@ export default function App() {
+             } else {
+               // Route the edit into the bridge; it debounces, drops our own echo,
+               // and merges genuine external edits live into the open Y.Text.
++              //
++              // `unchanged` entries go in too, deliberately. This is the one
++              // consumer that reconciles the open doc against the FILE rather
++              // than against the index, and those two can disagree while the
++              // bytes sit still (a cold-applied update, a hydrate that lost a
++              // race). It is 150ms-debounced, echo-guarded by `lastWrittenHash`
++              // and scoped to the single open note, so the worst an idle vault's
++              // read-event storm costs here is one `readNote` — nothing like the
++              // tree re-list, title re-read and graph rebuild below.
+               bridgeManager.handleFileChanged(e.path);
+             }
+             // …and the sync layer sees it either way. Deleting the note you have
+diff --git a/app/apps/desktop/src/components/HtmlView.tsx b/app/apps/desktop/src/components/HtmlView.tsx
+index 625a55f8..572880ed 100644
+--- a/app/apps/desktop/src/components/HtmlView.tsx
++++ b/app/apps/desktop/src/components/HtmlView.tsx
+@@ -33,10 +33,15 @@ export function HtmlView({ path }: { path: string }) {
+     };
+     void load();
+ 
+-    // Follow external edits, but never clobber an unsaved source draft.
++    // Follow external edits, but never clobber an unsaved source draft. An
++    // `unchanged` event (#155) is by definition not an edit — same sha256 as the
++    // index already held — so re-reading the file would only re-render what is
++    // already on screen.
+     let unlisten: (() => void) | undefined;
+     void ipc.onFileChanged((e) => {
+-      if (e.path === path && e.kind === "modified" && !dirtyRef.current) void load();
++      if (e.path === path && e.kind === "modified" && !e.unchanged && !dirtyRef.current) {
++        void load();
++      }
+     }).then((fn) => {
+       unlisten = fn;
+     });
+diff --git a/app/apps/desktop/src/lib/graph/useGraphData.ts b/app/apps/desktop/src/lib/graph/useGraphData.ts
+index 8522334d..74b96dcc 100644
+--- a/app/apps/desktop/src/lib/graph/useGraphData.ts
++++ b/app/apps/desktop/src/lib/graph/useGraphData.ts
+@@ -152,7 +152,10 @@ export function useGraphData(): GraphDataState {
+     let unlisten: UnlistenFn | undefined;
+     let cancelled = false;
+     onFilesChanged((changes) => {
+-      if (changes.length > 0) collect(changes);
++      // Same bytes as the index already held (#155): no link, tag or title a
++      // node or edge is built from can have moved, so the graph is not dirty.
++      const real = changes.filter((c) => !c.unchanged);
++      if (real.length > 0) collect(real);
+     }).then((fn) => {
+       if (cancelled) fn();
+       else unlisten = fn;
+diff --git a/app/apps/desktop/src/lib/ipc.ts b/app/apps/desktop/src/lib/ipc.ts
+index c1f6faf2..6775879c 100644
+--- a/app/apps/desktop/src/lib/ipc.ts
++++ b/app/apps/desktop/src/lib/ipc.ts
+@@ -179,6 +179,22 @@ export interface ResolvedLink {
+ export interface FileChanged {
+   path: string;
+   kind: "modified" | "removed" | "tree";
++  /**
++   * The bytes on disk did NOT change: the indexer read the file and its sha256
++   * equalled the one the SQLite index already held for this same path (#155).
++   *
++   * Only ever set on `modified` — `removed` and `tree` always report `false`.
++   * Optional so an older Rust build (whose payload has no such field) still
++   * decodes; a missing value means `false`, i.e. "assume the bytes moved".
++   *
++   * Sources: our own egest echo, a materialized placeholder echoing back, a
++   * `git checkout` / cloud-sync / backup tool rewriting identical bytes, and the
++   * spurious inotify read events that made an idle Linux vault re-index itself.
++   * Rust never drops these entries — the bookkeeping they carry (a materialized
++   * echo to consume, a pending disk delete to cancel) is real; what they must
++   * not do is re-index, re-render or re-upload anything.
++   */
++  unchanged?: boolean;
+ }
+ 
+ /** One attachment file's metadata (mirrors the Rust `AttachmentMeta`). */
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts b/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts
+index 7e1efb1f..2acba1a0 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/docSessionBulkOrder.test.ts
+@@ -176,6 +176,11 @@ const storeHooks = vi.hoisted(() => ({
+   opts: null as VaultDocStoreOptions | null,
+   open: null as string | null,
+   promoted: [] as string[],
++  /** Docs the hot tier is holding a LIVE bridge for, by docId. A watcher event
++   *  for one of these is supposed to be merged into the doc immediately. */
++  residents: new Set<string>(),
++  /** Every `peekResident(...)?.ingestNow()` the sync layer actually made. */
++  residentIngests: [] as string[],
+ }));
+ 
+ vi.mock("../vaultDocStore", () => ({
+@@ -196,8 +201,14 @@ vi.mock("../vaultDocStore", () => ({
+     }
+     async demote() {}
+     async release() {}
+-    peekResident() {
+-      return null;
++    peekResident(docId: string) {
++      if (!storeHooks.residents.has(docId)) return null;
++      return {
++        ingestNow: async () => {
++          storeHooks.residentIngests.push(docId);
++          return false;
++        },
++      };
+     }
+     suppressedDoc() {
+       return storeHooks.open;
+@@ -290,6 +301,8 @@ beforeEach(() => {
+   storeHooks.opts = null;
+   storeHooks.open = null;
+   storeHooks.promoted = [];
++  storeHooks.residents = new Set();
++  storeHooks.residentIngests = [];
+   connects.order = [];
+   connects.destroyed = [];
+ });
+@@ -703,6 +716,153 @@ describe("SyncManager.handleLocalFilesChanged", () => {
+     expect(fakeRegistry.pull).toHaveBeenCalledTimes(1);
+     vi.useRealTimers();
+   });
++
++  // ---- `unchanged` entries (#155) ------------------------------------------
++  //
++  // Rust now says, per `modified` entry, whether the file's sha256 still equals
++  // the one the index already held. Our own egest echo, a materialized
++  // placeholder echoing back, `git checkout` restoring identical bytes, a backup
++  // tool touching files, and — the trigger — Linux's spurious inotify READ
++  // events all arrive that way. An idle vault can emit hundreds of them, so they
++  // have to cost the sync layer exactly its bookkeeping and nothing else.
++
++  it("an unchanged entry for a mapped doc queues no push and never re-ingests a resident doc", async () => {
++    vi.useFakeTimers();
++    fakeRegistry.getMapping.mockImplementation((relPath: string) =>
++      relPath === "Idle.md" ? { vaultId: "collection-1", docId: "i1" } : null,
++    );
++    fakeRegistry.pushed.add("i1");
++    storeHooks.residents.add("i1"); // a live bridge in the hot tier
++    const sm = new SyncManager();
++    await enable(sm);
++    fakeRegistry.pull.mockClear();
++
++    sm.handleLocalFilesChanged([{ path: "Idle.md", kind: "modified", unchanged: true }]);
++    expect(sm.inspectDoc("i1").queued).toBe(false);
++    expect(storeHooks.residentIngests).toEqual([]);
++    expect(sm.hasPendingRegistryPull()).toBe(false);
++    await vi.advanceTimersByTimeAsync(2_000);
++    expect(fakeRegistry.pull).not.toHaveBeenCalled();
++    expect(storeHooks.promoted).toEqual([]);
++    expect(connects.order).toEqual([]);
++
++    // The same path with NEW bytes is the ordinary path, untouched: queued,
++    // merged into the resident doc, and pushed.
++    sm.handleLocalFilesChanged([{ path: "Idle.md", kind: "modified" }]);
++    expect(sm.inspectDoc("i1").queued).toBe(true);
++    expect(storeHooks.residentIngests).toEqual(["i1"]);
++    await vi.advanceTimersByTimeAsync(2_000);
++    expect(storeHooks.promoted).toContain("i1");
++    fakeRegistry.getMapping.mockReturnValue(null);
++    vi.useRealTimers();
++  });
++
++  it("an unchanged entry still spends the registry's materialized echo", async () => {
++    // A materialized placeholder IS an unchanged `modified`: Rust wrote the
++    // 0-byte file and re-indexed it, so the watcher's read finds the sha it just
++    // stored. The claim has to be spent by the EVENT, not by what the event
++    // turned out to contain — otherwise the note's first real edit, whenever it
++    // comes, is the one that gets mistaken for the echo and dropped.
++    vi.useFakeTimers();
++    fakeRegistry.getMapping.mockImplementation((relPath: string) =>
++      relPath === "Fresh.md" ? { vaultId: "collection-1", docId: "f1" } : null,
++    );
++    fakeRegistry.materialized = new Set(["Fresh.md"]);
++    const sm = new SyncManager();
++    await enable(sm);
++
++    sm.handleLocalFilesChanged([{ path: "Fresh.md", kind: "modified", unchanged: true }]);
++    expect(fakeRegistry.materialized.size).toBe(0); // consumed, exactly once
++    await vi.advanceTimersByTimeAsync(2_000);
++    expect(connects.order).toEqual([]);
++    fakeRegistry.getMapping.mockReturnValue(null);
++    vi.useRealTimers();
++  });
++
++  it("an unchanged entry for an UNMAPPED path still asks for a registry pull", async () => {
++    // "Unchanged" is a statement about the index, not about the server. A file
++    // the registry does not map has never been registered, however old its bytes
++    // are — dropping it here is how a note stays invisible to the team forever.
++    vi.useFakeTimers();
++    const sm = new SyncManager();
++    await enable(sm);
++    fakeRegistry.pull.mockClear();
++
++    sm.handleLocalFilesChanged([{ path: "Unregistered.md", kind: "modified", unchanged: true }]);
++    expect(sm.hasPendingRegistryPull()).toBe(true);
++    await vi.advanceTimersByTimeAsync(300);
++    expect(fakeRegistry.pull).toHaveBeenCalledTimes(1);
++    vi.useRealTimers();
++  });
++
++  it("an unchanged entry does not reopen a permanent failure", async () => {
++    // The other verdict about the file's bytes. A note over `MAX_NOTE_BYTES`
++    // fails ONCE, permanently, without a socket; only bytes that actually moved
++    // can make it worth trying again. A read event re-queueing it would put the
++    // 10 MB read back on every watcher tick, forever.
++    vi.useFakeTimers();
++    fakeDisk.files.set("Huge.md", "x".repeat(11 * 1024 * 1024));
++    fakeRegistry.getMapping.mockImplementation((relPath: string) =>
++      relPath === "Huge.md" ? { vaultId: "collection-1", docId: "h1" } : null,
++    );
++    fakeRegistry.pathForDocId.mockImplementation((d: string) => (d === "h1" ? "Huge.md" : null));
++    const sm = new SyncManager();
++    await enable(sm);
++
++    sm.handleLocalFilesChanged([{ path: "Huge.md", kind: "modified" }]);
++    await vi.advanceTimersByTimeAsync(2_000);
++    await flush();
++    expect(sm.inspectDoc("h1").permanentFailure).toMatch(/too large/);
++
++    sm.handleLocalFilesChanged([{ path: "Huge.md", kind: "modified", unchanged: true }]);
++    expect(sm.inspectDoc("h1").permanentFailure).toMatch(/too large/);
++    expect(sm.inspectDoc("h1").queued).toBe(false);
++
++    // Trimmed under the ceiling — real new bytes, so the verdict is void.
++    sm.handleLocalFilesChanged([{ path: "Huge.md", kind: "modified" }]);
++    expect(sm.inspectDoc("h1").permanentFailure).toBeNull();
++    expect(sm.inspectDoc("h1").queued).toBe(true);
++
++    fakeRegistry.getMapping.mockReturnValue(null);
++    fakeRegistry.pathForDocId.mockReturnValue(null);
++    vi.useRealTimers();
++  });
++
++  it("an unchanged entry does not clear the `empty everywhere` verdict the file earned", async () => {
++    // `emptyEverywhere` and `permanentFailures` are cleared by the SAME skipped
++    // line, and both are verdicts about the file's BYTES — which an unchanged
++    // event says have not moved. Re-opening them would put the doc back in the
++    // work list on every read event, which is the "re-syncing 307 notes" bug
++    // wearing a different hat.
++    fakeRegistry.mappedNotes.mockReturnValue([{ docId: "e1", relPath: "Empty.md" }]);
++    fakeRegistry.getMapping.mockImplementation((relPath: string) =>
++      relPath === "Empty.md" ? { vaultId: "collection-1", docId: "e1" } : null,
++    );
++    fakeRegistry.pathForDocId.mockImplementation((d: string) => (d === "e1" ? "Empty.md" : null));
++    fakeRegistry.emptyOnDisk = new Set(["Empty.md"]);
++    fakeDisk.files.set("Empty.md", "");
++    const sm = new SyncManager();
++    await enable(sm);
++    engineHooks.settled = true;
++    engineHooks.opts!.onServerEmpty?.(["e1"], false);
++    await sm.whenBulkSyncSettled();
++    await flush();
++    expect(sm.inspectDoc("e1").emptyEverywhere).toBe(true);
++
++    sm.handleLocalFilesChanged([{ path: "Empty.md", kind: "modified", unchanged: true }]);
++    expect(sm.inspectDoc("e1").emptyEverywhere).toBe(true);
++    expect(sm.inspectDoc("e1").queued).toBe(false);
++
++    // New bytes void it: the placeholder may hold text now.
++    sm.handleLocalFilesChanged([{ path: "Empty.md", kind: "modified" }]);
++    expect(sm.inspectDoc("e1").emptyEverywhere).toBe(false);
++    expect(sm.inspectDoc("e1").queued).toBe(true);
++
++    sm.disable();
++    await sm.whenBulkSyncSettled();
++    fakeRegistry.getMapping.mockReturnValue(null);
++    fakeRegistry.pathForDocId.mockReturnValue(null);
++  });
+ });
+ 
+ /**
+@@ -814,6 +974,24 @@ describe("SyncManager — disk deletes propagate under a grace window", () => {
+     vi.useRealTimers();
+   });
+ 
++  it("an UNCHANGED `modified` inside the window cancels the delete just the same", async () => {
++    // An editor that saves by unlinking and rewriting, a `git checkout` back to
++    // HEAD, a rename-there-and-back: the rewritten bytes are identical, so the
++    // watcher reports `unchanged`. The delete is still off — the point of the
++    // `modified` half is that the file EXISTS, not that it differs (#155).
++    const sm = new SyncManager();
++    mapOne("Reverted.md");
++    await live(sm);
++
++    sm.handleLocalFilesChanged([{ path: "Reverted.md", kind: "removed" }]);
++    sm.handleLocalFilesChanged([{ path: "Reverted.md", kind: "modified", unchanged: true }]);
++    await drain();
++
++    expect(fakeRegistry.deletePath).not.toHaveBeenCalled();
++    expect(fakeDisk.trashed).toEqual([]);
++    vi.useRealTimers();
++  });
++
+   it("does not propagate when the file is back on disk by drain time", async () => {
+     const sm = new SyncManager();
+     mapOne("Checkout.md");
+diff --git a/app/apps/desktop/src/lib/sync/docSession.ts b/app/apps/desktop/src/lib/sync/docSession.ts
+index 943d3ff2..42aa6788 100644
+--- a/app/apps/desktop/src/lib/sync/docSession.ts
++++ b/app/apps/desktop/src/lib/sync/docSession.ts
+@@ -1330,7 +1330,14 @@ export class SyncManager implements InboundHost {
+    *    volume — is filtered inside that window instead.
+    */
+   handleLocalFilesChanged(
+-    changes: ReadonlyArray<{ path: string; kind: "modified" | "removed" | "tree" }>,
++    changes: ReadonlyArray<{
++      path: string;
++      kind: "modified" | "removed" | "tree";
++      /** The indexer found the file's sha256 equal to the index's — the bytes did
++       *  not move (`ipc.FileChanged.unchanged`). Bookkeeping still runs; the push
++       *  does not. Never set on `removed`/`tree`. */
++      unchanged?: boolean;
++    }>,
+   ): void {
+     const scope = this.scope;
+     if (!this.enabled || !scope || !scope.isCurrent()) return;
+@@ -1350,7 +1357,7 @@ export class SyncManager implements InboundHost {
+       if (kind !== "removed") continue;
+       if (this.queueDiskDelete(scope, relPath)) queuedDelete = true;
+     }
+-    for (const { path: relPath, kind } of changes) {
++    for (const { path: relPath, kind, unchanged } of changes) {
+       if (kind === "removed") continue; // handled above
+       if (kind === "tree") {
+         // Folders are NOT handled here, deliberately.
+@@ -1399,6 +1406,24 @@ export class SyncManager implements InboundHost {
+       // Belt and braces with the uploader's own `skip`: the open note's editor
+       // session owns its provider, and its bridge already ingests watcher events.
+       if (this.docStore?.suppressedDoc() === mapping.docId) continue;
++      // Same bytes as the index already held, so there is nothing new to send
++      // (#155). Everything ABOVE this line still ran, and each of those lines is
++      // kept deliberately:
++      //  - `consumeMaterialized`: the one-echo-per-materialized-path contract is
++      //    spent by the event, not by what the event turned out to contain — a
++      //    placeholder's echo IS an unchanged `modified`, and leaving the claim
++      //    unspent would make the note's FIRST real edit look like an echo;
++      //  - `cancelDiskDelete`: an editor that saves by unlinking and rewriting
++      //    identical bytes (a revert, a `git checkout` back to HEAD) still owes
++      //    its pending delete a cancellation — the delete is real, the rewrite
++      //    is what proves the file is still there;
++      //  - the unmapped branch: a file nobody maps still has to be REGISTERED,
++      //    however old its bytes are. "Unchanged" says the index knew them, not
++      //    that the server does.
++      // What an unchanged entry must never do is queue an upload: no verdict to
++      // clear, no drain to arm, no resident doc to re-ingest, and no log line —
++      // an idle vault emitting these by the hundred used to read as work.
++      if (unchanged) continue;
+       // The file has new bytes, so two verdicts about its OLD bytes are void: an
+       // empty placeholder may now hold text, and an oversized file may have been
+       // trimmed under the ceiling. Both get a fresh push.
+@@ -1781,8 +1806,12 @@ export class SyncManager implements InboundHost {
+ 
+   /** Single-event form of {@link handleLocalFilesChanged}, for call sites that
+    *  see one change at a time. */
+-  handleLocalFileChanged(relPath: string, kind: "modified" | "removed" | "tree"): void {
+-    this.handleLocalFilesChanged([{ path: relPath, kind }]);
++  handleLocalFileChanged(
++    relPath: string,
++    kind: "modified" | "removed" | "tree",
++    unchanged = false,
++  ): void {
++    this.handleLocalFilesChanged([{ path: relPath, kind, unchanged }]);
+   }
+ 
+   private armLocalChangeDrain(scope: VaultScope, delayMs: number): void {
+diff --git a/app/apps/desktop/src/lib/tree/lazyTree.test.ts b/app/apps/desktop/src/lib/tree/lazyTree.test.ts
+index b6cdf8ee..20853782 100644
+--- a/app/apps/desktop/src/lib/tree/lazyTree.test.ts
++++ b/app/apps/desktop/src/lib/tree/lazyTree.test.ts
+@@ -1,6 +1,13 @@
+ import { describe, expect, it } from "vitest";
+ import type { TreeNode } from "../ipc";
+-import { loadedFolderPaths, setChildrenAt, implicatedFolders, mergeChildren, nodeAt } from "./lazyTree";
++import {
++  loadedFolderPaths,
++  setChildrenAt,
++  implicatedFolders,
++  mergeChildren,
++  nodeAt,
++  refreshWorthy,
++} from "./lazyTree";
+ 
+ // The sidebar folds itself up if a refresh forgets which folders were expanded.
+ // `refreshTree` runs on every `file-changed` burst and every sync registry pull
+@@ -175,6 +182,48 @@ describe("targeted refresh helpers (#82)", () => {
+     ).toBeNull();
+   });
+ 
++  it("implicatedFolders ignores entries whose bytes did not move", () => {
++    // `unchanged` (#155) means the indexer found the file's sha256 equal to the
++    // one it already held — our own egest echo, `git checkout` restoring the
++    // same bytes, or Linux's spurious inotify read events. The folder's listing
++    // cannot have changed, so the folder is not implicated…
++    expect(
++      implicatedFolders([
++        { path: "Daily/quiet.md", kind: "modified", unchanged: true },
++        { path: "Notes/real.md", kind: "modified" },
++      ]),
++    ).toEqual(new Set(["Notes"]));
++    // …and an all-unchanged batch implicates nothing at all, rather than
++    // re-listing the folders it names.
++    expect(
++      implicatedFolders([
++        { path: "Daily/a.md", kind: "modified", unchanged: true },
++        { path: "b.md", kind: "modified", unchanged: true },
++      ]),
++    ).toEqual(new Set());
++  });
++
++  it("refreshWorthy drops unchanged entries and keeps everything else", () => {
++    const batch = [
++      { path: "Echo.md", kind: "modified" as const, unchanged: true },
++      { path: "Edited.md", kind: "modified" as const, unchanged: false },
++      { path: "Gone.md", kind: "removed" as const },
++      { path: "Archive", kind: "tree" as const },
++      { path: "Legacy.md", kind: "modified" as const }, // older Rust: no field
++    ];
++    expect(refreshWorthy(batch).map((c) => c.path)).toEqual([
++      "Edited.md",
++      "Gone.md",
++      "Archive",
++      "Legacy.md",
++    ]);
++    // A batch of nothing but echoes is empty — App.tsx's cue not to arm the
++    // 120ms tree/titles/backlinks refresh at all.
++    expect(refreshWorthy([{ path: "Echo.md", kind: "modified" as const, unchanged: true }])).toEqual(
++      [],
++    );
++  });
++
+   it("mergeChildren keeps an expanded sub-folder loaded across a fresh listing", () => {
+     const previous = [
+       dir("A/inner", { childrenLoaded: true, children: [file("A/inner/n.md")] }),
+diff --git a/app/apps/desktop/src/lib/tree/lazyTree.ts b/app/apps/desktop/src/lib/tree/lazyTree.ts
+index a1f58025..3c192ba5 100644
+--- a/app/apps/desktop/src/lib/tree/lazyTree.ts
++++ b/app/apps/desktop/src/lib/tree/lazyTree.ts
+@@ -54,18 +54,44 @@ export function nodeAt(node: TreeNode, path: string): TreeNode | null {
+   return null;
+ }
+ 
++/** The shape of one watcher entry the refresh planning below reads. */
++type WatcherChange = {
++  path: string;
++  kind: "modified" | "removed" | "tree";
++  /** The bytes did not move (`ipc.FileChanged.unchanged`, #155). */
++  unchanged?: boolean;
++};
++
++/**
++ * The entries in a watcher batch that can have changed what the UI shows.
++ *
++ * An `unchanged` entry is a file whose sha256 still equals the index's — our own
++ * egest echo, a `git checkout` back to the same bytes, or (the reason this exists)
++ * a spurious inotify read event. Nothing the sidebar, the titles, the backlinks or
++ * the graph derive from a note can differ, so re-listing folders and re-reading
++ * titles for it is pure work. A batch made ENTIRELY of them is empty here, which
++ * is the caller's cue not to arm a refresh at all.
++ */
++export function refreshWorthy<T extends WatcherChange>(changes: ReadonlyArray<T>): T[] {
++  return changes.filter((c) => !c.unchanged);
++}
++
+ /**
+  * The folders a watcher batch can have changed the LISTING of, for a targeted
+  * sidebar refresh (#82): a modified or removed file changes only its parent
+  * folder's listing. Returns null when the batch has a structural change (`tree`:
+  * a folder created/removed/renamed, a non-note file) — those can move whole
+  * subtrees, and only a full re-list is honest there.
++ *
++ * `unchanged` entries are ignored outright (not even their parent is implicated),
++ * and cannot make the answer `null` either — same bytes, same listing.
+  */
+ export function implicatedFolders(
+-  changes: ReadonlyArray<{ path: string; kind: "modified" | "removed" | "tree" }>,
++  changes: ReadonlyArray<WatcherChange>,
+ ): Set<string> | null {
+   const dirs = new Set<string>();
+   for (const c of changes) {
++    if (c.unchanged) continue;
+     if (c.kind === "tree") return null;
+     const i = c.path.lastIndexOf("/");
+     dirs.add(i === -1 ? "" : c.path.slice(0, i));
+diff --git a/docs/RELEASE_NOTES.md b/docs/RELEASE_NOTES.md
+index 02c753be..dd559f0c 100644
+--- a/docs/RELEASE_NOTES.md
++++ b/docs/RELEASE_NOTES.md
+@@ -18,6 +18,11 @@
+     in. If that section does not exist yet, create it at the top.
+ -->
+ 
++## 0.1.62
++
++- Linux: Baalda no longer re-indexes your vault non-stop while it sits idle, which was keeping a core busy and writing to disk constantly.
++- Baalda now checks whether a file's contents actually changed before doing anything with it, so backup, git and cloud-sync tools touching your vault no longer cause re-indexing or re-syncing.
++
+ ## 0.1.61
+ 
+ - Baalda now updates itself: it checks, downloads, installs and restarts at a quiet moment, and only shows the "Update required" screen if that fails. After a restart, What's New lists just the handful of things that changed in the version you got.

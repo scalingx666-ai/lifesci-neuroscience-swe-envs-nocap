@@ -1,0 +1,1324 @@
+diff --git a/changelog.d/20260914_160000_yarikoptic_download_retry_and_diagnostics.md b/changelog.d/20260914_160000_yarikoptic_download_retry_and_diagnostics.md
+new file mode 100644
+index 0000000000..796760fea4
+--- /dev/null
++++ b/changelog.d/20260914_160000_yarikoptic_download_retry_and_diagnostics.md
+@@ -0,0 +1,19 @@
++### 🐛 Bug Fixes
++
++- `download-url` and other downloads retry a transfer interrupted by a dropped
++  connection, up to `datalad.downloaders.retry` times (default: 5), and on
++  failure report how much was stored and, if short, the free space.
++  Fixes [ReproNim/containers#169](https://github.com/ReproNim/containers/issues/169) via
++  [PR #7930](https://github.com/datalad/datalad/pull/7930)
++  (by [@yarikoptic](https://github.com/yarikoptic))
++
++- Error messages, e.g. of `download-url`, no longer repeat the underlying
++  error.
++  [PR #7930](https://github.com/datalad/datalad/pull/7930)
++  (by [@yarikoptic](https://github.com/yarikoptic))
++
++### 🏠 Internal
++
++- A `DownloadError` message no longer includes that of its `__cause__`.
++  [PR #7930](https://github.com/datalad/datalad/pull/7930)
++  (by [@yarikoptic](https://github.com/yarikoptic))
+diff --git a/datalad/core/local/tests/test_results.py b/datalad/core/local/tests/test_results.py
+index 37ff4bc637..85ab075f27 100644
+--- a/datalad/core/local/tests/test_results.py
++++ b/datalad/core/local/tests/test_results.py
+@@ -33,6 +33,11 @@ def test_generic_result_renderer():
+         # plain message makes it through
+         (dict(message='funky', error_message='extra-funky'),
+          ['<action-unspecified>(<status-unspecified>): [funky] [extra-funky]']),
++        # ... but not when the message already says it
++        (dict(message='it broke -caused by- disk full', error_message='it broke'),
++         ['<action-unspecified>(<status-unspecified>): [it broke -caused by- disk full]\n']),
++        (dict(message=('%s broke badly', 'it'), error_message=('%s broke', 'it')),
++         ['<action-unspecified>(<status-unspecified>): [it broke badly]\n']),
+     ]
+     if on_windows:
+         testcases.extend([
+diff --git a/datalad/downloaders/base.py b/datalad/downloaders/base.py
+index 9001a35b68..c41f14cb6a 100644
+--- a/datalad/downloaders/base.py
++++ b/datalad/downloaders/base.py
+@@ -12,14 +12,19 @@
+ 
+ __docformat__ = 'restructuredtext'
+ 
++import errno
+ import os
+ import os.path as op
++import shutil
++import ssl
+ import sys
+ import time
+ from abc import (
+     ABCMeta,
+     abstractmethod,
+ )
++from collections import Counter
++from http.client import IncompleteRead
+ from logging import getLogger
+ from os.path import (
+     exists,
+@@ -27,8 +32,13 @@
+ )
+ from os.path import join as opj
+ 
++import botocore.exceptions as botocore_exc
+ import msgpack
++import requests.exceptions as requests_exc
++import urllib3.exceptions as urllib3_exc
++from humanize import naturalsize
+ 
++from datalad.dochelpers import single_or_plural
+ from datalad.downloaders import CREDENTIAL_TYPES
+ 
+ from .. import cfg
+@@ -41,6 +51,7 @@
+     DownloadError,
+     IncompleteDownloadError,
+     UnaccountedDownloadError,
++    iter_exception_chain,
+ )
+ from ..support.locking import (
+     InterProcessLock,
+@@ -58,6 +69,120 @@
+ lgr = getLogger('datalad.downloaders')
+ 
+ 
++def _errnos(*names):
++    """Errnos for those of `names` which are known on this platform"""
++    return {getattr(errno, name) for name in names if hasattr(errno, name)}
++
++
++# connection failures which OSError does not map to ConnectionError itself
++_TRANSIENT_ERRNOS = _errnos('EHOSTUNREACH', 'ENETDOWN', 'ENETRESET', 'ENETUNREACH')
++_OUT_OF_SPACE_ERRNOS = _errnos('ENOSPC', 'EDQUOT', 'EFBIG')
++_MAX_RETRY_DELAY = 60  # seconds
++
++_TRANSIENT_EXCEPTIONS = (
++    ConnectionError, TimeoutError, IncompleteRead,
++    # the peer went away, unlike e.g. with a bad certificate
++    ssl.SSLEOFError, ssl.SSLZeroReturnError,
++    requests_exc.ChunkedEncodingError, requests_exc.ConnectionError,
++    requests_exc.Timeout,
++    urllib3_exc.ProtocolError, urllib3_exc.TimeoutError,
++    botocore_exc.ConnectionError, botocore_exc.ConnectionClosedError,
++    botocore_exc.IncompleteReadError, botocore_exc.ResponseStreamingError,
++)
++
++
++def is_transient_download_error(exc):
++    """Whether `exc`, or anything it was raised from, is worth retrying
++
++    Only ``__cause__`` counts: a failure raised while merely handling a
++    transient one is not transient itself.
++    """
++    return any(
++        isinstance(e, _TRANSIENT_EXCEPTIONS)
++        or (isinstance(e, OSError) and e.errno in _TRANSIENT_ERRNOS)
++        for e in iter_exception_chain(exc)
++    )
++
++
++def _is_out_of_space_error(exc):
++    return any(
++        isinstance(e, OSError) and e.errno in _OUT_OF_SPACE_ERRNOS
++        for e in iter_exception_chain(exc)
++    )
++
++
++def _get_free_space(path):
++    """Free space (bytes) on the file system `path` resides on, None if unknown
++    """
++    try:
++        return shutil.disk_usage(op.dirname(op.abspath(path))).free
++    except OSError as e:
++        lgr.debug("Could not determine free space for %s: %s",
++                  path, CapturedException(e))
++        return None
++
++
++def _free_space_note(free_space, path):
++    return "only %s free on the file system holding %s" % (
++        naturalsize(free_space), op.dirname(path) or os.curdir)
++
++
++def _warn_if_not_enough_space(url, path, target_size):
++    if not target_size:
++        return
++    free_space = _get_free_space(path)
++    if free_space is not None and free_space < target_size:
++        lgr.warning(
++            "Downloading %s requires %s, but there is %s -- the download "
++            "is likely to fail", url, naturalsize(target_size),
++            _free_space_note(free_space, path))
++
++
++def _get_transfer_error(exc, url, filepath, fp, target_size):
++    """The DownloadError to raise for `exc`; an IncompleteDownloadError if
++    worth retrying"""
++    try:
++        # tell() counts buffered bytes, fstat() what boto3 wrote at offsets
++        stored = max(fp.tell(), os.fstat(fp.fileno()).st_size)
++    except (OSError, ValueError) as e:
++        lgr.debug("Could not determine how much of %s was written: %s",
++                  filepath, CapturedException(e))
++        stored = None
++    out_of_space = _is_out_of_space_error(exc)
++    details = []
++    if stored is not None:
++        details.append("%s of %s stored" % (
++            naturalsize(stored),
++            naturalsize(target_size) if target_size else "an unknown total"))
++    free_space = _get_free_space(filepath)
++    if free_space is not None and (
++            out_of_space
++            or (stored is not None and target_size
++                and free_space < target_size - stored)):
++        details.append(_free_space_note(free_space, filepath))
++    suffix = " (%s)" % ", ".join(details) if details else ""
++    if out_of_space:
++        return DownloadError("Ran out of space while downloading %s into %s%s"
++                             % (url, filepath, suffix))
++    if is_transient_download_error(exc):
++        return IncompleteDownloadError("Transfer of %s was interrupted%s"
++                                       % (url, suffix))
++    return DownloadError("Failed to download %s into %s%s"
++                         % (url, filepath, suffix))
++
++
++def _backoff(failures, kind, ce, retries):
++    """Count a failure of `kind`; back off and return True if to retry it"""
++    failures[kind] += 1
++    if failures[kind] > retries:
++        return False
++    delay = min(0.5 * (failures[kind] ** 1.2), _MAX_RETRY_DELAY)
++    lgr.info("Retrying from the start (%d out of %d) in %.1f seconds after: %s",
++             failures[kind], retries, delay, ce.format_with_cause())
++    time.sleep(delay)
++    return True
++
++
+ # TODO: remove headers, HTTP specific
+ @auto_repr
+ class DownloaderSession(object):
+@@ -149,14 +274,18 @@ def access(self, method, url, allow_old_session=True, **kwargs):
+             lgr.debug("set credential context as %s", url)
+             self.credential.set_context(auth_url=url)
+ 
+-        attempt, incomplete_attempt, server_error_attempt = 0, 0, 0
++        retries = cfg.obtain('datalad.downloaders.retry')
++        failures = Counter()
++        attempt = 0
+         result = None
+         credential_was_refreshed = False
+         while True:
+             attempt += 1
+-            if attempt > 20:
++            # each kind of failure in `failures` may use up all `retries`
++            if attempt > 20 + 3 * retries:
+                 # are we stuck in a loop somehow? I think logic doesn't allow this atm
+-                raise RuntimeError("Got to the %d'th iteration while trying to download %s" % (attempt, url))
++                raise DownloadError(
++                    "Failed to download %s in %d attempts" % (url, attempt - 1))
+             exc_info = None
+             msg_types = ''
+             supported_auth_types = []
+@@ -179,13 +308,18 @@ def access(self, method, url, allow_old_session=True, **kwargs):
+                 lgr.log(5, "Calling out into %s for %s", method, url)
+                 result = method(url, **kwargs)
+                 # assume success if no puke etc
++                if failures:
++                    lgr.info("Access to %s succeeded after %s", url,
++                             single_or_plural('retry', 'retries',
++                                              failures.total(),
++                                              include_count=True))
+                 break
+             except AccessDeniedError as e:
+                 ce = CapturedException(e)
+-                if hasattr(e, 'status') and e.status == 429:
++                if e.status == 429:
+                     # Too many requests.
+-                    # We can retry by continuing the loop.
+-                    time.sleep(0.5*(attempt**1.2))
++                    if not _backoff(failures, 'throttled', ce, retries):
++                        raise
+                     continue
+ 
+                 if isinstance(e, AnonymousAccessDeniedError):
+@@ -235,29 +369,20 @@ def access(self, method, url, allow_old_session=True, **kwargs):
+                         # and redo connect/download attempt
+                 continue
+ 
++            except UnaccountedDownloadError:
++                raise  # more than announced: a retry would get the same
+             except IncompleteDownloadError as e:
+                 ce = CapturedException(e)
+                 exc_info = sys.exc_info()
+-                incomplete_attempt += 1
+-                if incomplete_attempt > 5:
+-                    # give up
++                if not _backoff(failures, 'incomplete', ce, retries):
+                     raise
+-                lgr.debug("Failed to download fully, will try again: %s", ce)
+-                # TODO: may be fail earlier than after 20 attempts in such a case?
+             except AccessFailedError as e:
+-                # Handle retryable server errors (5xx)
+-                if hasattr(e, 'status') and e.status is not None and 500 <= e.status < 600:
++                # server errors (5xx), or a session failing to connect
++                if (is_transient_download_error(e) if e.status is None
++                        else 500 <= e.status < 600):
+                     ce = CapturedException(e)
+-                    server_error_attempt += 1
+-                    if server_error_attempt > 5:
+-                        # give up after 5 retries
++                    if not _backoff(failures, 'server', ce, retries):
+                         raise
+-                    lgr.debug(
+-                        "Server error (status %d), will retry (attempt %d): %s",
+-                        e.status, server_error_attempt, ce
+-                    )
+-                    # Exponential backoff similar to 429 handling
+-                    time.sleep(0.5 * (server_error_attempt ** 1.2))
+                     continue
+                 # Non-retryable AccessFailedError
+                 raise
+@@ -437,7 +562,8 @@ def _verify_download(self, url, downloaded_size, target_size, file_=None, conten
+ 
+         if target_size and target_size != downloaded_size:
+             raise (IncompleteDownloadError if target_size > downloaded_size else UnaccountedDownloadError)(
+-                "Downloaded size %d differs from originally announced %d" % (downloaded_size, target_size))
++                "Download of %s finished with %d bytes, %d were announced"
++                % (url, downloaded_size, target_size))
+ 
+     def _download(self, url, path=None, overwrite=False, size=None, stats=None):
+         """Download content into a file
+@@ -490,6 +616,7 @@ def _download(self, url, path=None, overwrite=False, size=None, stats=None):
+         # FETCH CONTENT
+         # TODO: pbar = ui.get_progressbar(size=response.headers['size'])
+         temp_filepath = self._get_temp_download_filename(filepath)
++        _warn_if_not_enough_space(url, temp_filepath, target_size)
+         try:
+             if exists(temp_filepath):
+                 # eventually we might want to continue the download
+@@ -498,14 +625,32 @@ def _download(self, url, path=None, overwrite=False, size=None, stats=None):
+                     "It will be overridden" % temp_filepath)
+                 # TODO.  also logic below would clean it up atm
+ 
+-            with open(temp_filepath, 'wb') as fp:
+-                # TODO: url might be a bit too long for the beast.
+-                # Consider to improve to make it animated as well, or shorten here
+-                pbar = ui.get_progressbar(label=url, fill_text=filepath, total=target_size)
++            # TODO: url might be a bit too long for the beast.
++            # Consider to improve to make it animated as well, or shorten here
++            pbar = ui.get_progressbar(label=url, fill_text=filepath, total=target_size)
++            # not `with`: after ENOSPC, close() would fail again and mask it
++            fp = open(temp_filepath, 'wb')
++            transfer_failed = True
++            try:
+                 t0 = time.time()
+                 downloader_session.download(fp, pbar, size=size)
++                fp.flush()  # for a deferred ENOSPC to be diagnosed below
+                 downloaded_time = time.time() - t0
+-                pbar.finish()
++                transfer_failed = False
++            except DownloadError:
++                raise
++            except Exception as e:
++                raise _get_transfer_error(
++                    e, url, filepath, fp, target_size) from e
++            finally:
++                pbar.finish()  # also on failure, lest a retry stack up bars
++                try:
++                    fp.close()
++                except OSError as e:
++                    if not transfer_failed:
++                        raise
++                    lgr.debug("Failed to close %s: %s", temp_filepath,
++                              CapturedException(e))
+             downloaded_size = os.stat(temp_filepath).st_size
+ 
+             # (headers.get('Content-type', "") and headers.get('Content-Type')).startswith('text/html')
+@@ -525,12 +670,14 @@ def _download(self, url, path=None, overwrite=False, size=None, stats=None):
+                 stats.overwritten += int(existed)
+                 stats.downloaded_size += downloaded_size
+                 stats.downloaded_time += downloaded_time
+-        except (AccessDeniedError, IncompleteDownloadError) as e:
++        except DownloadError as e:
++            e.filepath = filepath
+             raise
+         except Exception as e:
+             ce = CapturedException(e)
+-            lgr.error("Failed to download %s into %s: %s", url, filepath, ce)
+-            raise DownloadError(ce) from e # for now
++            lgr.debug("Failed to download %s into %s: %s", url, filepath, ce)
++            raise DownloadError("Failed to download %s into %s" % (url, filepath),
++                                filepath=filepath) from e
+         finally:
+             if exists(temp_filepath):
+                 # clean up
+@@ -558,7 +705,12 @@ def download(self, url, path=None, **kwargs):
+         # TODO: may be move all the path dealing logic here
+         # but then it might require sending request anyways for Content-Disposition
+         # so probably nah
+-        lgr.info("Downloading %r into %r", url, path)
++        if not path:
++            lgr.info("Downloading '%s' into the current directory", url)
++        elif isdir(path) or path.endswith((os.sep, '/')):
++            lgr.info("Downloading '%s' into directory '%s'", url, path)
++        else:
++            lgr.info("Downloading '%s' into '%s'", url, path)
+         return self.access(self._download, url, path=path, **kwargs)
+ 
+     @property
+@@ -640,12 +792,15 @@ def _fetch(self, url, cache=None, size=None, allow_redirects=True, decode=True):
+ 
+             self._verify_download(url, downloaded_size, target_size, None, content=content)
+ 
+-        except (AccessDeniedError, IncompleteDownloadError) as e:
++        except DownloadError:
+             raise
+         except Exception as e:
+             ce = CapturedException(e)
+-            lgr.error("Failed to fetch %s: %s", url, ce)
+-            raise DownloadError(ce) from e  # for now
++            lgr.debug("Failed to fetch %s: %s", url, ce)
++            if is_transient_download_error(e):
++                raise IncompleteDownloadError(
++                    "Transfer of %s was interrupted" % url) from e
++            raise DownloadError("Failed to fetch %s" % url) from e
+ 
+         if cache:
+             # apparently requests' CaseInsensitiveDict is not serialazable
+diff --git a/datalad/downloaders/http.py b/datalad/downloaders/http.py
+index c116486770..9a5fbc83b8 100644
+--- a/datalad/downloaders/http.py
++++ b/datalad/downloaders/http.py
+@@ -19,7 +19,10 @@
+ from requests.utils import parse_dict_header
+ 
+ from .. import __version__
+-from ..dochelpers import borrowkwargs
++from ..dochelpers import (
++    borrowkwargs,
++    single_or_plural,
++)
+ from ..log import LoggerHelper
+ from ..support.cookies import cookies_db
+ from ..support.exceptions import (
+@@ -634,13 +637,15 @@ def get_downloader_session(self, url,
+                 if retry >= nretries:
+                     #import epdb; epdb.serve()
+                     if not _FTP_SUPPORT and url.startswith("ftp://"):
+-                        msg_ftp = "For ftp:// support, install requests_ftp. "
++                        msg_ftp = ". For ftp:// support, install requests_ftp"
+                     else:
+                         msg_ftp = ""
+ 
+                     raise AccessFailedError(
+-                        "Failed to establish a new session %d times. %s"
+-                        % (nretries, msg_ftp)) from exc
++                        "Failed to establish a new session in %s%s"
++                        % (single_or_plural('attempt', 'attempts', nretries,
++                                            include_count=True),
++                           msg_ftp)) from exc
+                 lgr.warning(
+                     "Caught exception %s. Will retry %d out of %d times",
+                     ce, retry + 1, nretries)
+diff --git a/datalad/downloaders/tests/test_base.py b/datalad/downloaders/tests/test_base.py
+index 801a3c1663..a4a549c40a 100644
+--- a/datalad/downloaders/tests/test_base.py
++++ b/datalad/downloaders/tests/test_base.py
+@@ -8,5 +8,90 @@
+ # ## ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ##
+ """Tests for downloaders base"""
+ 
++import errno
++import logging
++import os.path as op
++import ssl
++from http.client import IncompleteRead
++from unittest.mock import patch
++
++import pytest
++from requests.exceptions import ProxyError
++from urllib3.exceptions import ProtocolError
++
++from datalad.downloaders.base import (
++    _get_transfer_error,
++    _warn_if_not_enough_space,
++    is_transient_download_error,
++)
++from datalad.support.exceptions import IncompleteDownloadError
++from datalad.tests.utils_pytest import (
++    assert_equal,
++    assert_in,
++    swallow_logs,
++    with_tempfile,
++)
++
++
+ def test_docstring():
+     pass
++
++
++@pytest.mark.ai_generated
++@pytest.mark.parametrize("exc, transient", [
++    (ConnectionResetError("reset by peer"), True),
++    (IncompleteRead(b'123', 100), True),
++    (OSError(errno.ENETUNREACH, "Network is unreachable"), True),
++    (ProtocolError("Connection broken"), True),
++    (ProxyError("proxy went away"), True),  # a requests.ConnectionError
++    (OSError(errno.ENOSPC, "No space left on device"), False),
++    (ValueError("not a network problem"), False),
++    (ssl.SSLCertVerificationError("bad certificate"), False),
++])
++def test_is_transient_download_error(exc, transient):
++    caused, handling = RuntimeError(), RuntimeError()
++    caused.__cause__ = handling.__context__ = exc
++    assert is_transient_download_error(exc) is transient
++    assert is_transient_download_error(caused) is transient
++    assert not is_transient_download_error(handling)
++
++
++@pytest.mark.ai_generated
++@with_tempfile(content="123")
++def test_warn_if_not_enough_space(path=None):
++    url = "http://example.com/f.dat"
++    with swallow_logs(new_level=logging.WARNING) as cml:
++        _warn_if_not_enough_space(url, path, 1024 ** 6)
++        assert_in("the download is likely to fail", cml.out)
++        assert_in("on the file system holding %s" % op.dirname(path), cml.out)
++    with swallow_logs(new_level=logging.WARNING) as cml:
++        _warn_if_not_enough_space(url, path, 1)
++        _warn_if_not_enough_space(url, path, None)
++        assert_equal(cml.out, '')
++
++
++@pytest.mark.ai_generated
++@with_tempfile
++def test_get_transfer_error(path=None):
++    url = "http://example.com/f.dat"
++
++    def get_error(exc, target_size=1000):
++        with open(path, 'wb') as fp:
++            fp.write(b'123')
++            return _get_transfer_error(exc, url, path, fp, target_size)
++
++    err = get_error(ConnectionResetError("reset by peer"))
++    assert isinstance(err, IncompleteDownloadError)
++    assert_equal(str(err),
++                 "Transfer of %s was interrupted (3 Bytes of 1.0 kB stored)"
++                 % url)
++    assert_in("of an unknown total", str(get_error(ValueError(), None)))
++    # free space is named when short
++    with patch('datalad.downloaders.base._get_free_space', return_value=5):
++        assert_in("only 5 Bytes free", str(get_error(ConnectionResetError())))
++
++    err = get_error(OSError(errno.ENOSPC, "No space left on device"))
++    assert not isinstance(err, IncompleteDownloadError)
++    assert_in("Ran out of space", str(err))
++    assert_in("free on the file system holding %s" % op.dirname(path),
++              str(err))
+diff --git a/datalad/downloaders/tests/test_http.py b/datalad/downloaders/tests/test_http.py
+index 49e244831b..4491e5359c 100644
+--- a/datalad/downloaders/tests/test_http.py
++++ b/datalad/downloaders/tests/test_http.py
+@@ -8,13 +8,18 @@
+ # ## ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ##
+ """Tests for http downloader"""
+ 
+-import builtins
++import errno
++import logging
+ import os
+ import re
+ import time
+ from calendar import timegm
++from contextlib import contextmanager
++from http.client import IncompleteRead
+ from os.path import join as opj
+ 
++from urllib3.exceptions import ProtocolError
++
+ from datalad.downloaders.providers import Providers
+ from datalad.downloaders.tests.utils import get_test_providers
+ from datalad.support.network import (
+@@ -22,7 +27,6 @@
+     get_url_straight_filename,
+ )
+ from datalad.support.path import Path
+-from datalad.utils import ensure_unicode
+ 
+ from ...support.exceptions import AccessFailedError
+ from ..base import (
+@@ -41,6 +45,7 @@
+     HTTPBaseAuthenticator,
+     HTTPBearerTokenAuthenticator,
+     HTTPDownloader,
++    HTTPDownloaderSession,
+     HTTPTokenAuthenticator,
+     process_www_authenticate,
+ )
+@@ -56,13 +61,18 @@ class NoHTTPPretty(object):
+        activate = lambda s, t: t
+     httpretty = NoHTTPPretty()
+ 
+-from unittest.mock import patch
++from unittest.mock import (
++    Mock,
++    patch,
++)
+ 
+ import pytest
+ 
+ from ...support.exceptions import (
+     AccessDeniedError,
+     AnonymousAccessDeniedError,
++    CapturedException,
++    UnaccountedDownloadError,
+ )
+ from ...support.network import get_url_disposition_filename
+ from ...support.status import FileStatus
+@@ -76,6 +86,7 @@ class NoHTTPPretty(object):
+     assert_raises,
+     known_failure_githubci_win,
+     ok_file_has_content,
++    patch_config,
+     serve_path_via_http,
+     skip_if,
+     skip_if_no_network,
+@@ -89,7 +100,10 @@ class NoHTTPPretty(object):
+     with_tree,
+     without_http_proxy,
+ )
+-from ...utils import read_file
++from ...utils import (
++    chpwd,
++    read_file,
++)
+ 
+ 
+ def test_docstring():
+@@ -97,30 +111,21 @@ def test_docstring():
+     assert_in("\ncredential: Credential", doc)
+ 
+ 
+-# XXX doesn't quite work as it should since doesn't provide context handling
+-# I guess... but at least causes the DownloadError ;)
+-_builtins_open = builtins.open
++@contextmanager
++def _retries(n):
++    """Pin the retry budget (tox passes DATALAD_* on), and skip the backoff"""
++    with patch_config({'datalad.downloaders.retry': str(n)}), \
++            patch('datalad.downloaders.base.time.sleep') as sleep:
++        yield sleep
+ 
+ 
+-def fake_open(write_=None, skip_regex=None):
+-    class myfile(object):
+-        """file which does nothing"""
+-        if write_:
+-            def write(self, *args, **kwargs):
+-                write_(*args, **kwargs)
+-        def close(self):
+-            pass
+-
+-    def myopen(path, *args, **kwargs):
+-        if skip_regex and re.search(skip_regex, ensure_unicode(path)):
+-            return _builtins_open(path, *args, **kwargs)
+-        else:
+-            return myfile
+-    return myopen
+-
+-
+-def _raise_IOError(*args, **kwargs):
+-    raise IOError("Testing here")
++def _fail_first(n, orig, fail):
++    """Call `fail` instead of `orig` for the first `n` calls, counted in .calls"""
++    def wrapper(*args, **kwargs):
++        wrapper.calls += 1
++        return (fail if wrapper.calls <= n else orig)(*args, **kwargs)
++    wrapper.calls = 0
++    return wrapper
+ 
+ 
+ def test_process_www_authenticate():
+@@ -141,7 +146,9 @@ def test_HTTPDownloader_basic(toppath=None, topurl=None):
+     tfpath = opj(toppath, "file-downloaded.dat")
+     downloader = HTTPDownloader()  # no auth/credentials needed
+     download = downloader.download
+-    download(furl, tfpath)
++    with swallow_logs(new_level=logging.INFO) as cml:
++        download(furl, tfpath)
++        assert_in("into '%s'" % tfpath, cml.out)
+     ok_file_has_content(tfpath, 'abc')
+ 
+     # download() creates leading directories if needed for file targets...
+@@ -151,7 +158,9 @@ def test_HTTPDownloader_basic(toppath=None, topurl=None):
+ 
+     # ... and for directory targets.
+     subdir_dirtarget = opj(toppath, "d1", "d2", "")
+-    download(furl, subdir_dirtarget)
++    with swallow_logs(new_level=logging.INFO) as cml:
++        download(furl, subdir_dirtarget)
++        assert_in("into directory '%s'" % subdir_dirtarget, cml.out)
+     ok_file_has_content(opj(subdir_dirtarget, "file.dat"), "abc")
+ 
+     # see if fetch works correctly
+@@ -159,6 +168,9 @@ def test_HTTPDownloader_basic(toppath=None, topurl=None):
+ 
+     # By default should not overwrite the file
+     assert_raises(DownloadError, download, furl, tfpath)
++    with chpwd(toppath), swallow_logs(new_level=logging.INFO) as cml:
++        assert_raises(DownloadError, download, furl)
++        assert_in("into the current directory", cml.out)
+     # but be able to redownload whenever overwrite==True
+     downloaded_path = download(furl, tfpath, overwrite=True)
+     assert_equal(downloaded_path, tfpath)
+@@ -170,36 +182,57 @@ def test_HTTPDownloader_basic(toppath=None, topurl=None):
+         download(topurl, toppath)
+     assert_in("File name could not be determined", str(cm.value))
+ 
+-    # Some errors handling
+-    # XXX obscure mocking since impossible to mock write alone
+-    # and it still results in some warning being spit out
+-    # Note: we need to avoid mocking opening of the lock file!
++    # Some errors handling: the temporary file failing a write, failing
++    # flush() and close() as a buffered write out of space does, or failing
++    # close() after a complete transfer
++    ioerror = IOError("Testing here")
++    enospc = OSError(errno.ENOSPC, "No space left on device")
++    eio = OSError(errno.EIO, "I/O error")
++    for methods, message, cause in (
++            (dict(write=Mock(side_effect=ioerror)), "Failed to download", ioerror),
++            (dict(flush=Mock(side_effect=enospc), close=Mock(side_effect=enospc)),
++             "Ran out of space", enospc),
++            (dict(close=Mock(side_effect=eio)), "Failed to download", eio)):
++        tempfile = Mock(fileno=Mock(side_effect=ValueError), **methods)
++        with swallow_logs(), \
++                patch('datalad.downloaders.base.open', return_value=tempfile,
++                      create=True):
++            with assert_raises(DownloadError) as cm:
++                download(furl, tfpath, overwrite=True)
++        assert_in(message, str(cm.value))
++        assert_false(isinstance(cm.value, IncompleteDownloadError))
++        assert cm.value.__cause__ is cause
++        assert_not_in(str(cause), str(cm.value))
++    # a DownloadError of the session is not wrapped again
++    original = DownloadError("the session knows what went wrong")
+     with swallow_logs(), \
+-         patch.object(builtins, 'open', fake_open(write_=_raise_IOError, skip_regex=r'.*\.lck$')):
+-        assert_raises(DownloadError, download, furl, tfpath, overwrite=True)
+-
+-    # incomplete download scenario - should have 3 tries
+-    def _fail_verify_download(try_to_fail):
+-        try_ = [0]
+-        _orig_verify_download = BaseDownloader._verify_download
+-        def _verify_download(self, *args, **kwargs):
+-            try_[0] += 1
+-            if try_[0] >= try_to_fail:
+-                return _orig_verify_download(self, *args, **kwargs)
+-            raise IncompleteDownloadError()
+-        return _verify_download
+-
+-    with patch.object(BaseDownloader, '_verify_download', _fail_verify_download(6)), \
+-        swallow_logs():
+-            # how was before the "fix":
+-            #assert_raises(DownloadError, downloader.fetch, furl)
+-            #assert_raises(DownloadError, downloader.fetch, furl)
+-            # now should download just fine
+-            assert_equal(downloader.fetch(furl), 'abc')
+-    # but should fail if keeps failing all 5 times and then on 11th should raise DownloadError
+-    with patch.object(BaseDownloader, '_verify_download', _fail_verify_download(7)), \
+-        swallow_logs():
+-            assert_raises(DownloadError, downloader.fetch, furl)
++            patch.object(HTTPDownloaderSession, 'download', side_effect=original):
++        with assert_raises(DownloadError) as cm:
++            download(furl, tfpath, overwrite=True)
++    assert cm.value is original
++    with swallow_logs(), \
++            patch.object(HTTPDownloaderSession, 'download', side_effect=ioerror):
++        with assert_raises(DownloadError) as cm:
++            downloader.fetch(furl)
++    assert_false(isinstance(cm.value, IncompleteDownloadError))
++    assert cm.value.__cause__ is ioerror
++
++    # incomplete download scenario
++    def _incomplete(*args, **kwargs):
++        raise IncompleteDownloadError()
++
++    verify = BaseDownloader._verify_download
++    with _retries(5), \
++            patch.object(BaseDownloader, '_verify_download',
++                         _fail_first(5, verify, _incomplete)), \
++            swallow_logs():
++        assert_equal(downloader.fetch(furl), 'abc')
++    # but not when failing more often than retried
++    with _retries(5), \
++            patch.object(BaseDownloader, '_verify_download',
++                         _fail_first(6, verify, _incomplete)), \
++            swallow_logs():
++        assert_raises(DownloadError, downloader.fetch, furl)
+ 
+     # TODO: access denied scenario
+     # TODO: access denied detection
+@@ -850,40 +883,43 @@ def request_post_callback(request, uri, headers):
+ @with_tree(tree=[('file.dat', 'abc')])
+ @serve_path_via_http
+ def test_server_error_retry(toppath=None, topurl=None):
+-    """Test retry logic for 5xx server errors (e.g., 503 Service Unavailable)."""
++    """Test retry logic for 5xx server errors (e.g., 503 Service Unavailable),
++    throttling (429), and a session which fails to connect."""
+     furl = "%sfile.dat" % topurl
+     downloader = HTTPDownloader()
++    get_session = HTTPDownloader.get_downloader_session
+ 
+-    def _fail_get_downloader_session(try_to_fail):
+-        """Return a function that raises AccessFailedError for N tries, then succeeds."""
+-        try_ = [0]
+-        _orig_get_downloader_session = HTTPDownloader.get_downloader_session
+-
+-        def _get_downloader_session(self, *args, **kwargs):
+-            try_[0] += 1
+-            if try_[0] >= try_to_fail:
+-                return _orig_get_downloader_session(self, *args, **kwargs)
+-            raise AccessFailedError(
+-                f"Access to {args[0]} has failed: status code 503",
+-                status=503
+-            )
++    def _refuse(exc_class, status):
++        def _get_downloader_session(self, url, *args, **kwargs):
++            raise exc_class(f"Access to {url} has failed: status code {status}",
++                            status=status)
+         return _get_downloader_session
+ 
++    def _fail_to_connect(self, *args, **kwargs):
++        raise AccessFailedError("Failed to establish a new session") \
++            from ConnectionResetError("reset by peer")
++
+     start_time = time.time()
+ 
+-    # Mock time.sleep to avoid actual delays during testing
+-    with patch('datalad.downloaders.base.time.sleep'):
+-        # Should succeed after 5 failures (on 6th attempt)
+-        with patch.object(HTTPDownloader, 'get_downloader_session',
+-                          _fail_get_downloader_session(6)), \
++    for fail, exc_class in ((_refuse(AccessFailedError, 503), AccessFailedError),
++                            (_refuse(AccessDeniedError, 429), AccessDeniedError),
++                            (_fail_to_connect, AccessFailedError)):
++        # Should succeed after 5 failures (on 6th attempt), backing off in between
++        with _retries(5) as sleep, \
++                patch.object(HTTPDownloader, 'get_downloader_session',
++                             _fail_first(5, get_session, fail)), \
+                 swallow_logs():
+             assert_equal(downloader.fetch(furl), 'abc')
++        assert_equal(sleep.call_count, 5)
++        delays = [c.args[0] for c in sleep.call_args_list]
++        assert_greater(delays[-1], delays[0])
+ 
+         # Should fail after 6 failures (exceeds 5 retry limit)
+-        with patch.object(HTTPDownloader, 'get_downloader_session',
+-                          _fail_get_downloader_session(7)), \
++        with _retries(5), \
++                patch.object(HTTPDownloader, 'get_downloader_session',
++                             _fail_first(6, get_session, fail)), \
+                 swallow_logs():
+-            assert_raises(AccessFailedError, downloader.fetch, furl)
++            assert_raises(exc_class, downloader.fetch, furl)
+ 
+     elapsed = time.time() - start_time
+     # Ensure test runs fast (sleep is mocked) - fail if implementation changes
+@@ -891,6 +927,64 @@ def _get_downloader_session(self, *args, **kwargs):
+     assert elapsed < 1.0, f"Test took {elapsed:.1f}s, expected < 1s (is sleep mocked?)"
+ 
+ 
++@pytest.mark.ai_generated
++@with_tree(tree=[('file.dat', 'abc')])
++@serve_path_via_http
++def test_interrupted_transfer_retry(toppath=None, topurl=None):
++    furl = "%sfile.dat" % topurl
++    tfpath = opj(toppath, "downloaded.dat")
++    downloader = HTTPDownloader()
++    download = HTTPDownloaderSession.download
++
++    def _lose_connection(self, f=None, pbar=None, size=None):
++        if f is not None:
++            f.write(b'a')
++        # the way urllib3 reports a connection dropped mid-transfer
++        try:
++            raise IncompleteRead(b'a', 2)
++        except IncompleteRead as e:
++            raise ProtocolError("Connection broken: %r" % e, e) from e
++
++    with _retries(5):
++        failing = _fail_first(2, download, _lose_connection)
++        with patch.object(HTTPDownloaderSession, 'download', failing), \
++                swallow_logs(new_level=logging.INFO) as cml:
++            assert_equal(downloader.download(furl, tfpath, overwrite=True),
++                         tfpath)
++            assert_in("Retrying from the start (1 out of 5)", cml.out)
++            assert_in("after: Transfer of %s was interrupted" % furl, cml.out)
++            assert_in("succeeded after 2 retries", cml.out)
++        ok_file_has_content(tfpath, 'abc')
++        assert_equal(failing.calls, 3)
++
++        failing = _fail_first(2, download, _lose_connection)
++        with patch.object(HTTPDownloaderSession, 'download', failing), \
++                swallow_logs():
++            assert_equal(downloader.fetch(furl), 'abc')
++        assert_equal(failing.calls, 3)
++
++        # more than was announced would come again
++        failing = _fail_first(1, download,
++                              lambda self, f, *args, **kw: f.write(b'abcde'))
++        with patch.object(HTTPDownloaderSession, 'download', failing), \
++                swallow_logs():
++            assert_raises(UnaccountedDownloadError,
++                          downloader.download, furl, tfpath, overwrite=True)
++
++    for retries in (2, 0):
++        failing = _fail_first(10, download, _lose_connection)
++        with _retries(retries), \
++                patch.object(HTTPDownloaderSession, 'download', failing), \
++                swallow_logs():
++            with assert_raises(IncompleteDownloadError) as cm:
++                downloader.download(furl, tfpath, overwrite=True)
++        assert_equal(failing.calls, retries + 1)
++    assert_in("1 Byte of 3 Bytes stored", str(cm.value))
++    assert_not_in("datalad-download-temp", str(cm.value))
++    assert_equal(cm.value.filepath, tfpath)
++    assert_equal(str(CapturedException(cm.value)).count('-caused by-'), 1)
++
++
+ @with_tree(tree=[('file.dat', 'abc')])
+ @serve_path_via_http
+ def test_download_url(toppath=None, topurl=None):
+diff --git a/datalad/interface/common_cfg.py b/datalad/interface/common_cfg.py
+index f2b02f8c62..c84aa17823 100644
+--- a/datalad/interface/common_cfg.py
++++ b/datalad/interface/common_cfg.py
+@@ -28,6 +28,7 @@
+     EnsureInt,
+     EnsureListOf,
+     EnsureNone,
++    EnsureRange,
+     EnsureStr,
+ )
+ from datalad.utils import on_windows
+@@ -527,6 +528,15 @@ def get_default_ssh():
+         'type': EnsureInt(),
+         'default': 3,
+     },
++    'datalad.downloaders.retry': {
++        'ui': ('question',
++               {'title': 'Number of retries of a failed download',
++                'text': 'How often to retry a download which was '
++                        'interrupted, could not connect, or got an HTTP 429 '
++                        'or 5xx response. A retry starts from the beginning'}),
++        'type': EnsureInt() & EnsureRange(min=0),
++        'default': 5,
++    },
+     'datalad.repo.backend': {
+         'ui': ('question', {
+                'title': 'git-annex backend',
+diff --git a/datalad/interface/utils.py b/datalad/interface/utils.py
+index 2ddbabc553..3a884cff23 100644
+--- a/datalad/interface/utils.py
++++ b/datalad/interface/utils.py
+@@ -226,6 +226,13 @@ def eval_results(wrapped):
+     return eval_results_moved(wrapped)
+ 
+ 
++def _interpolate_message(msg):
++    """Render a result record's message, which may be a `(fmt, *args)` tuple"""
++    if not msg:
++        return ''
++    return str(msg[0] % msg[1:] if isinstance(msg, tuple) else msg)
++
++
+ def generic_result_renderer(res):
+     if res.get('status', None) != 'notneeded':
+         path = res.get('path', None)
+@@ -236,6 +243,11 @@ def generic_result_renderer(res):
+                 # can happen, e.g., on windows with paths from different
+                 # drives. just go with the original path in this case
+                 pass
++        msg = _interpolate_message(res.get('message'))
++        err = _interpolate_message(res.get('error_message')) \
++            if res.get('status') != 'ok' else ''
++        if err in msg:  # typically the head of a message with its causes
++            err = ''
+         ui.message('{action}({status}):{path}{type}{msg}{err}'.format(
+             action=ac.color_word(
+                 res.get('action', '<action-unspecified>'),
+@@ -245,16 +257,8 @@ def generic_result_renderer(res):
+             type=' ({})'.format(
+                 ac.color_word(res['type'], ac.MAGENTA)
+             ) if 'type' in res else '',
+-            msg=' [{}]'.format(
+-                res['message'][0] % res['message'][1:]
+-                if isinstance(res['message'], tuple) else res[
+-                    'message'])
+-            if res.get('message', None) else '',
+-            err=ac.color_word(' [{}]'.format(
+-                res['error_message'][0] % res['error_message'][1:]
+-                if isinstance(res['error_message'], tuple) else res[
+-                    'error_message']), ac.RED)
+-            if res.get('error_message', None) and res.get('status', None) != 'ok' else ''))
++            msg=' [{}]'.format(msg) if msg else '',
++            err=ac.color_word(' [{}]'.format(err), ac.RED) if err else ''))
+ 
+ 
+ # keep for legacy compatibility
+diff --git a/datalad/local/download_url.py b/datalad/local/download_url.py
+index ff84772ca2..5bb13fc40d 100644
+--- a/datalad/local/download_url.py
++++ b/datalad/local/download_url.py
+@@ -206,7 +206,7 @@ def __call__(urls,
+                     status="error",
+                     message=str(ce),
+                     type="file",
+-                    path=path,
++                    path=getattr(e, 'filepath', None) or path,
+                     exception=ce,
+                     **common_report)
+             else:
+diff --git a/datalad/support/exceptions.py b/datalad/support/exceptions.py
+index 159507275f..5c1321bf22 100644
+--- a/datalad/support/exceptions.py
++++ b/datalad/support/exceptions.py
+@@ -9,6 +9,7 @@
+ """ datalad exceptions
+ """
+ 
++import ast
+ import logging
+ import re
+ import sys
+@@ -93,9 +94,7 @@ def format_short(self):
+         str
+         """
+         s = self.name + '(' + self.message + ')'
+-        if exc_cause := getattr(self.tb, '__cause__', None):
+-            s += f' -caused by- {format_exception_with_cause(exc_cause)}'
+-        return s
++        return s + _format_causes(self.tb, self.message)
+ 
+     def format_with_cause(self):
+         """Returns a representation of the original exception including the
+@@ -111,7 +110,7 @@ def message(self):
+         -------
+         str
+         """
+-        return str(self.tb)
++        return _exception_message(self.tb)
+ 
+     if sys.version_info < (3, 13):
+         @property
+@@ -179,9 +178,7 @@ def format_oneline_tb(exc, tb=None, limit=None, include_str=True):
+     if include_str:
+         # try exc message else exception type
+         leading = exc.message or exc.name
+-        out = "{} ".format(leading)
+-        if exc_cause := getattr(tb, '__cause__', None):
+-            out += f'-caused by- {format_exception_with_cause(exc_cause)} '
++        out = "{}{} ".format(leading, _format_causes(tb, exc.message))
+     else:
+         out = ""
+ 
+@@ -209,7 +206,7 @@ def format_oneline_tb(exc, tb=None, limit=None, include_str=True):
+ 
+ 
+ def format_exception_with_cause(e):
+-    """Helper to recursively format an exception with all underlying causes
++    """Helper to format an exception with all underlying causes
+ 
+     For each exception in the chain either the str() of it is taken, or the
+     class name of the exception, with the aim to generate a simple and
+@@ -221,14 +218,66 @@ class name of the exception, with the aim to generate a simple and
+     while being recognizably different from potential exception payload
+     messages.
+     """
+-    s = str(e) or \
+-        ((e.exc_type.__name__ if sys.version_info < (3, 13) else e.exc_type_str)
+-         if isinstance(e, traceback.TracebackException)
+-         else e.__class__.__name__)
+-    exc_cause = getattr(e, '__cause__', None)
+-    if exc_cause:
+-        s += f' -caused by- {format_exception_with_cause(exc_cause)}'
+-    return s
++    s = _exception_message(e) or _exception_type_name(e)
++    return s + _format_causes(e, s)
++
++
++def iter_exception_chain(e):
++    """Yield `e` and the exceptions it was raised from, stopping at a cycle"""
++    seen = set()
++    while e is not None and id(e) not in seen:
++        seen.add(id(e))
++        yield e
++        e = e.__cause__
++
++
++def _format_causes(e, text):
++    """' -caused by- ...' for the causes of `e` not already shown in `text`"""
++    out = ''
++    for cause in list(iter_exception_chain(e))[1:]:
++        msg = _exception_message(cause) or _exception_type_name(cause)
++        if not _renders_exception(text, cause):
++            out += f' -caused by- {msg}'
++        text = msg
++    return out
++
++
++def _renders_exception(text, e):
++    """Whether `text` shows `e`: its repr(), or its type and message"""
++    # the bare name: python 3.13+ reports e.g. http.client.IncompleteRead
++    name = _exception_type_name(e).rpartition('.')[2]
++    return bool(str(e)) and (
++        f'{name}(' in text
++        or (name in text and _exception_message(e) in text))
++
++
++def _exception_type_name(e):
++    """Class name of `e`, which may be an exception or a TracebackException"""
++    if isinstance(e, traceback.TracebackException):
++        return e.exc_type.__name__ if sys.version_info < (3, 13) \
++            else e.exc_type_str
++    return e.__class__.__name__
++
++
++# str() of an exception with several args is the repr() of all of them;
++# urllib3's ProtocolError has (message, wrapped exception)
++_MESSAGE_AND_EXCEPTION_ARGS = re.compile(
++    r"""\(('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"), ([A-Za-z_][\w.]*\(.*\))\)\Z""",
++    re.S)
++
++
++def _exception_message(e):
++    """str(e), or just the message of a (message, exception) args tuple if
++    that message already includes the exception"""
++    s = str(e)
++    m = _MESSAGE_AND_EXCEPTION_ARGS.match(s)
++    if not m:
++        return s
++    try:
++        message = ast.literal_eval(m[1])
++    except (SyntaxError, ValueError):  # a custom __str__ can render anything
++        return s
++    return message if m[2] in message else s
+ 
+ 
+ class MissingExternalDependency(RuntimeError):
+@@ -559,10 +608,11 @@ class ConnectionOpenFailedError(CommandError):
+ 
+ class DownloadError(Exception):
+ 
+-    def __init__(self, msg=None, status=None, **kwargs):
++    def __init__(self, msg=None, status=None, filepath=None, **kwargs):
+         super(DownloadError, self).__init__(msg, **kwargs)
+         # store response status code
+         self.status = status
++        self.filepath = filepath  # the destination, once known
+ 
+ 
+ class IncompleteDownloadError(DownloadError):
+diff --git a/datalad/support/tests/test_captured_exception.py b/datalad/support/tests/test_captured_exception.py
+index 2621194410..5f20a0d7b4 100644
+--- a/datalad/support/tests/test_captured_exception.py
++++ b/datalad/support/tests/test_captured_exception.py
+@@ -1,9 +1,13 @@
+ import sys
++from http.client import IncompleteRead
+ from unittest.mock import patch
+ 
++import pytest
++
+ from datalad import cfg
+ from datalad.support.exceptions import (
+     CapturedException,
++    _exception_message,
+     format_exception_with_cause,
+ )
+ from datalad.tests.utils_pytest import (
+@@ -117,3 +121,63 @@ def test_format_exception_with_cause():
+         assert_equal(
+             ce.format_with_cause(),
+             'RuntimeError -caused by- ValueError -caused by- Mike')
++    # a cyclic chain is rendered once
++    a, b = RuntimeError("a"), RuntimeError("b")
++    a.__cause__, b.__cause__ = b, a
++    assert_equal(format_exception_with_cause(a), "a -caused by- b")
++    a.__cause__ = a
++    assert_equal(CapturedException(a).format_short(), "RuntimeError(a)")
++
++
++_RESET = ConnectionResetError(104, 'Connection reset by peer')
++
++
++@pytest.mark.ai_generated
++@pytest.mark.parametrize('chain, expected', [
++    # a cause its wrapper already rendered, the way urllib3 reports a broken
++    # connection, is not spelled out a second time
++    ([RuntimeError("Connection broken: %r" % IncompleteRead(b'a', 2)),
++      IncompleteRead(b'a', 2)],
++     "Connection broken: IncompleteRead(1 bytes read, 2 more expected)"),
++    ([RuntimeError("Connection broken: %r" % _RESET, _RESET), _RESET],
++     "Connection broken: ConnectionResetError(104, 'Connection reset by peer')"),
++    # ... but only that one: its own cause is still reported
++    ([RuntimeError("step failed: %r" % ValueError("write failed")),
++      ValueError("write failed"), OSError(28, "No space left on device")],
++     "step failed: ValueError('write failed') "
++     "-caused by- [Errno 28] No space left on device"),
++    # sharing a word, or a type name without a message, is not a rendering
++    ([RuntimeError("the connection failed"), _RESET],
++     "the connection failed -caused by- [Errno 104] Connection reset by peer"),
++    ([RuntimeError("could not parse the ValueError log"), ValueError()],
++     "could not parse the ValueError log -caused by- ValueError"),
++])
++def test_format_exception_with_cause_skips_rendered_causes(chain, expected):
++    for e, cause in zip(chain, chain[1:]):
++        e.__cause__ = cause
++    assert_equal(format_exception_with_cause(chain[0]), expected)
++    assert_equal(CapturedException(chain[0]).format_with_cause(), expected)
++    message, sep, causes = expected.partition(' -caused by- ')
++    assert_equal(CapturedException(chain[0]).format_short(),
++                 f'RuntimeError({message}){sep}{causes}')
++
++
++class _VerbatimStr(Exception):
++    def __str__(self):
++        return self.args[0]
++
++
++@pytest.mark.ai_generated
++@pytest.mark.parametrize('exc, expected', [
++    (Exception("Connection broken: %r" % _RESET, _RESET),
++     "Connection broken: ConnectionResetError(104, 'Connection reset by peer')"),
++    (Exception("""he said "hi": %r""" % ValueError(), ValueError()),
++     """he said "hi": ValueError()"""),
++    # anything else is left as is
++    (Exception("Connection aborted.", _RESET),
++     "('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))"),
++    (Exception('a', 'b('), "('a', 'b(')"),
++    (_VerbatimStr(r"('\x', ValueError('y'))"), r"('\x', ValueError('y'))"),
++])
++def test_exception_message(exc, expected):
++    assert_equal(_exception_message(exc), expected)
+diff --git a/tools/flaky-httpd b/tools/flaky-httpd
+new file mode 100755
+index 0000000000..7eae932ce1
+--- /dev/null
++++ b/tools/flaky-httpd
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python
++"""HTTP server which fails in reproducible ways, to exercise downloaders
++
++usage: flaky-httpd [PORT]    (default: 8378), then e.g.
++
++  datalad download-url 'http://127.0.0.1:8378/flaky?size=8388608&after=65536'
++
++Endpoints, announcing size=N bytes (default: 1 MiB) and sending after=M of
++them (default: half) before failing:
++
++  /ok                  send all N bytes
++  /truncate            hang up
++  /flaky?fail=K        /truncate the first K (default: 2) requests for this
++                       very URL (vary it to start over), then /ok
++  /reset               reset the connection
++  /stall?delay=S       stall for S seconds (default: 300), then hang up
++  /status/CODE         respond with CODE (429 with Retry-After: 1)
++"""
++
++import socket
++import struct
++import sys
++import time
++from collections import Counter
++from http.server import (
++    BaseHTTPRequestHandler,
++    ThreadingHTTPServer,
++)
++from urllib.parse import (
++    parse_qsl,
++    urlparse,
++)
++
++CHUNK = 64 * 1024
++REQUESTS = Counter()  # for /flaky, by URL
++
++
++class Handler(BaseHTTPRequestHandler):
++    protocol_version = 'HTTP/1.1'
++
++    def _reply(self, code, body=b'', size=None):
++        self.send_response(code)
++        self.send_header('Content-Length', str(len(body) if size is None else size))
++        self.send_header('Accept-Ranges', 'none')  # a retry has to start over
++        if code == 429:
++            self.send_header('Retry-After', '1')
++        self.end_headers()
++        self.wfile.write(body)
++
++    def _send_bytes(self, count):
++        while count > 0:
++            n = min(count, CHUNK)
++            self.wfile.write(b'x' * n)
++            self.wfile.flush()
++            count -= n
++
++    def _hang_up(self, reset=False):
++        self.close_connection = True
++        try:
++            if reset:
++                # RST instead of FIN
++                self.connection.setsockopt(
++                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
++                self.connection.close()
++            else:
++                self.connection.shutdown(socket.SHUT_RDWR)
++        except OSError as e:
++            self.log_message('could not hang up: %s', e)
++
++    def do_GET(self):
++        url = urlparse(self.path)
++        route = url.path.rstrip('/')
++        query = dict(parse_qsl(url.query))
++        size = int(query.get('size', 1 << 20))
++        after = min(int(query.get('after', size // 2)), size)
++
++        if route in ('/ok', '/truncate', '/flaky', '/reset', '/stall'):
++            full = route == '/ok'
++            if route == '/flaky':
++                REQUESTS[self.path] += 1
++                full = REQUESTS[self.path] > int(query.get('fail', 2))
++                self.log_message('request %d: %s', REQUESTS[self.path],
++                                 'in full' if full else 'truncated')
++            self._reply(200, size=size)
++            self._send_bytes(size if full else after)
++            if route == '/stall':
++                time.sleep(int(query.get('delay', 300)))
++            if not full:
++                self._hang_up(reset=route == '/reset')
++        elif route.startswith('/status/'):
++            code = int(route[len('/status/'):])
++            self._reply(code, b'%d\n' % code)
++        else:
++            self._reply(404, __doc__.encode())
++
++
++if __name__ == '__main__':
++    if {'-h', '--help'} & set(sys.argv[1:]):
++        print(__doc__)
++        sys.exit()
++    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8378
++    print('Serving http://127.0.0.1:%d' % port, file=sys.stderr)
++    try:
++        ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
++    except KeyboardInterrupt:
++        sys.exit(130)

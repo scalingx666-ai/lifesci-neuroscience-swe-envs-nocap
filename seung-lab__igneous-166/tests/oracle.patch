@@ -1,0 +1,250 @@
+diff --git a/README.md b/README.md
+index 1a8da079..58aedeb7 100755
+--- a/README.md
++++ b/README.md
+@@ -467,7 +467,9 @@ Of note: Meshing is a memory intensive operation. The underlying zmesh library h
+ Igneous provides the engine for performing out-of-core skeletonization of labeled images. 
+ The in-core part of the algorithm is provided by the [Kimimaro](https://github.com/seung-lab/kimimaro) library.  
+ 
+-The strategy is to apply Kimimaro mass skeletonization to 1 voxel overlapping chunks of the segmentation and then fuse them in a second pass. Both sharded and unsharded formats are supported. For very large datasets, note that sharded runs better on a local cluster as it can make use of `mmap`.
++The strategy is to apply Kimimaro mass skeletonization to 1 voxel overlapping chunks of the segmentation and then fuse them in a second pass. Both sharded and unsharded formats are supported. For very large datasets, note that sharded runs better on a local cluster as it can make use of `mmap`.  
++
++We also support computing the cross sectional area at each vertex, but be aware that this will add significant time to the computation (currently many hours for a densely labeled task). This is practical for sparse labeling though. This should be improved substantially in the future.
+ 
+ #### CLI Skeletonization
+ 
+@@ -513,6 +515,8 @@ tasks = tc.create_skeletonizing_tasks(
+     parallel=1, # Number of parallel processes to use (more useful locally)
+     spatial_index=True, # generate a spatial index for querying skeletons by bounding box
+     sharded=False, # generate intermediate shard fragments for later processing into sharded format
++    cross_sectional_area=False, # Compute the cross sectional area for each vertex.
++    cross_sectional_area_smoothing_window=5, # Rolling average of vertices.
+   )
+ 
+ # Second Pass: Fuse Skeletons (unsharded version)
+diff --git a/igneous/task_creation/skeleton.py b/igneous/task_creation/skeleton.py
+index 0d2c4289..a328d334 100644
+--- a/igneous/task_creation/skeleton.py
++++ b/igneous/task_creation/skeleton.py
+@@ -49,7 +49,9 @@ def create_skeletonizing_tasks(
+     parallel=1, fill_missing=False, 
+     sharded=False, frag_path=None, spatial_index=True,
+     synapses=None, num_synapses=None,
+-    dust_global=False
++    dust_global=False, 
++    cross_sectional_area=False,
++    cross_sectional_area_smoothing_window=5,
+   ):
+   """
+   Assign tasks with one voxel overlap in a regular grid 
+@@ -124,6 +126,13 @@ def create_skeletonizing_tasks(
+     Iterable yielding ((x,y,z),segid,swc_label)
+ 
+   num_synapses: If synapses is an iterator, you must provide the total number of synapses.
++
++  cross_sectional_area: At each vertex, compute the area covered by a 
++  section plane whose direction is defined by the normal vector pointing
++  to the next vertex in the sequence. (n.b. this will add significant time
++  to the total computation.)
++  cross_sectional_area_smoothing_window: Perform a rolling average of the 
++    normal vectors across these many vectors.
+   """
+   shape = Vec(*shape)
+   vol = CloudVolume(cloudpath, mip=mip, info=info)
+@@ -152,7 +161,18 @@ def create_skeletonizing_tasks(
+     vol.skeleton.meta.info['spatial_index']['chunk_size'] = tuple(shape * vol.resolution)
+   
+   vol.skeleton.meta.info['mip'] = int(mip)
+-  vol.skeleton.meta.info['vertex_attributes'] = vol.skeleton.meta.info['vertex_attributes'][:1]
++  vol.skeleton.meta.info['vertex_attributes'] = [ 
++    attr for attr in vol.skeleton.meta.info['vertex_attributes']
++    if attr["data_type"] == "float32"
++  ]
++
++  if cross_sectional_area:
++    vol.skeleton.meta.info['vertex_attributes'].append({
++      "id": "cross_sectional_area",
++      "data_type": "float32",
++      "num_components": 1,
++    })
++
+   vol.skeleton.meta.commit_info()
+ 
+   will_postprocess = bool(np.any(vol.bounds.size3() > shape))
+@@ -187,6 +207,8 @@ def task(self, shape, offset):
+         spatial_grid_shape=shape.clone(), # used for writing index filenames
+         synapses=bbox_synapses,
+         dust_global=dust_global,
++        cross_sectional_area=bool(cross_sectional_area),
++        cross_sectional_area_smoothing_window=int(cross_sectional_area_smoothing_window),
+       )
+ 
+     def synapses_for_bbox(self, shape, offset):
+@@ -230,6 +252,8 @@ def on_finish(self):
+           'spatial_index': bool(spatial_index),
+           'synapses': bool(synapses),
+           'dust_global': bool(dust_global),
++          'cross_sectional_area': bool(cross_sectional_area),
++          'cross_sectional_area_smoothing_window': int(cross_sectional_area_smoothing_window),
+         },
+         'by': operator_contact(),
+         'date': strftime('%Y-%m-%d %H:%M %Z'),
+diff --git a/igneous/tasks/skeleton.py b/igneous/tasks/skeleton.py
+index 898bc2fe..c2e5d652 100644
+--- a/igneous/tasks/skeleton.py
++++ b/igneous/tasks/skeleton.py
+@@ -72,9 +72,11 @@ def __init__(
+     dust_threshold=1000, progress=False,
+     parallel=1, fill_missing=False, sharded=False,
+     frag_path=None, spatial_index=True, spatial_grid_shape=None,
+-    synapses=None, dust_global=False
++    synapses=None, dust_global=False,
++    cross_sectional_area=False,
++    cross_sectional_area_smoothing_window=1,
+   ):
+-    super(SkeletonTask, self).__init__(
++    super().__init__(
+       cloudpath, shape, offset, mip, 
+       teasar_params, will_postprocess, 
+       info, object_ids, mask_ids,
+@@ -82,7 +84,8 @@ def __init__(
+       fix_avocados, fill_holes,
+       dust_threshold, progress, parallel,
+       fill_missing, bool(sharded), frag_path, bool(spatial_index),
+-      spatial_grid_shape, synapses, bool(dust_global)
++      spatial_grid_shape, synapses, bool(dust_global),
++      bool(cross_sectional_area), int(cross_sectional_area_smoothing_window),
+     )
+     self.bounds = Bbox(offset, Vec(*shape) + Vec(*offset))
+     self.index_bounds = Bbox(offset, Vec(*spatial_grid_shape) + Vec(*offset))
+@@ -129,7 +132,15 @@ def execute(self):
+       fill_holes=self.fill_holes,
+       parallel=self.parallel,
+       extra_targets_after=extra_targets_after.keys(),
+-    )    
++    )
++
++    if self.cross_sectional_area:
++      skeletons = kimimaro.cross_sectional_area(
++        all_labels, skeletons,
++        anisotropy=vol.resolution,
++        smoothing_window=self.cross_sectional_area_smoothing_window,
++        progress=self.progress,
++      )
+ 
+     # voxel centered (+0.5) and uses more accurate bounding box from mip 0
+     corrected_offset = (bbox.minpt.astype(np.float32) - vol.meta.voxel_offset(self.mip) + 0.5) * vol.meta.resolution(self.mip)
+diff --git a/igneous_cli/cli.py b/igneous_cli/cli.py
+index fe625133..2f3521b8 100644
+--- a/igneous_cli/cli.py
++++ b/igneous_cli/cli.py
+@@ -1164,13 +1164,15 @@ def skeletongroup():
+ @click.option('--max-paths', default=None, help="Abort skeletonizing an object after this many paths have been traced.", type=float)
+ @click.option('--sharded', is_flag=True, default=False, help="Generate shard fragments instead of outputing skeleton fragments.", show_default=True)
+ @click.option('--labels', type=TupleN(), default=None, help="Skeletonize only this comma separated list of labels.", show_default=True)
++@click.option('--cross-section', type=int, default=0, help="Compute the cross sectional area for each skeleton vertex. May add substantial computation time. Integer value is the normal vector rolling average smoothing window over vertices. 0 means off.", show_default=True)
+ @click.pass_context
+ def skeleton_forge(
+   ctx, path, queue, mip, shape, 
+   fill_missing, dust_threshold, dust_global, spatial_index,
+   fix_branching, fix_borders, fix_avocados, 
+   fill_holes, scale, const, soma_detect, soma_accept,
+-  soma_scale, soma_const, max_paths, sharded, labels
++  soma_scale, soma_const, max_paths, sharded, labels,
++  cross_section,
+ ):
+   """
+   (1) Synthesize skeletons from segmentation cutouts.
+@@ -1213,6 +1215,8 @@ def skeleton_forge(
+     parallel=1, fill_missing=fill_missing, 
+     sharded=sharded, spatial_index=spatial_index,
+     dust_global=dust_global, object_ids=labels,
++    cross_sectional_area=(cross_section > 0),
++    cross_sectional_area_smoothing_window=int(cross_section),
+   )
+ 
+   enqueue_tasks(ctx, queue, tasks)
+diff --git a/requirements.txt b/requirements.txt
+index 6880fa09..0a19b5c3 100755
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,13 +1,13 @@
+ click>=6.7
+ cloud-files>=4.11.0
+-cloud-volume>=8.11.1
++cloud-volume>=8.29.0
+ crackle-codec
+ connected-components-3d>=3.10.1
+ DracoPy>=1.0.1,<2.0.0
+ fastremap>=1.13.2
+ google-cloud-logging
+-kimimaro>=0.5.0
+-mapbuffer>=0.6.0
++kimimaro>=3.4.0
++mapbuffer>=0.7.1
+ networkx
+ numpy>=1.14.2
+ pathos
+@@ -20,5 +20,6 @@ shard-computer
+ tinybrain
+ task-queue>=2.4.0
+ tqdm
+-zmesh>=1.4,<2.0
+-trimesh[easy]
+\ No newline at end of file
++trimesh[easy]
++xs3d>=0.2.0
++zmesh>=1.4,<2.0
+\ No newline at end of file
+diff --git a/test/test_tasks.py b/test/test_tasks.py
+index 27dce6a7..908fee90 100755
+--- a/test/test_tasks.py
++++ b/test/test_tasks.py
+@@ -505,26 +505,40 @@ def test_contrast_normalization_task():
+     tq.insert_all(tasks)
+ 
+ 
+-def test_skeletonization_task():
++@pytest.mark.parametrize("cross_sectional_area", [False, True])
++def test_skeletonization_task(cross_sectional_area):
+     directory = '/tmp/removeme/skeleton/'
+     layer_path = 'file://' + directory
+     delete_layer(layer_path)
+ 
+-    img = np.ones((256,256,256), dtype=np.uint64)
++    img = np.ones((128,128,128), dtype=np.uint64)
+     img[:,:,:] = 2
+     cv = CloudVolume.from_numpy(
+         img,
+         layer_type='segmentation',
+-        vol_path=layer_path, 
++        vol_path=layer_path,
+     )
+ 
+     tq = MockTaskQueue()
+-    tasks = tc.create_skeletonizing_tasks(layer_path, mip=0, teasar_params={
+-        'scale': 10,
+-        'const': 10,
+-    })
++    tasks = tc.create_skeletonizing_tasks(
++        layer_path,
++        mip=0,
++        teasar_params={
++            'scale': 10,
++            'const': 10,
++        },
++        cross_sectional_area=cross_sectional_area,
++        cross_sectional_area_smoothing_window=1,
++    )
+     tq.insert_all(tasks)
+ 
++    cv = CloudVolume(layer_path)
++    skel = cv.skeleton.get(2)
++
++    assert len(skel.vertices) > 0
++    if cross_sectional_area:
++        assert len(skel.cross_sectional_area) > 0
++        assert np.all(skel.cross_sectional_area >= 0)
+ 
+ def test_voxel_counting_task():
+     directory = '/tmp/removeme/voxelcounting/'

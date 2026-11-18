@@ -1,0 +1,245 @@
+diff --git a/src/Analysis/SecurityAnalyzer.php b/src/Analysis/SecurityAnalyzer.php
+index d5fd3349..79a620c7 100644
+--- a/src/Analysis/SecurityAnalyzer.php
++++ b/src/Analysis/SecurityAnalyzer.php
+@@ -4,6 +4,7 @@
+ 
+ namespace LaraMint\LaravelBrain\Analysis;
+ 
++use LaraMint\LaravelBrain\Parser\PhpExtendsFqcnResolver;
+ use LaraMint\LaravelBrain\Parser\PhpFileParser;
+ use PhpParser\Node;
+ use PhpParser\NodeTraverser;
+@@ -106,6 +107,14 @@ class SecurityAnalyzer
+     /** @var array<string, list<array<string, mixed>>>|null */
+     private ?array $externalByFile = null;
+ 
++    /**
++     * Memoised result of {@see self::isAuthClass()} keyed by FQCN, so each
++     * middleware class's `extends` chain is walked at most once per scan.
++     *
++     * @var array<string, bool>
++     */
++    private array $authClassCache = [];
++
+     /**
+      * Effective auth-middleware patterns (defaults + $extraAuthPatterns),
+      * pre-computed so classifyExposure() doesn't re-merge per route.
+@@ -281,11 +290,18 @@ private function classifyExposure(array $middlewares): string
+                 return 'admin';
+             }
+         }
+-        // Auth check
++        // Auth check — pattern/basename match OR a verified `extends
++        // Authenticate` chain. The chain walk catches a custom guard whose
++        // class name doesn't contain "auth" (e.g. `auth.customer` mapped to
++        // App\Http\Middleware\AuthenticateCustomer), which basename matching
++        // against the framework `Authenticate` alone would miss.
+         foreach ($middlewares as $mw) {
+             if ($this->middlewareMatches($mw, $this->authPatterns)) {
+                 return 'authed';
+             }
++            if ($this->isAuthClass($this->middlewareClass($mw))) {
++                return 'authed';
++            }
+         }
+         // Guest check
+         foreach ($middlewares as $mw) {
+@@ -595,6 +611,94 @@ private function middlewareBasename(string $middleware): string
+         return strtolower($pos === false ? $name : substr($name, $pos + 1));
+     }
+ 
++    /**
++     * The class/alias part of a resolved middleware string, stripped of any
++     * `:params` suffix. The registry has already resolved aliases to FQCNs,
++     * so this is usually a class name.
++     */
++    private function middlewareClass(string $middleware): string
++    {
++        return explode(':', $middleware, 2)[0];
++    }
++
++    /**
++     * True when $fqcn is the framework's Authenticate middleware or any class
++     * whose `extends` chain reaches it. Results are memoised per scan so each
++     * FQCN is walked at most once.
++     */
++    private function isAuthClass(string $fqcn): bool
++    {
++        $fqcn = ltrim($fqcn, '\\');
++        if ($fqcn === '') {
++            return false;
++        }
++        if (isset($this->authClassCache[$fqcn])) {
++            return $this->authClassCache[$fqcn];
++        }
++        if ($fqcn === 'Illuminate\\Auth\\Middleware\\Authenticate') {
++            return $this->authClassCache[$fqcn] = true;
++        }
++
++        // Seed the memo *before* recursing so a cyclic `extends` chain (two
++        // classes that extend each other — only possible with a broken class
++        // Brain can't execute) terminates instead of exhausting memory and
++        // taking the whole scan down. The real result overwrites this below.
++        $this->authClassCache[$fqcn] = false;
++
++        $parent = $this->resolveParentClass($fqcn);
++        if ($parent === null) {
++            return false;
++        }
++
++        return $this->authClassCache[$fqcn] = $this->isAuthClass($parent);
++    }
++
++    /**
++     * Best-effort: parse the file declaring $fqcn (PSR-4 convention) and
++     * return the FQCN of its `extends` clause, or null when the file can't be
++     * found or the class doesn't extend anything we can resolve.
++     */
++    private function resolveParentClass(string $fqcn): ?string
++    {
++        $file = $this->locateClassFile($fqcn);
++        if ($file === null) {
++            return null;
++        }
++
++        $parsed = $this->cachedParse($file);
++        if (($parsed['ast'] ?? null) === null) {
++            return null;
++        }
++
++        $namespace = PhpExtendsFqcnResolver::namespaceFromAst($parsed['ast']);
++        $useMap = $parsed['useMap'] ?? [];
++
++        $parent = null;
++        $traverser = new NodeTraverser;
++        $traverser->addVisitor(new class($parent, $namespace, $useMap) extends NodeVisitorAbstract
++        {
++            public function __construct(public ?string &$parent, private string $namespace, private array $useMap) {}
++
++            public function enterNode(Node $node): ?int
++            {
++                if ($node instanceof Node\Stmt\Class_ && $node->extends !== null) {
++                    $this->parent = PhpExtendsFqcnResolver::resolveExtends(
++                        $node->extends,
++                        $this->namespace,
++                        $this->useMap,
++                    );
++
++                    return NodeTraverser::STOP_TRAVERSAL;
++                }
++
++                return null;
++            }
++        });
++        $traverser->traverse($parsed['ast']);
++
++        return $parent;
++    }
++
+     /**
+      * Expand middleware group aliases (auth, guest, etc.) using the registry.
+      */
+diff --git a/tests/Unit/SecurityAnalyzerTest.php b/tests/Unit/SecurityAnalyzerTest.php
+index dcdb96d6..cb40d570 100644
+--- a/tests/Unit/SecurityAnalyzerTest.php
++++ b/tests/Unit/SecurityAnalyzerTest.php
+@@ -487,3 +487,49 @@ function issueTypes(array $analysis, string $routeId): array
+     expect(issueTypes($analysis, 'route::POST::/login-noop'))
+         ->toContain('MISSING_THROTTLE');
+ });
++
++// =============================================================================
++// Custom auth guard detection via a verified `extends Authenticate` chain.
++// Catches guards whose class name does not contain "auth" (e.g. an
++// `auth.customer` alias mapped to App\Http\Middleware\AuthenticateCustomer),
++// which basename matching against the framework `Authenticate` alone misses.
++// =============================================================================
++
++function customAuthFixtureRoot(): string
++{
++    return fixture('custom-auth-project');
++}
++
++it('classifies a differently-named Authenticate subclass (resolved via alias) as authed', function () {
++    $route = makeSecurityRoute('DELETE', '/account/claims/{claim}', ['auth.customer']);
++    $registry = new MiddlewareRegistry([], [], [
++        'auth.customer' => 'App\\Http\\Middleware\\AuthenticateCustomer',
++    ]);
++
++    $analysis = (new SecurityAnalyzer)->analyze([$route], $registry, [], customAuthFixtureRoot());
++
++    $routeId = 'route::DELETE::/account/claims/{claim}';
++    expect($analysis[$routeId]['exposure'])->toBe('authed')
++        ->and(issueTypes($analysis, $routeId))->not->toContain('PUBLIC_WRITE');
++});
++
++it('classifies a differently-named Authenticate subclass given by bare FQCN as authed', function () {
++    $route = makeSecurityRoute('POST', '/account/profile', ['App\\Http\\Middleware\\AuthenticateCustomer']);
++    $registry = new MiddlewareRegistry([], [], []);
++
++    $analysis = (new SecurityAnalyzer)->analyze([$route], $registry, [], customAuthFixtureRoot());
++
++    expect($analysis['route::POST::/account/profile']['exposure'])->toBe('authed');
++});
++
++it('terminates on a cyclic middleware extends chain instead of exhausting memory', function () {
++    // CyclicA extends CyclicB extends CyclicA. Neither reaches Authenticate, so
++    // the route stays public; the point is that the walk returns at all.
++    $route = makeSecurityRoute('POST', '/cyclic', ['App\\Http\\Middleware\\CyclicA']);
++    $registry = new MiddlewareRegistry([], [], []);
++
++    $analysis = (new SecurityAnalyzer)->analyze([$route], $registry, [], customAuthFixtureRoot());
++
++    expect($analysis['route::POST::/cyclic']['exposure'])->toBe('public')
++        ->and(issueTypes($analysis, 'route::POST::/cyclic'))->toContain('PUBLIC_WRITE');
++});
+diff --git a/tests/fixtures/custom-auth-project/app/Http/Middleware/AuthenticateCustomer.php b/tests/fixtures/custom-auth-project/app/Http/Middleware/AuthenticateCustomer.php
+new file mode 100644
+index 00000000..f95bd5e3
+--- /dev/null
++++ b/tests/fixtures/custom-auth-project/app/Http/Middleware/AuthenticateCustomer.php
+@@ -0,0 +1,14 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use Illuminate\Auth\Middleware\Authenticate;
++
++/**
++ * Custom auth middleware backing a second guard (e.g. the `auth.customer`
++ * alias). Extending the framework's Authenticate is the standard Laravel
++ * idiom for adding a guard alongside `auth` — but the class name does not
++ * contain "auth", so basename matching against `Authenticate` alone misses
++ * it and the extends-chain walk is what recognises it.
++ */
++class AuthenticateCustomer extends Authenticate {}
+diff --git a/tests/fixtures/custom-auth-project/app/Http/Middleware/CyclicA.php b/tests/fixtures/custom-auth-project/app/Http/Middleware/CyclicA.php
+new file mode 100644
+index 00000000..3af0a3a0
+--- /dev/null
++++ b/tests/fixtures/custom-auth-project/app/Http/Middleware/CyclicA.php
+@@ -0,0 +1,11 @@
++<?php
++
++namespace App\Http\Middleware;
++
++/**
++ * Deliberately broken: CyclicA and CyclicB extend each other. This can only
++ * happen with a class PHP could never load, but Brain parses source without
++ * executing it, so the extends walk in SecurityAnalyzer::isAuthClass() must
++ * terminate on the cycle instead of recursing until memory is exhausted.
++ */
++class CyclicA extends CyclicB {}
+diff --git a/tests/fixtures/custom-auth-project/app/Http/Middleware/CyclicB.php b/tests/fixtures/custom-auth-project/app/Http/Middleware/CyclicB.php
+new file mode 100644
+index 00000000..96f53450
+--- /dev/null
++++ b/tests/fixtures/custom-auth-project/app/Http/Middleware/CyclicB.php
+@@ -0,0 +1,6 @@
++<?php
++
++namespace App\Http\Middleware;
++
++/** Counterpart to CyclicA — see that class for why this cycle exists. */
++class CyclicB extends CyclicA {}

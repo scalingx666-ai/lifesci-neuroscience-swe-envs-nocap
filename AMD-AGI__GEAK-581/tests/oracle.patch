@@ -1,0 +1,228 @@
+diff --git a/.github/workflows/ci-l0-checks.yml b/.github/workflows/ci-l0-checks.yml
+index 7a4f9a7cd..0ac012952 100644
+--- a/.github/workflows/ci-l0-checks.yml
++++ b/.github/workflows/ci-l0-checks.yml
+@@ -125,6 +125,7 @@ jobs:
+             e2e_workflow/scripts/tests/test_overlay_installers.py \
+             e2e_workflow/scripts/tests/test_seam_trace.py \
+             e2e_workflow/scripts/tests/test_seam_trace_capture_guard.py \
++            e2e_workflow/scripts/tests/test_seam_trace_compiled.py \
+             e2e_workflow/scripts/tests/test_kernel_selection.py \
+             e2e_workflow/scripts/tests/test_kernel_extract_targets.py \
+             e2e_workflow/knowledge/kernel_extraction_skills/kernel-extract/tests/test_sampling_pipeline.py \
+diff --git a/e2e_workflow/scripts/seam_trace.py b/e2e_workflow/scripts/seam_trace.py
+index 2ba984e74..03c1a04a7 100644
+--- a/e2e_workflow/scripts/seam_trace.py
++++ b/e2e_workflow/scripts/seam_trace.py
+@@ -72,6 +72,17 @@ def _capturing():
+         return False
+ 
+ 
++def _compile_probe():
++    """``torch.compiler.is_compiling``, or a constant False where torch (or that query) is absent.
++
++    Resolved once by install(), so the marker never imports torch while Dynamo traces it."""
++    try:
++        import torch
++        return torch.compiler.is_compiling
++    except (ImportError, AttributeError):
++        return lambda: False
++
++
+ def _record_install_markers():
+     """Put proof of successful installation in every process-local trace."""
+     import torch
+@@ -212,9 +223,14 @@ def install(target):
+     original = getattr(module, attr)
+     if not _wrappable(original):
+         raise RuntimeError(f"cannot safely mark non-Python callable {target}")
++    is_compiling = _compile_probe()
+ 
+     @functools.wraps(original)
+     def marked(*args, **kwargs):
++        if is_compiling():
++            # Dynamo folds this to True while tracing a compiled region (vLLM's fullgraph forward). It
++            # cannot trace the capture query below, which returns a bool, nor the profiler calls.
++            return original(*args, **kwargs)
+         if _capturing():
+             # Pure pass-through mid-capture: no profile lifecycle, no record_function node baked
+             # into the captured graph.
+diff --git a/e2e_workflow/scripts/tests/test_seam_trace_capture_guard.py b/e2e_workflow/scripts/tests/test_seam_trace_capture_guard.py
+index 71dabe4fa..89f2a2a41 100644
+--- a/e2e_workflow/scripts/tests/test_seam_trace_capture_guard.py
++++ b/e2e_workflow/scripts/tests/test_seam_trace_capture_guard.py
+@@ -36,10 +36,11 @@
+ class _FakeTorch(types.ModuleType):
+     """Minimal torch surface: a flippable capture flag, plus recording profiler objects."""
+ 
+-    def __init__(self, capturing=False, has_capture_query=True):
++    def __init__(self, capturing=False, has_capture_query=True, compiling=None):
+         super().__init__("torch")
+         self.entered = []          # record_function labels entered, and EXPORT: paths
+         self.profiles_started = 0
++        self.capture_queries = 0
+         self._capturing = capturing
+         outer = self
+ 
+@@ -76,7 +77,13 @@ def export_chrome_trace(self, path):
+         self.cuda = types.SimpleNamespace(synchronize=lambda *a, **k: None,
+                                           is_available=lambda: True)
+         if has_capture_query:
+-            self.cuda.is_current_stream_capturing = lambda: self._capturing
++            self.cuda.is_current_stream_capturing = self._capture_query
++        if compiling is not None:
++            self.compiler = types.SimpleNamespace(is_compiling=lambda: compiling)
++
++    def _capture_query(self):
++        self.capture_queries += 1
++        return self._capturing
+ 
+     def set_capturing(self, value):
+         self._capturing = value
+@@ -201,6 +208,47 @@ def test_marker_resumes_once_capture_ends(self):
+                             f"marker never resumed after capture ended; entered={torch.entered}")
+ 
+ 
++class TestMarkerIsPassThroughWhileCompiling(unittest.TestCase):
++    """Under torch.compile the marker must not reach the capture query, which Dynamo cannot trace."""
++
++    def _call_while_compiling(self, neutralise_check=False):
++        with fake_torch(capturing=False, compiling=True) as torch:
++            seam = load_seam()
++            if neutralise_check:
++                seam._compile_probe = lambda: (lambda: False)
++            mod, calls, target = make_target()
++            seam.install(target)
++            result = mod.work(2, y=3)
++            return result, torch, seam, calls
++
++    def test_wrapped_function_still_runs_and_returns_correctly(self):
++        result, _torch, _seam, calls = self._call_while_compiling()
++        self.assertEqual(result, 5)
++        self.assertEqual(calls, [(2, 3)])
++
++    def test_neither_the_capture_query_nor_a_marker_runs(self):
++        _r, torch, seam, _c = self._call_while_compiling()
++        self.assertEqual(torch.capture_queries, 0,
++                         "the capture query ran while compiling: Dynamo rejects it and the engine dies")
++        self.assertEqual(torch.entered, [])
++        self.assertEqual(torch.profiles_started, 0)
++        self.assertEqual(seam._PROFILE["active_calls"], 0)
++
++    def test_without_the_check_the_capture_query_runs(self):
++        _r, torch, _seam, _c = self._call_while_compiling(neutralise_check=True)
++        self.assertGreater(torch.capture_queries, 0,
++                           "NON-DISCRIMINATING: the capture query was skipped even with the check "
++                           "neutralised, so these tests do not cover the check")
++
++    def test_torch_without_the_compiler_query_is_treated_as_not_compiling(self):
++        with fake_torch(capturing=False) as torch:
++            seam = load_seam()
++            mod, _calls, target = make_target()
++            seam.install(target)
++            mod.work(1)
++            self.assertTrue(any(target in entry for entry in torch.entered))
++
++
+ class TestProfileLifecycleGuards(unittest.TestCase):
+     """_start_profile needs GEAK_SELECTION_TRACE set, or it declines for an unrelated reason."""
+ 
+diff --git a/e2e_workflow/scripts/tests/test_seam_trace_compiled.py b/e2e_workflow/scripts/tests/test_seam_trace_compiled.py
+new file mode 100644
+index 000000000..e8adf8bb7
+--- /dev/null
++++ b/e2e_workflow/scripts/tests/test_seam_trace_compiled.py
+@@ -0,0 +1,93 @@
++"""seam_trace's marker inside a torch.compile(fullgraph=True) region, the way vLLM compiles a model forward.
++
++vLLM's forward calls the marked seam (e.g. ``rocm_unquantized_gemm``) inside a graph that Dynamo traces with
++``fullgraph=True``. The marker's capture query, ``torch.cuda.is_current_stream_capturing()``, returns a bool, which
++Dynamo cannot put in a graph, so an untraceable marker is an engine-start failure, not a missing marker. Needs
++torch; skipped where it is not installed or cannot load its runtime.
++"""
++import importlib
++import importlib.util
++import itertools
++import os
++import sys
++import types
++import unittest
++
++
++def _import_torch():
++    """torch, or None when it is absent or installed with a runtime library that cannot be loaded."""
++    try:
++        return importlib.import_module("torch")
++    except (ImportError, OSError):
++        return None
++
++
++torch = _import_torch()
++
++SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++_LOADS = itertools.count()
++
++
++def _load_seam_trace():
++    # A name per load: Dynamo resolves an inlined function's globals through sys.modules by name, so a reused
++    # name would let one test's compiled graph read the previous test's module state.
++    spec = importlib.util.spec_from_file_location(
++        f"seam_trace_compiled_{next(_LOADS)}", os.path.join(SCRIPTS_DIR, "seam_trace.py"))
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++@unittest.skipIf(torch is None, "needs torch")
++class TestMarkerUnderCompile(unittest.TestCase):
++    def setUp(self):
++        self.seam = _load_seam_trace()
++        self.addCleanup(sys.modules.pop, self.seam.__name__, None)
++        layer = types.ModuleType(f"fake_marked_layer_{next(_LOADS)}")
++        layer.gemm = lambda x, w: x @ w.t()
++        sys.modules[layer.__name__] = layer
++        self.addCleanup(sys.modules.pop, layer.__name__, None)
++        self.layer = layer
++        self.target = f"{layer.__name__}:gemm"
++        torch._dynamo.reset()
++        self.addCleanup(torch._dynamo.reset)
++
++    def _forward(self, x, w):
++        return self.layer.gemm(x, w) + 1
++
++    def _install(self):
++        self.seam.install(self.target)
++
++    def test_the_marked_callable_compiles_with_fullgraph(self):
++        self._install()
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        compiled = torch.compile(self._forward, fullgraph=True, backend="eager")
++
++        torch.testing.assert_close(compiled(x, w), x @ w.t() + 1)
++
++    def test_without_the_compile_check_fullgraph_tracing_fails(self):
++        """Neutralise the check and the capture query is traced again, which Dynamo rejects."""
++        self.seam._compile_probe = lambda: (lambda: False)
++        self._install()
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        compiled = torch.compile(self._forward, fullgraph=True, backend="eager")
++
++        with self.assertRaisesRegex(
++            (torch._dynamo.exc.Unsupported, torch._dynamo.exc.TorchRuntimeError),
++            "is_current_stream_capturing|_cuda_isCurrentStreamCapturing",
++        ):
++            compiled(x, w)
++
++    def test_eager_calls_still_enter_the_marker(self):
++        self._install()
++        x, w = torch.randn(4, 8), torch.randn(16, 8)
++        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
++            self._forward(x, w)
++
++        names = {event.name for event in prof.events()}
++        self.assertIn(self.seam.MARKER_PREFIX + self.target, names)
++
++
++if __name__ == "__main__":
++    unittest.main()

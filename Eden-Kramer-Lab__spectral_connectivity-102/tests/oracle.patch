@@ -1,0 +1,725 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 61e0963..a89906f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -99,12 +99,17 @@ directly with results from 2.x.
+   measures, which require a full two-sided spectrum. Morlet coefficients are
+   scaled so that `power()` is the one-sided PSD in signal²/Hz, on the same
+   scale as `Multitaper` (FieldTrip's convention; MNE's wavelet power is
+-  `2 * sampling_frequency` times larger).
++  `2 * sampling_frequency` times larger). `ShortTimeFourierTransform`'s `repr`
++  and `summarize_parameters()` describe its Hann window and equivalent noise
++  bandwidth; `Welch` exposes its resolved settings (segment duration and step,
++  overlap, detrending, start time, FFT length, workers) as read-only
++  properties.
+ - Morlet transforms now expose strict time-frequency edge validity and support
+   constant/reflect/edge convolution padding, keep/NaN/trim edge policies,
+   adjacent-frequency smoothing, and boxcar or Hann time-frequency kernels.
+   Connectivity expectations consume the local weights directly, and xarray
+-  results carry the `valid_time_frequency` mask.
++  results carry the `valid_time_frequency` mask alongside their labeled time
++  and frequency coordinates.
+ - `SpectralTransform`, a public, runtime-checkable `typing.Protocol` for the
+   transforms `Connectivity.from_transform` and `Connectivity.from_multitaper`
+   accept: `fft()`, `frequencies`, and `time` are required, and the optional
+@@ -310,7 +315,9 @@ directly with results from 2.x.
+ - xarray results carry `long_name` and `units` on every variable (spectral
+   densities in `(<input units>)^2/Hz` when the input states its units),
+   `band_lower`/`band_upper` coordinates after band reduction, and an input
+-  DataArray's per-signal coordinates as `source_<name>`/`target_<name>`.
++  DataArray's per-signal coordinates, with their attrs, as
++  `source_<name>`/`target_<name>`. The package's coordinates (including band
++  names and edges and component connection labels) carry a `long_name`.
+   `frequency_band_reduce` takes `circular=` and infers circular averaging
+   from `units="rad"`. Large array input attributes are summarized by shape.
+ 
+@@ -405,6 +412,13 @@ directly with results from 2.x.
+ 
+ ### Fixed
+ 
++- `Multitaper` reports the supplied column count for custom tapers. For DPSS,
++  `n_tapers` keeps describing the requested count after low-bias filtering,
++  so repeated wrapper calls retain the same taper-count provenance.
++- `Multitaper` rejects an impossible `n_tapers` when it is constructed: zero,
++  negative, larger than the window, a boolean, or disagreeing with the columns
++  of supplied `tapers`. 2.x accepted these and failed later inside `fft()` with
++  an opaque SciPy `select_range` error, or used `True` as one taper.
+ - `canonical_coherence` overstated the coherence of a group containing a dead,
+   duplicated, or (numerically) collinear channel, by up to 0.12 in tests: the
+   SVD-based whitening turned each zero singular direction into an arbitrary
+diff --git a/src/spectral_connectivity/_frequency_bands.py b/src/spectral_connectivity/_frequency_bands.py
+index 69cbfe9..6d011ac 100644
+--- a/src/spectral_connectivity/_frequency_bands.py
++++ b/src/spectral_connectivity/_frequency_bands.py
+@@ -197,6 +197,11 @@ def _reduce_dataarray(data: xr.DataArray) -> xr.DataArray:
+             # average a different set of bins per time point.
+             if reduction == "integral":
+                 reduced = xr.dot(selected, xr.DataArray(weights[used], dims="frequency"))
++                # Some xarray versions (e.g. 2025.6) drop coordinate attrs in
++                # xr.dot; restore them from the input's coordinates.
++                for name, coordinate in reduced.coords.items():
++                    if name in selected.coords:
++                        coordinate.attrs.update(selected.coords[name].attrs)
+             elif (
+                 circular
+                 if circular is not None
+@@ -219,20 +224,30 @@ def _reduce_dataarray(data: xr.DataArray) -> xr.DataArray:
+             if "valid_time_frequency" in selected.coords:
+                 band_validity.append(selected.coords["valid_time_frequency"].all("frequency"))
+ 
+-        reduced = xr.concat(reduced_bands, dim="band").assign_coords(band=band_names)
+-        edge_attrs = {
++        band = ("band", band_names, {"long_name": "Frequency band"})
++        reduced = xr.concat(reduced_bands, dim="band").assign_coords(band=band)
++        units = {
+             key: value
+             for key, value in data.coords["frequency"].attrs.items()
+             if key == "units"
+         }
+         reduced = reduced.assign_coords(
+-            band_lower=("band", [low for _, (low, _) in band_masks_and_bounds], edge_attrs),
+-            band_upper=("band", [high for _, (_, high) in band_masks_and_bounds], edge_attrs),
++            band_lower=(
++                "band",
++                [low for _, (low, _) in band_masks_and_bounds],
++                {"long_name": "Lower edge of the frequency band", **units},
++            ),
++            band_upper=(
++                "band",
++                [high for _, (_, high) in band_masks_and_bounds],
++                {"long_name": "Upper edge of the frequency band", **units},
++            ),
+         )
+         if band_validity:
+             reduced = reduced.assign_coords(
+                 valid_time_band=xr.concat(band_validity, dim="band")
+-                .assign_coords(band=band_names)
++                # The same labeled band coordinate, so the merge keeps its attrs.
++                .assign_coords(band=band)
+                 # Any surviving non-frequency axes (typically "time", but none
+                 # if the caller already selected a single time point) come
+                 # first; "band" is placed last without naming "time" explicitly.
+diff --git a/src/spectral_connectivity/_input_handling.py b/src/spectral_connectivity/_input_handling.py
+index 325abd7..0a9c97d 100644
+--- a/src/spectral_connectivity/_input_handling.py
++++ b/src/spectral_connectivity/_input_handling.py
+@@ -51,9 +51,10 @@ class _TimeAxis(NamedTuple):
+ class _SignalMetadata(NamedTuple):
+     """What an input DataArray says about its signals, carried into results."""
+ 
+-    # 1-D non-index coordinates on the signal dimension (e.g. brain region);
+-    # each becomes ``<axis>_<name>`` on the result's source/target/signal axis.
+-    coordinates: Mapping[str, NDArray[Any]]
++    # 1-D non-index coordinates on the signal dimension (e.g. brain region), as
++    # ``(values, attrs)``; each becomes ``<axis>_<name>`` on the result's
++    # source/target/signal axis, keeping its attrs.
++    coordinates: Mapping[str, tuple[NDArray[Any], dict[Hashable, Any]]]
+     # The input's ``units`` attribute; spectral densities report (units)^2/Hz.
+     units: str | None
+ 
+@@ -601,10 +602,11 @@ def _signal_labels_from_dataarray(
+ 
+ def _signal_coordinates_from_dataarray(
+     data_array: xr.DataArray, signal_dimension: Hashable
+-) -> dict[str, NDArray[Any]]:
+-    """1-D non-index coordinates along the signal dimension (e.g. brain region)."""
++) -> dict[str, tuple[NDArray[Any], dict[Hashable, Any]]]:
++    """1-D non-index coordinates along the signal dimension (e.g. brain region),
++    as ``(values, attrs)``."""
+     return {
+-        str(name): np.asarray(coordinate.to_numpy())
++        str(name): (np.asarray(coordinate.to_numpy()), dict(coordinate.attrs))
+         for name, coordinate in data_array.coords.items()
+         if name != signal_dimension and coordinate.dims == (signal_dimension,)
+     }
+diff --git a/src/spectral_connectivity/_result_formatting.py b/src/spectral_connectivity/_result_formatting.py
+index 6d1295b..baba0fa 100644
+--- a/src/spectral_connectivity/_result_formatting.py
++++ b/src/spectral_connectivity/_result_formatting.py
+@@ -187,12 +187,12 @@ def _connectivity_result_to_xarray(
+         {} if signal_metadata is None else dict(signal_metadata.coordinates)
+     )
+     source_extras = {
+-        f"source_{name}": ("source", values)
+-        for name, values in extra_signal_coordinates.items()
++        f"source_{name}": ("source", values, attrs)
++        for name, (values, attrs) in extra_signal_coordinates.items()
+     }
+     target_extras = {
+-        f"target_{name}": ("target", values)
+-        for name, values in extra_signal_coordinates.items()
++        f"target_{name}": ("target", values, attrs)
++        for name, (values, attrs) in extra_signal_coordinates.items()
+     }
+     signal_coordinates.update(source_extras)
+     signal_coordinates.update(target_extras)
+@@ -454,18 +454,20 @@ def _connectivity_result_to_xarray(
+             "connection_seed_group": (
+                 "connection",
+                 numerical_result.connections[:, 0],
++                {"long_name": "Seed group of the connection"},
+             ),
+             "connection_target_group": (
+                 "connection",
+                 numerical_result.connections[:, 1],
++                {"long_name": "Target group of the connection"},
+             ),
+             "side": ("side", ["seed", "target"], {"long_name": "Side of the connection"}),
+             "signal": ("signal", signal_labels, {"long_name": "Signal"}),
+             "group": ("group", numerical_result.group_labels, {"long_name": "Signal group"}),
+         }
+         signal_extras = {
+-            f"signal_{name}": ("signal", values)
+-            for name, values in extra_signal_coordinates.items()
++            f"signal_{name}": ("signal", values, attrs)
++            for name, (values, attrs) in extra_signal_coordinates.items()
+         }
+         data_vars = {
+             method: xr.DataArray(
+diff --git a/src/spectral_connectivity/transforms.py b/src/spectral_connectivity/transforms.py
+index ecc34a5..fd7f89d 100644
+--- a/src/spectral_connectivity/transforms.py
++++ b/src/spectral_connectivity/transforms.py
+@@ -1133,10 +1133,14 @@ def __init__(
+         self._n_fft_samples = n_fft_samples
+         self._tapers = None if tapers is None else _immutable_array_snapshot(tapers)
+         self._taper_eigenvalues: BackendArray | None = None
+-        # Reject a fractional n_tapers at construction so the reported
+-        # n_tapers metadata cannot disagree with the (integer) taper count used.
+-        if n_tapers is not None and (not np.isfinite(n_tapers) or int(n_tapers) != n_tapers):
+-            msg = f"n_tapers must be an integer, got {n_tapers}."
++        # Reject a fractional (or boolean) n_tapers at construction so the
++        # reported n_tapers metadata cannot disagree with the taper count used.
++        if n_tapers is not None and (
++            isinstance(n_tapers, (bool, np.bool_))
++            or not np.isfinite(n_tapers)
++            or int(n_tapers) != n_tapers
++        ):
++            msg = f"n_tapers must be an integer, got {n_tapers!r}."
+             raise ValueError(msg)
+         self._n_tapers = n_tapers
+         # A duration and a sample count for the same window or step must name
+@@ -1178,6 +1182,22 @@ def __init__(
+                     f"taper, n_time_samples_per_window rows -- got {self._tapers.shape}."
+                 )
+                 raise ValueError(msg)
++        if n_tapers is not None:
++            # Check the count now that the window is known, so an impossible
++            # value fails here rather than inside fft().
++            window = self.n_time_samples_per_window
++            if not 1 <= n_tapers <= window:
++                msg = (
++                    f"n_tapers must satisfy 1 <= n_tapers <= n_time_samples_per_window "
++                    f"(= {window}), got {n_tapers}."
++                )
++                raise ValueError(msg)
++            if self._tapers is not None and self._tapers.shape[1] != n_tapers:
++                msg = (
++                    f"n_tapers ({n_tapers}) disagrees with the {self._tapers.shape[1]} "
++                    "columns of tapers; pass one or make them agree."
++                )
++                raise ValueError(msg)
+         object.__setattr__(self, "_initialized", True)
+ 
+     @property
+@@ -1302,7 +1322,26 @@ def summarize_parameters(self) -> str:
+         estimate_frequency_resolution : Estimate frequency resolution
+         estimate_n_tapers : Estimate number of tapers
+         """
+-        # Calculate time windows info
++        return self._summary(
++            "Multitaper Spectral Analysis Configuration",
++            [
++                ("Time-halfbandwidth product", self.time_halfbandwidth_product),
++                ("Number of tapers", self.n_tapers),
++            ],
++            ("Frequency resolution", f"{self.frequency_resolution:.1f} Hz"),
++        )
++
++    def _summary(
++        self,
++        title: str,
++        spectral_rows: list[tuple[str, Any]],
++        bandwidth_row: tuple[str, str],
++    ) -> str:
++        """Human-readable configuration summary shared by the windowed transforms.
++
++        ``spectral_rows`` follow the sampling frequency in "Spectral Parameters";
++        ``bandwidth_row`` heads "Frequency Analysis".
++        """
+         n_time_samples = self._time_series.shape[0]
+         signal_duration = n_time_samples / self.sampling_frequency
+         n_windows = int(
+@@ -1324,8 +1363,25 @@ def summarize_parameters(self) -> str:
+             )
+             overlap_desc = f"({overlap_percent:.0f}% overlap)"
+ 
+-        return f"""Multitaper Spectral Analysis Configuration
+-===========================================
++        spectral = "\n".join(
++            f"{label + ':':<31}{value}"
++            for label, value in [
++                ("Sampling frequency", f"{self.sampling_frequency:g} Hz"),
++                *spectral_rows,
++            ]
++        )
++        frequency_rows = [
++            bandwidth_row,
++            ("Nyquist frequency", f"{self.nyquist_frequency:.1f} Hz"),
++            ("Frequency range", f"0.0 - {self.nyquist_frequency:.1f} Hz"),
++            ("FFT samples", f"{self.n_fft_samples}"),
++        ]
++        width = max(22, max(len(label) + 2 for label, _ in frequency_rows))
++        frequency = "\n".join(
++            f"{label + ':':<{width}}{value}" for label, value in frequency_rows
++        )
++        return f"""{title}
++{"=" * (len(title) + 1)}
+ 
+ Data Shape
+ ----------
+@@ -1335,9 +1391,7 @@ def summarize_parameters(self) -> str:
+ 
+ Spectral Parameters
+ -------------------
+-Sampling frequency:            {self.sampling_frequency:g} Hz
+-Time-halfbandwidth product:    {self.time_halfbandwidth_product}
+-Number of tapers:              {self.n_tapers}
++{spectral}
+ 
+ Time Windowing
+ --------------
+@@ -1347,10 +1401,7 @@ def summarize_parameters(self) -> str:
+ 
+ Frequency Analysis
+ ------------------
+-Frequency resolution: {self.frequency_resolution:.1f} Hz
+-Nyquist frequency:    {self.nyquist_frequency:.1f} Hz
+-Frequency range:      0.0 - {self.nyquist_frequency:.1f} Hz
+-FFT samples:          {self.n_fft_samples}
++{frequency}
+ """
+ 
+     @property
+@@ -1423,8 +1474,11 @@ def time_window_step(self) -> float:
+     def n_tapers(self) -> int:
+         """Return number of desired tapers.
+ 
+-        Note that the number of tapers may be less than this number if
+-        the bias of the tapers is too high (eigenvalues > MIN_EIGENVALUE_THRESHOLD = 0.9).
++        The explicit ``n_tapers``, else the number of columns of custom
++        ``tapers``, else the count implied by ``time_halfbandwidth_product``.
++        The actual DPSS count may be lower when low-bias filtering removes
++        tapers with concentration ratios at or below 0.9. Computing the
++        transform does not change the desired count reported here.
+ 
+         Returns
+         -------
+@@ -1432,9 +1486,13 @@ def n_tapers(self) -> int:
+             Number of tapers to use.
+ 
+         """
+-        if self._n_tapers is None:
+-            return estimate_n_tapers(self.time_halfbandwidth_product)
+-        return self._n_tapers
++        if self._n_tapers is not None:
++            return self._n_tapers
++        if self._tapers is not None and self._taper_eigenvalues is None:
++            # Custom tapers have no concentration ratios. Cached DPSS tapers
++            # may have been filtered and must not override the desired count.
++            return int(self._tapers.shape[1])
++        return estimate_n_tapers(self.time_halfbandwidth_product)
+ 
+     @property
+     def n_time_samples_per_window(self) -> int:
+@@ -1870,6 +1928,42 @@ def frequency_resolution(self) -> float:
+         """Equivalent-noise bandwidth of the periodic Hann window in Hz."""
+         return 1.5 / self.time_window_duration
+ 
++    def __repr__(self) -> str:
++        """Return the STFT's settings; its single Hann window has no NW or tapers."""
++        return (
++            "ShortTimeFourierTransform("
++            f"sampling_frequency={self.sampling_frequency!r}, window='hann_periodic',\n"
++            f"                          time_window_duration={self.time_window_duration!r}, "
++            f"time_window_step={self.time_window_step!r},\n"
++            f"                          detrend_type={self.detrend_type!r}, "
++            f"start_time={self.start_time})"
++        )
++
++    def summarize_parameters(self) -> str:
++        """Human-readable summary of the STFT's settings.
++
++        Returns
++        -------
++        summary : str
++            Data shape, the Hann window, time windowing, and the window's
++            equivalent noise bandwidth, Nyquist frequency, and FFT length.
++
++        Examples
++        --------
++        >>> import numpy as np
++        >>> from spectral_connectivity.transforms import ShortTimeFourierTransform
++        >>> stft = ShortTimeFourierTransform(
++        ...     np.zeros((1000, 1, 2)), sampling_frequency=100, time_window_duration=0.5
++        ... )
++        >>> print(stft.summarize_parameters().splitlines()[0])
++        Short-Time Fourier Transform Configuration
++        """
++        return self._summary(
++            "Short-Time Fourier Transform Configuration",
++            [("Window", "Hann (periodic, L2-normalized)")],
++            ("Equivalent noise bandwidth", f"{self.frequency_resolution:.1f} Hz"),
++        )
++
+     def _provenance_metadata(self) -> dict[str, Any]:
+         metadata = super()._provenance_metadata()
+         for key in (
+@@ -1986,10 +2080,58 @@ def __init__(
+             n_time_samples_per_step=step_samples,
+             fft_workers=fft_workers,
+         )
+-        self.sampling_frequency = sampling_frequency
+-        self.segment_overlap = float(segment_overlap)
+-        self.n_time_samples_per_segment = segment_samples
+-        self.n_time_samples_per_step = step_samples
++        self._segment_overlap = float(segment_overlap)
++
++    # The settings below are read from the internal STFT that does the
++    # computation, so they cannot be reassigned out of step with it.
++    @property
++    def sampling_frequency(self) -> float:
++        """Samples per second, in Hz."""
++        return self._stft.sampling_frequency
++
++    @property
++    def n_time_samples_per_segment(self) -> int:
++        """Segment length in samples."""
++        return int(self._stft.n_time_samples_per_window)
++
++    @property
++    def segment_duration(self) -> float:
++        """Segment length in seconds, after rounding to whole samples."""
++        return self.n_time_samples_per_segment / self.sampling_frequency
++
++    @property
++    def segment_overlap(self) -> float:
++        """Requested overlap between segments, as a fraction of a segment.
++
++        The realized step, ``n_time_samples_per_step``, is this fraction's
++        complement of a segment rounded to whole samples (at least one).
++        """
++        return self._segment_overlap
++
++    @property
++    def n_time_samples_per_step(self) -> int:
++        """Realized step between segment starts, in samples."""
++        return int(self._stft.n_time_samples_per_step)
++
++    @property
++    def detrend_type(self) -> str | None:
++        """Detrending applied to each segment before the FFT."""
++        return self._stft.detrend_type
++
++    @property
++    def start_time(self) -> Any:
++        """Time of the first sample, in seconds."""
++        return self._stft.start_time
++
++    @property
++    def n_fft_samples(self) -> int:
++        """FFT length of each segment."""
++        return int(self._stft.n_fft_samples)
++
++    @property
++    def fft_workers(self) -> int | None:
++        """Worker threads for SciPy's CPU FFT (``None`` uses SciPy's default)."""
++        return self._stft.fft_workers
+ 
+     @property
+     def frequencies(self) -> NDArray[np.floating]:
+diff --git a/src/spectral_connectivity/wrapper.py b/src/spectral_connectivity/wrapper.py
+index 3635720..d41c0ae 100644
+--- a/src/spectral_connectivity/wrapper.py
++++ b/src/spectral_connectivity/wrapper.py
+@@ -399,7 +399,15 @@ def connectivity_to_xarray(
+             # attaching the transform's full frequency axis to the result.
+             result_frequencies = np.asarray(result.coords["frequency"])
+             aligned_validity = full_validity.sel(frequency=result_frequencies)
+-            result = result.assign_coords(valid_time_frequency=aligned_validity)
++            # Attach the values alone: a DataArray would bring its own, unlabeled
++            # time and frequency coordinates and replace the result's.
++            result = result.assign_coords(
++                valid_time_frequency=(
++                    ("time", "frequency"),
++                    aligned_validity.values,
++                    validity_attrs,
++                )
++            )
+         elif "time" in result.dims:
+             # PSI and group delay aggregate a frequency band. They have no
+             # frequency dimension on which a 2-D coordinate can live, so expose
+@@ -822,8 +830,10 @@ def multitaper_connectivity(
+     Every variable has ``long_name`` and ``units`` attrs (``"1"`` for
+     dimensionless scores, ``"rad"`` for phase, ``"s"`` for delay; spectral
+     densities are ``"(<units>)^2/Hz"`` when an input DataArray states its
+-    ``units``, and ``"(<units>)^2"`` once integrated over a band). Non-index coordinates on an input DataArray's signal dimension
+-    (e.g. ``region``) are carried as ``source_<name>``/``target_<name>``.
++    ``units``, and ``"(<units>)^2"`` once integrated over a band). Non-index
++    coordinates on an input DataArray's signal dimension (e.g. ``region``) are
++    carried as ``source_<name>``/``target_<name>`` with their attrs unchanged,
++    so those attrs must be NetCDF-serializable to save the result.
+ 
+     Real-valued results write with any NetCDF engine (booleans are stored as
+     0/1). Complex results (``coherency``, ``cross_spectral_density``,
+diff --git a/tests/test_transforms.py b/tests/test_transforms.py
+index c9becff..6b518c5 100644
+--- a/tests/test_transforms.py
++++ b/tests/test_transforms.py
+@@ -58,6 +58,69 @@ def test_dpss_and_stft_observations_are_independent():
+     assert stft.observations_are_independent is True
+ 
+ 
++def test_stft_describes_itself_as_a_hann_stft():
++    """repr and summarize_parameters name the Hann STFT, its window and step,
++    and its equivalent noise bandwidth, not inherited Multitaper settings."""
++    stft = ShortTimeFourierTransform(
++        np.zeros((1000, 2, 3)),
++        sampling_frequency=100,
++        time_window_duration=0.5,
++        time_window_step=0.25,
++    )
++    description = repr(stft)
++    assert description.startswith("ShortTimeFourierTransform(")
++    assert "time_window_duration=0.5" in description
++    assert "time_window_step=0.25" in description
++    assert "hann" in description
++
++    summary = stft.summarize_parameters()
++    assert summary.startswith("Short-Time Fourier Transform Configuration")
++    assert "Window:" in summary
++    assert "Hann" in summary
++    assert "Equivalent noise bandwidth: 3.0 Hz" in summary  # 1.5 / 0.5 s
++    assert "Window step:      0.250 s (50% overlap)" in summary
++    for multitaper_only in ("Multitaper", "halfbandwidth", "tapers", "Frequency resolution"):
++        assert multitaper_only not in description + summary, multitaper_only
++
++
++def test_welch_exposes_its_resolved_settings_read_only():
++    """Welch reports the settings it computes with: the segment length rounded
++    to whole samples, the realized step, and its FFT options; none can be
++    reassigned out of step with the computation."""
++    welch = Welch(
++        np.zeros((1000, 2, 2)),
++        sampling_frequency=100,
++        segment_duration=0.123,  # 12.3 samples -> 12
++        segment_overlap=0.3,  # realized step round(12 * 0.7) = 8 samples
++        detrend_type="linear",
++        start_time=2.0,
++        n_fft_samples=16,
++        fft_workers=1,
++    )
++    assert welch.n_time_samples_per_segment == 12
++    assert welch.segment_duration == pytest.approx(0.12)
++    assert welch.segment_overlap == 0.3  # the requested fraction
++    assert welch.n_time_samples_per_step == 8
++    assert welch.sampling_frequency == 100.0
++    assert welch.detrend_type == "linear"
++    assert float(welch.start_time) == 2.0
++    assert welch.n_fft_samples == 16
++    assert welch.fft_workers == 1
++    for name in (
++        "sampling_frequency",
++        "segment_duration",
++        "segment_overlap",
++        "n_time_samples_per_segment",
++        "n_time_samples_per_step",
++        "detrend_type",
++        "start_time",
++        "n_fft_samples",
++        "fft_workers",
++    ):
++        with pytest.raises(AttributeError):
++            setattr(welch, name, 1)
++
++
+ @pytest.mark.parametrize(
+     ("segment_overlap", "expected"),
+     [(0.0, True), (0.25, True), (0.5, True), (0.75, False), (0.9, False)],
+@@ -1113,6 +1176,46 @@ def test_multitaper_warns_on_step_larger_than_duration():
+         )
+ 
+ 
++@pytest.mark.parametrize(
++    "n_tapers",
++    [0, -1, True, np.True_, 51],
++    ids=["zero", "negative", "bool", "numpy_bool", "above_window"],
++)
++def test_multitaper_rejects_an_invalid_taper_count_at_construction(n_tapers):
++    """An impossible n_tapers fails when the transform is built, not later
++    inside fft(); a bool is not a count. The window here is 50 samples."""
++    with pytest.raises(ValueError, match="n_tapers"):
++        Multitaper(
++            np.zeros((500, 2, 2)),
++            sampling_frequency=100,
++            time_window_duration=0.5,
++            n_tapers=n_tapers,
++        )
++
++
++def test_multitaper_reports_the_supplied_taper_count():
++    """With custom tapers and no explicit n_tapers, n_tapers is the number of
++    taper columns used, not the count NW would imply."""
++    mt = Multitaper(np.zeros((100, 1, 2)), sampling_frequency=100, tapers=np.ones((100, 3)))
++    assert mt.n_tapers == 3
++    assert mt._provenance_metadata()["n_tapers"] == 3
++    assert mt.fft().shape[2] == 3
++    assert mt.n_tapers == 3
++    assert mt._provenance_metadata()["n_tapers"] == 3
++
++
++def test_multitaper_rejects_n_tapers_that_disagrees_with_the_tapers():
++    with pytest.raises(ValueError, match="n_tapers"):
++        Multitaper(
++            np.zeros((100, 1, 2)), sampling_frequency=100, n_tapers=2, tapers=np.ones((100, 3))
++        )
++    # Agreeing counts, or n_tapers omitted, are accepted.
++    Multitaper(
++        np.zeros((100, 1, 2)), sampling_frequency=100, n_tapers=3, tapers=np.ones((100, 3))
++    )
++    Multitaper(np.zeros((100, 1, 2)), sampling_frequency=100, tapers=np.ones((100, 3)))
++
++
+ def test_multitaper_configuration_and_array_snapshots_are_immutable():
+     """Derived state cannot become stale through public mutation."""
+     source = np.arange(200.0).reshape(100, 1, 2)
+diff --git a/tests/test_wrapper.py b/tests/test_wrapper.py
+index 6d7189e..e15c363 100644
+--- a/tests/test_wrapper.py
++++ b/tests/test_wrapper.py
+@@ -2186,6 +2186,29 @@ def test_result_carries_provenance_metadata():
+     assert da.attrs["mt_frequency_resolution"] == pytest.approx(3.90625)
+ 
+ 
++@pytest.mark.parametrize("n_tapers", [None, 31])
++def test_low_bias_taper_filtering_keeps_requested_count_and_provenance(n_tapers):
++    """Caching filtered DPSS tapers must not change the requested taper count
++    or the provenance of repeated computations with the same transform."""
++    data = np.random.default_rng(123).standard_normal((1000, 2, 2))
++    with pytest.warns(UserWarning, match="unusually large"):
++        mt = Multitaper(
++            data,
++            sampling_frequency=100,
++            time_halfbandwidth_product=16,
++            n_tapers=n_tapers,
++        )
++    assert mt.n_tapers == 31
++
++    first = connectivity_to_xarray(mt, method="power")
++    assert mt.tapers.shape[1] < 31  # Low-bias filtering actually removed tapers.
++    assert mt.n_tapers == 31
++    second = connectivity_to_xarray(mt, method="power")
++    assert first.attrs["mt_n_tapers"] == 31
++    assert second.attrs["mt_n_tapers"] == 31
++    xr.testing.assert_identical(first, second)
++
++
+ def test_provenance_records_measure_kwargs(tmp_path, stub_measure):
+     """Measure keyword arguments are recorded as ``arg_<key>``.
+ 
+@@ -3476,6 +3499,46 @@ def test_connectivity_to_xarray_exposes_morlet_invalid_edges():
+     np.testing.assert_array_equal(result.isnull().all("source"), ~result.valid_time_frequency)
+ 
+ 
++@pytest.mark.parametrize("method", ["coherence_magnitude", "power", "delay"])
++def test_morlet_results_keep_their_coordinate_labels(method, tmp_path):
++    """Attaching the validity mask must not strip the time and frequency
++    coordinates' long_name and units, and they survive a NetCDF round trip."""
++    data = np.random.default_rng(320).standard_normal((192, 5, 2))
++    morlet = connectivity_to_xarray(
++        MorletWavelet(data, 64, np.array([4.0, 8.0, 12.0, 16.0])),
++        method=method,
++    )
++    reference = connectivity_to_xarray(Multitaper(data, sampling_frequency=64), method="power")
++    assert "valid_time_frequency" in morlet.coords
++    assert (
++        morlet.time.attrs
++        == reference.time.attrs
++        == {
++            "long_name": "Window center time",
++            "units": "s",
++        }
++    )
++    assert morlet.frequency.attrs == reference.frequency.attrs
++
++    path = tmp_path / "morlet.nc"
++    morlet.to_netcdf(path)
++    with xr.open_dataarray(path) as reloaded:
++        assert reloaded.time.attrs == morlet.time.attrs
++        assert reloaded.frequency.attrs == morlet.frequency.attrs
++
++
++def test_band_label_survives_the_validity_mask():
++    """Reducing a Morlet result into bands also reduces its validity mask; that
++    must not replace the labeled band coordinate with an unlabeled one."""
++    data = np.random.default_rng(321).standard_normal((192, 5, 2))
++    power = connectivity_to_xarray(
++        MorletWavelet(data, 64, np.array([4.0, 8.0, 12.0, 16.0])), method="power"
++    )
++    reduced = frequency_band_reduce(power, {"theta": (4.0, 12.0)})
++    assert "valid_time_band" in reduced.coords
++    assert reduced.band.attrs == {"long_name": "Frequency band"}
++
++
+ def test_morlet_validity_aligns_with_nonstandard_xarray_shapes():
+     data = np.random.default_rng(319).standard_normal((192, 5, 2))
+     # Adjacent-bin measures require a uniform grid; the band below still
+@@ -3744,6 +3807,48 @@ def test_per_signal_input_coordinates_follow_source_and_target(labeled_channels)
+     assert squeezed.target_region.item() == "PFC"
+ 
+ 
++def test_every_result_coordinate_is_described():
++    """Band names and edges and per-connection group labels carry a long_name
++    (and units where they have them); a channel coordinate copied from the
++    input keeps the input's own attrs, which the package does not invent."""
++    rng = np.random.default_rng(51)
++    data = xr.DataArray(
++        rng.standard_normal((1000, 4, 4)),
++        dims=("time", "trial", "channel"),
++        coords={
++            "time": np.arange(1000) / 500,
++            "channel": ["a", "b", "c", "d"],
++            "region": ("channel", ["CA1", "CA1", "PFC", "PFC"], {"long_name": "Brain region"}),
++            "depth": ("channel", [1.0, 2.0, 3.0, 4.0], {"units": "mm"}),
++        },
++    )
++    power = multitaper_connectivity(
++        data,
++        method="power",
++        frequency_bands={"theta": (4.0, 8.0)},
++        frequency_reduction="integral",
++    )
++    assert power.band.attrs["long_name"] == "Frequency band"
++    for edge in ("band_lower", "band_upper"):
++        assert power[edge].attrs["units"] == "Hz"
++        assert power[edge].attrs["long_name"]
++    assert power.source_region.attrs == {"long_name": "Brain region"}
++    assert power.source_depth.attrs == {"units": "mm"}
++
++    coherence = multitaper_connectivity(data, method="coherence_magnitude")
++    assert coherence.target_region.attrs == {"long_name": "Brain region"}
++
++    components = multitaper_connectivity(
++        data, method="canonical_coherency", group_labels=["x", "x", "y", "y"]
++    )
++    copied = {"signal_region", "signal_depth"}  # the input's own attrs, as given
++    assert components.signal_region.attrs == {"long_name": "Brain region"}
++    assert components.signal_depth.attrs == {"units": "mm"}
++    for name, coordinate in components.coords.items():
++        if name not in copied:
++            assert coordinate.attrs.get("long_name"), name
++
++
+ def test_spectral_densities_carry_units_derived_from_the_input(labeled_channels):
+     result = multitaper_connectivity(
+         labeled_channels, sampling_frequency=500, method=["power", "cross_spectral_density"]

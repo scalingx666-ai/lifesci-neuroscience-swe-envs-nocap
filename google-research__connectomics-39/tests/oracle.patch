@@ -1,0 +1,639 @@
+diff --git a/connectomics/pipeline/dask/cluster.py b/connectomics/pipeline/dask/cluster.py
+index 835738d..4b0ec7b 100644
+--- a/connectomics/pipeline/dask/cluster.py
++++ b/connectomics/pipeline/dask/cluster.py
+@@ -25,10 +25,19 @@
+ 
+ @dataclasses.dataclass
+ class LocalDaskClusterConfig(dataclasses_json.DataClassJsonMixin):
+-  """Dataclass version of the parameters passed to dask.distributed.Cluster."""
+-
+-  # Number of workers in the local cluster.
+-  n_workers: int
++  """Dataclass version of parameters passed to dask.distributed.LocalCluster."""
++
++  # Number of workers in the local cluster. Exact count depends on the
++  # underlying Dask configuration (i.e. `'threaded'` vs `'processes'`), but in
++  # general will default to the number of available virtual cores.
++  n_workers: Optional[int]
++
++  # Number of threads per worker. Exact count depends on the underlying Dask
++  # configuration (i.e. `'threaded'` vs `'processes'`), but in general will
++  # default to the number of available virtual cores. Note that in combination
++  # with `n_workers`, thread count can be intentionally oversubscribed, which
++  # can be useful in situations where I/O is a bottleneck.
++  threads_per_worker: Optional[int]
+ 
+   # Name of the cluster.
+   name: str = 'local_cluster'
+diff --git a/connectomics/pipeline/dask/plugins.py b/connectomics/pipeline/dask/plugins.py
+index 92a4362..e569ff1 100644
+--- a/connectomics/pipeline/dask/plugins.py
++++ b/connectomics/pipeline/dask/plugins.py
+@@ -15,12 +15,10 @@
+ """Dask plugins supporting subvolume processing."""
+ 
+ import typing
+-from typing import Sequence
+ 
+-from absl import logging
+-from connectomics.common import bounding_box
+ from connectomics.volume import base
+ from connectomics.volume import descriptor
++from connectomics.volume import subvolume
+ from connectomics.volume import subvolume_processor
+ import dask.distributed as dd
+ 
+@@ -28,7 +26,7 @@
+ class TSVolume(dd.WorkerPlugin):
+ 
+   def __init__(self, vol_descriptor: descriptor.VolumeDescriptor):
+-    self.descriptor = vol_descriptor.to_json()
++    self.descriptor = vol_descriptor.to_json(indent=2)
+ 
+   def setup(self, worker: dd.Worker):
+     self.vol = descriptor.open_descriptor(self.descriptor)
+@@ -64,29 +62,14 @@ def _get_volume(self, name: str) -> base.BaseVolume:
+                                                                 name)])
+     return ts_volume.vol
+ 
+-  def process_bundle(self, bundle: Sequence[bounding_box.BoundingBox]):
+-    logging.info('Worker %s processing bundle of size %s', self._id,
+-                 len(bundle))
+-
+-    input_volume = self._get_volume('input_volume')
+-    output_volume = self._get_volume('output_volume')
++  def process_subvolume(self,
++                        subvol: subvolume.Subvolume) -> subvolume.Subvolume:
+     processor = subvolume_processor.get_processor(self._config.processor)
+-
+-    results = []
+-    for bbox in bundle:
+-      processor.set_effective_subvol_and_overlap(bbox.size, processor.overlap())
+-      results.append(
+-          self.process_bbox(processor, input_volume, output_volume, bbox))
+-    return results
+-
+-  def process_bbox(self, processor: subvolume_processor.SubvolumeProcessor,
+-                   input_volume: base.BaseVolume,
+-                   output_volume: base.BaseVolume,
+-                   bbox: bounding_box.BoundingBox):
+-    # TODO(timblakely): Modify input bounding box based on required context.
+-    logging.info('Processing bounding box %s', bbox)
+-    subvol = input_volume[bbox.to_slice4d()]
++    processor.set_effective_subvol_and_overlap(subvol.bbox.size,
++                                               processor.overlap())
+     result = processor.process(subvol)
++    if isinstance(result, list):
++      raise ValueError(
++          'Dask SubvolumeProcessors must return a single subvolume.')
+     assert isinstance(result, base.Subvolume)
+-    output_volume.write(result)
+     return result
+diff --git a/connectomics/pipeline/dask/runner.py b/connectomics/pipeline/dask/runner.py
+index ab864c1..8106b41 100644
+--- a/connectomics/pipeline/dask/runner.py
++++ b/connectomics/pipeline/dask/runner.py
+@@ -15,33 +15,118 @@
+ """Dask-based SubvolumeProcessor."""
+ 
+ import copy
++import dataclasses
+ import os
+ import typing
+-from typing import Optional
++from typing import Any, Optional
+ import uuid
+ 
+ from absl import logging
+ from connectomics.common import bounding_box
+-from connectomics.common import box_generator
+ from connectomics.common import file
+-from connectomics.common import utils
+ from connectomics.pipeline.dask import cluster
+ from connectomics.pipeline.dask import plugins
++from connectomics.volume import base
+ from connectomics.volume import descriptor
++from connectomics.volume import subvolume
+ from connectomics.volume import subvolume_processor
+ from connectomics.volume import tensorstore as tsv
++import dask.array as da
++from dask.delayed import Delayed
+ import dask.distributed as dd
++import numpy as np
+ 
+ ProcessSubvolumeWorker = plugins.ProcessSubvolumeWorker
+ TSVolume = plugins.TSVolume
+ 
+ 
+-def process_bundle(pipeline_id: str, *args, **kwargs):
++@dataclasses.dataclass
++class ProcessorOutput:
++  """Calculated output parameters for a processed volume."""
++  chunk_size: np.array
++  voxel_size: np.array
++  bounding_boxes: list[bounding_box.BoundingBoxBase]
++  dtype: str
++
++  # Dimensions of the chunks for each channel. For example, a 1x1000^3 4D volume
++  # in CZYX format processed at an XYZ subvolume size of 350x300x400 would
++  # result in the following chunksizes:
++  #    ((1,), (350, 350, 300), (300, 300, 300, 100), (400, 400, 200))
++  dask_chunks: tuple[tuple[int]]
++
++
++class DaskTensorStoreWriter:
++  """Dask-compatible wrapper class passable to dask.array.store()."""
++
++  def __init__(self, desc, context: Optional[dict[str, Any]] = None):
++    self.out = _open_volume_with_context(desc, context)
++
++  def __setitem__(self, slices: list[slice], value):
++    # Ensure clamping if needed; Dask can't natively handle sub-chunk-size
++    # chunks that SubvolumeProcessors can potentially output at the edges.
++    clipped_slices = []
++    for i, slc in enumerate(slices):
++      sz = slc.stop - slc.start
++      diff = sz - value.shape[i]
++      if diff < 0:
++        raise ValueError(
++            'Unexpectedly large array to write: {value.shape} vs {slices}')
++      clipped_slices.append(slice(slc.start, slc.stop - diff, slc.step))
++    self.out.write_slices(clipped_slices, value)
++
++
++class TensorStoreDaskArray:
++  """Dask-compatible wrapper around a TensorstoreVolume."""
++
++  def __init__(self, volume: tsv.TensorstoreVolume):
++    self._volume = volume
++    self.dtype = self._volume.dtype
++    self.chunks = self._volume.chunk_size
++
++  def __getitem__(self, item):
++    return self._volume.__getitem__(item).data
++
++  def __getattr__(self, attr):
++    if attr in self.__dict__:
++      return getattr(self, attr)
++    if attr == '_volume':
++      raise AttributeError
++    return getattr(self._volume, attr)
++
++
++def bbox_from_info(info, index=0):
++  info = info[index]
++  array_loc = np.array(info['array-location'])[3:0:-1, :]
++  return bounding_box.BoundingBox(**dict(zip(['start', 'end'], array_loc.T)))
++
++
++def process_block(data, block_info, pipeline_id: str):
+   worker = dd.get_worker()
+   dask_worker = typing.cast(
+       ProcessSubvolumeWorker,
+       worker.plugins[ProcessSubvolumeWorker.name(pipeline_id)])
+-  return dask_worker.process_bundle(*args, **kwargs)
++
++  bbox = bbox_from_info(block_info)
++  subvol = subvolume.Subvolume(data, bbox)
++  return dask_worker.process_subvolume(subvol).data
++
++
++def _open_volume_with_context(
++    desc: descriptor.VolumeDescriptor,
++    context: Optional[dict[str, Any]] = None) -> base.BaseVolume:
++  if context:
++    desc = copy.deepcopy(desc)
++    assert desc.tensorstore_config
++    desc.tensorstore_config.spec['context'] = context
++  return descriptor.open_descriptor(desc)
++
++
++def _create_volume_if_necessary(desc: descriptor.VolumeDescriptor):
++  modified_desc = copy.deepcopy(desc)
++  assert modified_desc.tensorstore_config
++  modified_desc.tensorstore_config.spec['create'] = True
++  modified_desc.tensorstore_config.spec['delete_existing'] = True
++  _ = descriptor.open_descriptor(modified_desc)
+ 
+ 
+ class DaskRunner:
+@@ -59,6 +144,7 @@ def __init__(self,
+                cluster_config: cluster.DaskClusterConfig,
+                pipeline_id: Optional[str] = None):
+     self._id = str(uuid.uuid4()) if pipeline_id is None else pipeline_id
++    logging.info('Initializing pipeline id %s', self._id)
+     self.cluster_config = cluster_config
+ 
+     if cluster_config.local:
+@@ -84,12 +170,6 @@ def _register_with_cluster(self,
+     self._client.register_worker_plugin(
+         ProcessSubvolumeWorker(self.id, config),
+         name=ProcessSubvolumeWorker.name(self.id))
+-    self._client.register_worker_plugin(
+-        TSVolume(config.input_volume),
+-        name=ProcessSubvolumeWorker.volume_name(self.id, 'input_volume'))
+-    self._client.register_worker_plugin(
+-        TSVolume(config.output_volume),
+-        name=ProcessSubvolumeWorker.volume_name(self.id, 'output_volume'))
+ 
+   @classmethod
+   def connect(cls,
+@@ -102,105 +182,122 @@ def connect(cls,
+       dask_runner._client.restart()
+     return dask_runner
+ 
+-  def _compute_output_spec(
+-      self, config: subvolume_processor.ProcessVolumeConfig
+-  ) -> subvolume_processor.ProcessVolumeConfig:
+-    """Compute the output chunking based on the input SubvolumeProcessor.
++  def _calculate_processor_output(
++      self, config: subvolume_processor.ProcessVolumeConfig) -> ProcessorOutput:
++    """Determines the output volume shape/params from a ProcessVolumeConfig.
+ 
+     Args:
+-      config: ProcessVolumeConfig pipeline configuration.
++      config: Configuration for the pipeline
+ 
+     Returns:
+-      Updated new ProcessSubvolumeConfig with correct output_volume.
++      ProcessorOutput containing the various aspects of the expected output
++      volume.
+     """
+-    computed_config = copy.deepcopy(config)
+-    processor = subvolume_processor.get_processor(computed_config.processor)
+-    input_volume = descriptor.open_descriptor(computed_config.input_volume)
+-
+-    processor.set_effective_subvol_and_overlap(computed_config.subvolume_size,
++    processor = subvolume_processor.get_processor(config.processor)
++    processor.set_effective_subvol_and_overlap(config.subvolume_size,
+                                                processor.overlap())
+-
+     output_box = processor.expected_output_box(
+-        bounding_box.BoundingBox([0, 0, 0],
+-                                 size=computed_config.subvolume_size))
+-
+-    output_descriptor = computed_config.output_volume
+-    # Set metadata
+-    assert output_descriptor.tensorstore_config
+-    output_voxel_size = processor.pixelsize(input_volume.voxel_size)
+-    output_chunk_size = output_box.size
+-    output_descriptor.tensorstore_config.metadata = tsv.TensorstoreMetadata(
+-        voxel_size=tuple([utils.from_np_type(v) for v in output_voxel_size]),
+-        bounding_boxes=copy.deepcopy(computed_config.bounding_boxes))
+-    # Set TS Config
+-    # TODO(timblakely): Check to make sure it's n5
++        bounding_box.BoundingBox([0, 0, 0], size=config.subvolume_size))
++
++    input_volume = _open_volume_with_context(config.input_volume,
++                                             config.input_ts_context)
++
+     output_channels = processor.num_channels(input_volume.shape[0])
+-    out_spec = output_descriptor.tensorstore_config.spec
+-    out_volume_name = computed_config.output_dir
+-    out_spec['kvstore']['path'] = out_volume_name
+-    out_spec['metadata'] = {
+-        'blockSize': [output_channels] + list(output_chunk_size[::-1]),
+-        'dataType':
+-            utils.canonicalize_dtype_for_ts(
+-                processor.output_type(input_volume.dtype)),
+-        'dimensions': [output_channels] +
+-                      [int(x) for x in input_volume.shape[1:]],
+-    }
+-    # Ensure we can JSON serialize it; np.uint64 isn't a valid JSON type :/
+-    for field in ['blockSize', 'dimensions']:
+-      out_spec['metadata'][field] = [
+-          utils.from_np_type(v) for v in out_spec['metadata'][field]
+-      ]
+-    attributes_file = os.path.join(out_volume_name, 'attributes.json')
+-    is_new = False
+-    if not file.Exists(attributes_file):
+-      is_new = True
+-      out_spec['create'] = True
+-      out_spec['delete_existing'] = True
+-      logging.info('Volume %s does not exist, creating', out_volume_name)
+-
+-    # Open the output volume once to make sure it's created if need be,
+-    # otherwise all workers will try to create it at once and all but one will
+-    # error out.
+-    logging.info('Opening output volume %s', out_volume_name)
+-    temp_desc = descriptor.open_descriptor(output_descriptor)
+-    del temp_desc
+-
+-    if is_new:
+-      del out_spec['create']
+-      del out_spec['delete_existing']
+-    logging.info('Computed config: %s', computed_config.to_json(indent=2))
+-    return computed_config
+-
+-  def run(self, config: subvolume_processor.ProcessVolumeConfig, wait=True):
++    chunk_size = [output_channels, *output_box.size[::-1]]
++
++    voxel_size = processor.pixelsize(input_volume.voxel_size)
++
++    bboxes = [
++        processor.expected_output_box(b) for b in input_volume.bounding_boxes
++    ]
++
++    dtype = processor.output_type(input_volume.dtype)
++
++    # TODO(timblakely): support multiple bounding boxes.
++    # Calculate expected dask output channels to the output size is correct.
++    dask_chunks = []
++
++    for idx, lim in enumerate(input_volume.shape):
++      if idx == 0:
++        # Channel dimension is always aligned
++        dask_chunks.append((output_channels,))
++        continue
++      chunk_sizes = [chunk_size[idx]]
++      remainder = lim % chunk_size[idx]
++      if remainder:
++        chunk_sizes.append(remainder)
++      dask_chunks.append(tuple(chunk_sizes))
++
++    return ProcessorOutput(chunk_size, voxel_size, bboxes, dtype.__name__,
++                           dask_chunks)
++
++  def run(self,
++          config: subvolume_processor.ProcessVolumeConfig,
++          wait=True) -> Optional[Delayed]:
+     """Begin processing a volume on a Dask cluster.
+ 
+     Args:
+       config: ProcessVolumeConfig to process.
+-      wait: Wait for all tasks to complete before returning.
++      wait: Wait for all tasks to complete before returning. If not set, will
++        return the dask.Delayed value from the dask.array.store() call.
++
++    Returns:
++      The dask.Delayed value from dask.array.store() if `wait` is set.
+     """
++    processed = self._calculate_processor_output(config)
++
++    input_vol = _open_volume_with_context(config.input_volume,
++                                          config.input_ts_context)
+ 
+-    computed_config = self._compute_output_spec(config)
+-    del config
+-    self._register_with_cluster(computed_config)
++    ts_array = TensorStoreDaskArray(input_vol)
++    dask_array = da.from_array(ts_array, chunks=tuple(ts_array.chunks))
+ 
+-    # TODO(timblakely): supoport back-shift-small-sub-boxes
+-    generator = box_generator.MultiBoxGenerator(
+-        computed_config.bounding_boxes,
+-        box_size=computed_config.subvolume_size,
+-        box_overlap=computed_config.overlap)
+-    logging.info('Number of bounding boxes to process: %s', generator.num_boxes)
++    # Rechunk according to subvolume_size.
+ 
+-    tasks = []
+-    for batch in utils.batch(
+-        range(generator.num_boxes), computed_config.batch_size):
+-      bboxes = [generator.generate(b)[1] for b in batch]
+-      tasks.append(self._client.submit(process_bundle, self.id, bboxes))
++    # Apply the mapping. We need to calculate the chunk size prior since the
++    # subvolume processor may change the output type.
++    mapped_array = dask_array.map_blocks(
++        process_block,
++        dtype=input_vol.dtype,
++        chunks=processed.chunk_size,
++        pipeline_id=self.id)
+ 
+-    if wait:
+-      dd.wait(tasks)
++    # Now that we have the mapped array we can determine the final dimensions of
++    # the output volume. Note that it may not match the actual bounding boxes
++    # which may be smaller.
++    out_desc = descriptor.VolumeDescriptor(
++        tensorstore_config=tsv.TensorstoreConfig(
++            spec={
++                'driver': 'n5',
++                'kvstore': {
++                    'driver': 'file',
++                    'path': config.output_dir,
++                },
++                'metadata': {
++                    'blockSize': processed.chunk_size,
++                    'dataType': processed.dtype,
++                    'dimensions': mapped_array.shape
++                },
++            },
++            metadata=tsv.TensorstoreMetadata(
++                voxel_size=processed.voxel_size,
++                bounding_boxes=processed.bounding_boxes)))
++
++    # Create the volume ahead of time so multiple workers don't try to write to
++    # attributes.json.
++    _create_volume_if_necessary(out_desc)
++
++    self._register_with_cluster(config)
++
++    # Store the volume. We don't need to lock, as our final chunk size is
++    # perfectly chunk-aligned to the output.
++    result = mapped_array.store(
++        DaskTensorStoreWriter(out_desc, config.output_ts_context),
++        lock=False,
++        compute=wait)
+ 
+     # Write out the VolumeDescriptor alongside the volume.
+-    with file.GFile(
+-        os.path.join(computed_config.output_dir, 'volume.json'), 'w') as f:
+-      f.write(computed_config.output_volume.to_json(indent=2))
++    with file.GFile(os.path.join(config.output_dir, 'volume.json'), 'w') as f:
++      f.write(out_desc.to_json(indent=2))
++
++    return result
+diff --git a/connectomics/pipeline/process_volume_dask.py b/connectomics/pipeline/process_volume_dask.py
+index 6860249..e61e166 100644
+--- a/connectomics/pipeline/process_volume_dask.py
++++ b/connectomics/pipeline/process_volume_dask.py
+@@ -18,6 +18,10 @@
+ clusters (e.g. by launch_local_dask_cluster.py or a Kubernetes cluster running
+ in the cloud).
+ 
++Note that currently only TensorStore + n5 compression are supported as output
++formats, though we expect to be able to support arbitrary TensorStore output
++formats in the near future.
++
+ Example usage:
+ 
+   python3 connectomics/pipeline/process_volume_dask.py \
+@@ -43,17 +47,18 @@
+     None,
+     'JSON DaskClusterConfig, or path to JSON config.',
+     required=True)
++_RESTART_WORKERS = flags.DEFINE_bool(
++    'restart_workers', False,
++    'Restart workers on initial connection to the cluster. If you are using '
++    'a long-running cluster and you are iterating on code, the workers will '
++    'not pick up or reload any changes unless they are restarted prior to '
++    'executing a pipeline.')
+ 
+ 
+ def verify_process_volume_config(
+     config: subvolume_processor.ProcessVolumeConfig):
+   if config.input_volume.volinfo is not None:
+     raise ValueError('Volinfo not supported externally')
+-  if config.output_volume.decorator_specs:
+-    raise ValueError('Output volumes cannot have decorators')
+-  if (config.output_volume.tensorstore_config and
+-      config.output_volume.tensorstore_config.metadata):
+-    raise ValueError('Output volumes cannot have metadata set')
+ 
+ 
+ def load_configs(
+@@ -85,7 +90,8 @@ def main(_) -> None:
+   logging.info('Loaded config: %s', config.to_json(indent=2))
+   verify_process_volume_config(config)
+ 
+-  dask_processor = runner.DaskRunner.connect(dask_config, restart=False)
++  dask_processor = runner.DaskRunner.connect(
++      dask_config, restart=_RESTART_WORKERS.value)
+   dask_processor.run(config)
+ 
+ 
+diff --git a/connectomics/volume/base.py b/connectomics/volume/base.py
+index b609e50..7d0977d 100644
+--- a/connectomics/volume/base.py
++++ b/connectomics/volume/base.py
+@@ -135,5 +135,10 @@ def bounding_boxes(self) -> list[bounding_box.BoundingBox]:
+     """List of bounding boxes contained in this volume."""
+     raise NotImplementedError
+ 
++  @property
++  def chunk_size(self) -> array.Tuple4i:
++    """Backing chunk size in voxels, CZYX."""
++    raise NotImplementedError
++
+   # TODO(timblakely): determine what other attributes we want to make mandatory for
+   # all implementations and add them here.
+diff --git a/connectomics/volume/descriptor.py b/connectomics/volume/descriptor.py
+index 1e0f9a6..9fc0b68 100644
+--- a/connectomics/volume/descriptor.py
++++ b/connectomics/volume/descriptor.py
+@@ -19,6 +19,7 @@
+ from typing import Optional, Union
+ 
+ from connectomics.common import file
++from connectomics.common import utils
+ from connectomics.volume import base
+ from connectomics.volume import decorator
+ from connectomics.volume import tensorstore as tsv
+@@ -26,7 +27,7 @@
+ 
+ 
+ @dataclasses.dataclass(frozen=True, eq=True)
+-class VolumeDescriptor(dataclasses_json.DataClassJsonMixin):
++class VolumeDescriptor(utils.NPDataClassJsonMixin):
+   """De/Serializable description of a volume."""
+ 
+   # List of python dicts of specs to decorate the volume via
+diff --git a/connectomics/volume/subvolume.py b/connectomics/volume/subvolume.py
+index 01ae549..efaed94 100644
+--- a/connectomics/volume/subvolume.py
++++ b/connectomics/volume/subvolume.py
+@@ -25,7 +25,9 @@
+ 
+ def _check_bbox_dims(bbox: bounding_box.BoundingBox, data: np.ndarray):
+   bbox_shape = bbox.size[::-1]
+-  data_shape = data.shape[1:]
++  data_shape = data.shape
++  if len(bbox_shape) != 4:
++    data_shape = data.shape[1:]
+   if not np.all(bbox_shape == data_shape):
+     raise ValueError(
+         f'New bbox does not match data shape: {bbox_shape} vs {data_shape}')
+diff --git a/connectomics/volume/subvolume_processor.py b/connectomics/volume/subvolume_processor.py
+index 82cce97..f0736e6 100644
+--- a/connectomics/volume/subvolume_processor.py
++++ b/connectomics/volume/subvolume_processor.py
+@@ -55,11 +55,6 @@ class ProcessVolumeConfig(dataclasses_json.DataClassJsonMixin):
+   # Input volume to process.
+   input_volume: descriptor.VolumeDescriptor
+ 
+-  # Output volume. Note that only TensorStore is currently supported. The
+-  # "metadata" field of the TensorStore spec should not be populated, as it is
+-  # automatically filled in by the processor.
+-  output_volume: descriptor.VolumeDescriptor
+-
+   # Output directory to write the volumetric data, inserted automatically into
+   # the output_volume's TensorStore spec.
+   output_dir: str
+@@ -82,10 +77,15 @@ class ProcessVolumeConfig(dataclasses_json.DataClassJsonMixin):
+   # Number of bounding boxes to batch together per work item during processing.
+   batch_size: int = 1
+ 
+-  # TODO(timblakely): Support back shifting edge boxes.
++  # Additional Tensorstore context configuration applied to the input. Useful
++  # for limiting parallelism.
++  input_ts_context: Optional[dict[str, Any]] = None
+ 
+-  # TODO(timblakely): Support expanding underlying tensorstore bounds so that end
+-  # chunks can be fully processed.
++  # Additional Tensorstore context configuration applied to the output. Useful
++  # for limiting parallelism.
++  output_ts_context: Optional[dict[str, Any]] = None
++
++  # TODO(timblakely): Support back shifting edge boxes.
+ 
+ 
+ class OutputNums(enum.Enum):
+diff --git a/connectomics/volume/tensorstore.py b/connectomics/volume/tensorstore.py
+index 7982613..a61d201 100644
+--- a/connectomics/volume/tensorstore.py
++++ b/connectomics/volume/tensorstore.py
+@@ -20,10 +20,10 @@
+ from connectomics.common import array
+ from connectomics.common import bounding_box
+ from connectomics.common import file
++from connectomics.common import utils
+ from connectomics.volume import base
+ import dataclasses_json
+ import numpy as np
+-
+ import tensorstore as ts
+ 
+ 
+@@ -34,7 +34,7 @@ def tuple_deserialize(v: Sequence[Union[int, float]]) -> array.Tuple3f:
+ 
+ 
+ @dataclasses.dataclass(eq=True)
+-class TensorstoreMetadata(dataclasses_json.DataClassJsonMixin):
++class TensorstoreMetadata(utils.NPDataClassJsonMixin):
+   """Additional volumetric metadata associated with TensorStore volumes.
+ 
+   Attributes:
+@@ -50,7 +50,7 @@ def __post_init__(self):
+ 
+ 
+ @dataclasses.dataclass(eq=True)
+-class TensorstoreConfig(dataclasses_json.DataClassJsonMixin):
++class TensorstoreConfig(utils.NPDataClassJsonMixin):
+   spec: dict[str, Any]
+   metadata: Optional[TensorstoreMetadata] = dataclasses.field(
+       default=None,
+@@ -106,7 +106,7 @@ def ndim(self) -> int:
+ 
+   @property
+   def dtype(self) -> np.dtype:
+-    return self._store.dtype
++    return self._store.dtype.numpy_dtype
+ 
+   @property
+   def bounding_boxes(self) -> list[bounding_box.BoundingBox]:
+@@ -121,7 +121,12 @@ def metadata(self) -> TensorstoreMetadata:
+   def write_slices(self, slices: array.CanonicalSlice, value: np.ndarray):
+     """Writes a subvolume of data based on a specified set of CZYX slices."""
+     with ts.Transaction():
+-      self._store[slices].write(value).result()
++      self._store[tuple(slices)].write(value).result()
++
++  @property
++  def chunk_size(self) -> array.Tuple4i:
++    """Backing chunk size in voxels, CZYX."""
++    return self._store.schema.chunk_layout.read_chunk.shape
+ 
+ 
+ class TensorstoreArrayVolume(TensorstoreVolume):

@@ -1,0 +1,260 @@
+diff --git a/pycbsdk/tests/conftest.py b/pycbsdk/tests/conftest.py
+index da201e6d..f53078d7 100644
+--- a/pycbsdk/tests/conftest.py
++++ b/pycbsdk/tests/conftest.py
+@@ -196,3 +196,22 @@ def nplay_session(nplayserver):
+ 
+     with Session(DeviceType.NPLAY) as session:
+         yield session
++
++
++@pytest.fixture
++def client_session(nplay_session):
++    """A CLIENT-mode Session attached to the STANDALONE nplay_session's shmem.
++
++    Function-scoped: created fresh for each test that requests it.
++    The STANDALONE nplay_session already owns native shmem for NPLAY;
++    creating another Session(DeviceType.NPLAY) finds that shmem and
++    attaches as CLIENT (skipping device creation).
++    """
++    from pycbsdk import DeviceType, Session
++
++    with Session(DeviceType.NPLAY) as session:
++        assert not session.is_standalone, (
++            "Expected CLIENT mode but got STANDALONE — "
++            "is the nplay_session fixture alive?"
++        )
++        yield session
+diff --git a/pycbsdk/tests/test_configuration.py b/pycbsdk/tests/test_configuration.py
+index f8848bc0..77c03289 100644
+--- a/pycbsdk/tests/test_configuration.py
++++ b/pycbsdk/tests/test_configuration.py
+@@ -503,6 +503,52 @@ def test_save_load_roundtrip(self, nplay_session):
+             Path(ccf_file).unlink(missing_ok=True)
+ 
+ 
++# ---------------------------------------------------------------------------
++# CCF loading — CLIENT mode
++# ---------------------------------------------------------------------------
++
++
++class TestClientCCF:
++    """CCF operations through a CLIENT-mode session (shmem only, no device)."""
++
++    @staticmethod
++    def _wait_for_smpfilter(session, chan_id, expected, timeout=5.0):
++        """Poll until channel smpfilter matches *expected* or timeout."""
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            if session.get_channel_smpfilter(chan_id) == expected:
++                return
++            time.sleep(0.1)
++        assert session.get_channel_smpfilter(chan_id) == expected
++
++    def test_load_ccf_sync(self, nplay_session, client_session):
++        """CLIENT-mode load_ccf_sync: exercises SYSREP detection via shmem."""
++        last_ch = nplay_session.num_fe_chans()
++        baseline = 2
++        canary = 3
++
++        # STANDALONE sets the baseline, then saves a CCF snapshot
++        nplay_session.set_channel_smpfilter(last_ch, baseline)
++        self._wait_for_smpfilter(nplay_session, last_ch, baseline)
++
++        with tempfile.NamedTemporaryFile(suffix=".ccf", delete=False) as f:
++            ccf_file = f.name
++        try:
++            nplay_session.save_ccf(ccf_file)
++
++            # STANDALONE changes to canary so we can tell when the CCF restores
++            nplay_session.set_channel_smpfilter(last_ch, canary)
++            self._wait_for_smpfilter(nplay_session, last_ch, canary)
++
++            # CLIENT loads CCF and waits for SYSREP through shmem
++            client_session.load_ccf_sync(ccf_file, timeout=5.0)
++
++            # Verify via STANDALONE that the baseline was restored
++            self._wait_for_smpfilter(nplay_session, last_ch, baseline)
++        finally:
++            Path(ccf_file).unlink(missing_ok=True)
++
++
+ # ---------------------------------------------------------------------------
+ # CMP files
+ # ---------------------------------------------------------------------------
+diff --git a/pycbsdk/tests/test_data_reception.py b/pycbsdk/tests/test_data_reception.py
+index 82650e49..5c1379b6 100644
+--- a/pycbsdk/tests/test_data_reception.py
++++ b/pycbsdk/tests/test_data_reception.py
+@@ -203,10 +203,13 @@ def on_spike(header, data):
+ 
+         # Phase 2: disable extraction on ALL channels — no new spikes should arrive
+         all_chans = nplay_session.max_chans()
+-        events.clear()
+         nplay_session.set_spike_extraction(
+             all_chans, ChannelType.FRONTEND, enabled=False,
+         )
++        # Wait for disable to propagate to device before clearing, so
++        # in-flight events from the enable→disable transition are drained.
++        time.sleep(0.5)
++        events.clear()
+         time.sleep(2)
+         phase2_count = len(events)
+         assert phase2_count == 0, (
+diff --git a/src/cbdev/src/device_session.cpp b/src/cbdev/src/device_session.cpp
+index df65e3f1..1b130ad6 100644
+--- a/src/cbdev/src/device_session.cpp
++++ b/src/cbdev/src/device_session.cpp
+@@ -615,18 +615,16 @@ Result<void> DeviceSession::sendPackets(const std::vector<cbPKT_GENERIC>& pkts)
+         return Result<void>::error("Device not connected");
+     }
+ 
+-    // Send each packet as its own datagram with a small delay between packets.
+-    // Note: Coalescing multiple packets into one datagram was tried but the device
+-    // expects one packet per UDP datagram.
++    // Send each packet as its own datagram (no coalescing).
++    // Each sendto() produces exactly one UDP datagram — the kernel never
++    // merges them.  The device firmware drains its socket receive buffer in
++    // a tight loop each main-loop iteration (~33 µs at 30 kHz), so packets
++    // simply queue in the device-side kernel buffer between iterations.
++    // No inter-packet delay is needed.
+     for (const auto& pkt : pkts) {
+         if (auto result = sendPacket(pkt); result.isError()) {
+             return result;
+         }
+-#ifdef _WIN32
+-        hr_sleep_us(50);
+-#else
+-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+-#endif
+     }
+ 
+     return Result<void>::ok();
+diff --git a/src/cbsdk/src/sdk_session.cpp b/src/cbsdk/src/sdk_session.cpp
+index 5b0a0cb5..c6e9bfd2 100644
+--- a/src/cbsdk/src/sdk_session.cpp
++++ b/src/cbsdk/src/sdk_session.cpp
+@@ -30,6 +30,34 @@
+ #include <vector>
+ #include "cbdev/clock_sync.h"
+ 
++namespace {
++
++/// High-resolution microsecond delay.
++/// On Windows, std::this_thread::sleep_for rounds up to ~15 ms which is far
++/// too coarse for the 50 µs inter-packet pacing the send thread needs.
++/// Use a QPC spin-wait instead (mirrors cbdev's hr_sleep_us).
++inline void hr_sleep_us([[maybe_unused]] uint64_t microseconds) {
++#ifdef _WIN32
++    if (microseconds == 0) return;
++    LARGE_INTEGER freq, start;
++    QueryPerformanceFrequency(&freq);
++    QueryPerformanceCounter(&start);
++    const double ticks_per_us = static_cast<double>(freq.QuadPart) / 1'000'000.0;
++    const LONGLONG delta = static_cast<LONGLONG>(microseconds * ticks_per_us);
++    LARGE_INTEGER target;
++    target.QuadPart = start.QuadPart + delta;
++    for (;;) {
++        LARGE_INTEGER now;
++        QueryPerformanceCounter(&now);
++        if (now.QuadPart >= target.QuadPart) break;
++    }
++#else
++    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(microseconds)));
++#endif
++}
++
++} // anonymous namespace
++
+ namespace cbsdk {
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -895,16 +923,17 @@ Result<void> SdkSession::start() {
+                         impl->stats.packets_sent_to_device.fetch_add(1, std::memory_order_relaxed);
+                     }
+ 
+-                    // Rate-limit: older firmware processes one packet per 50µs
+-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
++                    // No inter-packet delay needed: each sendto() produces
++                    // exactly one UDP datagram (kernel never merges them), and
++                    // the device firmware drains its socket receive buffer in a
++                    // tight loop each main-loop iteration (~33 µs at 30 kHz).
++                    // Packets that arrive between iterations simply queue in
++                    // the kernel's socket receive buffer on the device side.
+                 }
+ 
+-                if (has_packets) {
+-                    // Had packets - check again quickly
+-                    std::this_thread::yield();
+-                } else {
++                if (!has_packets) {
+                     // No packets - wait briefly before checking again
+-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
++                    hr_sleep_us(100);
+                 }
+             }
+         });
+@@ -1015,6 +1044,13 @@ Result<void> SdkSession::start() {
+                                     impl->pending_clock_probe.active = false;
+                                 }
+                             }
++                            // Check for SYSREP packets (handshake responses)
++                            if ((packets[i].cbpkt_header.type & 0xF0) == cbPKTTYPE_SYSREP) {
++                                const auto* sysinfo = reinterpret_cast<const cbPKT_SYSINFO*>(&packets[i]);
++                                impl->device_runlevel.store(sysinfo->runlevel, std::memory_order_release);
++                                impl->received_sysrep.store(true, std::memory_order_release);
++                                impl->handshake_cv.notify_all();
++                            }
+                             // Note: CMP positions are applied by the STANDALONE session
+                             // when it writes chaninfo to shmem. CLIENT doesn't need to
+                             // re-apply them.
+@@ -1928,12 +1964,44 @@ Result<void> SdkSession::loadCCFSync(const std::string& filename, uint32_t timeo
+     if (result.isError())
+         return result;
+ 
+-    // Synchronize: re-send the current runlevel (a no-op) and wait for the
+-    // SYSREP response.  The device processes packets in order, so receiving
+-    // the SYSREP confirms that all prior CCF configuration packets have
+-    // been applied.
++    // Synchronize: enqueue a no-op runlevel SET through the same shmem
++    // transmit queue that carries the CCF packets, then wait for the SYSREP
++    // response.  Because the device send thread drains this queue in order,
++    // the device will process every CCF packet before it sees the runlevel
++    // SET, so the resulting SYSREP confirms all configuration has been applied.
++    //
++    // NOTE: we deliberately use sendPacket() (shmem path) instead of
++    // device_session->setSystemRunLevel() (direct UDP) to avoid racing
++    // ahead of CCF packets still queued in shared memory.
++    m_impl->received_sysrep.store(false, std::memory_order_relaxed);
++
+     uint32_t current = m_impl->device_runlevel.load(std::memory_order_acquire);
+-    return setSystemRunLevel(current, 0, 0, 0, timeout_ms);
++    cbPKT_SYSINFO pkt = {};
++    pkt.cbpkt_header.time = 1;
++    pkt.cbpkt_header.chid = cbPKTCHAN_CONFIGURATION;
++    pkt.cbpkt_header.type = cbPKTTYPE_SYSSETRUNLEV;
++    pkt.cbpkt_header.dlen = cbPKTDLEN_SYSINFO;
++    pkt.runlevel = current;
++
++    auto send_result = sendPacket(reinterpret_cast<const cbPKT_GENERIC&>(pkt));
++    if (send_result.isError())
++        return send_result;
++
++    if (!waitForSysrep(timeout_ms, 0)) {
++        return Result<void>::error("No SYSREP response received for loadCCFSync");
++    }
++
++    // The device also sends SYSREP on network error / reset.  If the
++    // returned runlevel is HARDRESET or STANDBY the device dropped our
++    // config packets and restarted — report an error so the caller knows
++    // the CCF was not applied.
++    uint32_t rl = m_impl->device_runlevel.load(std::memory_order_acquire);
++    if (rl <= cbRUNLEVEL_STANDBY) {
++        return Result<void>::error(
++            "Device reset during CCF load (runlevel " + std::to_string(rl) + ")");
++    }
++
++    return Result<void>::ok();
+ }
+ 
+ ///--------------------------------------------------------------------------------------------

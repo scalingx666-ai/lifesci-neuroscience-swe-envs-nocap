@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Add Ubuntu 25.10 Questing to portability workflow
+
+## Description
+
+Supports #453 and #449
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `938af196347f`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,1167 @@
+diff --git a/connectomics/segmentation/export_pychunkedgraph_beam.py b/connectomics/segmentation/export_pychunkedgraph_beam.py
+new file mode 100644
+index 0000000..3337b58
+--- /dev/null
++++ b/connectomics/segmentation/export_pychunkedgraph_beam.py
+@@ -0,0 +1,617 @@
++# Copyright 2025 The Google Research Authors.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Apache Beam Python pipeline for exporting PyChunkedGraph ingest data."""
++
++import collections
++import json
++import math
++
++from absl import app
++from absl import flags
++import apache_beam as beam
++import numpy as np
++import tensorstore as ts
++import zstandard as zstd
++
++from apache_beam.io.gcp import bigquery as beam_bq
++from connectomics.segmentation import pychunkedgraph_proto as export_data_pb2
++
++_REQUEST_TEXT = flags.DEFINE_string(
++    'request_text',
++    None,
++    'TextFormat ExportPychunkedgraphRequest',
++)
++_RUNNER = flags.DEFINE_string('runner', None, 'Pipeline runner to use')
++_OUTPUT_TENSORSTORE_SPEC = flags.DEFINE_string(
++    'output_tensorstore_spec',
++    None,
++    'JSON TensorStore spec for writing remapped supervoxel volume. '
++    'Must be rank 3, dtype uint64, same shape as input volume.',
++)
++
++
++def get_pcg_segment_id_base(
++    coord_bits: int, cell_coords: tuple[int, int, int]
++) -> int:
++  id_base = 1 << (64 - 8)
++  for i in range(3):
++    id_base |= int(cell_coords[i]) << (64 - 8 - coord_bits * (i + 1))
++  return id_base
++
++
++class GridProcessorDoFn(beam.DoFn):
++  """Base DoFn with shared grid computation logic."""
++
++  def __init__(
++      self, request_proto: export_data_pb2.ExportPychunkedgraphRequest
++  ):
++    self.request_proto = request_proto
++
++  def setup(self):
++    json_spec = json.loads(self.request_proto.input_tensorstore_spec)
++    self.store = ts.open(json_spec, read=True).result()
++
++    shape = self.store.domain.shape
++    self.pychunkedgraph_block_shape = np.array([
++        self.request_proto.pychunkedgraph_block_shape.x,
++        self.request_proto.pychunkedgraph_block_shape.y,
++        self.request_proto.pychunkedgraph_block_shape.z,
++    ])
++    self.volume_shape = np.array(shape[:3])
++    self.pychunkedgraph_grid_shape = np.ceil(
++        self.volume_shape / self.pychunkedgraph_block_shape
++    ).astype(np.int64)
++
++    self.pychunkedgraph_coord_bits = 0
++    for i in range(3):
++      while (
++          1 << self.pychunkedgraph_coord_bits
++      ) < self.pychunkedgraph_grid_shape[i]:
++        self.pychunkedgraph_coord_bits += 1
++
++  def get_cell_coords_from_cell_index(
++      self, cell_index: int
++  ) -> tuple[int, int, int]:
++    coords = []
++    for i in range(3):
++      coords.append(int(cell_index % self.pychunkedgraph_grid_shape[i]))
++      cell_index //= self.pychunkedgraph_grid_shape[i]
++    return tuple(coords)
++
++  def get_cell_index_from_cell_coords(
++      self, coords: tuple[int, int, int]
++  ) -> int:
++    block_id = 0
++    stride = 1
++    for i in range(3):
++      block_id += stride * coords[i]
++      stride *= self.pychunkedgraph_grid_shape[i]
++    return block_id
++
++
++class MapSupervoxelsFn(GridProcessorDoFn):
++  """Maps supervoxels."""
++
++  def __init__(
++      self,
++      request_proto: export_data_pb2.ExportPychunkedgraphRequest,
++      output_tensorstore_spec: str | None = None,
++  ):
++    super().__init__(request_proto)
++    self.output_tensorstore_spec = output_tensorstore_spec
++
++  def setup(self):
++    super().setup()
++    if self.output_tensorstore_spec:
++      json_spec = json.loads(self.output_tensorstore_spec)
++      self.output_store = ts.open(
++          json_spec, dtype=ts.uint64, write=True
++      ).result()
++    else:
++      self.output_store = None
++
++  def process(self, input_index: int):
++    pychunkedgraph_cell_coords = self.get_cell_coords_from_cell_index(
++        input_index
++    )
++
++    start_voxel_coords = (
++        np.array(pychunkedgraph_cell_coords) * self.pychunkedgraph_block_shape
++    )
++    voxel_shape = np.minimum(
++        self.pychunkedgraph_block_shape, self.volume_shape - start_voxel_coords
++    )
++
++    x0, y0, z0 = start_voxel_coords
++    dx, dy, dz = voxel_shape
++    subvolume_array = (
++        self.store[x0 : x0 + dx, y0 : y0 + dy, z0 : z0 + dz].read().result()
++    )
++
++    flat_data = subvolume_array.ravel(order='F')
++    _, idx = np.unique(flat_data, return_index=True)
++    sorted_idx = np.sort(idx)
++    unique_ids_with_zero = flat_data[sorted_idx]
++    unique_ids = [int(k) for k in unique_ids_with_zero if k != 0]
++
++    if self.output_store is not None:
++      base_segment_id = get_pcg_segment_id_base(
++          self.pychunkedgraph_coord_bits, pychunkedgraph_cell_coords
++      )
++      remap = np.zeros_like(subvolume_array)
++      for i, orig_id in enumerate(unique_ids):
++        remap[subvolume_array == orig_id] = base_segment_id + i
++      x0i, y0i, z0i = int(x0), int(y0), int(z0)
++      dxi, dyi, dzi = int(dx), int(dy), int(dz)
++      self.output_store[
++          x0i : x0i + dxi, y0i : y0i + dyi, z0i : z0i + dzi
++      ].write(remap).result()
++
++    for k in unique_ids:
++      yield beam.pvalue.TaggedOutput('supervoxel_to_block', (k, input_index))
++
++    for neighbor_i in range(27):
++      neighbor_offset = [0, 0, 0]
++      v = neighbor_i
++      for i in range(3):
++        neighbor_offset[i] = (v % 3) - 1
++        v //= 3
++
++      neighbor_coords = (
++          pychunkedgraph_cell_coords[0] + neighbor_offset[0],
++          pychunkedgraph_cell_coords[1] + neighbor_offset[1],
++          pychunkedgraph_cell_coords[2] + neighbor_offset[2],
++      )
++
++      out_of_bounds = False
++      for i in range(3):
++        if (
++            neighbor_coords[i] < 0
++            or neighbor_coords[i] >= self.pychunkedgraph_grid_shape[i]
++        ):
++          out_of_bounds = True
++          break
++
++      if out_of_bounds:
++        continue
++
++      neighbor_block_id = self.get_cell_index_from_cell_coords(neighbor_coords)
++      yield beam.pvalue.TaggedOutput(
++          'map_output', (int(neighbor_block_id), (input_index, unique_ids))
++      )
++
++
++class OutputPychunkedgraphDataFn(GridProcessorDoFn):
++  """Outputs PyChunkedGraph data."""
++
++  def setup(self):
++    super().setup()
++    try:
++      json_spec = json.loads(self.request_proto.output_pychunkedgraph_kvstore)
++    except json.JSONDecodeError:
++      json_spec = self.request_proto.output_pychunkedgraph_kvstore
++    self.kvstore = ts.KvStore.open(json_spec).result()
++
++  def process(self, element):
++    block_id, group = element
++    supervoxel_maps = group['supervoxel_maps']
++    edges = group['edges']
++
++    block_to_supervoxels = {}
++    for map_tuple in supervoxel_maps:
++      source_block_id, original_ids = map_tuple
++      base = get_pcg_segment_id_base(
++          self.pychunkedgraph_coord_bits,
++          self.get_cell_coords_from_cell_index(source_block_id),
++      )
++      mapping = {}
++      for i, orig_id in enumerate(original_ids):
++        mapping[orig_id] = base + i
++      block_to_supervoxels[source_block_id] = mapping
++
++    edges_map = collections.defaultdict(dict)
++    for sv_a, sv_b, score in edges:
++      if sv_a == sv_b:
++        continue
++      if sv_b not in edges_map[sv_a] or score > edges_map[sv_a][sv_b]:
++        edges_map[sv_a][sv_b] = score
++      if sv_a not in edges_map[sv_b] or score > edges_map[sv_b][sv_a]:
++        edges_map[sv_b][sv_a] = score
++
++    seen_edges = set()
++
++    def emit_edge(a, b):
++      return (min(a, b), max(a, b))
++
++    def add_chunk_edges(source_block_id, target_block_id, keep_order):
++      result_edges = []
++      result_emits = []
++      if (
++          source_block_id not in block_to_supervoxels
++          or target_block_id not in block_to_supervoxels
++      ):
++        return result_edges, result_emits
++
++      source_supervoxels = block_to_supervoxels[source_block_id]
++      target_supervoxels = block_to_supervoxels[target_block_id]
++
++      for orig_source_sv, pcg_source_sv in source_supervoxels.items():
++        if orig_source_sv not in edges_map:
++          continue
++        for target_orig_sv, score in edges_map[orig_source_sv].items():
++          if target_orig_sv not in target_supervoxels:
++            continue
++
++          if source_block_id != target_block_id:
++            in_chunk_in_neighbor = False
++            for other_block_id, other_svs in block_to_supervoxels.items():
++              if (
++                  other_block_id != source_block_id
++                  and orig_source_sv in other_svs
++                  and target_orig_sv in other_svs
++              ):
++                in_chunk_in_neighbor = True
++                break
++            if in_chunk_in_neighbor:
++              continue
++
++          norm_edge = (
++              min(orig_source_sv, target_orig_sv),
++              max(orig_source_sv, target_orig_sv),
++          )
++          if norm_edge in seen_edges:
++            continue
++          seen_edges.add(norm_edge)
++
++          result_emits.append(emit_edge(orig_source_sv, target_orig_sv))
++          target_pcg_sv = target_supervoxels[target_orig_sv]
++
++          if not keep_order:
++            result_edges.append((
++                min(pcg_source_sv, target_pcg_sv),
++                max(pcg_source_sv, target_pcg_sv),
++                score,
++            ))
++          else:
++            result_edges.append((pcg_source_sv, target_pcg_sv, score))
++      return result_edges, result_emits
++
++    def remove_duplicate_edges(edge_list):
++      return sorted(list(set(edge_list)))
++
++    def get_in_chunk_edges():
++      result, emits = add_chunk_edges(block_id, block_id, False)
++      source_supervoxels = block_to_supervoxels[block_id]
++      for _, pcg_sv in source_supervoxels.items():
++        result.append((pcg_sv, pcg_sv, float('inf')))
++      return remove_duplicate_edges(result), emits
++
++    def get_cross_chunk_edges():
++      result = []
++      source_svs = block_to_supervoxels[block_id]
++      for target_block_id, target_svs in block_to_supervoxels.items():
++        if target_block_id == block_id:
++          continue
++        for orig_source_sv, pcg_source_sv in source_svs.items():
++          if orig_source_sv in target_svs:
++            target_pcg_sv = target_svs[orig_source_sv]
++            result.append((pcg_source_sv, target_pcg_sv, float('inf')))
++      return remove_duplicate_edges(result)
++
++    def get_between_chunk_edges():
++      source_coords = self.get_cell_coords_from_cell_index(block_id)
++      nearest_neighbors = []
++      next_nearest_neighbors = []
++
++      for target_block_id, _ in block_to_supervoxels.items():
++        if target_block_id == block_id:
++          continue
++        target_coords = self.get_cell_coords_from_cell_index(target_block_id)
++        diff = [source_coords[i] - target_coords[i] for i in range(3)]
++        dist = (diff[0] != 0) + (diff[1] != 0) + (diff[2] != 0)
++        if dist == 1:
++          nearest_neighbors.append(target_block_id)
++        else:
++          next_nearest_neighbors.append(target_block_id)
++
++      result = []
++      all_emits = []
++      for target_block_id in nearest_neighbors:
++        edges, emits = add_chunk_edges(block_id, target_block_id, True)
++        result.extend(edges)
++        all_emits.extend(emits)
++
++      for target_block_id in next_nearest_neighbors:
++        edges, emits = add_chunk_edges(block_id, target_block_id, True)
++        result.extend(edges)
++        all_emits.extend(emits)
++
++      return remove_duplicate_edges(result), all_emits
++
++    in_chunk_edges, in_emits = get_in_chunk_edges()
++    cross_chunk_edges = get_cross_chunk_edges()
++    between_chunk_edges, between_emits = get_between_chunk_edges()
++
++    for emit in in_emits:
++      yield emit
++    for emit in between_emits:
++      yield emit
++
++    def make_edges_msg(edges_list):
++      msg = export_data_pb2.ExportPychunkedgraphRequest.PychunkedgraphEdgesMsg()
++      node_ids1 = []
++      node_ids2 = []
++      affinities = []
++      for a, b, score in edges_list:
++        node_ids1.append(a)
++        node_ids2.append(b)
++        affinities.append(score)
++      msg.node_ids1 = np.array(node_ids1, dtype='<u8').tobytes()
++      msg.node_ids2 = np.array(node_ids2, dtype='<u8').tobytes()
++      msg.affinities = np.array(affinities, dtype='<f4').tobytes()
++      return msg
++
++    chunk_edges_msg = (
++        export_data_pb2.ExportPychunkedgraphRequest.PychunkedgraphChunkEdgesMsg()
++    )
++    chunk_edges_msg.in_chunk.CopyFrom(make_edges_msg(in_chunk_edges))
++    chunk_edges_msg.cross_chunk.CopyFrom(make_edges_msg(cross_chunk_edges))
++    chunk_edges_msg.between_chunk.CopyFrom(make_edges_msg(between_chunk_edges))
++
++    cctx = zstd.ZstdCompressor()
++    encoded_edges = cctx.compress(chunk_edges_msg.SerializeToString())
++
++    def get_components():
++      seen_segment_ids = set()
++      source_svs = block_to_supervoxels[block_id]
++      components = []
++      for orig_source_sv, _ in source_svs.items():
++        if orig_source_sv in seen_segment_ids:
++          continue
++
++        queue = collections.deque()
++        members = []
++
++        def add_to_component(orig_id, q, m):
++          seen_segment_ids.add(orig_id)
++          q.append(orig_id)
++          for _, other_svs in block_to_supervoxels.items():
++            if orig_id in other_svs:
++              m.append(other_svs[orig_id])
++
++        add_to_component(orig_source_sv, queue, members)
++
++        while queue:
++          orig_sv = queue.popleft()
++          if orig_sv not in edges_map:
++            continue
++          for target_orig_sv in edges_map[orig_sv]:
++            if target_orig_sv in seen_segment_ids:
++              continue
++            add_to_component(target_orig_sv, queue, members)
++
++        members.sort()
++        components.append(members)
++
++      components.sort()
++      msg = (
++          export_data_pb2.ExportPychunkedgraphRequest.PychunkedgraphChunkComponentsMsg()
++      )
++      flat_components = []
++      for members in components:
++        flat_components.append(len(members))
++        flat_components.extend(members)
++      msg.components.extend(flat_components)
++      return msg
++
++    encoded_components = get_components().SerializeToString()
++
++    cell_coords = self.get_cell_coords_from_cell_index(block_id)
++    edges_path = (
++        f'edges_{cell_coords[0]}_{cell_coords[1]}_{cell_coords[2]}.proto.zst'
++    )
++    components_path = (
++        f'components_{cell_coords[0]}_{cell_coords[1]}_{cell_coords[2]}.proto'
++    )
++
++    self.kvstore.write(edges_path, encoded_edges).result()
++    self.kvstore.write(components_path, encoded_components).result()
++
++
++def process_request(
++    request: export_data_pb2.ExportPychunkedgraphRequest,
++    pcoll_chosen_edges: beam.PCollection,
++    output_tensorstore_spec: str | None = None,
++):
++  """Processes the export request."""
++
++  def duplicate_edges(edge):
++    a, b, score = edge
++    yield (a, (b, score))
++    yield (b, (a, score))
++
++  chosen_edge_table = (
++      pcoll_chosen_edges
++      | 'DuplicateChosenEdges' >> beam.FlatMap(duplicate_edges)
++      | 'ReshuffleDuplicatedEdges' >> beam.Reshuffle()
++  )
++
++  def normalize_edges(kv):
++    a, (b, _) = kv
++    if a < b:
++      yield (a, b)
++    elif a > b:
++      yield (b, a)
++
++  normalized_edges = chosen_edge_table | 'NormalizeChosenEdges' >> beam.FlatMap(
++      normalize_edges
++  )
++
++  json_spec = json.loads(request.input_tensorstore_spec)
++  store = ts.open(json_spec, read=True).result()
++  volume_shape = np.array(store.domain.shape[:3])
++  pychunkedgraph_block_shape = np.array([
++      request.pychunkedgraph_block_shape.x,
++      request.pychunkedgraph_block_shape.y,
++      request.pychunkedgraph_block_shape.z,
++  ])
++  pychunkedgraph_grid_shape = np.ceil(
++      volume_shape / pychunkedgraph_block_shape
++  ).astype(np.int64)
++  num_blocks = int(np.prod(pychunkedgraph_grid_shape))
++
++  map_supervoxels_result = (
++      pcoll_chosen_edges.pipeline
++      | 'BlockIntegerRange' >> beam.Create(range(num_blocks))
++      | 'MapSupervoxels'
++      >> beam.ParDo(
++          MapSupervoxelsFn(request, output_tensorstore_spec)
++      ).with_outputs(
++          'map_output', 'supervoxel_to_block', main='main'
++      )
++  )
++
++  supervoxel_maps = map_supervoxels_result.map_output
++  supervoxel_to_block = map_supervoxels_result.supervoxel_to_block
++
++  def distribute_edges(kv):
++    sv_a, group = kv
++    blocks = list(group['supervoxel_to_block'])
++    if not blocks:
++      return
++    edges = group['chosen_edge_table']
++    for b, score in edges:
++      for block_id in blocks:
++        yield (block_id, (sv_a, b, score))
++
++  block_to_edges = (
++      {
++          'supervoxel_to_block': supervoxel_to_block,
++          'chosen_edge_table': chosen_edge_table,
++      }
++      | 'JoinEdgesToSupervoxels' >> beam.CoGroupByKey()
++      | 'DistributeEdgesToBlocks' >> beam.FlatMap(distribute_edges)
++  )
++
++  emitted_edges = (
++      {'supervoxel_maps': supervoxel_maps, 'edges': block_to_edges}
++      | 'JoinPerBlockSupervoxelMapsAndEdges' >> beam.CoGroupByKey()
++      | 'OutputPychunkedgraphData'
++      >> beam.ParDo(OutputPychunkedgraphDataFn(request))
++  )
++
++  def format_dropped(kv):
++    edge, group = kv
++    in_normalized = group['normalized']
++    in_emitted = group['emitted']
++    if in_normalized and not in_emitted:
++      yield f'{edge[0]},{edge[1]}'
++
++  _ = (
++      {
++          'normalized': (
++              normalized_edges | 'NormMap' >> beam.Map(lambda e: (e, 1))
++          ),
++          'emitted': emitted_edges | 'EmitMap' >> beam.Map(lambda e: (e, 1)),
++      }
++      | 'JoinForDiff' >> beam.CoGroupByKey()
++      | 'FilterDropped' >> beam.FlatMap(format_dropped)
++      | 'WriteDroppedEdges'
++      >> beam.io.WriteToText(
++          request.output_dropped_edges_path,
++          append_trailing_newlines=True,
++      )
++  )
++
++  def write_metadata(_):
++    try:
++      json_spec_out = json.loads(request.output_pychunkedgraph_kvstore)
++    except json.JSONDecodeError:
++      json_spec_out = request.output_pychunkedgraph_kvstore
++    kvstore = ts.KvStore.open(json_spec_out).result()
++
++    coord_bits = 0
++    for i in range(3):
++      while (1 << coord_bits) < pychunkedgraph_grid_shape[i]:
++        coord_bits += 1
++
++    metadata = {
++        'spatial_id_bits': coord_bits,
++        'fan_out': 2,
++        'layer_id_bits': 8,
++        'chunk_shape': [int(x) for x in pychunkedgraph_block_shape],
++        'volume_shape': [int(x) for x in volume_shape],
++        'chunk_grid_shape': [int(x) for x in pychunkedgraph_grid_shape],
++    }
++    kvstore.write(
++        'pychunkedgraph_metadata.json', json.dumps(metadata).encode('utf-8')
++    ).result()
++
++  _ = (
++      pcoll_chosen_edges.pipeline
++      | 'TriggerMetadata' >> beam.Create([1])
++      | 'WriteMetadata' >> beam.Map(write_metadata)
++  )
++
++
++def main(argv):
++  if not _REQUEST_TEXT.value:
++    raise app.UsageError('Flag --request_text must be specified.')
++  request = export_data_pb2.ExportPychunkedgraphRequest.from_json(
++      _REQUEST_TEXT.value
++  )
++
++  # argv[1:] contains the arguments that were not parsed as absl flags.
++  options = beam.options.pipeline_options.PipelineOptions(argv[1:])
++  standard_options = options.view_as(
++      beam.options.pipeline_options.StandardOptions
++  )
++  if _RUNNER.value:
++    standard_options.runner = _RUNNER.value
++
++  with beam.Pipeline(options=options) as p:
++    if request.HasField('chosen_edges_table'):
++      pcoll_edges = p | 'ReadEdgesFromBQ' >> beam_bq.ReadFromBigQuery(
++          table=f'{request.chosen_edges_table.project}:{request.chosen_edges_table.dataset}.{request.chosen_edges_table.table}',
++      )
++      num_edges_counter = beam.metrics.Metrics.counter('main', 'num-edges')
++
++      def parse_bq_row(row):
++        label_a = int(row['label_a'])
++        label_b = int(row['label_b'])
++        assert label_a > 0, f'label_a must be positive, got {label_a}'
++        assert label_b > 0, f'label_b must be positive, got {label_b}'
++        num_edges_counter.inc()
++        # Apply exp to ensure non-negative, matching C++ behavior.
++        try:
++          score = math.exp(float(row['score']))
++        except OverflowError:
++          score = float('inf')
++        return (label_a, label_b, score)
++
++      pcoll_edges = (
++          pcoll_edges
++          | 'ParseBQRow' >> beam.Map(parse_bq_row)
++          | 'ReshuffleEdges' >> beam.Reshuffle()
++      )
++    else:
++      pcoll_edges = p | 'EmptyEdges' >> beam.Create([])
++
++    process_request(request, pcoll_edges, _OUTPUT_TENSORSTORE_SPEC.value)
++
++
++if __name__ == '__main__':
++  app.run(main)
+diff --git a/connectomics/segmentation/export_pychunkedgraph_beam_test.py b/connectomics/segmentation/export_pychunkedgraph_beam_test.py
+new file mode 100644
+index 0000000..981ac81
+--- /dev/null
++++ b/connectomics/segmentation/export_pychunkedgraph_beam_test.py
+@@ -0,0 +1,225 @@
++# Copyright 2025 The Google Research Authors.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++import glob
++import json
++import os
++
++from absl.testing import absltest
++import apache_beam as beam
++from apache_beam.testing.test_pipeline import TestPipeline
++from connectomics.segmentation import export_pychunkedgraph_beam
++import numpy as np
++import tensorstore as ts
++import zstandard as zstd
++
++from connectomics.segmentation import pychunkedgraph_proto as export_data_pb2
++
++
++class ExportPychunkedgraphBeamTest(absltest.TestCase):
++
++  def test_get_pcg_segment_id_base_basic(self):
++    self.assertEqual(
++        (1 << 56) + (1 << 55),
++        export_pychunkedgraph_beam.get_pcg_segment_id_base(1, (1, 0, 0)),
++    )
++    self.assertEqual(
++        (1 << 56) + (1 << 54),
++        export_pychunkedgraph_beam.get_pcg_segment_id_base(2, (1, 0, 0)),
++    )
++    self.assertEqual(
++        (1 << 56) + (1 << 54) + (2 << 52) + (3 << 50),
++        export_pychunkedgraph_beam.get_pcg_segment_id_base(2, (1, 2, 3)),
++    )
++
++  def test_basic2x1x1(self):
++    temp_dir = self.create_tempdir().full_path
++
++    array = np.array(
++        [
++            [1, 2, 2, 3],
++            [4, 5, 5, 6],
++        ],
++        dtype=np.uint64,
++    )
++    array = array.T[:, :, np.newaxis]
++
++    ts_spec = {
++        'driver': 'zarr',
++        'kvstore': {
++            'driver': 'file',
++            'path': os.path.join(temp_dir, 'input_zarr/'),
++        },
++    }
++    dataset = ts.open(
++        ts_spec, dtype=ts.uint64, shape=array.shape, create=True
++    ).result()
++    dataset.write(array).result()
++
++    request = export_data_pb2.ExportPychunkedgraphRequest()
++    request.input_tensorstore_spec = json.dumps(ts_spec)
++    request.pychunkedgraph_block_shape.x = 2
++    request.pychunkedgraph_block_shape.y = 2
++    request.pychunkedgraph_block_shape.z = 1
++
++    output_kvstore_spec = {
++        'driver': 'file',
++        'path': os.path.join(temp_dir, 'graph/'),
++    }
++    request.output_pychunkedgraph_kvstore = json.dumps(output_kvstore_spec)
++    dropped_edges_path = os.path.join(temp_dir, 'dropped_edges.csv')
++    request.output_dropped_edges_path = dropped_edges_path
++
++    edges = [
++        (1, 2, 10.0),
++        (4, 6, 11.0),
++        (5, 6, 12.0),
++        (3, 6, 13.0),
++    ]
++
++    with TestPipeline() as p:
++      pcoll_edges = p | beam.Create(edges)
++      export_pychunkedgraph_beam.process_request(request, pcoll_edges)
++
++    with open(
++        os.path.join(temp_dir, 'graph/pychunkedgraph_metadata.json'), 'r'
++    ) as f:
++      metadata = json.load(f)
++      self.assertEqual(metadata['chunk_grid_shape'], [2, 1, 1])
++      self.assertEqual(metadata['chunk_shape'], [2, 2, 1])
++      self.assertEqual(metadata['volume_shape'], [4, 2, 1])
++      self.assertEqual(metadata['spatial_id_bits'], 1)
++
++    block0_segment_base = export_pychunkedgraph_beam.get_pcg_segment_id_base(
++        1, (0, 0, 0)
++    )
++    block1_segment_base = export_pychunkedgraph_beam.get_pcg_segment_id_base(
++        1, (1, 0, 0)
++    )
++
++    pcg0_1 = block0_segment_base + 0
++    pcg0_2 = block0_segment_base + 1
++    pcg0_4 = block0_segment_base + 2
++    pcg0_5 = block0_segment_base + 3
++    pcg1_2 = block1_segment_base + 0
++    pcg1_5 = block1_segment_base + 2
++    pcg1_6 = block1_segment_base + 3
++
++    def decode_chunk_edges(filepath):
++      with open(filepath, 'rb') as f:
++        compressed = f.read()
++      dctx = zstd.ZstdDecompressor()
++      uncompressed = dctx.decompress(compressed)
++      msg = (
++          export_data_pb2.ExportPychunkedgraphRequest.PychunkedgraphChunkEdgesMsg()
++      )
++      msg.ParseFromString(uncompressed)
++
++      def decode_msg(edges_msg):
++        node_ids1 = np.frombuffer(edges_msg.node_ids1, dtype='<u8')
++        node_ids2 = np.frombuffer(edges_msg.node_ids2, dtype='<u8')
++        affinities = np.frombuffer(edges_msg.affinities, dtype='<f4')
++        return list(zip(node_ids1, node_ids2, affinities))
++
++      return (
++          decode_msg(msg.in_chunk),
++          decode_msg(msg.cross_chunk),
++          decode_msg(msg.between_chunk),
++      )
++
++    in_chunk, cross_chunk, between_chunk = decode_chunk_edges(
++        os.path.join(temp_dir, 'graph/edges_0_0_0.proto.zst')
++    )
++    self.assertIn((pcg0_1, pcg0_1, float('inf')), in_chunk)
++    self.assertIn((pcg0_1, pcg0_2, 10.0), in_chunk)
++    self.assertIn((pcg0_2, pcg1_2, float('inf')), cross_chunk)
++    self.assertIn((pcg0_4, pcg1_6, 11.0), between_chunk)
++
++    def decode_components(filepath):
++      with open(filepath, 'rb') as f:
++        data = f.read()
++      msg = (
++          export_data_pb2.ExportPychunkedgraphRequest.PychunkedgraphChunkComponentsMsg()
++      )
++      msg.ParseFromString(data)
++      return list(msg.components)
++
++    comps0 = decode_components(
++        os.path.join(temp_dir, 'graph/components_0_0_0.proto')
++    )
++    self.assertEqual(
++        comps0, [3, pcg0_1, pcg0_2, pcg1_2, 4, pcg0_4, pcg0_5, pcg1_5, pcg1_6]
++    )
++
++  def test_basic2x3x1(self):
++    temp_dir = self.create_tempdir().full_path
++
++    array = np.array(
++        [
++            [1, 2, 2, 3],
++            [4, 5, 5, 6],
++            [7, 5, 5, 9],
++        ],
++        dtype=np.uint64,
++    )
++    array = array.T[:, :, np.newaxis]
++
++    ts_spec = {
++        'driver': 'zarr',
++        'kvstore': {
++            'driver': 'file',
++            'path': os.path.join(temp_dir, 'input_zarr/'),
++        },
++    }
++    dataset = ts.open(
++        ts_spec, dtype=ts.uint64, shape=array.shape, create=True
++    ).result()
++    dataset.write(array).result()
++
++    request = export_data_pb2.ExportPychunkedgraphRequest()
++    request.input_tensorstore_spec = json.dumps(ts_spec)
++    request.pychunkedgraph_block_shape.x = 2
++    request.pychunkedgraph_block_shape.y = 1
++    request.pychunkedgraph_block_shape.z = 1
++
++    output_kvstore_spec = {
++        'driver': 'file',
++        'path': os.path.join(temp_dir, 'graph/'),
++    }
++    request.output_pychunkedgraph_kvstore = json.dumps(output_kvstore_spec)
++    dropped_edges_path = os.path.join(temp_dir, 'dropped_edges.csv')
++    request.output_dropped_edges_path = dropped_edges_path
++
++    edges = [
++        (1, 2, 10.0),
++        (4, 6, 11.0),
++        (5, 6, 12.0),
++        (3, 6, 13.0),
++        (9, 1, 14.0),
++    ]
++
++    with TestPipeline() as p:
++      pcoll_edges = p | beam.Create(edges)
++      export_pychunkedgraph_beam.process_request(request, pcoll_edges)
++
++    dropped = ''
++    for f_path in sorted(glob.glob(dropped_edges_path + '*')):
++      with open(f_path, 'r') as f:
++        dropped += f.read()
++    self.assertIn('1,9', dropped)
++
++
++if __name__ == '__main__':
++  absltest.main()
+diff --git a/connectomics/segmentation/pychunkedgraph_proto.py b/connectomics/segmentation/pychunkedgraph_proto.py
+new file mode 100644
+index 0000000..ecda30c
+--- /dev/null
++++ b/connectomics/segmentation/pychunkedgraph_proto.py
+@@ -0,0 +1,307 @@
++# Copyright 2025 The Google Research Authors.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Pure-Python proto-compatible message definitions for PyChunkedGraph export.
++
++This module provides lightweight, dependency-free message classes that replicate
++the exact protobuf wire format of the ExportPychunkedgraphRequest message and
++its nested types.
++
++Using pure-Python dataclasses instead of generated protobuf code avoids the need
++for a protoc compilation step and proto library dependency. The wire format is
++byte-compatible with standard protobuf encoding, so downstream PyChunkedGraph
++consumers can parse the serialized output with either these classes or generated
++proto code.
++"""
++
++import dataclasses
++import json
++
++
++def _encode_varint(value: int) -> bytes:  # pylint: disable=invalid-name
++  """Encode an unsigned integer as a protobuf varint."""
++  result = bytearray()
++  while value > 0x7F:
++    result.append((value & 0x7F) | 0x80)
++    value >>= 7
++  result.append(value & 0x7F)
++  return bytes(result)
++
++
++def _encode_bytes_field(field_number: int, data: bytes) -> bytes:  # pylint: disable=invalid-name
++  """Encode a bytes field with protobuf wire type 2 (length-delimited)."""
++  tag = _encode_varint((field_number << 3) | 2)
++  length = _encode_varint(len(data))
++  return tag + length + data
++
++
++def _encode_packed_uint64_field(  # pylint: disable=invalid-name
++    field_number: int, values: list[int]
++) -> bytes:
++  """Encode a packed repeated uint64 field."""
++  if not values:
++    return b''
++  packed = b''
++  for v in values:
++    packed += _encode_varint(v)
++  return _encode_bytes_field(field_number, packed)
++
++
++def _encode_submessage_field(field_number: int, data: bytes) -> bytes:  # pylint: disable=invalid-name
++  """Encode a submessage field."""
++  return _encode_bytes_field(field_number, data)
++
++
++def _decode_varint(data: bytes, pos: int) -> tuple[int, int]:  # pylint: disable=invalid-name
++  """Decode a varint from bytes starting at pos. Returns (value, new_pos)."""
++  result = 0
++  shift = 0
++  while True:
++    b = data[pos]
++    result |= (b & 0x7F) << shift
++    pos += 1
++    if not (b & 0x80):
++      break
++    shift += 7
++  return result, pos
++
++
++@dataclasses.dataclass
++class PychunkedgraphEdgesMsg:
++  """Matches ExportPychunkedgraphRequest.PychunkedgraphEdgesMsg."""
++
++  # Contains n uint64le values for node endpoint 1.
++  node_ids1: bytes = b''
++  # Contains n uint64le values for node endpoint 2.
++  node_ids2: bytes = b''
++  # Contains n float32le values for affinities.
++  affinities: bytes = b''
++  # Contains n uint64le values for areas (or empty).
++  areas: bytes = b''
++
++  def SerializeToString(self) -> bytes:
++    """Serialize to protobuf wire format."""
++    result = b''
++    if self.node_ids1:
++      result += _encode_bytes_field(1, self.node_ids1)
++    if self.node_ids2:
++      result += _encode_bytes_field(2, self.node_ids2)
++    if self.affinities:
++      result += _encode_bytes_field(3, self.affinities)
++    if self.areas:
++      result += _encode_bytes_field(4, self.areas)
++    return result
++
++  def CopyFrom(self, other: 'PychunkedgraphEdgesMsg'):
++    self.node_ids1 = other.node_ids1
++    self.node_ids2 = other.node_ids2
++    self.affinities = other.affinities
++    self.areas = other.areas
++
++  @classmethod
++  def FromString(cls, data: bytes) -> 'PychunkedgraphEdgesMsg':
++    """Parse from protobuf wire format."""
++    msg = cls()
++    pos = 0
++    while pos < len(data):
++      tag, pos = _decode_varint(data, pos)
++      field_number = tag >> 3
++      wire_type = tag & 0x07
++      if wire_type == 2:  # Length-delimited
++        length, pos = _decode_varint(data, pos)
++        field_data = data[pos : pos + length]
++        pos += length
++        if field_number == 1:
++          msg.node_ids1 = field_data
++        elif field_number == 2:
++          msg.node_ids2 = field_data
++        elif field_number == 3:
++          msg.affinities = field_data
++        elif field_number == 4:
++          msg.areas = field_data
++      else:
++        raise ValueError(f'Unexpected wire type {wire_type}')
++    return msg
++
++  def ParseFromString(self, data: bytes):
++    """Parse from serialized protobuf bytes."""
++    parsed = PychunkedgraphEdgesMsg.FromString(data)
++    self.CopyFrom(parsed)
++
++
++@dataclasses.dataclass
++class PychunkedgraphChunkEdgesMsg:
++  """Matches ExportPychunkedgraphRequest.PychunkedgraphChunkEdgesMsg."""
++
++  in_chunk: PychunkedgraphEdgesMsg = dataclasses.field(
++      default_factory=PychunkedgraphEdgesMsg
++  )
++  cross_chunk: PychunkedgraphEdgesMsg = dataclasses.field(
++      default_factory=PychunkedgraphEdgesMsg
++  )
++  between_chunk: PychunkedgraphEdgesMsg = dataclasses.field(
++      default_factory=PychunkedgraphEdgesMsg
++  )
++
++  def SerializeToString(self) -> bytes:
++    result = b''
++    in_chunk_data = self.in_chunk.SerializeToString()
++    if in_chunk_data:
++      result += _encode_submessage_field(1, in_chunk_data)
++    cross_chunk_data = self.cross_chunk.SerializeToString()
++    if cross_chunk_data:
++      result += _encode_submessage_field(2, cross_chunk_data)
++    between_chunk_data = self.between_chunk.SerializeToString()
++    if between_chunk_data:
++      result += _encode_submessage_field(3, between_chunk_data)
++    return result
++
++  @classmethod
++  def FromString(cls, data: bytes) -> 'PychunkedgraphChunkEdgesMsg':
++    """Parse from serialized protobuf bytes."""
++    msg = cls()
++    pos = 0
++    while pos < len(data):
++      tag, pos = _decode_varint(data, pos)
++      field_number = tag >> 3
++      wire_type = tag & 0x07
++      if wire_type == 2:
++        length, pos = _decode_varint(data, pos)
++        field_data = data[pos : pos + length]
++        pos += length
++        if field_number == 1:
++          msg.in_chunk = PychunkedgraphEdgesMsg.FromString(field_data)
++        elif field_number == 2:
++          msg.cross_chunk = PychunkedgraphEdgesMsg.FromString(field_data)
++        elif field_number == 3:
++          msg.between_chunk = PychunkedgraphEdgesMsg.FromString(field_data)
++      else:
++        raise ValueError(f'Unexpected wire type {wire_type}')
++    return msg
++
++  def ParseFromString(self, data: bytes):
++    """Parse from serialized protobuf bytes."""
++    parsed = PychunkedgraphChunkEdgesMsg.FromString(data)
++    self.in_chunk = parsed.in_chunk
++    self.cross_chunk = parsed.cross_chunk
++    self.between_chunk = parsed.between_chunk
++
++
++@dataclasses.dataclass
++class PychunkedgraphChunkComponentsMsg:
++  """Matches ExportPychunkedgraphRequest.PychunkedgraphChunkComponentsMsg."""
++
++  components: list[int] = dataclasses.field(default_factory=list)
++
++  def SerializeToString(self) -> bytes:
++    return _encode_packed_uint64_field(1, self.components)
++
++  @classmethod
++  def FromString(cls, data: bytes) -> 'PychunkedgraphChunkComponentsMsg':
++    """Parse from serialized protobuf bytes."""
++    msg = cls()
++    pos = 0
++    while pos < len(data):
++      tag, pos = _decode_varint(data, pos)
++      field_number = tag >> 3
++      wire_type = tag & 0x07
++      if wire_type == 2 and field_number == 1:  # Packed repeated
++        length, pos = _decode_varint(data, pos)
++        end = pos + length
++        while pos < end:
++          value, pos = _decode_varint(data, pos)
++          msg.components.append(value)
++      elif wire_type == 0 and field_number == 1:  # Non-packed varint
++        value, pos = _decode_varint(data, pos)
++        msg.components.append(value)
++      else:
++        raise ValueError(
++            f'Unexpected wire type {wire_type} for field {field_number}'
++        )
++    return msg
++
++  def ParseFromString(self, data: bytes):
++    """Parse from serialized protobuf bytes."""
++    parsed = PychunkedgraphChunkComponentsMsg.FromString(data)
++    self.components = parsed.components
++
++
++@dataclasses.dataclass
++class Vector3j:
++  """Matches proto.Vector3j."""
++
++  x: int = 0
++  y: int = 0
++  z: int = 0
++
++
++@dataclasses.dataclass
++class BigquerySource:
++  """Matches ExportPychunkedgraphRequest.BigquerySource."""
++
++  project: str = ''
++  dataset: str = ''
++  table: str = ''
++
++
++@dataclasses.dataclass
++class ExportPychunkedgraphRequest:
++  """Pure-Python equivalent of the ExportPychunkedgraphRequest proto.
++
++  This provides a compatible API for configuration purposes. The nested
++  message types for wire-format serialization are defined above.
++  """
++
++  input_tensorstore_spec: str = ''
++  pychunkedgraph_block_shape: Vector3j = dataclasses.field(
++      default_factory=Vector3j
++  )
++  output_pychunkedgraph_kvstore: str = ''
++  chosen_edges_table: BigquerySource | None = None
++  output_dropped_edges_path: str = ''
++
++  # Nested message types for wire format compatibility.
++  PychunkedgraphEdgesMsg = PychunkedgraphEdgesMsg  # pylint: disable=invalid-name
++  PychunkedgraphChunkEdgesMsg = PychunkedgraphChunkEdgesMsg  # pylint: disable=invalid-name
++  PychunkedgraphChunkComponentsMsg = PychunkedgraphChunkComponentsMsg  # pylint: disable=invalid-name
++
++  def HasField(self, field_name: str) -> bool:
++    if field_name == 'chosen_edges_table':
++      return self.chosen_edges_table is not None
++    return bool(getattr(self, field_name, None))
++
++  @classmethod
++  def from_json(cls, json_str: str) -> 'ExportPychunkedgraphRequest':  # pylint: disable=invalid-name
++    """Parse from JSON string."""
++    d = json.loads(json_str)
++    request = cls()
++    request.input_tensorstore_spec = d.get('input_tensorstore_spec', '')
++    if 'pychunkedgraph_block_shape' in d:
++      bs = d['pychunkedgraph_block_shape']
++      request.pychunkedgraph_block_shape = Vector3j(
++          x=bs.get('x', 0), y=bs.get('y', 0), z=bs.get('z', 0)
++      )
++    request.output_pychunkedgraph_kvstore = d.get(
++        'output_pychunkedgraph_kvstore', ''
++    )
++    request.output_dropped_edges_path = d.get('output_dropped_edges_path', '')
++    if 'chosen_edges_table' in d:
++      ct = d['chosen_edges_table']
++      request.chosen_edges_table = BigquerySource(
++          project=ct.get('project', ''),
++          dataset=ct.get('dataset', ''),
++          table=ct.get('table', ''),
++      )
++    return request

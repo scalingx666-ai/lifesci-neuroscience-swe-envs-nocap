@@ -1,0 +1,192 @@
+diff --git a/packages/runtime/src/__tests__/event-mapping.test.ts b/packages/runtime/src/__tests__/event-mapping.test.ts
+index ad35482f..b0fc83c9 100644
+--- a/packages/runtime/src/__tests__/event-mapping.test.ts
++++ b/packages/runtime/src/__tests__/event-mapping.test.ts
+@@ -6,6 +6,7 @@ import {
+   type AgUiEvent,
+ } from "@brainpilot/protocol";
+ import { EventBus } from "../event-bus.js";
++import { RealAgentSession } from "../agent-factory.js";
+ import { MasAgent } from "../mas-agent.js";
+ import { MockAgentSession } from "../mock-agent.js";
+ import { ev } from "../events.js";
+@@ -17,6 +18,66 @@ import type { IAgentSession, PiAgentEvent } from "../types.js";
+  * (via parseEvent) and that the expected types appear in order.
+  */
+ describe("event mapping (Pi -> AG-UI via parseEvent)", () => {
++  it("branches real Pi context back before an interrupted top-level turn", async () => {
++    let leaf: string | null = "completed-turn";
++    let streaming = false;
++    let releasePrompt!: () => void;
++    const branches: string[] = [];
++    const promptLeaves: Array<string | null> = [];
++    const promptStates: unknown[][] = [];
++    let promptCount = 0;
++    const piSession = {
++      sessionId: "rollback-interrupted-turn",
++      get isStreaming() { return streaming; },
++      state: { messages: ["completed-context"] as unknown[] },
++      sessionManager: {
++        getLeafId: () => leaf,
++        branch: (entryId: string) => { branches.push(entryId); leaf = entryId; },
++        resetLeaf: () => { leaf = null; },
++        buildSessionContext: () => ({
++          messages: leaf === "completed-turn" ? ["completed-context"] : [],
++        }),
++      },
++      subscribe: () => () => {},
++      prompt: () => {
++        promptLeaves.push(leaf);
++        promptStates.push([...piSession.state.messages]);
++        promptCount += 1;
++        if (promptCount > 1) return Promise.resolve();
++        streaming = true;
++        leaf = "partial-tool-turn";
++        piSession.state.messages.push("stale interrupted tool call");
++        return new Promise<void>((resolve) => {
++          releasePrompt = () => { streaming = false; resolve(); };
++        });
++      },
++      setThinkingLevel: () => {},
++      abort: async () => releasePrompt(),
++      clearQueue: () => ({}),
++      dispose: () => {},
++    };
++    const session = new RealAgentSession(piSession, new Map());
++    const agent = new MasAgent({
++      sessionId: piSession.sessionId,
++      name: "principal",
++      role: "principal",
++      session,
++      bus: new EventBus(),
++    });
++
++    const interrupted = agent.prompt("obsolete work with tools");
++    await agent.abort();
++    await interrupted;
++    await agent.prompt("only answer recovered");
++
++    expect(branches).toEqual(["completed-turn"]);
++    expect(promptLeaves).toEqual(["completed-turn", "completed-turn"]);
++    expect(promptStates).toEqual([
++      ["completed-context"],
++      ["completed-context"],
++    ]);
++  });
++
+   it("clears SDK follow-up queues on both sides of abort settlement", async () => {
+     const bus = new EventBus();
+     let releasePrompt!: () => void;
+diff --git a/packages/runtime/src/agent-factory.ts b/packages/runtime/src/agent-factory.ts
+index ab22e2b1..d35b7a40 100644
+--- a/packages/runtime/src/agent-factory.ts
++++ b/packages/runtime/src/agent-factory.ts
+@@ -313,7 +313,10 @@ function adaptTool(defineTool: PiSdk["defineTool"], tool: SystemTool): unknown {
+ }
+ 
+ /** Thin adapter implementing IAgentSession over the real Pi AgentSession. */
+-class RealAgentSession implements IAgentSession {
++export class RealAgentSession implements IAgentSession {
++  private promptCheckpoint: string | null | undefined;
++  private retainCheckpointForAbort = false;
++
+   constructor(
+     private readonly s: PiSession,
+     private readonly bashControllers: Map<string, AbortController>,
+@@ -328,17 +331,47 @@ class RealAgentSession implements IAgentSession {
+     return this.s.subscribe((e: unknown) => listener(e as PiAgentEvent));
+   }
+   prompt(text: string, opts?: PromptOptions): Promise<void> {
+-    return this.s.prompt(text, opts);
++    // A top-level BrainPilot prompt begins a new user turn. Remember the last
++    // completed Pi leaf so Stop can branch away from any partially persisted
++    // user/assistant/tool entries. Follow-ups belong to the same turn and must
++    // never replace this checkpoint.
++    const topLevel = opts?.streamingBehavior === undefined && !this.s.isStreaming;
++    if (topLevel) {
++      this.promptCheckpoint = this.s.sessionManager.getLeafId();
++      this.retainCheckpointForAbort = false;
++    }
++    return this.s.prompt(text, opts).finally(() => {
++      if (topLevel && !this.retainCheckpointForAbort) {
++        this.promptCheckpoint = undefined;
++      }
++    });
+   }
+   setThinkingLevel(level: import("@brainpilot/protocol").ThinkingLevel): void {
+     this.s.setThinkingLevel(level);
+   }
+   abort(): Promise<void> {
++    if (this.promptCheckpoint !== undefined) this.retainCheckpointForAbort = true;
+     return this.s.abort();
+   }
+   clearQueue(): unknown {
+     return this.s.clearQueue();
+   }
++  rollbackInterruptedTurn(): void {
++    const checkpoint = this.promptCheckpoint;
++    if (checkpoint === undefined) return;
++    if (checkpoint === null) {
++      this.s.sessionManager.resetLeaf();
++    } else if (this.s.sessionManager.getLeafId() !== checkpoint) {
++      this.s.sessionManager.branch(checkpoint);
++    }
++    // AgentSession.prompt() appends to the in-memory Agent state directly; it
++    // does not rebuild that state from SessionManager on every prompt. Keep
++    // both representations on the same clean branch or stale tool calls can
++    // still execute even though the persisted leaf moved.
++    this.s.state.messages = this.s.sessionManager.buildSessionContext().messages;
++    this.promptCheckpoint = undefined;
++    this.retainCheckpointForAbort = false;
++  }
+   interruptTool(toolCallId: string): boolean {
+     const controller = this.bashControllers.get(toolCallId);
+     if (!controller || controller.signal.aborted) return false;
+@@ -354,6 +387,13 @@ class RealAgentSession implements IAgentSession {
+ interface PiSession {
+   readonly sessionId: string;
+   readonly isStreaming: boolean;
++  readonly state: { messages: unknown[] };
++  readonly sessionManager: {
++    getLeafId(): string | null;
++    branch(entryId: string): void;
++    resetLeaf(): void;
++    buildSessionContext(): { messages: unknown[] };
++  };
+   subscribe(listener: (e: unknown) => void): () => void;
+   prompt(text: string, opts?: { streamingBehavior?: "steer" | "followUp" }): Promise<void>;
+   setThinkingLevel(level: import("@brainpilot/protocol").ThinkingLevel): void;
+diff --git a/packages/runtime/src/mas-agent.ts b/packages/runtime/src/mas-agent.ts
+index 21e9bffe..e691f5ba 100644
+--- a/packages/runtime/src/mas-agent.ts
++++ b/packages/runtime/src/mas-agent.ts
+@@ -712,6 +712,11 @@ export class MasAgent {
+     // agent_end handlers may race the first clear while abort() unwinds. Fence
+     // them after the prompt has fully settled as well.
+     this.session.clearQueue?.();
++    // Pi persists the in-flight user/assistant/tool entries before abort
++    // settles. Clearing queues alone cannot stop those partial entries from
++    // becoming context for the next explicit user prompt (#532). Return the
++    // active Pi branch to the last completed top-level turn.
++    this.session.rollbackInterruptedTurn?.();
+     this.finishDanglingTools("task_interrupted");
+     this.pendingFollowUps = [];
+     // Keep abortRequested true until prompt() has fully unwound so both Pi's
+diff --git a/packages/runtime/src/types.ts b/packages/runtime/src/types.ts
+index 3529819f..3ac49327 100644
+--- a/packages/runtime/src/types.ts
++++ b/packages/runtime/src/types.ts
+@@ -53,6 +53,13 @@ export interface IAgentSession {
+   abort(): Promise<void>;
+   /** Drop SDK steering/follow-up messages that must not survive Stop. */
+   clearQueue?(): unknown;
++  /**
++   * Remove the interrupted top-level Pi turn from the active model-context
++   * branch after abort has fully settled. BrainPilot keeps its own visible
++   * audit history; this only prevents unfinished instructions and tool calls
++   * from resuming when the user sends the next message.
++   */
++  rollbackInterruptedTurn?(): void;
+   /** Cancel one locally-running tool without aborting the enclosing agent turn. */
+   interruptTool?(toolCallId: string): boolean;
+   /** Tear down; release resources. */

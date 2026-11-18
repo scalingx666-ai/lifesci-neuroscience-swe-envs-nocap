@@ -1,0 +1,1035 @@
+diff --git a/pycbsdk/pyproject.toml b/pycbsdk/pyproject.toml
+index b57a8bfd..4f715fcc 100644
+--- a/pycbsdk/pyproject.toml
++++ b/pycbsdk/pyproject.toml
+@@ -49,6 +49,8 @@ lint = [
+ test = [
+     "pytest",
+     "pytest-timeout",
++    "numpy",
++    "pylsl",
+ ]
+ 
+ [tool.setuptools.packages.find]
+@@ -60,6 +62,7 @@ pycbsdk = ["*.dll", "*.so", "*.so.*", "*.dylib"]
+ [tool.pytest.ini_options]
+ markers = [
+     "integration: tests requiring a running nPlayServer instance",
++    "lsl: nPlay+LSL tests; need an EXCLUSIVE nPlayServer (one shmem per device type). Auto-skipped when file-based nPlay tests are also collected — run with `pytest -m lsl`.",
+ ]
+ 
+ [tool.setuptools_scm]
+diff --git a/pycbsdk/tests/_lsl_generator.py b/pycbsdk/tests/_lsl_generator.py
+new file mode 100644
+index 00000000..bac8974b
+--- /dev/null
++++ b/pycbsdk/tests/_lsl_generator.py
+@@ -0,0 +1,72 @@
++"""Standalone 30 kHz int16 LSL stream generator for nPlay+LSL tests.
++
++Launched as a subprocess by the ``nplay_lsl`` fixture.  nPlayServer
++(``--device=LSL <name>``) resolves this stream by name and replays it onto the
++Cerebus protocol, deriving each packet's device timestamp from the stream's
++ORIGINATING time scaled to a 30 kHz sample counter.  We therefore pace pushes to
++real time so the originating timestamps advance at the true sample rate — the
++condition CereLink's clock sync must map to a monotonic host timeline.
++
++Usage:
++    python _lsl_generator.py <stream_name> [n_channels]
++
++Runs until killed (SIGTERM/SIGINT) by the fixture.
++"""
++
++import signal
++import sys
++import time
++
++import numpy as np
++import pylsl
++
++SRATE = 30000
++CHUNK_SAMPLES = 300  # 10 ms per push at 30 kHz
++
++
++def main() -> int:
++    name = sys.argv[1]
++    n_ch = int(sys.argv[2]) if len(sys.argv) > 2 else 8
++
++    info = pylsl.StreamInfo(
++        name=name,
++        type="EEG",
++        channel_count=n_ch,
++        nominal_srate=SRATE,
++        channel_format=pylsl.cf_int16,
++        source_id=f"{name}_src",
++    )
++    outlet = pylsl.StreamOutlet(info, chunk_size=CHUNK_SAMPLES, max_buffered=360)
++
++    # Exit cleanly on the fixture's terminate() so liblsl tears the outlet down.
++    running = {"go": True}
++
++    def _stop(*_a):
++        running["go"] = False
++
++    signal.signal(signal.SIGTERM, _stop)
++    signal.signal(signal.SIGINT, _stop)
++
++    # A slow sine across channels — content is irrelevant to the timing test,
++    # but non-constant data makes the stream easy to eyeball in a viewer.
++    phase = np.arange(CHUNK_SAMPLES, dtype=np.float64)
++    chan_offsets = np.linspace(0.0, np.pi, n_ch, dtype=np.float64)
++
++    t0 = time.monotonic()
++    idx = 0
++    while running["go"]:
++        angle = 2.0 * np.pi * (phase[:, None] + idx) / 3000.0 + chan_offsets[None, :]
++        chunk = (np.sin(angle) * 1000.0).astype(np.int16)
++        outlet.push_chunk(chunk)
++        idx += CHUNK_SAMPLES
++        # Pace to real time: sample idx should be emitted at t0 + idx/SRATE.
++        target = t0 + idx / SRATE
++        dt = target - time.monotonic()
++        if dt > 0:
++            time.sleep(dt)
++
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/pycbsdk/tests/conftest.py b/pycbsdk/tests/conftest.py
+index 5f03ba37..740e56d0 100644
+--- a/pycbsdk/tests/conftest.py
++++ b/pycbsdk/tests/conftest.py
+@@ -17,7 +17,7 @@
+ 
+ import pytest
+ 
+-CERELINK_RELEASE_URL = "https://github.com/CerebusOSS/CereLink/releases/download/v9.3.0"
++CERELINK_RELEASE_URL = "https://github.com/CerebusOSS/CereLink/releases/download/v9.11.0"
+ CACHE_DIR = Path(__file__).parent / ".test_cache"
+ 
+ 
+@@ -41,6 +41,89 @@ def _sem_unlink(name: str) -> None:
+     libc.sem_unlink(sem_name)  # ignore errors (ENOENT is fine)
+ 
+ 
++def _remove_lockfile(name: str) -> None:
++    """Remove nPlayServer's lock FILE ($TMPDIR/<name>.lock).
++
++    nPlayServer's lock is a file guarded by O_EXCL (not a POSIX semaphore), so a
++    hard-killed instance leaves it behind — which makes the next launch with the
++    same name fail with "Cannot run multiple instances".  Safe when absent.
++    """
++    if platform.system() == "Windows":
++        return
++    tmp = os.environ.get("TMPDIR") or "/tmp"
++    (Path(tmp.rstrip("/")) / f"{name}.lock").unlink(missing_ok=True)
++
++
++def pytest_configure(config):
++    """Fail fast if the DEV-built libcbsdk is OLDER than the C++ sources.
++
++    In a source checkout pycbsdk loads ``cmake-build-*/src/cbsdk/libcbsdk.dylib``
++    (there is no wheel-bundled lib).  If that dylib was not rebuilt after a C++
++    change, the tests silently run STALE code — which once masked a clock-sync
++    fix for an entire debugging session.  Only a build-tree dylib is checked (an
++    installed/wheel-bundled lib has no sources to compare against); bypass with
++    ``PYCBSDK_ALLOW_STALE_LIB=1``.
++    """
++    if os.environ.get("PYCBSDK_ALLOW_STALE_LIB"):
++        return
++    try:
++        from pycbsdk._lib import _find_library
++        lib_path = Path(_find_library())
++    except Exception:
++        return  # can't resolve the lib — let the normal load path report it
++    lib_str = str(lib_path)
++    if "cmake-build" not in lib_str and f"{os.sep}build{os.sep}" not in lib_str:
++        return  # installed/bundled lib, not a dev build tree
++    if not lib_path.exists():
++        return
++    repo_root = Path(__file__).resolve().parents[2]
++    src_root = repo_root / "src"
++    if not src_root.exists():
++        return
++    lib_mtime = lib_path.stat().st_mtime
++    newest, newest_file = lib_mtime, None
++    for f in src_root.rglob("*"):
++        if f.suffix in (".cpp", ".h", ".hpp", ".c", ".cc") and f.is_file():
++            m = f.stat().st_mtime
++            if m > newest:
++                newest, newest_file = m, f
++    if newest_file is not None:
++        raise pytest.UsageError(
++            f"Stale libcbsdk: {lib_path}\n"
++            f"  built {time.ctime(lib_mtime)} is OLDER than C++ source "
++            f"{newest_file.relative_to(repo_root)} ({time.ctime(newest)}).\n"
++            f"  Tests would run pre-change code. Rebuild the dev dylib:\n"
++            f"    cmake --build {lib_path.parents[2]} --target cbsdk_shared\n"
++            f"  (or set PYCBSDK_ALLOW_STALE_LIB=1 to bypass this check)."
++        )
++
++
++@pytest.hookimpl(trylast=True)
++def pytest_collection_modifyitems(config, items):
++    """Auto-skip ``lsl`` tests when file-based nPlay tests are also collected.
++
++    Both bring up a STANDALONE ``Session(DeviceType.NPLAY)`` whose shared memory
++    is keyed by device type, so two nPlayServer instances cannot coexist.  When a
++    single run collects both, skip the LSL ones with guidance to run them alone.
++
++    Runs ``trylast`` so pytest's own ``-m``/``-k`` deselection happens FIRST:
++    under ``pytest -m lsl`` the file-based tests are already removed from
++    ``items``, so the LSL tests are NOT skipped and actually run.
++    """
++    lsl_items = [it for it in items if it.get_closest_marker("lsl")]
++    nplay_file_items = [
++        it for it in items
++        if it.get_closest_marker("integration") and not it.get_closest_marker("lsl")
++    ]
++    if lsl_items and nplay_file_items:
++        skip = pytest.mark.skip(
++            reason="LSL nPlay tests need an exclusive nPlayServer "
++                   "(one shmem per device type); run separately: pytest -m lsl"
++        )
++        for it in lsl_items:
++            it.add_marker(skip)
++
++
+ def _nplay_asset_name() -> str | None:
+     """Return the nPlayServer zip asset name for this platform, or None."""
+     system = platform.system()
+@@ -162,11 +245,29 @@ def nplayserver_binary() -> Path | None:
+     for candidate in extract_dir.rglob(f"nPlayServer{exe_suffix}"):
+         if candidate.is_file():
+             if platform.system() != "Windows":
+-                candidate.chmod(0o755)
++                _ensure_executable(candidate)
+             return candidate
+     return None
+ 
+ 
++def _ensure_executable(path: Path) -> None:
++    """Make *path* executable, tolerating a transient EPERM on macOS.
++
++    A freshly-downloaded SIGNED binary is briefly locked by Gatekeeper /
++    syspolicyd on first access, so chmod can raise PermissionError.  The file is
++    usually already 0755 (preserved by the archive), so we skip when it's already
++    executable and otherwise retry a few times before giving up.
++    """
++    for _ in range(5):
++        if os.access(path, os.X_OK):
++            return
++        try:
++            path.chmod(0o755)
++            return
++        except PermissionError:
++            time.sleep(0.5)
++
++
+ @pytest.fixture(scope="session")
+ def nplayserver(nplayserver_binary: Path | None, ns6_path: Path):
+     """Start nPlayServer playing back test data; kill on teardown.
+@@ -244,3 +345,105 @@ def client_session(nplay_session):
+             "is the nplay_session fixture alive?"
+         )
+         yield session
++
++
++# ---------------------------------------------------------------------------
++# nPlay + LSL fixtures (mutually exclusive with the file-playback fixtures above;
++# see pytest_collection_modifyitems).  Run with: pytest -m lsl
++# ---------------------------------------------------------------------------
++
++@pytest.fixture(scope="session")
++def lsl_stream_name() -> str:
++    """Unique LSL stream name for this test process."""
++    return f"pycbsdk_lsl_{os.getpid()}"
++
++
++@pytest.fixture(scope="session")
++def lsl_generator(lsl_stream_name: str):
++    """Launch the 30 kHz int16 LSL generator and wait until its stream resolves.
++
++    Skips dependent tests if pylsl is unavailable.  Yields the stream name.
++    """
++    pylsl = pytest.importorskip("pylsl", reason="pylsl required for LSL tests")
++
++    gen_script = Path(__file__).parent / "_lsl_generator.py"
++    proc = subprocess.Popen(
++        [sys.executable, str(gen_script), lsl_stream_name, "8"],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++    )
++
++    streams = pylsl.resolve_byprop("name", lsl_stream_name, timeout=10)
++    if not streams:
++        proc.terminate()
++        proc.wait()
++        out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
++        pytest.fail(f"LSL generator stream '{lsl_stream_name}' never appeared\n{out}")
++
++    yield lsl_stream_name
++
++    proc.terminate()
++    try:
++        proc.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        proc.kill()
++        proc.wait()
++
++
++@pytest.fixture(scope="session")
++def nplay_lsl(nplayserver_binary: Path | None, lsl_generator: str):
++    """Start nPlayServer as an LSL inlet reading the generator stream.
++
++    nPlayServer derives device timestamps from the stream's originating time
++    (× 30 kHz), so this exercises the LSL clock path rather than file playback.
++    """
++    if nplayserver_binary is None:
++        pytest.skip(
++            f"nPlayServer not available for {platform.system()}/{platform.machine()}"
++        )
++
++    lock_name = f"nplay_lsl_{os.getpid()}"
++    _remove_lockfile(lock_name)  # clear any stale lock from a hard-killed prior run
++
++    proc = subprocess.Popen(
++        [
++            str(nplayserver_binary),
++            "--audio", "none",
++            "--lockfile", lock_name,
++            "--device=LSL", lsl_generator,
++            "-A",  # autostart
++        ],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++    )
++
++    # Allow time to resolve the LSL inlet and bind its UDP ports.
++    time.sleep(3)
++
++    if proc.poll() is not None:
++        stdout = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
++        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
++        _remove_lockfile(lock_name)
++        pytest.fail(
++            f"nPlayServer --device=LSL exited immediately (rc={proc.returncode})\n"
++            f"stdout: {stdout}\nstderr: {stderr}"
++        )
++
++    yield proc
++
++    proc.terminate()
++    try:
++        proc.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        proc.kill()
++        proc.wait()
++    _remove_lockfile(lock_name)
++
++
++@pytest.fixture(scope="session")
++def nplay_lsl_session(nplay_lsl):
++    """A STANDALONE Session connected to the LSL-fed nPlayServer."""
++    from pycbsdk import DeviceType, Session
++
++    with Session(DeviceType.NPLAY) as session:
++        yield session
+diff --git a/pycbsdk/tests/test_lsl_sync.py b/pycbsdk/tests/test_lsl_sync.py
+new file mode 100644
+index 00000000..976e66ab
+--- /dev/null
++++ b/pycbsdk/tests/test_lsl_sync.py
+@@ -0,0 +1,239 @@
++"""nPlay + LSL clock-synchronization stress test.
++
++nPlayServer (``--device=LSL <name>``) replays a live LSL stream onto the Cerebus
++protocol, deriving each packet's device timestamp from the stream's ORIGINATING
++time scaled to a 30 kHz sample counter.  Unlike file playback (a sample counter
++that RESETS every time the short file wraps), the LSL device clock increases
++monotonically for the whole run — so CereLink's host-mapped timeline must be
++monotonic across the ENTIRE capture, not just within wrap segments.
++
++This is the path where the ±0.6 s backward-jump bug was reported (the cursor
++pipeline, 2026-06): the offset estimate recalibrated against a replay clock that
++did not advance at true wall-rate, so ``device_to_monotonic`` stepped backward
++and stalled any downstream consumer that assumes monotonic time.  Here we stamp
++every 30 kHz batch with ``device_to_monotonic(first_ts)`` — exactly as a consumer
++does — and require the resulting timeline to be monotonic.
++
++MUTUALLY EXCLUSIVE with the file-playback tests (both use a STANDALONE NPLAY
++session, whose shmem is keyed by device type).  Run in isolation::
++
++    pytest -m lsl
++"""
++
++import os
++import time
++
++import pytest
++
++from pycbsdk import ChannelType, DeviceType, SampleRate, Session
++
++pytestmark = [pytest.mark.integration, pytest.mark.lsl]
++
++N_CHANS = 8
++WARMUP_S = 3          # let channels configure and the first offset settle
++CAPTURE_S = 15        # long enough to catch a recalibration thrash
++
++# A backward jump in DEVICE time larger than this would mark a clock reset.  The
++# LSL origin clock does not wrap, so we expect ZERO of these — asserting it makes
++# an unexpected wrap visible instead of silently splitting the timeline.
++WRAP_BACK_S = 0.050
++
++# After any segment start, ignore this much device time so a settling offset is
++# not mistaken for a bug.  (For LSL there is one segment; this just guards the
++# very first samples after warmup.)
++GUARD_S = 0.150
++
++# Max tolerated BACKWARD step in the host-mapped timeline.  Healthy localhost
++# sync tracks the origin clock ~1:1 and never steps back; the guarded-against bug
++# jumps ~600 ms, so 20 ms cleanly separates them while tolerating sub-deadband
++# offset corrections.
++MONO_BACKSTEP_S = 0.020
++
++
++def _analyze(dev_ns, mono_s):
++    """Walk a captured (device_ns, host_monotonic_s) timeline.
++
++    Splits on device-clock resets (none expected for LSL), skips a short guard at
++    each segment start, and counts BACKWARD steps in the host-mapped time beyond
++    MONO_BACKSTEP_S.  Returns a stats dict.
++    """
++    n = len(dev_ns)
++    stats = {"n_samples": 0, "n_wraps": 0, "n_segments": 0,
++             "n_backsteps": 0, "max_backstep_s": 0.0}
++
++    # Segment boundaries from the device-time series.
++    bounds = [0]
++    for i in range(1, n):
++        if dev_ns[i] - dev_ns[i - 1] < -WRAP_BACK_S * 1e9:
++            stats["n_wraps"] += 1
++            bounds.append(i)
++    bounds.append(n)
++
++    for s in range(len(bounds) - 1):
++        begin, end = bounds[s], bounds[s + 1]
++        if end <= begin:
++            continue
++        seg_dev0 = dev_ns[begin]
++        prev = None
++        evaluated = 0
++        first_eval = last_eval = None
++        for i in range(begin, end):
++            # Skip the post-(re)acquisition guard at the segment start.
++            if (dev_ns[i] - seg_dev0) < GUARD_S * 1e9:
++                prev = None
++                continue
++            if first_eval is None:
++                first_eval = dev_ns[i]
++            last_eval = dev_ns[i]
++            evaluated += 1
++            if prev is not None:
++                backstep = prev - mono_s[i]  # >0 => went backward
++                if backstep > stats["max_backstep_s"]:
++                    stats["max_backstep_s"] = backstep
++                if backstep > MONO_BACKSTEP_S:
++                    stats["n_backsteps"] += 1
++            prev = mono_s[i]
++
++        # Only count segments with a meaningful post-guard span.
++        if first_eval is not None and (last_eval - first_eval) > 0.3e9:
++            stats["n_segments"] += 1
++            stats["n_samples"] += evaluated
++
++    return stats
++
++
++def _start_capture(session):
++    """Register a 30 kHz batch capture on *session*.
++
++    Stamps each batch's first sample with ``device_to_monotonic`` — the way an
++    acquisition consumer maps the device clock onto the host monotonic clock —
++    and returns the (device_ns, host_monotonic_s) lists it appends to.
++    """
++    dev_ns: list[int] = []
++    mono_s: list[float] = []
++
++    @session.on_group_batch(SampleRate.SR_30kHz)
++    def _on_batch(samples, timestamps):
++        if len(timestamps) == 0:
++            return
++        t0 = int(timestamps[0])
++        try:
++            m = session.device_to_monotonic(t0)
++        except RuntimeError:
++            return  # no clock offset yet — the safe fallback
++        dev_ns.append(t0)
++        mono_s.append(m)
++
++    return dev_ns, mono_s
++
++
++def _hardware_multidevice_enabled() -> bool:
++    """True if the operator opted in to driving a live Hub (CERELINK_HW_MULTIDEVICE)."""
++    return bool(os.environ.get("CERELINK_HW_MULTIDEVICE"))
++
++
++def test_lsl_host_mapped_timeline_monotonic(nplay_lsl_session):
++    """device_to_monotonic(first_ts) must be monotonic across the LSL run."""
++    session = nplay_lsl_session
++
++    session.set_sample_group(
++        N_CHANS, ChannelType.FRONTEND, SampleRate.SR_30kHz, disable_others=True,
++    )
++    time.sleep(WARMUP_S)
++
++    dev_ns, mono_s = _start_capture(session)
++    time.sleep(CAPTURE_S)
++
++    # Snapshot (the callback keeps firing on the shared session).
++    dev = list(dev_ns)
++    mono = list(mono_s)
++    assert len(dev) > 1000, f"Too few batches captured ({len(dev)}) — no data flowing?"
++
++    stats = _analyze(dev, mono)
++    print(
++        f"\n=== nPlay+LSL timeline: {len(dev)} batches, {stats['n_wraps']} wraps, "
++        f"{stats['n_segments']} segments, {stats['n_backsteps']} backstep(s) "
++        f"> {MONO_BACKSTEP_S * 1e3:.0f} ms, max backstep = "
++        f"{stats['max_backstep_s'] * 1e3:.3f} ms ==="
++    )
++
++    # The LSL origin clock is monotonic and never resets.
++    assert stats["n_wraps"] == 0, (
++        f"Unexpected device-clock reset(s) ({stats['n_wraps']}) on the LSL path — "
++        "the origin timestamp should increase monotonically"
++    )
++    assert stats["n_segments"] > 0, "No evaluable timeline captured"
++
++    assert stats["n_backsteps"] == 0, (
++        f"{stats['n_backsteps']} backward jump(s) in nPlay's host-mapped LSL "
++        f"timeline (max {stats['max_backstep_s'] * 1e3:.3f} ms). The offset is "
++        "recalibrating against the replayed origin clock — the non-monotonic "
++        "timestamp bug that stalls downstream RESAMPLE/MERGE."
++    )
++
++
++def test_lsl_nplay_and_hub2_timelines_monotonic(nplay_lsl_session):
++    """LSL-fed nPlay + a LIVE Hub2: both device clocks map to one monotonic host clock.
++
++    The cross-device merge topology with nPlay driven from LSL instead of a file.
++    nPlay's device clock is the LSL stream's originating time (× 30 kHz) while
++    Hub2's is PTP — two unrelated time bases that each ClockSync maps onto the
++    SAME host monotonic clock.  If nPlay's LSL-derived timeline goes non-monotonic
++    while Hub2's real clock stays clean, a consumer resampling one onto the other
++    stalls.  Hardware-gated: bringing up Hub2 runs a handshake that may HARDRESET
++    it, so this is opt-in.
++    """
++    if not _hardware_multidevice_enabled():
++        pytest.skip(
++            "Set CERELINK_HW_MULTIDEVICE=1 to run against a live Hub2 alongside "
++            "the LSL-fed nPlay (the Hub handshake may HARDRESET it)."
++        )
++
++    nplay = nplay_lsl_session
++    nplay.set_sample_group(
++        N_CHANS, ChannelType.FRONTEND, SampleRate.SR_30kHz, disable_others=True,
++    )
++
++    with Session(DeviceType.HUB2) as hub2:
++        hub2.set_sample_group(
++            N_CHANS, ChannelType.FRONTEND, SampleRate.SR_30kHz, disable_others=True,
++        )
++        time.sleep(WARMUP_S)
++
++        ndev, nmono = _start_capture(nplay)
++        hdev, hmono = _start_capture(hub2)
++        time.sleep(CAPTURE_S)
++
++        # Snapshot while Hub2 is still alive (its callback stops when it closes).
++        ndev, nmono = list(ndev), list(nmono)
++        hdev, hmono = list(hdev), list(hmono)
++
++    assert len(ndev) > 1000, f"No LSL-fed nPlay data flowing ({len(ndev)})"
++    assert len(hdev) > 1000, f"No Hub2 data flowing ({len(hdev)})"
++
++    ns = _analyze(ndev, nmono)
++    hs = _analyze(hdev, hmono)
++    print(
++        f"\n=== LSL-nPlay: {ns['n_segments']} seg, {ns['n_backsteps']} backstep(s), "
++        f"max {ns['max_backstep_s'] * 1e3:.3f} ms | "
++        f"Hub2: {hs['n_segments']} seg, {hs['n_backsteps']} backstep(s), "
++        f"max {hs['max_backstep_s'] * 1e3:.3f} ms ==="
++    )
++
++    # Neither the LSL-origin clock nor Hub2's PTP clock wraps.
++    assert ns["n_wraps"] == 0 and hs["n_wraps"] == 0, (
++        f"Unexpected device-clock reset(s): LSL-nPlay={ns['n_wraps']}, Hub2={hs['n_wraps']}"
++    )
++    assert ns["n_segments"] > 0, "No evaluable LSL-nPlay timeline captured"
++    assert hs["n_segments"] > 0, "No evaluable Hub2 timeline captured"
++
++    assert hs["n_backsteps"] == 0, (
++        f"Live Hub2 host-mapped timeline went non-monotonic (max "
++        f"{hs['max_backstep_s'] * 1e3:.3f} ms) — unexpected for a real PTP clock; "
++        "check the rig before blaming nPlay."
++    )
++    assert ns["n_backsteps"] == 0, (
++        f"{ns['n_backsteps']} backward jump(s) in the LSL-fed nPlay host-mapped "
++        f"timeline (max {ns['max_backstep_s'] * 1e3:.3f} ms) while a real Hub2 "
++        "stayed monotonic — the cross-device merge stall reproduces on the LSL path."
++    )
+diff --git a/tests/integration/CMakeLists.txt b/tests/integration/CMakeLists.txt
+index 54507e4d..7f1384a6 100644
+--- a/tests/integration/CMakeLists.txt
++++ b/tests/integration/CMakeLists.txt
+@@ -21,7 +21,7 @@ include(GoogleTest)
+ # Download nPlayServer binary and test data from the CereLink GitHub release
+ ###############################################################################
+ 
+-set(CERELINK_RELEASE_URL "https://github.com/CerebusOSS/CereLink/releases/download/v9.3.0")
++set(CERELINK_RELEASE_URL "https://github.com/CerebusOSS/CereLink/releases/download/v9.11.0")
+ set(NPLAY_CACHE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_nplay_cache")
+ file(MAKE_DIRECTORY ${NPLAY_CACHE_DIR})
+ 
+@@ -147,6 +147,7 @@ if(NPLAY_AVAILABLE AND NPLAY_DATA_AVAILABLE)
+         test_sdk_data_reception.cpp
+         test_sdk_clock_sync.cpp
+         test_multidevice_clock_sync.cpp
++        test_nplay_sync_stress.cpp
+     )
+ 
+     target_link_libraries(cbsdk_integration_tests
+diff --git a/tests/integration/nplay_fixture.h b/tests/integration/nplay_fixture.h
+index 0b14e60f..172ec754 100644
+--- a/tests/integration/nplay_fixture.h
++++ b/tests/integration/nplay_fixture.h
+@@ -15,6 +15,7 @@
+ 
+ #include <gtest/gtest.h>
+ 
++#include <atomic>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -50,13 +51,25 @@
+ class NPlayFixture : public ::testing::Test {
+ protected:
+     void SetUp() override {
++        // Unique lock name PER LAUNCH, not per process: gtest runs every TEST_F
++        // in one process, so a pid-only name would collide across consecutive
++        // SetUp()s.  The trailing counter guarantees each nPlayServer instance
++        // gets its own lock (and its own plugin-container shmem channel names,
++        // which are also derived from the lock name).
+         m_lockName = "nplay_integ_" + std::to_string(
+ #ifdef _WIN32
+             GetCurrentProcessId()
+ #else
+             getpid()
+ #endif
+-        );
++        ) + "_" + std::to_string(nextLaunchId());
++
++#ifndef _WIN32
++        // Defensive: clear any stale lock file a hard-killed prior run left
++        // behind.  nPlayServer guards the lock with O_EXCL, so a leftover file
++        // would make this launch fail with "Cannot run multiple instances".
++        std::remove(lockFilePath().c_str());
++#endif
+ 
+         std::string binary = NPLAY_BINARY_PATH;
+         std::string ns6    = NPLAY_NS6_PATH;
+@@ -112,9 +125,15 @@ class NPlayFixture : public ::testing::Test {
+             }
+             m_pid = -1;
+ 
+-            // Clean up the POSIX named semaphore
+-            std::string sem_name = "/" + m_lockName;
+-            sem_unlink(sem_name.c_str());
++            // nPlayServer's lock is a FILE ($TMPDIR/<name>.lock guarded by
++            // O_EXCL), not a named semaphore.  A SIGKILLed instance leaves it
++            // behind, so remove it here.  (The per-launch unique name already
++            // prevents collisions; this just keeps TMPDIR from accumulating
++            // stale locks.)
++            std::remove(lockFilePath().c_str());
++            // Belt-and-suspenders: older builds also created a named semaphore;
++            // unlinking a non-existent name is harmless.
++            sem_unlink(("/" + m_lockName).c_str());
+         }
+ #endif
+     }
+@@ -147,6 +166,22 @@ class NPlayFixture : public ::testing::Test {
+     }
+ 
+ private:
++    /// Monotonically increasing id so each launch gets a unique lock name,
++    /// even though all TEST_F instances share one process (and thus one pid).
++    static unsigned nextLaunchId() {
++        static std::atomic<unsigned> counter{0};
++        return counter.fetch_add(1, std::memory_order_relaxed);
++    }
++
++    /// Path of nPlayServer's lock file for the current lock name, computed the
++    /// same way nPlayServer does ($TMPDIR/<name>.lock, falling back to /tmp).
++    std::string lockFilePath() const {
++        const char* tmp = std::getenv("TMPDIR");
++        std::string dir = (tmp != nullptr && tmp[0] != '\0') ? tmp : "/tmp";
++        if (!dir.empty() && dir.back() == '/') dir.pop_back();
++        return dir + "/" + m_lockName + ".lock";
++    }
++
+     std::string m_lockName;
+ #ifdef _WIN32
+     PROCESS_INFORMATION m_pi = {};
+diff --git a/tests/integration/test_nplay_sync_stress.cpp b/tests/integration/test_nplay_sync_stress.cpp
+new file mode 100644
+index 00000000..46c45556
+--- /dev/null
++++ b/tests/integration/test_nplay_sync_stress.cpp
+@@ -0,0 +1,343 @@
++///////////////////////////////////////////////////////////////////////////////////////////////////
++/// @file   test_nplay_sync_stress.cpp
++/// @author CereLink Development Team
++///
++/// @brief  Stress tests for nPlayServer clock synchronization
++///
++/// nPlayServer replays a recording (or an LSL stream) and stamps each packet
++/// with a DEVICE clock that is NOT a real wall clock: for file playback it is
++/// "samples since the start of the file", which RESETS to ~0 every time the
++/// short test file wraps.  CereLink's ClockSync maps that device clock onto the
++/// host steady_clock; downstream consumers (e.g. ezmsg-blackrock RESAMPLE/MERGE)
++/// then require the resulting HOST-mapped timeline to be MONOTONIC.
++///
++/// The failure mode these tests guard against (observed in the cursor pipeline,
++/// 2026-06): nPlay's host-mapped timestamps jump BACKWARD by ~0.6 s *within* a
++/// single playback pass — the offset estimate recalibrates against a replay
++/// clock that does not advance at true wall-rate — which stalls any consumer
++/// that assumes monotonic time.  A real Hub on a stable PTP clock does not do
++/// this, so the symptom only appears when nPlay feeds a monotonic-time consumer.
++///
++/// Two scenarios:
++///   1. SINGLE nPlay (always runs when the nPlayServer binary + test data are
++///      available, like the other integration tests): stamp every data batch
++///      with toLocalTime(first_ts) — exactly as a consumer does — over a long
++///      run that crosses many file wraps, then assert the host-mapped timeline
++///      is monotonic WITHIN each no-wrap segment (the wrap itself is a legitimate
++///      device-clock reset and is excluded).
++///
++///   2. nPlay + a LIVE Hub2 (hardware-gated, opt-in): the actual cross-device
++///      merge topology.  Brings up an nPlay session AND a real Hub2 session
++///      concurrently and asserts BOTH host-mapped timelines stay monotonic and
++///      that each device's current time maps to ~now() — so nPlay's replay clock
++///      cannot silently diverge from the real Hub while a merge consumes both.
++///      SKIPPED unless CERELINK_HW_MULTIDEVICE is set (bringing up a live Hub
++///      runs a handshake that can HARDRESET it — disruptive on a recording rig).
++///
++/// The wrap-aware, segmented monotonicity check is intentional: a naive "offset
++/// is constant" assertion would false-positive at every file wrap, where the
++/// committed offset MUST step by the file length to keep current device time
++/// mapped to ~now.
++///////////////////////////////////////////////////////////////////////////////////////////////////
++
++#include <gtest/gtest.h>
++#include "nplay_fixture.h"
++
++#include <cbproto/cbproto.h>
++#include <cbsdk/sdk_session.h>
++
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++using namespace cbsdk;
++
++namespace {
++
++/// Channels to stream at 30 kHz while measuring the timeline.
++constexpr uint32_t N_CHANS = 8;
++
++/// Seconds to wait after configuring channels for the first clock probe / data
++/// fallback to produce an offset (the SDK probes at handshake then every ~2 s).
++constexpr int SYNC_WARMUP_S = 3;
++
++/// A backward jump in DEVICE time larger than this marks a file wrap (the replay
++/// counter resetting to ~0), not a glitch.  The dnss256 test file is ~2 s, so a
++/// wrap drops device time by ~2e9 ns; a within-pass sample step is ~3e4 ns.
++constexpr int64_t WRAP_BACK_NS = 50'000'000;  // 50 ms
++
++/// After a wrap the committed offset must STEP to track the reset device clock;
++/// the commit discipline (step_persist / stepout_samples) takes a few samples to
++/// re-acquire.  Ignore host-mapped samples within this much DEVICE time of the
++/// start of a segment so the legitimate re-acquisition is not counted as a bug.
++constexpr int64_t POST_WRAP_GUARD_NS = 150'000'000;  // 150 ms
++
++/// Maximum tolerated BACKWARD jump in the host-mapped timeline within a no-wrap
++/// segment.  Healthy localhost sync keeps the offset stable to well under a
++/// millisecond, so the host-mapped time tracks device time ~1:1 and never steps
++/// back.  The guarded-against bug jumps ~600 ms; this threshold sits ~30x below
++/// that while tolerating normal sub-deadband offset corrections.
++constexpr int64_t MONO_BACKSTEP_NS = 20'000'000;  // 20 ms
++
++/// Only evaluate segments whose post-guard device span exceeds this, so a
++/// partial segment captured at the very start/end of the run is not judged.
++constexpr int64_t MIN_SEGMENT_SPAN_NS = 300'000'000;  // 300 ms
++
++/// One captured data batch: the first sample's device time and the host time it
++/// mapped to, computed live (in the callback) just as a consumer would stamp it.
++struct TimelineSample {
++    uint64_t dev_ns;     ///< first device timestamp in the batch (nanoseconds)
++    int64_t host_ns;     ///< toLocalTime(dev_ns) as ns since the steady epoch
++    bool host_valid;     ///< false if no clock offset was available yet
++};
++
++/// Result of walking a captured timeline and checking within-segment monotonicity.
++struct TimelineStats {
++    size_t n_samples = 0;       ///< valid (synced) samples evaluated
++    size_t n_wraps = 0;         ///< device-clock resets detected
++    size_t n_segments = 0;      ///< no-wrap segments long enough to evaluate
++    size_t n_backsteps = 0;     ///< within-segment backward jumps > MONO_BACKSTEP_NS
++    int64_t max_backstep_ns = 0;///< largest within-segment backward jump seen (>=0)
++};
++
++/// Capture a continuous device→host timeline by stamping each 30 kHz data batch
++/// with toLocalTime(first_ts), the way an acquisition consumer does.
++class TimelineCapture {
++public:
++    /// Register the batch callback on @p session.  Stamps run on the callback
++    /// thread; toLocalTime() is internally locked, so this is safe.
++    explicit TimelineCapture(SdkSession& session) {
++        m_handle = session.registerGroupBatchCallback(
++            SampleRate::SR_30kHz,
++            [this, &session](const int16_t*, size_t n_samples, size_t,
++                             const uint64_t* timestamps) {
++                if (n_samples == 0) return;
++                const uint64_t dev_ns = timestamps[0];
++                auto local = session.toLocalTime(dev_ns);
++                TimelineSample s;
++                s.dev_ns = dev_ns;
++                s.host_valid = local.has_value();
++                s.host_ns = local.has_value()
++                    ? std::chrono::duration_cast<std::chrono::nanoseconds>(
++                          local->time_since_epoch()).count()
++                    : 0;
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_samples.push_back(s);
++            });
++    }
++
++    std::vector<TimelineSample> drain() {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        return m_samples;
++    }
++
++private:
++    std::mutex m_mutex;
++    std::vector<TimelineSample> m_samples;
++    CallbackHandle m_handle = 0;
++};
++
++/// Evaluate one no-wrap segment [begin, end) and fold its findings into @p st.
++/// (Defined below; forward-declared so analyzeTimeline can call it.)
++void analyzeSegment(const std::vector<TimelineSample>& samples,
++                    size_t begin, size_t end, TimelineStats& st);
++
++/// Walk a captured timeline: split it into no-wrap segments (a wrap is a large
++/// backward jump in DEVICE time), skip a short re-acquisition guard at the start
++/// of each segment, and count BACKWARD jumps in the host-mapped time that exceed
++/// MONO_BACKSTEP_NS.  Healthy sync produces zero.
++TimelineStats analyzeTimeline(const std::vector<TimelineSample>& samples) {
++    TimelineStats st;
++
++    // First pass: locate segment boundaries from the device-time series alone,
++    // independent of whether the offset was available at that instant.
++    size_t seg_start = 0;
++    for (size_t i = 0; i < samples.size(); ++i) {
++        const bool wrap = i > 0 &&
++            static_cast<int64_t>(samples[i].dev_ns) -
++            static_cast<int64_t>(samples[i - 1].dev_ns) < -WRAP_BACK_NS;
++        if (wrap) {
++            ++st.n_wraps;
++            analyzeSegment(samples, seg_start, i, st);
++            seg_start = i;
++        }
++    }
++    analyzeSegment(samples, seg_start, samples.size(), st);
++    return st;
++}
++
++void analyzeSegment(const std::vector<TimelineSample>& samples,
++                    size_t begin, size_t end, TimelineStats& st) {
++    if (end <= begin) return;
++    const uint64_t seg_dev_start = samples[begin].dev_ns;
++
++    // Span check uses the guarded portion only.
++    bool have_prev = false;
++    int64_t prev_host = 0;
++    int64_t seg_first_eval = -1, seg_last_eval = -1;
++    size_t seg_samples = 0, seg_backsteps = 0;
++    int64_t seg_max_backstep = 0;
++
++    for (size_t i = begin; i < end; ++i) {
++        const auto& s = samples[i];
++        if (!s.host_valid) { have_prev = false; continue; }
++        // Skip the post-wrap re-acquisition window.
++        if (static_cast<int64_t>(s.dev_ns - seg_dev_start) < POST_WRAP_GUARD_NS) {
++            have_prev = false;
++            continue;
++        }
++        if (seg_first_eval < 0) seg_first_eval = static_cast<int64_t>(s.dev_ns);
++        seg_last_eval = static_cast<int64_t>(s.dev_ns);
++        ++seg_samples;
++
++        if (have_prev) {
++            const int64_t backstep = prev_host - s.host_ns;  // >0 = went backward
++            if (backstep > seg_max_backstep) seg_max_backstep = backstep;
++            if (backstep > MONO_BACKSTEP_NS) ++seg_backsteps;
++        }
++        prev_host = s.host_ns;
++        have_prev = true;
++    }
++
++    // Ignore segments too short (post-guard) to judge meaningfully.
++    if (seg_first_eval < 0 || (seg_last_eval - seg_first_eval) < MIN_SEGMENT_SPAN_NS)
++        return;
++
++    ++st.n_segments;
++    st.n_samples += seg_samples;
++    st.n_backsteps += seg_backsteps;
++    if (seg_max_backstep > st.max_backstep_ns) st.max_backstep_ns = seg_max_backstep;
++}
++
++Result<SdkSession> createSession(DeviceType type) {
++    SdkConfig config;
++    config.device_type = type;
++    return SdkSession::create(config);
++}
++
++bool hardwareHub2Enabled() {
++    const char* v = std::getenv("CERELINK_HW_MULTIDEVICE");
++    return v != nullptr && v[0] != '\0';
++}
++
++}  // namespace
++
++///////////////////////////////////////////////////////////////////////////////////////////////////
++// Scenario 1: single nPlay — host-mapped timeline monotonic across a long run
++///////////////////////////////////////////////////////////////////////////////////////////////////
++
++class NPlaySyncStressTest : public NPlayFixture {};
++
++// Stamp every 30 kHz batch with toLocalTime(first_ts) over ~20 s of playback
++// (many file wraps) and require the host-mapped timeline to be monotonic within
++// each no-wrap segment.  This is the direct regression guard for the ±0.6 s
++// backward jumps that stall downstream RESAMPLE/MERGE.
++TEST_F(NPlaySyncStressTest, HostMappedTimelineMonotonicAcrossLongPlayback) {
++    auto result = createSession(DeviceType::NPLAY);
++    ASSERT_TRUE(result.isOk()) << result.error();
++    auto& session = result.value();
++
++    ASSERT_TRUE(session.setSampleGroup(N_CHANS, ChannelType::FRONTEND,
++                                       SampleRate::SR_30kHz, true).isOk());
++    // Let channels configure and the first offset settle before capturing.
++    std::this_thread::sleep_for(std::chrono::seconds(SYNC_WARMUP_S));
++
++    TimelineCapture capture(session);
++    std::this_thread::sleep_for(std::chrono::seconds(20));
++    session.stop();
++
++    const auto samples = capture.drain();
++    ASSERT_GT(samples.size(), 1000u)
++        << "Too few batches captured (" << samples.size() << ") — no data flowing?";
++
++    const TimelineStats st = analyzeTimeline(samples);
++
++    std::printf("=== nPlay timeline: %zu batches, %zu wraps, %zu segments, "
++                "%zu backstep(s) > %lld ms, max backstep = %.3f ms ===\n",
++                samples.size(), st.n_wraps, st.n_segments, st.n_backsteps,
++                static_cast<long long>(MONO_BACKSTEP_NS / 1'000'000),
++                static_cast<double>(st.max_backstep_ns) / 1e6);
++    std::fflush(stdout);
++
++    // Sanity: the run must actually exercise wraps and at least one real segment,
++    // otherwise the monotonicity assertion below is vacuous.
++    EXPECT_GT(st.n_wraps, 0u) << "Expected the short test file to wrap during 20 s";
++    ASSERT_GT(st.n_segments, 0u) << "No evaluable no-wrap segment captured";
++
++    EXPECT_EQ(st.n_backsteps, 0u)
++        << st.n_backsteps << " within-pass backward jump(s) in the host-mapped "
++        << "timeline (max " << static_cast<double>(st.max_backstep_ns) / 1e6
++        << " ms). nPlay's offset is recalibrating against the replay clock — "
++        << "this is the non-monotonic-timestamp bug that stalls RESAMPLE/MERGE.";
++}
++
++///////////////////////////////////////////////////////////////////////////////////////////////////
++// Scenario 2: nPlay + a LIVE Hub2 — both timelines stay monotonic and host-anchored
++///////////////////////////////////////////////////////////////////////////////////////////////////
++
++// The real cross-device merge topology: nPlay (first/reference device) plus a
++// real Hub2.  If nPlay's host-mapped timeline goes non-monotonic while Hub2's
++// stays clean, a consumer resampling one onto the other stalls.  Hardware-gated.
++TEST_F(NPlaySyncStressTest, NPlayAndLiveHub2TimelinesStayMonotonic) {
++    if (!hardwareHub2Enabled()) {
++        GTEST_SKIP() << "Set CERELINK_HW_MULTIDEVICE=1 to run against a live Hub2 "
++                        "alongside nPlay (the handshake may HARDRESET the Hub).";
++    }
++
++    auto nplay = createSession(DeviceType::NPLAY);
++    ASSERT_TRUE(nplay.isOk()) << "nPlay: " << nplay.error();
++    auto hub2 = createSession(DeviceType::HUB2);
++    ASSERT_TRUE(hub2.isOk()) << "Hub2: " << hub2.error();
++
++    auto& nplay_s = nplay.value();
++    auto& hub2_s = hub2.value();
++
++    ASSERT_TRUE(nplay_s.setSampleGroup(N_CHANS, ChannelType::FRONTEND,
++                                       SampleRate::SR_30kHz, true).isOk());
++    ASSERT_TRUE(hub2_s.setSampleGroup(N_CHANS, ChannelType::FRONTEND,
++                                      SampleRate::SR_30kHz, true).isOk());
++    std::this_thread::sleep_for(std::chrono::seconds(SYNC_WARMUP_S));
++
++    TimelineCapture nplay_cap(nplay_s);
++    TimelineCapture hub2_cap(hub2_s);
++    std::this_thread::sleep_for(std::chrono::seconds(15));
++    nplay_s.stop();
++    hub2_s.stop();
++
++    const auto nplay_samples = nplay_cap.drain();
++    const auto hub2_samples = hub2_cap.drain();
++    ASSERT_GT(nplay_samples.size(), 1000u) << "No nPlay data flowing";
++    ASSERT_GT(hub2_samples.size(), 1000u) << "No Hub2 data flowing";
++
++    const TimelineStats ns = analyzeTimeline(nplay_samples);
++    const TimelineStats hs = analyzeTimeline(hub2_samples);
++
++    std::printf("=== nPlay: %zu seg, %zu backstep(s), max %.3f ms | "
++                "Hub2: %zu seg, %zu backstep(s), max %.3f ms ===\n",
++                ns.n_segments, ns.n_backsteps,
++                static_cast<double>(ns.max_backstep_ns) / 1e6,
++                hs.n_segments, hs.n_backsteps,
++                static_cast<double>(hs.max_backstep_ns) / 1e6);
++    std::fflush(stdout);
++
++    ASSERT_GT(ns.n_segments, 0u) << "No evaluable nPlay segment";
++    ASSERT_GT(hs.n_segments, 0u) << "No evaluable Hub2 segment";
++
++    EXPECT_EQ(hs.n_backsteps, 0u)
++        << "Live Hub2 host-mapped timeline went non-monotonic (max "
++        << static_cast<double>(hs.max_backstep_ns) / 1e6 << " ms) — unexpected "
++        << "for a real PTP clock; check the rig before blaming nPlay.";
++    EXPECT_EQ(ns.n_backsteps, 0u)
++        << ns.n_backsteps << " within-pass backward jump(s) in nPlay's host-mapped "
++        << "timeline (max " << static_cast<double>(ns.max_backstep_ns) / 1e6
++        << " ms) while a real Hub2 stayed monotonic — the cross-device merge "
++        << "stall reproduces here.";
++}

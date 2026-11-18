@@ -1,0 +1,410 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 77a6bd1c..13983d27 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -137,6 +137,13 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+   happened drawn as dashed `data-future` cells that never take a heat level.
+ 
+ ### Fixed
++- **Files stuck "syncing" after a false disk delete (desktop + server).** The binary delete
++  queue read ANY failed `file_stat` as "deleted" and removed the server's `files` row for
++  files that never left disk; the device then kept the dead id and every upload got 400
++  `invalid_rel_path` forever. Now a new Rust `binary_exists` answers `false` only for a
++  real not-found, the drain refuses a delete the disk listing still names, a 400
++  `invalid_rel_path` on an id'd upload drops the dead id and re-registers once, and
++  `DELETE /api/files/:id` writes a `file_tombstones` row like a folder delete.
+ - **Access panel is fast on large vaults.** Per-person summaries no longer resolve every note
+   with ~5 queries per person: `loadAccessIndex` preloads the organization's share rows and
+   structure once per request and the unchanged resolver (`resolveAccessForUser`) reads them in
+diff --git a/app/apps/desktop/src-tauri/src/attachments.rs b/app/apps/desktop/src-tauri/src/attachments.rs
+index 37527065..b9063283 100644
+--- a/app/apps/desktop/src-tauri/src/attachments.rs
++++ b/app/apps/desktop/src-tauri/src/attachments.rs
+@@ -52,6 +52,24 @@ pub fn file_stat(vault: &Path, rel: &str) -> AppResult<FileStat> {
+     Ok(FileStat { size: meta.len(), modified })
+ }
+ 
++/// Is there a FILE at this vault-relative path?
++///
++/// `Ok(false)` only for a definite answer — nothing there, or something that is
++/// not a file. Every other failure (a permission error, an interrupted call) is
++/// an `Err`, never a `false`: the disk-delete queue deletes the server's copy of
++/// whatever this calls absent, so "couldn't look" must not read as "gone".
++pub fn binary_exists(vault: &Path, rel: &str) -> AppResult<bool> {
++    let abs = resolve_in_vault(vault, rel)?;
++    match std::fs::metadata(&abs) {
++        Ok(meta) => Ok(meta.is_file()),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
++        // A component of the path that is a file, not a directory: nothing can
++        // exist below it, which is as definite as NotFound.
++        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
++        Err(e) => Err(e.into()),
++    }
++}
++
+ /// Hex SHA-256 over raw bytes.
+ pub fn sha256_bytes(bytes: &[u8]) -> String {
+     let mut hasher = Sha256::new();
+diff --git a/app/apps/desktop/src-tauri/src/commands.rs b/app/apps/desktop/src-tauri/src/commands.rs
+index d41cfdd3..e78c0955 100644
+--- a/app/apps/desktop/src-tauri/src/commands.rs
++++ b/app/apps/desktop/src-tauri/src/commands.rs
+@@ -2402,6 +2402,17 @@ pub async fn file_stat(
+     attachments::file_stat(&vault, &rel_path)
+ }
+ 
++/// Disk-truth for the binary delete queue — see `attachments::binary_exists`.
++#[tauri::command]
++pub async fn binary_exists(
++    state: State<'_, AppState>,
++    rel_path: String,
++    expected_epoch: Option<u64>,
++) -> AppResult<bool> {
++    let (vault, _) = require_vault_at(&state, expected_epoch)?;
++    attachments::binary_exists(&vault, &rel_path)
++}
++
+ #[tauri::command(async)]
+ pub fn write_binary_file(
+     state: State<'_, AppState>,
+diff --git a/app/apps/desktop/src-tauri/src/lib.rs b/app/apps/desktop/src-tauri/src/lib.rs
+index ecb77805..d9448409 100644
+--- a/app/apps/desktop/src-tauri/src/lib.rs
++++ b/app/apps/desktop/src-tauri/src/lib.rs
+@@ -229,6 +229,7 @@ pub fn run() {
+             commands::clear_yjs_doc,
+             commands::read_binary_file,
+             commands::file_stat,
++            commands::binary_exists,
+             commands::write_binary_file,
+             commands::write_tree_binary,
+             commands::list_attachments,
+diff --git a/app/apps/desktop/src/lib/ipc.ts b/app/apps/desktop/src/lib/ipc.ts
+index 4e74469e..ca06120c 100644
+--- a/app/apps/desktop/src/lib/ipc.ts
++++ b/app/apps/desktop/src/lib/ipc.ts
+@@ -808,6 +808,11 @@ export const readBinaryFile = (relPath: string, expectedEpoch?: VaultEpoch) =>
+ export const fileStat = (relPath: string, expectedEpoch?: VaultEpoch) =>
+   invoke<FileStat>("file_stat", { relPath, expectedEpoch: expectedEpoch ?? null });
+ 
++/** Is there a file at this path? `false` only for a definite not-found; any
++ *  other failure rejects (see `attachments.rs binary_exists`). */
++export const binaryExists = (relPath: string, expectedEpoch?: VaultEpoch) =>
++  invoke<boolean>("binary_exists", { relPath, expectedEpoch: expectedEpoch ?? null });
++
+ export const writeBinaryFile = (
+   relPath: string,
+   bytes: Uint8Array,
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/binaryDeletes.test.ts b/app/apps/desktop/src/lib/sync/__tests__/binaryDeletes.test.ts
+index ecd876b2..1c29e127 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/binaryDeletes.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/binaryDeletes.test.ts
+@@ -120,6 +120,39 @@ describe("BinaryDeleteQueue", () => {
+     expect(h.forgotten).toEqual(["Team/guide.pdf"]);
+   });
+ 
++  it("never deletes a file the disk listing still names, whatever its stat said", async () => {
++    // 2026-09-22: 88 binaries that never left the disk lost their `files` rows
++    // because a failed stat read as "deleted". The listing is the second witness.
++    const shots = ["ts-shots/s-000.png", "ts-shots/s-001.png"];
++    const h = harness({
++      local: shots.map((relPath, i) => ({ relPath, sha256: `sha-${i}` })),
++      server: shots.map((p, i) => blob(`b${i}`, p, `sha-${i}`)),
++      onDisk: [], // the per-path check answered "not there" for both
++      fileIds: { [shots[0]]: "file-0", [shots[1]]: "file-1" },
++    });
++    for (const p of shots) h.queue.noteChanged(p);
++    await h.queue.drain();
++
++    expect(h.deleted).toEqual([]);
++    expect(h.blobsDeleted).toEqual([]);
++    expect(h.forgotten).toEqual([]);
++  });
++
++  it("reads a stat that throws as couldn't-ask, not as a delete", async () => {
++    const h = harness({
++      server: [blob("b1", "Team/guide.pdf")],
++      fileIds: { "Team/guide.pdf": "file-1" },
++    });
++    h.deps.exists = async () => {
++      throw new Error("IPC custom protocol failed");
++    };
++    h.queue.noteChanged("Team/guide.pdf");
++    await h.queue.drain();
++
++    expect(h.deleted).toEqual([]);
++    expect(h.forgotten).toEqual([]);
++  });
++
+   it("deletes an attachments/ drop by blob id, never by a files row", async () => {
+     const h = harness({
+       server: [blob("b9", "attachments/abc.png")],
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/treeBinaries.test.ts b/app/apps/desktop/src/lib/sync/__tests__/treeBinaries.test.ts
+index 5046102f..e06ec784 100644
+--- a/app/apps/desktop/src/lib/sync/__tests__/treeBinaries.test.ts
++++ b/app/apps/desktop/src/lib/sync/__tests__/treeBinaries.test.ts
+@@ -182,6 +182,61 @@ describe("tree binaries register as `files` rows", () => {
+     expect(log.intents[0].docId).toBe("id-from-config");
+   });
+ 
++  it("drops a remembered id the server no longer has, re-registers, and uploads", async () => {
++    // 2026-09-22: rows deleted server-side while the file stayed on disk. The
++    // intent named a dead id, the server fell through to the `attachments/`-only
++    // path check and answered 400 `invalid_rel_path` — on every pass, forever.
++    let known: string | null = "dead-id";
++    const forgotten: string[] = [];
++    const intents: Array<string | null | undefined> = [];
++    const { sync, log } = makeVault([{ relPath: "research/s-000.png" }], {
++      knownFileId: () => known,
++      forgetFileId: (relPath) => {
++        forgotten.push(relPath);
++        known = null;
++      },
++      createIntent: async (input) => {
++        intents.push(input.docId);
++        if (input.docId === "dead-id") throw serverError(400, "invalid_rel_path");
++        return {
++          blobId: "blob-1",
++          completeUrl: "https://api.test/blobs/1/complete",
++          upload: {
++            kind: "single" as const,
++            method: "PUT",
++            url: "https://s3.test/put",
++            headers: {},
++            expiresAt: Date.now() + 60_000,
++            direct: true,
++          },
++        };
++      },
++    });
++    const res = await sync.reconcile();
++
++    expect(res.uploaded).toBe(1);
++    expect(intents).toEqual(["dead-id", "local-id-0"]);
++    expect(forgotten).toEqual(["research/s-000.png"]);
++    expect(log.registered).toEqual([{ relPath: "research/s-000.png", id: "local-id-0" }]);
++    expect(log.confirmed).toEqual(["research/s-000.png"]);
++  });
++
++  it("retries a dead id only once per upload", async () => {
++    const intents: Array<string | null | undefined> = [];
++    const { sync } = makeVault([{ relPath: "research/s-000.png" }], {
++      knownFileId: () => "dead-id",
++      registerFile: async () => "still-dead",
++      createIntent: async (input) => {
++        intents.push(input.docId);
++        throw serverError(400, "invalid_rel_path");
++      },
++    });
++    const res = await sync.reconcile();
++
++    expect(res.uploaded).toBe(0);
++    expect(intents).toEqual(["dead-id", "dead-id"]);
++  });
++
+   it("uploads without a doc_id when the server refuses the row, and stops asking", async () => {
+     const registerFile = vi.fn(async () => {
+       throw serverError(403, "no_write_access");
+diff --git a/app/apps/desktop/src/lib/sync/attachments.ts b/app/apps/desktop/src/lib/sync/attachments.ts
+index 994faf8b..a8a74659 100644
+--- a/app/apps/desktop/src/lib/sync/attachments.ts
++++ b/app/apps/desktop/src/lib/sync/attachments.ts
+@@ -1168,8 +1168,9 @@ export class AttachmentSync {
+     }
+   }
+ 
+-  /** {@link uploadOne}'s body, with this sha's claim already held. */
+-  private async uploadOneClaimed(a: LocalAttachment): Promise<boolean> {
++  /** {@link uploadOne}'s body, with this sha's claim already held. `healed`:
++   *  this is the one retry after {@link forgetDeadFileId} dropped a dead id. */
++  private async uploadOneClaimed(a: LocalAttachment, healed = false): Promise<boolean> {
+     const mime = mimeForPath(a.relPath);
+     // A tree binary is a `files` row FIRST: the id has to exist before the
+     // bytes, because it is what the blob carries as `doc_id` and what the
+@@ -1221,6 +1222,22 @@ export class AttachmentSync {
+         this.notifyStorageLimit();
+         throw new AbortPass(errCode(e) ?? "storage_limit_reached");
+       }
++      if (
++        status === 400 &&
++        errCode(e) === "invalid_rel_path" &&
++        docId &&
++        !healed &&
++        !isUnderAttachments(a.relPath)
++      ) {
++        // The server resolved our `files` id to NO row, so it read this as an
++        // `attachments/` drop — and a tree path is not one. The id is dead: the
++        // row was deleted (by a delete propagated from a stat that failed, or on
++        // another device) while this device kept the file and remembered the id.
++        // Retrying it is a guaranteed 400 on every pass, forever, with the file
++        // badged as syncing. Forget it and register the file afresh, once.
++        this.forgetDeadFileId(a.relPath, docId);
++        return this.uploadOneClaimed(a, true);
++      }
+       if (status === 413 || status === 415) {
+         // Permanent for these bytes: the file is over the cap or of a type the
+         // server refuses. Retrying it every pass is a guaranteed failure every
+@@ -1678,6 +1695,23 @@ export class AttachmentSync {
+     }
+   }
+ 
++  /**
++   * Drop a `files` id the server no longer has, everywhere this device keeps it:
++   * the session cache {@link ensureFileRow} reads first, and the registry (which
++   * persists it to `.context/config.json` together with the claim that the
++   * server holds its bytes — a claim about a row that is gone).
++   */
++  private forgetDeadFileId(relPath: string, deadId: string): void {
++    this.fileIds.delete(relPath);
++    this.registerRefused.delete(relPath);
++    // `localIds` is deliberately kept: the local index's id is what the retry
++    // registers, and without it the file would upload with no id at all.
++    this.deps.forgetFileId?.(relPath);
++    console.warn(
++      `[attachments] ${relPath} — files row ${deadId} no longer exists on the server; registering it again`,
++    );
++  }
++
+   /**
+    * The server `files` id for a tree binary, registering one if this device has
+    * not already.
+diff --git a/app/apps/desktop/src/lib/sync/binaryDeletes.ts b/app/apps/desktop/src/lib/sync/binaryDeletes.ts
+index ead75334..6d7e29f4 100644
+--- a/app/apps/desktop/src/lib/sync/binaryDeletes.ts
++++ b/app/apps/desktop/src/lib/sync/binaryDeletes.ts
+@@ -100,7 +100,13 @@ export interface BinaryDeleteDeps {
+    * the disk (or the pull) hasn't caught up, not that anyone deleted it.
+    */
+   isLive(): boolean;
+-  /** Is the file at this path on disk right now (`ipc.fileStat`)? */
++  /**
++   * Is the file at this path on disk right now (`ipc.binaryExists`)?
++   *
++   * `false` ONLY for a definite not-found. Anything that stopped the disk from
++   * answering must THROW — the drain reads a throw as "couldn't ask", and a
++   * `false` here is the first step toward deleting the server's copy.
++   */
+   exists(relPath: string): Promise<boolean>;
+   /** Every local binary — the rename hunt and the blast-radius cap read it. */
+   listLocal(): Promise<LocalBinary[]>;
+@@ -367,6 +373,22 @@ export class BinaryDeleteQueue {
+       }
+       if (!this.deps.isCurrent()) return;
+ 
++      // 1b. A second witness before anything destructive. The per-path stat in
++      //     step 1 reads "couldn't answer" as "gone" for any error Rust returns,
++      //     and the disk listing we just made may still name the file. When the
++      //     two disagree the file is on disk: a delete propagated from a stat
++      //     that failed is how 88 present binaries lost their `files` rows at
++      //     once (2026-09-22), each one then stuck re-uploading under a dead id.
++      const onDisk = new Set(local.map((a) => key(a.relPath)));
++      for (let i = gone.length - 1; i >= 0; i--) {
++        if (!onDisk.has(key(gone[i].relPath))) continue;
++        console.info(
++          `[attachments] ${gone[i].relPath} failed its stat but is still listed on disk — not a delete`,
++        );
++        gone.splice(i, 1);
++      }
++      if (gone.length === 0) return;
++
+       const blobByPath = new Map<string, RemoteBlob>();
+       for (const b of server) if (b.relPath) blobByPath.set(key(b.relPath), b);
+       const localBySha = new Map<string, LocalBinary[]>();
+diff --git a/app/apps/desktop/src/lib/sync/docSession.ts b/app/apps/desktop/src/lib/sync/docSession.ts
+index c73239f9..769f0b80 100644
+--- a/app/apps/desktop/src/lib/sync/docSession.ts
++++ b/app/apps/desktop/src/lib/sync/docSession.ts
+@@ -4682,21 +4682,23 @@ export class SyncManager implements InboundHost {
+       // The same liveness the note queue uses: the vault channel is synced and
+       // one pull has completed, so a missing file is a decision, not a startup.
+       isLive: () => this.isLive(),
+-      exists: async (relPath) => {
+-        try {
+-          await ipc.fileStat(relPath, epoch);
+-          return true;
+-        } catch (e) {
+-          // A vault switch is NOT an answer about this file — rethrow, and the
+-          // drain's own catch reads it as "couldn't ask" rather than "gone".
+-          if (ipc.isVaultMismatch(e)) throw e;
+-          return false;
+-        }
+-      },
++      // `false` only for a definite not-found; every other failure — a vault
++      // switch, an IPC hiccup under load — rejects, and the drain reads a
++      // rejection as "couldn't ask" rather than "gone". This used to be a
++      // `file_stat` whose EVERY error meant "deleted", which propagated deletes
++      // for binaries that never left the disk.
++      exists: (relPath) => ipc.binaryExists(relPath, epoch),
+       listLocal: () => ipc.listBinaries(epoch),
+       listServer: () => api.listVaultBlobs(vaultId),
+       fileId: (relPath) => this.registry.getFileId(relPath),
+-      forgetFileId: (relPath) => this.registry.forgetFileId(relPath),
++      // The mirror caches ids per path too, and consults that cache BEFORE the
++      // registry. Forgetting only the registry's copy left the dead id live for
++      // the rest of the session: a file that came back uploaded under a row
++      // the server had just deleted, and failed on every pass.
++      forgetFileId: (relPath) => {
++        this.registry.forgetFileId(relPath);
++        this.attachments?.forgetFile(relPath);
++      },
+       moveFileId: (from, to) => this.registry.moveFileId(from, to),
+       deleteFile: (id) => api.deleteFile(id),
+       // Never forced: a 409 means a note still embeds those bytes, and that
+diff --git a/app/apps/server/src/http/routes/registry.ts b/app/apps/server/src/http/routes/registry.ts
+index d291948d..f6d2ae03 100644
+--- a/app/apps/server/src/http/routes/registry.ts
++++ b/app/apps/server/src/http/routes/registry.ts
+@@ -32,6 +32,7 @@ import {
+   resolveFolderParent,
+   resolveParentFolder,
+   samePath,
++  tombstoneFile,
+ } from "../../registry/tree-ops.js";
+ import { getSession } from "../session.js";
+ 
+@@ -1002,6 +1003,11 @@ export function createRegistryRoutes(deps: RegistryDeps = {}): Hono {
+     // exactly the shape `canReadAttachment` falls back to the path heuristic
+     // for, i.e. bytes nobody can see and nothing will collect.
+     const blobs = await deleteDocBlobs(id, row.vault_id);
++    // Tombstone BEFORE the row goes, as a folder delete does. Without it the id
++    // simply stops existing, and nothing on the server can say this file was
++    // deleted rather than never registered — which is the first question when a
++    // device turns up still holding the id. Re-registering the id stays allowed.
++    await tombstoneFile(pool, id);
+     await pool.query("DELETE FROM files WHERE id = $1", [id]);
+     console.info(`[registry] deleted file ${row.path} (${id}) and ${blobs} blob(s)`);
+     changed(c, row.vault_id);
+diff --git a/app/apps/server/tests/registry-file-delete.test.ts b/app/apps/server/tests/registry-file-delete.test.ts
+index b24a1ab0..63304342 100644
+--- a/app/apps/server/tests/registry-file-delete.test.ts
++++ b/app/apps/server/tests/registry-file-delete.test.ts
+@@ -79,6 +79,29 @@ describe("DELETE /api/files/:id", () => {
+     expect((await del(owner, randomUUID())).status).toBe(204);
+   });
+ 
++  it("leaves a tombstone, and the id can still be registered again", async () => {
++    const docId = await seedFile(vaultId, folderId, "Team/shot.png");
++    expect((await del(owner, docId)).status).toBe(204);
++
++    const { rows } = await pool.query<{ path: string }>(
++      "SELECT path FROM file_tombstones WHERE id = $1",
++      [docId],
++    );
++    expect(rows).toEqual([{ path: "Team/shot.png" }]);
++
++    // A device that kept the file (and its id) re-registers it — the desktop's
++    // recovery when its upload names a row the server no longer has.
++    const again = await app.fetch(
++      new Request("http://local/api/files", {
++        method: "POST",
++        headers: { ...authHeaders(owner), "content-type": "application/json" },
++        body: JSON.stringify({ vaultId, path: "Team/shot.png", docId }),
++      }),
++    );
++    expect(again.status).toBe(201);
++    expect(await fileRows(docId)).toBe(1);
++  });
++
+   it("drops the file from the blob listing, so no device re-downloads it", async () => {
+     const docId = await seedFile(vaultId, folderId, "Team/deck.pptx");
+     await seedBlob(vaultId, orgId, "Team/deck.pptx", { docId });

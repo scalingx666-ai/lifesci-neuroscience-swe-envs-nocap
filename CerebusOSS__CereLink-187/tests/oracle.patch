@@ -1,0 +1,165 @@
+diff --git a/src/cbdev/include/cbdev/device_session.h b/src/cbdev/include/cbdev/device_session.h
+index 2c51d70f..6963db8e 100644
+--- a/src/cbdev/include/cbdev/device_session.h
++++ b/src/cbdev/include/cbdev/device_session.h
+@@ -26,6 +26,33 @@
+ 
+ namespace cbdev {
+ 
++/// @brief Convert a raw device timestamp to nanoseconds.
++///
++/// Gemini devices report timestamps already in nanoseconds (no-op here). Other
++/// processors (e.g. nPlay) report sample-count *ticks* that must be scaled by
++/// the reduced 1e9/sysfreq fraction (@p ts_convert_num / @p ts_convert_den).
++///
++/// Every clock-sync input -- the NPLAYREP probe, the bulk data-delivery
++/// conversion, and the data-packet fallback -- MUST pass its raw timestamp
++/// through this one function so they all share a single time domain. Feeding raw
++/// ticks where nanoseconds are expected yields an offset of roughly -host_clock
++/// and poisons the clock-sync estimate (see CereLink #185/#186 follow-up).
++///
++/// @param raw_timestamp           Raw device timestamp (ns on Gemini, ticks otherwise).
++/// @param timestamps_are_nanoseconds  True for Gemini; the value is returned unchanged.
++/// @param ts_convert_num          Numerator of the reduced 1e9/sysfreq fraction.
++/// @param ts_convert_den          Denominator; <= 1 disables conversion.
++/// @return The timestamp in nanoseconds.
++inline uint64_t deviceTimestampToNs(uint64_t raw_timestamp,
++                                    bool timestamps_are_nanoseconds,
++                                    uint64_t ts_convert_num,
++                                    uint64_t ts_convert_den) {
++    if (!timestamps_are_nanoseconds && ts_convert_den > 1) {
++        return raw_timestamp * ts_convert_num / ts_convert_den;
++    }
++    return raw_timestamp;
++}
++
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ /// @name Callback Types for Receive Thread
+ /// @{
+diff --git a/src/cbdev/src/device_session.cpp b/src/cbdev/src/device_session.cpp
+index 46e31e5b..0eb30e92 100644
+--- a/src/cbdev/src/device_session.cpp
++++ b/src/cbdev/src/device_session.cpp
+@@ -547,7 +547,9 @@ Result<int> DeviceSession::receivePackets(void* buffer, const size_t buffer_size
+                 const size_t packet_size = cbPKT_HEADER_SIZE + (header->dlen * 4);
+                 if (offset + packet_size > total_bytes) break;
+ 
+-                header->time = header->time * m_impl->ts_convert_num / m_impl->ts_convert_den;
++                header->time = deviceTimestampToNs(
++                    header->time, m_impl->timestamps_are_nanoseconds,
++                    m_impl->ts_convert_num, m_impl->ts_convert_den);
+ 
+                 offset += packet_size;
+             }
+@@ -1580,21 +1582,32 @@ void DeviceSession::updateConfigFromBuffer(const void* buffer, const size_t byte
+                     // (we zero-initialize it). Fall back to header->time which is
+                     // the stale ptptime from the previous main loop iteration.
+                     constexpr uint64_t STALENESS_CORRECTION_NS = 165000;
+-                    uint64_t device_time_ns;
++                    // A probe is only usable if it carries a real device timestamp.
++                    // Both sources can be zero: .etime is zero on firmware that
++                    // doesn't write it, and header->time is zero while the device
++                    // clock isn't running yet (e.g. nPlay before playback starts,
++                    // proctime == 0). Such a probe yields offset ~= -host_clock,
++                    // which poisons the estimate (the max-offset/glitch filter then
++                    // strips the later good probes as outliers). Skip it.
++                    uint64_t device_time_ns = 0;
++                    bool have_device_time = true;
+                     if (nplay->etime != 0) {
+                         device_time_ns = nplay->etime;
++                    } else if (header->time != 0) {
++                        device_time_ns = deviceTimestampToNs(
++                                             header->time, m_impl->timestamps_are_nanoseconds,
++                                             m_impl->ts_convert_num, m_impl->ts_convert_den)
++                                       + STALENESS_CORRECTION_NS;
+                     } else {
+-                        device_time_ns = header->time;
+-                        if (!m_impl->timestamps_are_nanoseconds && m_impl->ts_convert_den > 1) {
+-                            device_time_ns = device_time_ns * m_impl->ts_convert_num / m_impl->ts_convert_den;
+-                        }
+-                        device_time_ns += STALENESS_CORRECTION_NS;
++                        have_device_time = false;  // device clock not running yet
+                     }
+ 
+-                    m_impl->clock_sync.addProbeSample(
+-                        m_impl->pending_clock_probe.t1_local,
+-                        device_time_ns,
+-                        m_impl->last_recv_timestamp);
++                    if (have_device_time) {
++                        m_impl->clock_sync.addProbeSample(
++                            m_impl->pending_clock_probe.t1_local,
++                            device_time_ns,
++                            m_impl->last_recv_timestamp);
++                    }
+                     m_impl->pending_clock_probe.active = false;
+                 }
+             }
+@@ -1614,8 +1627,15 @@ void DeviceSession::updateConfigFromBuffer(const void* buffer, const size_t byte
+         offset += packet_size;
+     }
+ 
+-    // Feed the last data packet's timestamp for fallback clock sync.
++    // Feed the last data packet's timestamp for fallback clock sync. Convert
++    // ticks->ns the same way the probe and data-delivery paths do: on non-Gemini
++    // devices (e.g. nPlay) header->time is a sample count, not nanoseconds, so
++    // passing it raw makes the fallback offset ~= -host_clock and poisons the
++    // estimate. On Gemini (timestamps_are_nanoseconds) this is a no-op.
+     if (last_data_time != 0) {
++        last_data_time = deviceTimestampToNs(
++            last_data_time, m_impl->timestamps_are_nanoseconds,
++            m_impl->ts_convert_num, m_impl->ts_convert_den);
+         m_impl->clock_sync.addDataPacketSample(
+             last_data_time, m_impl->last_recv_timestamp);
+     }
+diff --git a/tests/unit/test_clock_sync.cpp b/tests/unit/test_clock_sync.cpp
+index 94ecf8f6..78db3f11 100644
+--- a/tests/unit/test_clock_sync.cpp
++++ b/tests/unit/test_clock_sync.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <gtest/gtest.h>
+ #include "cbdev/clock_sync.h"
++#include "cbdev/device_session.h"  // deviceTimestampToNs
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
+@@ -522,3 +523,39 @@ TEST(ClockSyncDisciplineTest, StepoutReacquiresAfterPersistentDisagreement) {
+     addProbeWithOffset(sync, 105'000'000);
+     EXPECT_EQ(*sync.getOffsetNs(), 105'000'000) << "stepout should re-acquire";
+ }
++
++// ---------------------------------------------------------------------------
++// deviceTimestampToNs: every clock-sync input (NPLAYREP probe, bulk
++// data-delivery, and the data-packet fallback) routes raw device timestamps
++// through this single helper so they all share one time domain. Regression
++// guard for the #185/#186 follow-up bug where the data-packet fallback fed raw
++// nPlay ticks as if they were nanoseconds, yielding an offset of ~ -host_clock
++// that poisoned the estimate.
++// ---------------------------------------------------------------------------
++
++// nPlay reports 30 kHz sample-count ticks; sysfreq 30000 => 1e9/30000 reduces to
++// 100000/3. These MUST be scaled to nanoseconds before reaching the clock sync.
++TEST(DeviceTimestampToNs, NonGeminiTicksScaleToNanoseconds) {
++    EXPECT_EQ(deviceTimestampToNs(30000, /*ts_are_ns=*/false, 100000, 3), 1'000'000'000ULL); // 1 s
++    EXPECT_EQ(deviceTimestampToNs(3,     /*ts_are_ns=*/false, 100000, 3),       100'000ULL);  // 3 ticks = 100 us
++}
++
++// A large proctime (a long uptime in 30 kHz ticks) must be scaled to ns and must
++// NOT pass through as raw ticks -- the exact mistake the data-packet fallback made.
++TEST(DeviceTimestampToNs, LargeTicksAreNotPassedThroughRaw) {
++    const uint64_t ticks = 71'390'520'562ULL;            // ~2.38e6 s of 30 kHz ticks
++    const uint64_t ns = deviceTimestampToNs(ticks, /*ts_are_ns=*/false, 100000, 3);
++    EXPECT_EQ(ns, ticks * 100000 / 3);
++    EXPECT_NE(ns, ticks);                                // regression guard
++}
++
++// Gemini already reports nanoseconds -> pass through unchanged.
++TEST(DeviceTimestampToNs, GeminiNanosecondsPassThrough) {
++    const uint64_t ptp_ns = 1'771'721'518'000'000'000ULL;
++    EXPECT_EQ(deviceTimestampToNs(ptp_ns, /*ts_are_ns=*/true, 100000, 3), ptp_ns);
++}
++
++// A trivial denominator (no usable sysfreq) disables conversion regardless of flag.
++TEST(DeviceTimestampToNs, TrivialDenominatorDisablesConversion) {
++    EXPECT_EQ(deviceTimestampToNs(12345, /*ts_are_ns=*/false, 1, 1), 12345ULL);
++}

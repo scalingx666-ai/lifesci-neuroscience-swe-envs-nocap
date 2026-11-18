@@ -1,0 +1,281 @@
+diff --git a/src/Analysis/Incremental/ScopeExpansion.php b/src/Analysis/Incremental/ScopeExpansion.php
+new file mode 100644
+index 00000000..417417eb
+--- /dev/null
++++ b/src/Analysis/Incremental/ScopeExpansion.php
+@@ -0,0 +1,94 @@
++<?php
++
++declare(strict_types=1);
++
++namespace LaraMint\LaravelBrain\Analysis\Incremental;
++
++use LaraMint\LaravelBrain\Analysis\ProjectAnalyzer;
++use LaraMint\LaravelBrain\Graph\Graph;
++
++/**
++ * Which controllers a scoped run has to trace beyond the ones the changed files declare.
++ *
++ * A scoped run traces controllers, and everything a controller reaches is traced with it. So a
++ * changed file that declares no controller — a service, an action class, anything the chain
++ * descends into — contributes nothing to the fresh graph, and the soundness check in
++ * {@see ProjectAnalyzer} then compares the previous build's owned edges against nothing at all.
++ * When the edit added an edge, both sides read empty, the check approves, and the merge carries
++ * the previous graph's edges over: the added call is missing from a graph nothing reports as
++ * stale.
++ *
++ * The previous build already knows which controllers reach that file — it recorded the chain. So
++ * the scope is widened with them, the fresh build re-derives the file's own edges through those
++ * chains, and the check gets something real to compare. An edit that moved a call is then refused
++ * as it should be; one that did not keeps the fast path, and its nodes are substituted with their
++ * freshly built selves rather than carried over stale.
++ *
++ * Only what the previous graph can see. A file it attributes nothing to — most of `app/` — widens
++ * nothing, because there is no chain recorded to widen along.
++ */
++final class ScopeExpansion
++{
++    /** Node types that a traced controller file declares. */
++    private const CONTROLLER_NODE_TYPES = ['controller', 'action'];
++
++    /**
++     * The files declaring controllers whose call chain reached anything the changed files own.
++     *
++     * @param  string[]  $changedFiles
++     * @return array<string, true> owning file path => true, in the form the previous build recorded
++     */
++    public static function controllerFilesReaching(Graph $previous, array $changedFiles): array
++    {
++        $provenance = GraphProvenance::of($previous);
++
++        $frontier = [];
++        foreach ($provenance->nodeIdsForFiles(...$changedFiles) as $id) {
++            $frontier[$id] = true;
++        }
++
++        if ($frontier === []) {
++            return [];
++        }
++
++        $callers = [];
++        foreach ($previous->edges() as $edge) {
++            $callers[$edge->target][$edge->source] = true;
++        }
++
++        $nodesById = [];
++        foreach ($previous->nodes() as $node) {
++            $nodesById[$node->id] = $node;
++        }
++
++        // Walk the chain backwards from what the changed files own. Every controller on the way
++        // up has to be traced again for those files to be rebuilt through it.
++        $seen = $frontier;
++        $files = [];
++        while ($frontier !== []) {
++            $next = [];
++            foreach (array_keys($frontier) as $id) {
++                foreach (array_keys($callers[$id] ?? []) as $caller) {
++                    if (isset($seen[$caller])) {
++                        continue;
++                    }
++                    $seen[$caller] = true;
++                    $next[$caller] = true;
++
++                    $node = $nodesById[$caller] ?? null;
++                    if ($node === null || ! in_array($node->type, self::CONTROLLER_NODE_TYPES, true)) {
++                        continue;
++                    }
++
++                    $file = $node->data['file'] ?? null;
++                    if (is_string($file) && $file !== '') {
++                        $files[$file] = true;
++                    }
++                }
++            }
++            $frontier = $next;
++        }
++
++        return $files;
++    }
++}
+diff --git a/src/Analysis/ProjectAnalyzer.php b/src/Analysis/ProjectAnalyzer.php
+index a81d4042..fffb64a8 100644
+--- a/src/Analysis/ProjectAnalyzer.php
++++ b/src/Analysis/ProjectAnalyzer.php
+@@ -6,6 +6,7 @@
+ 
+ use LaraMint\LaravelBrain\Analysis\Incremental\IncrementalMerge;
+ use LaraMint\LaravelBrain\Analysis\Incremental\ScopedRebuildNotApplicable;
++use LaraMint\LaravelBrain\Analysis\Incremental\ScopeExpansion;
+ use LaraMint\LaravelBrain\Graph\Graph;
+ use LaraMint\LaravelBrain\Graph\GraphBuilder;
+ use LaraMint\LaravelBrain\Graph\GraphSplitter;
+@@ -270,9 +271,18 @@ private function runAnalysis(string $projectRoot, ?callable $onProgress = null):
+         $this->emit('step:start', ['step' => 'controllers', 'label' => 'Analyzing controllers', 'message' => '  → Analyzing controllers...']);
+         $controllers = $this->controllerAnalyzer->analyze($projectRoot, $routes);
+ 
+-        // A scoped run traces only the controllers declared in the changed files.
++        // A scoped run traces the controllers declared in the changed files, plus the ones whose
++        // chain reached those files in the previous build — see {@see ScopeExpansion}. Without the
++        // second half a changed file that declares no controller is never rebuilt, and the check
++        // below has nothing to compare, so an edit that added a call passes as one that changed
++        // nothing.
+         if ($scopeToFiles !== null) {
+             $wanted = array_flip(array_map(static fn (string $f): string => realpath($f) ?: $f, $scopeToFiles));
++            if ($mergeInto !== null) {
++                foreach (array_keys(ScopeExpansion::controllerFilesReaching($mergeInto, $scopeToFiles)) as $file) {
++                    $wanted[realpath($file) ?: $file] = true;
++                }
++            }
+             $controllers = array_filter(
+                 $controllers,
+                 static fn (ControllerDefinition $c): bool => isset($wanted[realpath($c->file) ?: $c->file]),
+diff --git a/tests/Unit/ScopedRebuildTest.php b/tests/Unit/ScopedRebuildTest.php
+index 0ec6db45..d7494222 100644
+--- a/tests/Unit/ScopedRebuildTest.php
++++ b/tests/Unit/ScopedRebuildTest.php
+@@ -5,6 +5,7 @@
+ use Illuminate\Config\Repository;
+ use Illuminate\Container\Container;
+ use LaraMint\LaravelBrain\Analysis\Incremental\GraphProvenance;
++use LaraMint\LaravelBrain\Analysis\Incremental\IncrementalMerge;
+ use LaraMint\LaravelBrain\Analysis\Incremental\ScopedRebuildNotApplicable;
+ use LaraMint\LaravelBrain\Analysis\ProjectAnalyzer;
+ use LaraMint\LaravelBrain\Graph\Graph;
+@@ -83,8 +84,15 @@ function writeScopedSource(string $path, string $code): void
+     static $age = 900;
+ 
+     file_put_contents($path, $code);
++
++    // A distinct mtime for every write, each one further into the past. The parse cache keys on
++    // path + mtime + size, and two versions of one file are readily the same size — `run` and
++    // `log` differ by no bytes — so a repeated mtime hands the second version's build the first
++    // version's parse. The age used to walk toward the present and stop 10 seconds short of it,
++    // which collided as soon as a run made enough writes to get there; walking the other way
++    // cannot, and never reaches the present, which the cache treats as unsettled.
+     touch($path, time() - $age);
+-    $age = max(10, $age - 30);
++    $age++;
+     clearstatcache(true, $path);
+ }
+ 
+@@ -239,3 +247,119 @@ function edgeSignature(Graph $graph): array
+ 
+     expect(edgeSignature($scoped))->toBe(edgeSignature(buildFull($this->root)));
+ });
++
++// =============================================================================
++// A changed file that declares no controller. The scoped pass traces controllers,
++// so such a file is rebuilt only through the chains that reach it — and until it
++// is, the soundness check above compares the previous build's owned edges against
++// nothing at all.
++// =============================================================================
++
++/** The service, with a body that calls `helper()` or does not. */
++function publisherCalling(bool $callsHelper): string
++{
++    $body = $callsHelper ? 'return $this->helper();' : 'return 1;';
++
++    return <<<PHP
++        <?php
++
++        namespace App\Services;
++
++        class Publisher
++        {
++            public function run()
++            {
++                {$body}
++            }
++
++            public function helper()
++            {
++                return 2;
++            }
++
++            public function log()
++            {
++                return 'logged';
++            }
++        }
++        PHP;
++}
++
++it('refuses an edit that added a call inside a file declaring no controller', function () {
++    // The edit adds `run() -> helper()`. Nothing declares a controller in this file, so before
++    // the scope was widened the fresh pass built nothing for it: the check compared an empty set
++    // against an empty set, approved, and the merge carried the previous edges over — a graph
++    // missing the call that had just been added, and nothing to say so.
++    writeScopedSource($this->root.'/app/Services/Publisher.php', publisherCalling(false));
++    $previous = buildFull($this->root);
++
++    writeScopedSource($this->root.'/app/Services/Publisher.php', publisherCalling(true));
++
++    expect(fn () => buildScoped($this->root, [$this->root.'/app/Services/Publisher.php'], $previous))
++        ->toThrow(ScopedRebuildNotApplicable::class);
++});
++
++it('rebuilds a non-controller file through the chain that reaches it', function () {
++    // The other half: an edit that changed the body without touching a call must still take the
++    // fast path, and the file's own nodes must come back rebuilt rather than carried over. Node
++    // signatures are compared, not edges: the edges are identical by construction here, and it is
++    // the node data — what the fresh pass produces and the previous build cannot — that a merge
++    // reusing the old node would get wrong.
++    writeScopedSource($this->root.'/app/Services/Publisher.php', publisherCalling(false));
++    $previous = buildFull($this->root);
++
++    writeScopedSource($this->root.'/app/Services/Publisher.php', <<<'PHP'
++        <?php
++
++        namespace App\Services;
++
++        class Publisher
++        {
++            public function run()
++            {
++                $doubled = 1 + 1;
++
++                return $doubled;
++            }
++
++            public function helper()
++            {
++                return 2;
++            }
++
++            public function log()
++            {
++                return 'logged';
++            }
++        }
++        PHP);
++
++    $scoped = buildScoped($this->root, [$this->root.'/app/Services/Publisher.php'], $previous);
++
++    expect(edgeSignature($scoped))->toBe(edgeSignature(buildFull($this->root)))
++        ->and(IncrementalMerge::signature($scoped)['nodes'])->toBe(IncrementalMerge::signature(buildFull($this->root))['nodes']);
++});
++
++it('refuses when a file the previous build could not parse comes back', function () {
++    // The same hole reached from the other side. A file that does not parse still owns the node
++    // its caller created for it — the class is resolved from the call site, not from the file —
++    // but it owns none of the edges its body would have made. Fixing the syntax adds them, and
++    // that is an edit to the call graph like any other.
++    writeScopedSource($this->root.'/app/Services/Publisher.php', <<<'PHP'
++        <?php
++
++        namespace App\Services;
++
++        class Publisher
++        {
++            public function run( { }
++        }
++        PHP);
++    $previous = buildFull($this->root);
++    expect(IncrementalMerge::ownedEdgeKeySet($previous, [$this->root.'/app/Services/Publisher.php']))->toBe([]);
++
++    writeScopedSource($this->root.'/app/Services/Publisher.php', publisherCalling(true));
++
++    expect(fn () => buildScoped($this->root, [$this->root.'/app/Services/Publisher.php'], $previous))
++        ->toThrow(ScopedRebuildNotApplicable::class);
++});

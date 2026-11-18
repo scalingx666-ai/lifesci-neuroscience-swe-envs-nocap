@@ -1,0 +1,456 @@
+diff --git a/igneous/task_creation/mesh.py b/igneous/task_creation/mesh.py
+index d32e4e2c..328ef7d8 100644
+--- a/igneous/task_creation/mesh.py
++++ b/igneous/task_creation/mesh.py
+@@ -1,6 +1,8 @@
+ import copy
+ from collections import defaultdict
+ from functools import reduce, partial
++import itertools
++import re
+ from typing import (
+   Any, Dict, Optional, 
+   Union, Tuple, cast,
+@@ -22,7 +24,9 @@
+ from igneous.tasks import (
+   MeshTask, MeshManifestTask, GrapheneMeshTask,
+   MeshSpatialIndex, MultiResShardedMeshMergeTask,
+-  MultiResUnshardedMeshMergeTask
++  MultiResUnshardedMeshMergeTask, 
++  MultiResShardedFromUnshardedMeshMergeTask,
++  TransferMeshFilesTask
+ )
+ from .common import (
+   operator_contact, FinelyDividedTaskIterator, 
+@@ -38,6 +42,8 @@
+   "create_spatial_index_mesh_tasks",
+   "create_unsharded_multires_mesh_tasks",
+   "create_sharded_multires_mesh_tasks",
++  "create_sharded_multires_mesh_from_unsharded_tasks",
++  "create_xfer_meshes_tasks",
+ ]
+ 
+ # split the work up into ~1000 tasks (magnitude 3)
+@@ -389,6 +395,150 @@ def __iter__(self):
+ 
+   return UnshardedMultiResTaskIterator()
+ 
++def create_xfer_meshes_tasks(
++  src:str,
++  dest:str,
++  mesh_dir:Optional[str] = None, 
++  magnitude=2,
++):
++  cv_src = CloudVolume(src)
++  cf_dest = CloudFiles(dest)
++
++  if not mesh_dir:
++    info = cf_dest.get_json("info")
++    if info.get("mesh", None):
++      mesh_dir = info.get("mesh")
++
++  cf_dest.put_json(f"{mesh_dir}/info", cv_src.mesh.meta.info)
++
++  alphabet = [ str(i) for i in range(10) ]
++  if cv_src.mesh.meta.is_sharded():
++    alphabet += [ 'a', 'b', 'c', 'd', 'e', 'f' ]
++
++  prefixes = itertools.product(*([ alphabet ] * magnitude))
++  prefixes = [ "".join(x) for x in prefixes ]
++
++  # explicitly enumerate all prefixes smaller than the magnitude.
++  for i in range(1, magnitude):
++    explicit_prefix = itertools.product(*([ alphabet ] * i))
++    explicit_prefix = [ "".join(x) for x in explicit_prefix ]
++    if cv_src.mesh.meta.is_sharded():
++      prefixes += [ f"{x}." for x in explicit_prefix ]
++    else:
++      prefixes += [ f"{x}:0" for x in explicit_prefix ]
++
++  return [
++    partial(TransferMeshFilesTask,
++      src=src,
++      dest=dest,
++      prefix=prefix,
++      mesh_dir=mesh_dir,
++    )
++    for prefix in prefixes
++  ]
++
++def create_sharded_multires_mesh_from_unsharded_tasks(
++  src:str, 
++  dest:str,
++  shard_index_bytes=2**13, 
++  minishard_index_bytes=2**15,
++  num_lod:int = 1, 
++  draco_compression_level:int = 1,
++  vertex_quantization_bits:int = 16,
++  minishard_index_encoding="gzip", 
++  mesh_dir:Optional[str] = None, 
++) -> Iterator[MultiResShardedMeshMergeTask]: 
++  
++  configure_multires_info(
++    dest, 
++    vertex_quantization_bits, 
++    mesh_dir
++  )
++
++  cv_src = CloudVolume(src)
++  cf = CloudFiles(cv_src.mesh.meta.layerpath)
++
++  all_labels = []
++  SEGID_RE = re.compile(r'(\d+):0(?:\.gz|\.br|\.zstd)?$')
++  for path in cf.list():
++    match = SEGID_RE.search(path)
++    if match is None:
++      continue
++    (segid,) = match.groups()
++    all_labels.append(int(segid))
++
++  (shard_bits, minishard_bits, preshift_bits) = \
++    compute_shard_params_for_hashed(
++      num_labels=len(all_labels),
++      shard_index_bytes=int(shard_index_bytes),
++      minishard_index_bytes=int(minishard_index_bytes),
++    )
++
++  cv_dest = CloudVolume(dest, mesh_dir=mesh_dir)
++
++  spec = ShardingSpecification(
++    type='neuroglancer_uint64_sharded_v1',
++    preshift_bits=preshift_bits,
++    hash='murmurhash3_x86_128',
++    minishard_bits=minishard_bits,
++    shard_bits=shard_bits,
++    minishard_index_encoding=minishard_index_encoding,
++    data_encoding="raw", # draco encoded meshes
++  )
++
++  cv_dest.mesh.meta.info['sharding'] = spec.to_dict()
++  cv_dest.mesh.meta.commit_info()
++
++  cv_dest = CloudVolume(dest, mesh_dir=mesh_dir)
++
++  # perf: ~66.5k hashes/sec on M1 ARM64
++  shardfn = lambda lbl: cv_dest.mesh.reader.spec.compute_shard_location(lbl).shard_number
++
++  shard_labels = defaultdict(list)
++  for label in tqdm(all_labels, desc="Hashes"):
++    shard_labels[shardfn(label)].append(label)
++  del all_labels
++
++  cf = CloudFiles(cv_dest.mesh.meta.layerpath, progress=True)
++  files = ( 
++    (str(shardno) + '.labels', labels) 
++    for shardno, labels in shard_labels.items() 
++  )
++  cf.put_jsons(
++    files, compress="gzip", 
++    cache_control="no-cache", total=len(shard_labels)
++  )
++
++  cv_dest.provenance.processing.append({
++    'method': {
++      'task': 'MultiResShardedFromUnshardedMeshMergeTask',
++      'src': src,
++      'dest': dest,
++      'num_lod': num_lod,
++      'vertex_quantization_bits': vertex_quantization_bits,
++      'preshift_bits': preshift_bits, 
++      'minishard_bits': minishard_bits, 
++      'shard_bits': shard_bits,
++      'mesh_dir': mesh_dir,
++      'draco_compression_level': draco_compression_level,
++    },
++    'by': operator_contact(),
++    'date': strftime('%Y-%m-%d %H:%M %Z'),
++  }) 
++  cv_dest.commit_provenance()
++
++  return [
++    partial(MultiResShardedFromUnshardedMeshMergeTask,
++      src=src, 
++      dest=dest, 
++      shard_no=shard_no, 
++      num_lod=num_lod,
++      mesh_dir=mesh_dir, 
++      draco_compression_level=draco_compression_level,
++    )
++    for shard_no in shard_labels.keys()
++  ]
++
+ def create_sharded_multires_mesh_tasks(
+   cloudpath:str, 
+   shard_index_bytes=2**13, 
+@@ -444,7 +594,7 @@ def create_sharded_multires_mesh_tasks(
+     shard_labels[shardfn(label)].append(label)
+   del all_labels
+ 
+-  cf = CloudFiles(cv.skeleton.meta.layerpath, progress=True)
++  cf = CloudFiles(cv.mesh.meta.layerpath, progress=True)
+   files = ( 
+     (str(shardno) + '.labels', labels) 
+     for shardno, labels in shard_labels.items() 
+diff --git a/igneous/tasks/__init__.py b/igneous/tasks/__init__.py
+index 1d14fbab..d74c948e 100644
+--- a/igneous/tasks/__init__.py
++++ b/igneous/tasks/__init__.py
+@@ -7,6 +7,8 @@
+   GrapheneMeshTask, MeshSpatialIndex,
+   MultiResUnshardedMeshMergeTask,
+   MultiResShardedMeshMergeTask,
++  MultiResShardedFromUnshardedMeshMergeTask,
++  TransferMeshFilesTask,
+ )
+ from .image import (
+   HyperSquareConsensusTask, #HyperSquareTask,
+diff --git a/igneous/tasks/image.py b/igneous/tasks/image.py
+index 7020622b..464c750c 100755
+--- a/igneous/tasks/image.py
++++ b/igneous/tasks/image.py
+@@ -38,7 +38,7 @@ def downsample_and_upload(
+     ds_shape = min2(vol.volume_size, ds_shape[:3])
+     underlying_mip = (mip + 1) if (mip + 1) in vol.available_mips else mip
+     chunk_size = vol.meta.chunk_size(underlying_mip).astype(np.float32)
+-
++    
+     if factor is None:
+       factor = downsample_scales.axis_to_factor(axis)
+     factors = downsample_scales.compute_factors(ds_shape, factor, chunk_size)
+diff --git a/igneous/tasks/mesh/mesh.py b/igneous/tasks/mesh/mesh.py
+index 5bc41650..b07a661f 100644
+--- a/igneous/tasks/mesh/mesh.py
++++ b/igneous/tasks/mesh/mesh.py
+@@ -28,7 +28,7 @@
+ 
+ __all__ = [
+   "MeshTask", "GrapheneMeshTask", "MeshManifestTask",
+-  "MeshSpatialIndex"
++  "MeshSpatialIndex", "TransferMeshFilesTask"
+ ]
+ 
+ def find_objects(labels):
+@@ -602,3 +602,32 @@ def MeshSpatialIndex(
+     cache_control=False,
+   )
+ 
++@queueable
++def TransferMeshFilesTask(
++  src:str,
++  dest:str,
++  prefix:str,
++  mesh_dir:Optional[str] = None
++):
++  cv_src = CloudVolume(src)
++  cv_dest = CloudVolume(dest, mesh_dir=mesh_dir)
++
++  cf_src = CloudFiles(cv_src.mesh.meta.layerpath)
++  cf_dest = CloudFiles(cv_dest.mesh.meta.layerpath)
++
++  cf_src.transfer_to(cf_dest, paths=cf_src.list(prefix=prefix))
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/igneous/tasks/mesh/multires.py b/igneous/tasks/mesh/multires.py
+index d8ef03a8..5b4617c5 100644
+--- a/igneous/tasks/mesh/multires.py
++++ b/igneous/tasks/mesh/multires.py
+@@ -16,7 +16,7 @@
+ from cloudfiles import CloudFiles
+ 
+ from cloudvolume import CloudVolume, Mesh, view
+-from cloudvolume.lib import Vec, Bbox, jsonify, sip
++from cloudvolume.lib import Vec, Bbox, jsonify, sip, toiter, first
+ from cloudvolume.datasource.precomputed.mesh.multilod \
+   import MultiLevelPrecomputedMeshManifest, to_stored_model_space
+ from cloudvolume.datasource.precomputed.sharding import synthesize_shard_files
+@@ -35,6 +35,7 @@
+ __all__ = [
+   "MultiResShardedMeshMergeTask",
+   "MultiResUnshardedMeshMergeTask",
++  "MultiResShardedFromUnshardedMeshMergeTask",
+ ]
+ 
+ @queueable
+@@ -73,12 +74,10 @@ def MultiResUnshardedMeshMergeTask(
+ def process_mesh(
+   cv:CloudVolume,
+   label:int,
+-  mesh_fragments: List[Mesh],
++  mesh: Mesh,
+   num_lod:int = 1,
+   draco_compression_level:int = 1,
+ ) -> Tuple[MultiLevelPrecomputedMeshManifest, Mesh]:
+-  
+-  mesh = Mesh.concatenate(*mesh_fragments)
+ 
+   manifest = MultiLevelPrecomputedMeshManifest(
+     segment_id=label, 
+@@ -171,8 +170,77 @@ def MultiResShardedMeshMergeTask(
+   meshes = collect_mesh_fragments(
+     cv, labels, filenames, mesh_dir, progress
+   )
+-  del labels
+   del filenames
++
++  # important to iterate this way to avoid
++  # creating a copy of meshes vs. { ... for in }
++  for label in labels:
++    meshes[label] = Mesh.concatenate(*meshes[label])
++  del labels
++
++  fname, shard = create_mesh_shard(
++    cv, meshes, 
++    num_lod, draco_compression_level,
++    progress, shard_no
++  )
++  del meshes
++
++  if shard is None:
++    return
++
++  cf = CloudFiles(cv.mesh.meta.layerpath)
++  cf.put(
++    fname, shard,
++    compress=False,
++    content_type='application/octet-stream',
++    cache_control='no-cache',
++  )
++
++@queueable
++def MultiResShardedFromUnshardedMeshMergeTask(
++  src:str,
++  dest:str,
++  shard_no:str,
++  cache_control:bool = False,
++  draco_compression_level:int = 1,
++  mesh_dir:Optional[str] = None,
++  num_lod:int = 1,
++  progress:bool = False,
++):
++  cv_src = CloudVolume(src)
++
++  if mesh_dir is None and 'mesh' in cv.info:
++    mesh_dir = cv.info['mesh']
++
++  cv_dest = CloudVolume(dest, mesh_dir=mesh_dir, progress=True)
++
++  labels = labels_for_shard(cv_dest, shard_no)
++  meshes = cv_src.mesh.get(labels, fuse=False)
++  del labels
++    
++  fname, shard = create_mesh_shard(
++    cv_dest, meshes, 
++    num_lod, draco_compression_level,
++    progress, shard_no
++  )
++  del meshes
++
++  if shard is None:
++    return
++
++  cf = CloudFiles(cv_dest.mesh.meta.layerpath)
++  cf.put(
++    fname, shard, # fname, data
++    compress=False,
++    content_type='application/octet-stream',
++    cache_control='no-cache',
++  )
++
++def create_mesh_shard(
++  cv:CloudVolume, meshes:dict, 
++  num_lod:int, draco_compression_level:int,
++  progress:bool, shard_no:str
++):
+   meshes = {
+     label: process_mesh(
+       cv, label, mesh_frags,
+@@ -190,13 +258,11 @@ def MultiResShardedMeshMergeTask(
+   }
+ 
+   if len(meshes) == 0:
+-    return
++    return None, None
+ 
+   shard_files = synthesize_shard_files(
+     cv.mesh.reader.spec, meshes, data_offset
+   )
+-  del meshes
+-  del data_offset
+ 
+   if len(shard_files) != 1:
+     raise ValueError(
+@@ -205,13 +271,8 @@ def MultiResShardedMeshMergeTask(
+         str(shard_no), ", ".join(shard_files.keys())
+     ))
+ 
+-  cf = CloudFiles(cv.mesh.meta.layerpath, progress=progress)
+-  cf.puts(
+-    ( (fname, data) for fname, data in shard_files.items() ),
+-    compress=False,
+-    content_type='application/octet-stream',
+-    cache_control='no-cache',
+-  )
++  filename = first(shard_files.keys())
++  return filename, shard_files[filename]
+ 
+ def collect_mesh_fragments(
+   cv:CloudVolume, 
+diff --git a/igneous_cli/cli.py b/igneous_cli/cli.py
+index d3e22ef3..4d7b5d12 100644
+--- a/igneous_cli/cli.py
++++ b/igneous_cli/cli.py
+@@ -358,6 +358,41 @@ def meshgroup():
+   """
+   pass
+ 
++@meshgroup.command("xfer")
++@click.argument("src")
++@click.argument("dest")
++@click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)
++@click.option("--sharded", is_flag=True, default=False, help="Generate shard fragments instead of outputing mesh fragments.", show_default=True)
++@click.option("--dir", "mesh_dir", type=str, default=None, help="Write meshes into this directory instead of the one indicated in the info file.")
++@click.option('--magnitude', default=2, help="Split up the work with 10^(magnitude) prefix based tasks.", show_default=True)
++@click.pass_context
++def mesh_xfer(
++  ctx, src, dest, queue,
++  sharded, mesh_dir, magnitude
++):
++  src = cloudfiles.paths.normalize(src)
++  dest = cloudfiles.paths.normalize(dest)
++  cv_src = CloudVolume(src)
++
++  if not cv_src.mesh.meta.is_sharded() and sharded:
++    print("there")
++    tasks = tc.create_sharded_multires_mesh_from_unsharded_tasks(
++      src, dest,
++      num_lod=1, 
++      mesh_dir=mesh_dir, 
++    )
++  else:
++    print("here")
++    tasks = tc.create_xfer_meshes_tasks(
++      src, dest, 
++      mesh_dir=mesh_dir, 
++      magnitude=magnitude,
++    )
++
++  parallel = int(ctx.obj.get("parallel", 1))
++  tq = TaskQueue(normalize_path(queue))
++  tq.insert(tasks, parallel=parallel)
++
+ @meshgroup.command("forge")
+ @click.argument("path")
+ @click.option('--queue', required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue", type=str)

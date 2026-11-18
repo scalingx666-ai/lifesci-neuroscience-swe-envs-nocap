@@ -1,0 +1,377 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b5157329af..8ed2fac11f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -249,6 +249,9 @@ for label, interval_data in results.groupby("interval_labels"):
+     type and arguments that cannot affect the sizing answer are rejected rather
+     than ignored #1635
+ - Remove items scheduled for 0.6.0 deprecation #1633
++- Add `--container-vol-dir` pytest option to store the test container's MySQL
++    data on a chosen disk, and document it alongside the existing
++    `--container-name`/`--container-port` options #1661
+ 
+ ### Pipelines
+ 
+@@ -284,7 +287,8 @@ for label, interval_data in results.groupby("interval_labels"):
+     - Fix bug with `LabTeam().create_new_team` when `google_user_name` is not
+         available #1546
+     - Fix bug from overlapping intervals in interval union #1520
+-    - Bypass delete permission check when removing null `PositionIntervalMap` entries in `convert_epoch_interval_name_to_position_interval_name` #1640
++    - Bypass delete permission check when removing null `PositionIntervalMap`
++        entries in `convert_epoch_interval_name_to_position_interval_name` #1640
+     - Clear a file's existing `InsertError` rows at the start of
+         `populate_all_common`, so a rerun no longer reports or rolls back on
+         failures logged by an earlier attempt #1497
+diff --git a/tests/README.md b/tests/README.md
+index 5aed48bb11..8ea51883bd 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -260,8 +260,39 @@ All tests run with default parameters from `pyproject.toml`. To customize:
+ 
+ --no-dlc            # Skip DeepLabCut tests and downloads
+ # Useful for: systems without DLC, faster test runs
++
++--container-name NAME  # Docker container name (default: branch-derived)
++--container-port PORT  # Host port mapped to MySQL's 3306
++
++--container-vol-dir PATH  # Host dir for the container's MySQL data
++# Useful for: keeping a populated test database off a small root disk
++```
++
++#### Container Data Directory
++
++By default Docker stores the test database on its own root filesystem, which on
++a shared machine is often the smallest disk available. A populated test database
++is not small, so `--container-vol-dir` bind-mounts the container's
++`/var/lib/mysql` onto a directory you choose:
++
++```bash
++pytest --container-vol-dir /path/to/roomy-disk/docker-vols/
+ ```
+ 
++Each container gets its own subdirectory, `<vol-dir>/<container-name>`, so
++concurrent runs on different branches do not share data. The directory is
++created if it does not exist. Without the flag, storage is left to Docker
++exactly as before.
++
++Unless `--no-teardown` is passed, this directory is deleted along with the
++container at the end of the run, so a later run that reuses the same
++`--container-name` always starts from an empty data dir rather than rebooting
++MySQL onto stale, partially-cleaned-up data. With `--no-teardown`, both the
++container and its data dir are left in place. Note that `--container-vol-dir`
++only takes effect when the container is (re)created — if a container with the
++matching name is already running (e.g. from a prior `--no-teardown` run), the
++flag has no effect on it; a warning is logged in that case.
++
+ ### Debugging Options
+ 
+ ```bash
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 376f7a15ed..2140e5fb58 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -276,7 +276,8 @@ def pytest_addoption(parser):
+     --no-teardown (bool): Default False. Delete pipeline on close.
+     --no-docker (bool): Default False. Run datajoint mysql server in Docker.
+     --no-dlc (bool): Default False. Skip DLC tests. Also skip video downloads.
+-    --container-name (str): Default 'spyglass-pytest'. Docker container name.
++    --container-name (str): Default None (derived from git branch as
++        'spyglass-pytest-<branch>'). Docker container name.
+     --container-port (str): Default None (uses 330[mysql_version]). Port mapping.
+     """
+     parser.addoption(
+@@ -321,9 +322,12 @@ def pytest_addoption(parser):
+     parser.addoption(  # Allows for concurrency with other pytest runs
+         "--container-name",
+         action="store",
+-        default="spyglass-pytest",
++        default=None,
+         dest="container_name",
+-        help="Docker container name for MySQL server.",
++        help="Docker container name for MySQL server. Default: derived from "
++        + "the current git branch, so concurrent runs on different branches "
++        + "don't share a container (or, with --container-vol-dir, a data "
++        + "dir).",
+     )
+     parser.addoption(  # Allows for concurrency with other pytest runs
+         "--container-port",
+@@ -332,6 +336,15 @@ def pytest_addoption(parser):
+         dest="container_port",
+         help="Port to map to MySQL's default 3306. Defaults to 330[mysql_version].",
+     )
++    parser.addoption(  # Keeps MySQL data off a potentially small root disk
++        "--container-vol-dir",
++        action="store",
++        default=None,
++        dest="container_vol_dir",
++        help="Parent dir for the container's MySQL data, bind-mounted as "
++        + "<vol-dir>/<container-name> -> /var/lib/mysql. Default: "
++        + "Docker-managed storage.",
++    )
+ 
+ 
+ def pytest_configure(config):
+@@ -356,6 +369,7 @@ def pytest_configure(config):
+     SERVER = DockerMySQLManager(
+         container_name=config.option.container_name,
+         port=config.option.container_port,
++        vol_dir=config.option.container_vol_dir,
+         restart=TEARDOWN,
+         shutdown=TEARDOWN,
+         null_server=config.option.no_docker,
+diff --git a/tests/container.py b/tests/container.py
+index 05109efb65..3b648ee79c 100644
+--- a/tests/container.py
++++ b/tests/container.py
+@@ -1,8 +1,10 @@
+ import atexit
+ import hashlib
++import re
+ import socket
+ import subprocess
+ import time
++from pathlib import Path
+ 
+ import datajoint as dj
+ import docker
+@@ -32,6 +34,10 @@ class DockerMySQLManager:
+         If True, stop and remove container on exit from python. Default True.
+     verbose : bool
+         If True, print container status on startup. Default False.
++    vol_dir : str
++        Parent directory for the container's MySQL data dir, bind-mounted as
++        `<vol_dir>/<container_name>` -> /var/lib/mysql. Default None, letting
++        Docker manage storage on its own root disk.
+     """
+ 
+     def __init__(
+@@ -44,6 +50,7 @@ def __init__(
+         verbose: bool = False,
+         container_name: str = None,
+         port: int = None,
++        vol_dir: str = None,
+     ) -> None:
+         self.image_name = image_name
+         self.mysql_version = mysql_version
+@@ -57,11 +64,14 @@ def __init__(
+         self.logger = logger
+         self.logger.setLevel("INFO" if verbose else "ERROR")
+ 
+-        if container_name is None or port is None:
+-            container_name, port = self._container_name_from_branch()
++        if container_name is None:
++            container_name = self._resolve_container_name()
++        if port is None:
++            port = self._resolve_port(container_name)
+ 
+         self.container_name = container_name
+         self.port = port
++        self.vol_dir = self._resolve_vol_dir(vol_dir)
+ 
+         if not self.null_server:
+             if shutdown:
+@@ -102,13 +112,17 @@ def _get_existing_container_port(self, container_name: str) -> int:
+             )
+         return None
+ 
+-    def _container_name_from_branch(self) -> tuple:
+-        """Generate container name from current git branch."""
+-        # default is 3308, as a holdover from mysql version testing
+-        defaults = "spyglass-pytest", 3300 + int(self.mysql_version[0])
++    def _resolve_container_name(self) -> str:
++        """Generate a container name from the current git branch.
++
++        Resolved independently of `port` so that an explicit `--container-
++        name` is never silently discarded just because `--container-port`
++        was omitted (and vice versa).
++        """
++        default_name = "spyglass-pytest"
+ 
+         if self.null_server:
+-            return defaults
++            return default_name
+ 
+         try:
+             branch_name = (
+@@ -118,22 +132,64 @@ def _container_name_from_branch(self) -> tuple:
+             )
+         except Exception as e:
+             logger.error(f"Failed to get git branch name: {e}")
+-            return defaults
++            return default_name
+ 
+         self.branch_name = branch_name
+-        container_name = f"spyglass-pytest-{branch_name}"
++        return f"spyglass-pytest-{branch_name}"
++
++    def _resolve_port(self, container_name: str) -> int:
++        """Pick a port for `container_name`.
++
++        Reuses the port of an existing container with that name if one is
++        running; otherwise deterministically derives one from the name.
++        """
++        # default is 3308, as a holdover from mysql version testing
++        default_port = 3300 + int(self.mysql_version[0])
++
++        if self.null_server:
++            return default_port
+ 
+         # Check if container with this name already exists and get its port
+         existing_port = self._get_existing_container_port(container_name)
+         if existing_port is not None:
+-            return container_name, existing_port
++            return existing_port
+ 
+         # Otherwise, find an available port
+         port = self.string_to_port(container_name)
+         while self.port_in_use(port):
+             port += 1
+ 
+-        return container_name, port
++        return port
++
++    def _resolve_vol_dir(self, vol_dir: str = None) -> Path:
++        """Resolve the host directory to bind-mount as MySQL's data dir.
++
++        Keeps container data off the root disk, which can be small relative to
++        the space a populated test database needs.
++
++        Parameters
++        ----------
++        vol_dir : str, optional
++            Parent directory for container volumes. If not given, returns None
++            and Docker manages storage itself.
++
++        Returns
++        -------
++        Path or None
++            `<vol_dir>/<container_name>`, else None.
++        """
++        if not vol_dir or self.null_server:
++            return None
++
++        # container_name may derive from a branch name (e.g. "feature/foo");
++        # strip path separators and other non-filename characters so it can't
++        # create nested directories or escape vol_dir via ".." segments.
++        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", self.container_name)
++        safe_name = safe_name.strip(".") or "_"  # reject bare "." / ".."
++        path = Path(vol_dir).expanduser().absolute() / safe_name
++        self.logger.info(f"{self.msg}data dir: {path}")
++
++        return path
+ 
+     @staticmethod
+     def string_to_port(
+@@ -190,15 +246,26 @@ def start(self) -> str:
+             return None
+ 
+         elif self.container_status in ["created", "running", "restarting"]:
++            self._warn_if_vol_dir_ignored()
+             self.logger.info(
+                 self.msg + "starting: " + self.container_status + "."
+             )
+ 
+         elif self.container_status == "exited":
++            self._warn_if_vol_dir_ignored()
+             self.logger.info(self.msg + "restarting.")
+             self.container.restart()
+ 
+         else:
++            volumes = None
++            if self.vol_dir:
++                self.vol_dir.mkdir(parents=True, exist_ok=True)
++                volumes = {
++                    str(self.vol_dir): {
++                        "bind": "/var/lib/mysql",
++                        "mode": "rw",
++                    }
++                }
+             self._ran_container = self.client.containers.run(
+                 image=f"{self.image_name}:{self.mysql_version}",
+                 name=self.container_name,
+@@ -207,6 +274,7 @@ def start(self) -> str:
+                     f"MYSQL_ROOT_PASSWORD={self.password}",
+                     "MYSQL_DEFAULT_STORAGE_ENGINE=InnoDB",
+                 ],
++                volumes=volumes,
+                 detach=True,
+                 tty=True,
+             )
+@@ -214,6 +282,16 @@ def start(self) -> str:
+ 
+         return self.container.name
+ 
++    def _warn_if_vol_dir_ignored(self) -> None:
++        """Warn that `vol_dir` cannot apply to a container we didn't create."""
++        if self.vol_dir is not None:
++            self.logger.warning(
++                self.msg
++                + "reusing an existing container; --container-vol-dir has "
++                + "no effect unless the container is removed and recreated "
++                + "(omit --no-teardown, or pick a fresh --container-name)."
++            )
++
+     def wait(self, timeout=120, wait=3) -> None:
+         """Wait for healthy container.
+ 
+@@ -304,18 +382,50 @@ def connected(self) -> bool:
+         return dj.conn().is_connected
+ 
+     def stop(self, remove=True) -> None:
+-        """Stop and remove container."""
++        """Stop and remove container, clearing its data dir if removed.
++
++        `vol_dir` bind-mounts outlive the container itself: removing the
++        container without also clearing `vol_dir` leaves a later run that
++        reuses this container name pointed at a stale MySQL data dir, even
++        though its on-disk artifacts (NWB files, DLC projects, etc.) were
++        already deleted by that earlier run's teardown. Clearing `vol_dir`
++        here whenever the container is removed keeps the two in sync.
++
++        An "exited" container is already stopped, but still gets removed
++        when `remove` is True -- otherwise `start()`'s restart branch would
++        bring it back on the old mount/port after its data dir was cleared.
++        """
+         if self.null_server:
+             return None
+-        if not self.container_status or self.container_status == "exited":
+-            return
+ 
+-        container_name = self.container_name
+-        self.container.stop()  # Logger I/O operations close during teardown
+-        logline = f"Container {container_name} stopped"
++        if self.container_status:  # present, whether running or exited
++            if self.container_status != "exited":
++                self.container.stop()  # Logger I/O closes during teardown
++                logline = f"Container {self.container_name} stopped"
++            else:
++                logline = f"Container {self.container_name} (exited)"
++
++            if remove:
++                self.container.remove()
++                logline += " and removed"
++
++            print(f"{logline}.")
+ 
+-        if remove:
+-            self.container.remove()
+-            logline += " and removed"
++        if remove and self.vol_dir is not None:
++            self._clear_vol_dir()
+ 
+-        print(f"{logline}.")
++    def _clear_vol_dir(self) -> None:
++        """Remove `vol_dir` so a later run starts from scratch."""
++        if not self.vol_dir.exists():
++            return
++        try:
++            self.client.containers.run(
++                image="alpine",
++                command=["sh", "-c", "rm -rf /data/..?* /data/.[!.]* /data/*"],
++                volumes={str(self.vol_dir): {"bind": "/data", "mode": "rw"}},
++                remove=True,
++                detach=False,
++            )
++            self.vol_dir.rmdir()
++        except Exception as e:
++            self.logger.warning(f"{self.msg}failed to clear vol_dir: {e}")

@@ -1,0 +1,306 @@
+diff --git a/app/apps/server/migrations/092_score_pack.sql b/app/apps/server/migrations/092_score_pack.sql
+new file mode 100644
+index 00000000..a6d2d7ce
+--- /dev/null
++++ b/app/apps/server/migrations/092_score_pack.sql
+@@ -0,0 +1,10 @@
++SET LOCAL lock_timeout = '10s';
++-- SPDX-License-Identifier: Apache-2.0
++--
++-- Score blobs (090, 091) are now compressed before sealing: they averaged 8 KB
++-- per note, not the ~1 KB 090 expected, and a 14k-note vault's search spent
++-- most of its 10-20 s receiving them (2026-11-02). Keyed vaults re-run the
++-- backfill once so the new `*_score_pack` steps re-seal existing blobs
++-- compressed, in place. No schema change; every other step is already done.
++UPDATE vault_crypto_state SET cursors = cursors - 'completedAt'
++ WHERE vault_id IN (SELECT id FROM vaults WHERE vk_check IS NOT NULL);
+diff --git a/app/apps/server/src/crypto/backfill.ts b/app/apps/server/src/crypto/backfill.ts
+index 7a35a989..e23ad67b 100644
+--- a/app/apps/server/src/crypto/backfill.ts
++++ b/app/apps/server/src/crypto/backfill.ts
+@@ -37,8 +37,11 @@ import type pg from "pg";
+ import { pool as defaultPool } from "../db/pool.js";
+ import { inc } from "../metrics/sync-metrics.js";
+ import {
++  isUncompressedScore,
++  openBlobScorePlain,
+   openBlobScoreRow,
+   openBlobTextRow,
++  openScorePlain,
+   openScoreRow,
+   openSearchRow,
+   sealBlobScoreRow,
+@@ -73,6 +76,10 @@ export const BACKFILL_TABLES = [
+   // neither delays the null-out nor reads as plaintext remaining.
+   "note_index_score",
+   "blob_text_score",
++  // Score blobs written before they were compressed, re-sealed compressed in
++  // place (same content). Also never counted by `encryptionStatus`.
++  "note_index_score_pack",
++  "blob_text_score_pack",
+ ] as const;
+ export type BackfillTable = (typeof BACKFILL_TABLES)[number];
+ 
+@@ -191,6 +198,10 @@ async function runBatch(
+       return batchNoteIndexScore(c, after, limit, db);
+     case "blob_text_score":
+       return batchBlobTextScore(c, after, limit, db);
++    case "note_index_score_pack":
++      return batchScorePack("note_index_score_pack", c, after, limit, db);
++    case "blob_text_score_pack":
++      return batchScorePack("blob_text_score_pack", c, after, limit, db);
+   }
+ }
+ 
+@@ -355,6 +366,64 @@ async function batchNoteIndexScore(c: DocCrypto, after: string | null, limit: nu
+   return { ...scanned(rows), last: rows.at(-1)?.doc_id ?? after };
+ }
+ 
++/**
++ * An uncompressed score blob re-sealed compressed: the same vector and token
++ * set, a third of the bytes search has to receive. Written only while the row
++ * still holds exactly the blob just read, so a re-index in between wins.
++ */
++async function batchScorePack(
++  table: "note_index_score_pack" | "blob_text_score_pack",
++  c: DocCrypto,
++  after: string | null,
++  limit: number,
++  db: Queryable,
++): Promise<BatchResult> {
++  const notes = table === "note_index_score_pack";
++  const [tbl, key] = notes ? ["note_index", "doc_id"] : ["blob_text", "blob_id"];
++  const { rows } = await db.query<{ id: string; search_score_enc: Buffer }>(
++    byteBudgeted(
++      `SELECT ${key} AS id, search_score_enc
++         FROM ${tbl}
++        WHERE vault_id = $1 AND ${key} > $2 AND search_score_enc IS NOT NULL
++        ORDER BY ${key}
++        LIMIT $3`,
++      "x.search_score_enc",
++      "x.id",
++      4,
++    ),
++    [c.vaultId, after ?? "", limit, BACKFILL_BATCH_BYTES],
++  );
++  for (const r of rows) {
++    let plain: Buffer;
++    try {
++      plain = notes ? openScorePlain(c, r.id, r.search_score_enc) : openBlobScorePlain(c, r.id, r.search_score_enc);
++    } catch {
++      metric(table, "verify_failed");
++      continue;
++    }
++    if (!isUncompressedScore(plain)) continue;
++    const score = JSON.parse(plain.toString("utf8")) as Parameters<typeof sealScoreRow>[2];
++    const json = Buffer.from(JSON.stringify(score), "utf8");
++    const sealed = sealVerified(
++      table,
++      r.id,
++      json,
++      () => (notes ? sealScoreRow(c, r.id, score) : sealBlobScoreRow(c, r.id, score)),
++      (s) => Buffer.from(JSON.stringify(notes ? openScoreRow(c, r.id, s) : openBlobScoreRow(c, r.id, s)), "utf8"),
++    );
++    if (!sealed) continue;
++    await write(
++      table,
++      r.id,
++      `UPDATE ${tbl} SET search_score_enc = $2
++        WHERE ${key} = $1 AND vault_id = $4 AND search_score_enc = $3`,
++      [r.id, sealed, r.search_score_enc, c.vaultId],
++      db,
++    );
++  }
++  return { ...scanned(rows), last: rows.at(-1)?.id ?? after };
++}
++
+ /** The file half of {@link batchNoteIndexScore} (`blob_text.search_score_enc`). */
+ async function batchBlobTextScore(c: DocCrypto, after: string | null, limit: number, db: Queryable): Promise<BatchResult> {
+   const { rows } = await db.query<{ blob_id: string; search_enc: Buffer; updated_at: string }>(
+diff --git a/app/apps/server/src/index/indexer.ts b/app/apps/server/src/index/indexer.ts
+index 5f2883eb..d54e3933 100644
+--- a/app/apps/server/src/index/indexer.ts
++++ b/app/apps/server/src/index/indexer.ts
+@@ -1,3 +1,4 @@
++import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+ import type { DocCrypto } from "../crypto/doc-crypto.js";
+ import {
+   indexCryptoFor,
+@@ -463,11 +464,21 @@ export interface NoteSearchHit {
+ }
+ 
+ /**
+- * How many note_index rows to score per round trip. Only a doc id, a 256-float
+- * vector and a small integer cross the wire per row (~2-3 KB), so a batch peaks
+- * around 1 MB regardless of vault size. Note BODIES never leave Postgres.
++ * How many note_index rows to score per round trip. A row sends its vector and
++ * token set (plaintext columns, or a compressed sealed score blob of ~1.5 KB),
++ * so a batch is a few MB regardless of vault size. Note BODIES never leave
++ * Postgres. Every batch re-sends the whole readable id list, so fewer, larger
++ * batches: at 500, a 14k-note vault re-sent it 28 times per search.
+  */
+-const SEARCH_BATCH = 500;
++const SEARCH_BATCH = 2000;
++
++/**
++ * Sealed rows scored between yields to the event loop. Opening a score blob is
++ * synchronous work; a 14k-note vault searched 20 times a minute by one AI
++ * client held the loop for seconds at a time and slowed every other request
++ * on the server (2026-11-02). Same results, other requests answered between.
++ */
++const SEARCH_YIELD_EVERY = 250;
+ 
+ /**
+  * How many `blob_text` rows one query may score.
+@@ -602,7 +613,8 @@ export async function searchNoteIndex(opts: {
+       [opts.vaultId, docIds, after, qTokens, SEARCH_BATCH, legacySql],
+     );
+     if (rows.length === 0) break;
+-    for (const r of rows) {
++    for (const [i, r] of rows.entries()) {
++      if (i > 0 && i % SEARCH_YIELD_EVERY === 0) await yieldToEventLoop();
+       if (r.search_score_enc) {
+         if (!opts.crypto) throw new KeyRequiredError();
+         const score = scoreFromSealed(opts.crypto, r.doc_id, r.search_score_enc, qVec, qTokens, legacySql);
+@@ -805,7 +817,8 @@ async function searchBlobText(opts: {
+   );
+ 
+   const scored: NoteSearchHit[] = [];
+-  for (const r of rows) {
++  for (const [i, r] of rows.entries()) {
++    if (i > 0 && i % SEARCH_YIELD_EVERY === 0) await yieldToEventLoop();
+     const relPath = r.rel_path ?? "";
+     let vector = r.vector;
+     let matchedSealed: number | null = null;
+diff --git a/app/apps/server/src/index/sealed-index.ts b/app/apps/server/src/index/sealed-index.ts
+index a9c0ffe7..456f84a5 100644
+--- a/app/apps/server/src/index/sealed-index.ts
++++ b/app/apps/server/src/index/sealed-index.ts
+@@ -4,6 +4,7 @@
+ // AAD bound to (note_index, search_enc, vaultId, docId), holding everything
+ // search needs: the full text (so the pre-068 substring rule still works when
+ // a row has no token set), the embedding vector and the token set.
++import { deflateRawSync, inflateRawSync } from "node:zlib";
+ import type pg from "pg";
+ import { pool as defaultPool } from "../db/pool.js";
+ import { vaultKeysEnabled } from "../crypto/config.js";
+@@ -41,16 +42,48 @@ export interface SealedScoreRow {
+   tokens: string | null;
+ }
+ 
++/**
++ * A score blob's plaintext. The JSON is deflated behind a leading 0x00 byte:
++ * a token set plus a 256-number vector averaged 8 KB per note uncompressed, and
++ * a 14k-note vault's search spent most of its time just receiving 108 MB of
++ * them (2026-11-02). Older blobs are plain JSON (first byte `{`) and still open.
++ */
++const SCORE_DEFLATED = 0x00;
++/** Far above any real row (token sets cap at 64 KB); the plaintext is ours and
++ *  authenticated, this only bounds a bug. */
++const SCORE_MAX_BYTES = 4 * 1024 * 1024;
++
++function encodeScore(row: SealedScoreRow): Buffer {
++  return Buffer.concat([Buffer.of(SCORE_DEFLATED), deflateRawSync(JSON.stringify(row))]);
++}
++
++function decodeScore(plain: Buffer): SealedScoreRow {
++  const json = plain[0] === SCORE_DEFLATED
++    ? inflateRawSync(plain.subarray(1), { maxOutputLength: SCORE_MAX_BYTES })
++    : plain;
++  return JSON.parse(json.toString("utf8")) as SealedScoreRow;
++}
++
++/** True when a score blob's plaintext is the older uncompressed JSON. */
++export function isUncompressedScore(plain: Buffer): boolean {
++  return plain[0] !== SCORE_DEFLATED;
++}
++
+ function scoreAad(vaultId: string, docId: string): Buffer {
+   return aadFor("note_index", "search_score_enc", vaultId, docId);
+ }
+ 
+ export function sealScoreRow(c: DocCrypto, docId: string, row: SealedScoreRow): Buffer {
+-  return seal(c.key, scoreAad(c.vaultId, docId), Buffer.from(JSON.stringify(row), "utf8"), c.generation);
++  return seal(c.key, scoreAad(c.vaultId, docId), encodeScore(row), c.generation);
+ }
+ 
+ export function openScoreRow(c: DocCrypto, docId: string, sealed: Buffer): SealedScoreRow {
+-  return JSON.parse(open(c.key, scoreAad(c.vaultId, docId), sealed).toString("utf8")) as SealedScoreRow;
++  return decodeScore(openScorePlain(c, docId, sealed));
++}
++
++/** A score blob's raw plaintext (either encoding). */
++export function openScorePlain(c: DocCrypto, docId: string, sealed: Buffer): Buffer {
++  return open(c.key, scoreAad(c.vaultId, docId), sealed);
+ }
+ 
+ function blobAad(vaultId: string, blobId: string): Buffer {
+@@ -72,11 +105,16 @@ function blobScoreAad(vaultId: string, blobId: string): Buffer {
+ 
+ /** A file's ranking data, sealed apart from its text (`blob_text.search_score_enc`). */
+ export function sealBlobScoreRow(c: DocCrypto, blobId: string, row: SealedScoreRow): Buffer {
+-  return seal(c.key, blobScoreAad(c.vaultId, blobId), Buffer.from(JSON.stringify(row), "utf8"), c.generation);
++  return seal(c.key, blobScoreAad(c.vaultId, blobId), encodeScore(row), c.generation);
+ }
+ 
+ export function openBlobScoreRow(c: DocCrypto, blobId: string, sealed: Buffer): SealedScoreRow {
+-  return JSON.parse(open(c.key, blobScoreAad(c.vaultId, blobId), sealed).toString("utf8")) as SealedScoreRow;
++  return decodeScore(openBlobScorePlain(c, blobId, sealed));
++}
++
++/** A file score blob's raw plaintext (either encoding). */
++export function openBlobScorePlain(c: DocCrypto, blobId: string, sealed: Buffer): Buffer {
++  return open(c.key, blobScoreAad(c.vaultId, blobId), sealed);
+ }
+ 
+ /**
+diff --git a/app/apps/server/tests/sealed-search.test.ts b/app/apps/server/tests/sealed-search.test.ts
+index afc84795..4f0c5f5d 100644
+--- a/app/apps/server/tests/sealed-search.test.ts
++++ b/app/apps/server/tests/sealed-search.test.ts
+@@ -7,6 +7,8 @@ import { appendUpdate } from "../src/yjs/persistence.js";
+ import { indexDoc, searchNoteIndex } from "../src/index/indexer.js";
+ import { backfillVault } from "../src/crypto/backfill.js";
+ import { makeVkCheck } from "../src/crypto/vk-check.js";
++import { aadFor, open, seal } from "../src/crypto/envelope.js";
++import { isUncompressedScore, openScoreRow } from "../src/index/sealed-index.js";
+ import { vaultKeyCache } from "../src/crypto/key-cache.js";
+ import { KeyRequiredError } from "../src/crypto/transport.js";
+ import type { DocCrypto } from "../src/crypto/doc-crypto.js";
+@@ -135,6 +137,36 @@ describe("sealed note_index (W3)", () => {
+     expect(await Promise.all(["revenue plan", "lemon", "zzz"].map(search))).toEqual(before);
+   });
+ 
++  it("an uncompressed score blob still ranks, and the backfill re-seals it compressed", async () => {
++    const keyed = await corpus(true);
++    const release = vaultKeyCache.acquire(keyed.vaultId, keyed.key, 1);
++    for (const id of Object.keys(keyed.ids)) await indexDoc(id);
++    release();
++    const search = (query: string) =>
++      searchNoteIndex({ vaultId: keyed.vaultId, query, k: 10, readableDocIds: Object.keys(keyed.ids), includeFiles: false, crypto: keyed.crypto });
++    const before = await Promise.all(["revenue plan", "lemon", "zzz"].map(search));
++
++    // The format written before compression: the JSON sealed as is.
++    for (const id of Object.keys(keyed.ids)) {
++      const { rows } = await pool.query("SELECT search_score_enc FROM note_index WHERE doc_id = $1", [id]);
++      const plainJson = Buffer.from(JSON.stringify(openScoreRow(keyed.crypto!, id, rows[0].search_score_enc)), "utf8");
++      const old = seal(keyed.key, aadFor("note_index", "search_score_enc", keyed.vaultId, id), plainJson, 1);
++      await pool.query("UPDATE note_index SET search_score_enc = $2 WHERE doc_id = $1", [id, old]);
++    }
++    expect(await Promise.all(["revenue plan", "lemon", "zzz"].map(search))).toEqual(before);
++
++    await pool.query("INSERT INTO vault_crypto_state (vault_id, phase, generation) VALUES ($1, 'keyed', 1) ON CONFLICT DO NOTHING", [keyed.vaultId]);
++    const hold = vaultKeyCache.acquire(keyed.vaultId, keyed.key, 1);
++    expect(await backfillVault(keyed.vaultId, { throttleMs: 0 })).toBe("complete");
++    hold();
++    const { rows } = await pool.query("SELECT doc_id, search_score_enc FROM note_index WHERE vault_id = $1", [keyed.vaultId]);
++    expect(rows).toHaveLength(4);
++    for (const r of rows) {
++      expect(isUncompressedScore(open(keyed.key, aadFor("note_index", "search_score_enc", keyed.vaultId, r.doc_id), r.search_score_enc))).toBe(false);
++    }
++    expect(await Promise.all(["revenue plan", "lemon", "zzz"].map(search))).toEqual(before);
++  });
++
+   it("a keyed re-index never nulls an existing plaintext row's columns", async () => {
+     const k = await corpus(false);
+     const docId = Object.keys(k.ids)[0];

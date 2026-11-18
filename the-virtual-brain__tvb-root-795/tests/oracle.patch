@@ -1,0 +1,353 @@
+diff --git a/tvb_library/tvb/simulator/backend/nb_hybrid.py b/tvb_library/tvb/simulator/backend/nb_hybrid.py
+index 7a40ad1223..409a77be96 100644
+--- a/tvb_library/tvb/simulator/backend/nb_hybrid.py
++++ b/tvb_library/tvb/simulator/backend/nb_hybrid.py
+@@ -1542,16 +1542,33 @@ def _run_compiled(
+         rng_states: Optional[list] = None,
+     ) -> tuple:
+         """Build the argument list and call the pre-compiled kernel."""
+-        # Guard: chunk_size must not exceed the minimum horizon
+-        if analysis.all_projections:
+-            min_horizon = min(p.horizon for p in analysis.all_projections)
+-            if chunk_size > min_horizon:
+-                raise ValueError(
+-                    f"chunk_size={chunk_size} exceeds the minimum projection horizon "
+-                    f"({min_horizon} steps = min_delay / dt). "
+-                    f"Reduce chunk_size to at most {min_horizon}, or increase tract "
+-                    "lengths / reduce dt."
+-                )
++        # Sanity check replacing the old `chunk_size <= min-horizon` cap.
++        #
++        # The delayed-coupling history buffer is addressed by the global step
++        # modulo the buffer length, and is written *after* it is read within a
++        # step (read-before-write).  That invariant makes the simulation
++        # correct regardless of how many steps a chunk spans, so a chunk is
++        # free to cross a delay horizon (and several chunk boundaries may map
++        # onto the same modulo slots).  The cap existed only because the old
++        # full-run noise array was indexed by the global step; that array is
++        # now generated per chunk, so no cap is needed.
++        #
++        # What must still hold is the per-projection modulo-wrap invariant
++        #     horizon >= max(idelay) + 1
++        # (`horizon = max_delay + 1` by construction).  Violating it would
++        # alias two distinct delays onto the same buffer slot and silently
++        # corrupt the coupling, so we keep a loud failure here.
++        for p in analysis.all_projections:
++            idelays = np.atleast_1d(p.idelays)
++            if idelays.size:
++                max_idelay = int(np.max(idelays))
++                if p.horizon < max_idelay + 1:
++                    raise ValueError(
++                        f"Projection '{p.name}' has delay-buffer horizon "
++                        f"{p.horizon} < max(idelay)+1 = {max_idelay + 1}; the "
++                        "circular history buffer would alias distinct delays "
++                        "onto the same slot. Increase tract lengths / reduce dt."
++                    )
+         # Build argument list matching the generated run_network() signature
+         args = [nstep, step_offset]
+ 
+@@ -1616,24 +1633,30 @@ def _run_compiled(
+             cfun_params = _cfun_params(p)
+             args.append(cfun_params)
+ 
+-        # Per-subnetwork noise arrays (stochastic integrators)
++        # Per-subnetwork noise sources (stochastic integrators).
++        #
++        # Previously an (nstep, n_vars, n_nodes, n_modes) array was drawn here,
++        # scaled by noise_std, transposed and cast to float32 — an O(nstep)
++        # allocation that OOMs for long stochastic runs (and is worse still in
++        # the sweep backend).  Instead we hand the kernel the RNG stream and
++        # the per-variable noise scale; the run_network template draws a
++        # chunk-sized array inside the outer chunk loop, so peak allocation is
++        # O(chunk_size).
++        #
++        # Draw order is preserved across chunk sizes: each chunk draws
++        # (this_chunk, n_vars, n_nodes, n_modes) sequentially, in the same
++        # element order as the old single draw, so a given seed yields the same
++        # trajectory regardless of chunk_size (numpy's legacy RandomState draws
++        # elementwise and keeps its gauss cache in the bit-generator state, so
++        # splitting the draw across calls does not change the stream).
+         for sn_info in analysis.subnetworks:
+             if sn_info.is_stochastic:
+                 sn_obj = next(s for s in network_set.subnets if s.name == sn_info.name)
+                 dt = sn_obj.scheme.dt
+                 rng = sn_obj.scheme.noise.random_stream
+-                # Draw in (nstep, n_vars, n_nodes, n_modes) order so that
+-                # transposed [:, :, :, t] == t-th sequential randn(n_vars, n_nodes, n_modes) call
+-                dw = rng.randn(
+-                    nstep, sn_info.model.nvar, sn_info.n_nodes, sn_info.n_modes
+-                )
+-                noise_std = np.sqrt(2.0 * sn_info.noise_nsig * dt)  # (n_vars,)
+-                dw *= noise_std[np.newaxis, :, np.newaxis, np.newaxis]
+-                # Transpose to (n_vars, n_nodes, n_modes, nstep)
+-                dw = np.ascontiguousarray(np.transpose(dw, (1, 2, 3, 0))).astype(
+-                    np.float32
+-                )
+-                args.append(dw)
++                noise_std = np.sqrt(2.0 * sn_info.noise_nsig * dt)  # (n_vars,) float64
++                args.append(rng)
++                args.append(noise_std)
+ 
+         # Per-subnetwork stimulus arrays (pre-computed batch)
+         # TODO §8.4: use lazy chunk-by-chunk path when estimated stim_arr_mb
+diff --git a/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sim.py.mako b/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sim.py.mako
+index ea0daee7e3..5ae22afcba 100644
+--- a/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sim.py.mako
++++ b/tvb_library/tvb/simulator/backend/templates/nb-hybrid-sim.py.mako
+@@ -869,9 +869,12 @@ def network_chunk(
+     ${sn.name}_c,  # (n_cvar, n_nodes, n_modes) — scratch for coupling dispatch
+     % endfor
+     ## per-subnetwork noise arrays (stochastic only)
++    ## The single-run path passes a chunk-sized array regenerated each outer
++    ## chunk (indexed chunk-relatively, t_local); the CPU-sweep template passes
++    ## a full-run array (indexed by the global step, t - data_offset - 1).
+     % for sn in subnets:
+     % if sn.is_stochastic:
+-    ${sn.name}_noise,  # (n_vars, n_nodes, n_modes, nstep_total) float32
++    ${sn.name}_noise,  # (n_vars, n_nodes, n_modes, N) float32 — N=this chunk, or full run (sweep)
+     % endif
+     % endfor
+     ## per-subnetwork stimulus arrays (stimulus subnetworks only)
+@@ -986,8 +989,14 @@ def network_chunk(
+         % endfor
+ 
+         ## integrate each subnetwork in-place
++        ## A chunk-sized noise array has exactly `nstep` steps, so its shape
++        ## disambiguates the per-chunk path (t_local) from the full-run/sweep
++        ## path (global t - data_offset - 1).
+         % for sn in subnets:
+-        integrate_${sn.name}(${sn.name}_state, ${sn.name}_c${',' if sn.is_stochastic else ''} ${'%s_noise, t - data_offset - 1' % sn.name if sn.is_stochastic else ''}, ${sn.name}_sp)
++        % if sn.is_stochastic:
++        _t_noise_${sn.name} = t_local if ${sn.name}_noise.shape[3] == nstep else t - data_offset - 1
++        % endif
++        integrate_${sn.name}(${sn.name}_state, ${sn.name}_c${',' if sn.is_stochastic else ''} ${'%s_noise, _t_noise_%s' % (sn.name, sn.name) if sn.is_stochastic else ''}, ${sn.name}_sp)
+         % endfor
+ 
+         ## update shared source buffers (one write per source subnet)
+@@ -1090,10 +1099,13 @@ def run_network(
+     ${p.name}_scale, ${p.name}_target_scales,
+     ${p.name}_cfun_params,
+     % endfor
+-    ## noise arrays (stochastic subnetworks only)
++    ## noise sources (stochastic subnetworks only)
++    ## Instead of a full-run noise array, pass the RNG stream and the per-variable
++    ## noise scale; a chunk-sized noise array is generated inside the chunk loop.
+     % for sn in subnets:
+     % if sn.is_stochastic:
+-    ${sn.name}_noise,
++    ${sn.name}_rng,        # numpy RandomState
++    ${sn.name}_noise_std,  # (n_vars,) float64 = sqrt(2*nsig*dt)
+     % endif
+     % endfor
+     ## stimulus arrays (stimulus subnetworks only)
+@@ -1173,6 +1185,16 @@ def run_network(
+         % endfor
+         tavg_count[0] = 0
+ 
++        ## generate chunk-sized noise for each stochastic subnet
++        ## (avoids allocating an nstep-sized array on the single-run path)
++        % for sn in subnets:
++        % if sn.is_stochastic:
++        _dw_${sn.name} = ${sn.name}_rng.randn(this_chunk, ${sn.model.nvar}, ${sn.n_nodes}, ${sn.n_modes})
++        _dw_${sn.name} *= ${sn.name}_noise_std[np.newaxis, :, np.newaxis, np.newaxis]
++        ${sn.name}_noise = np.ascontiguousarray(np.transpose(_dw_${sn.name}, (1, 2, 3, 0))).astype(np.float32)
++        % endif
++        % endfor
++
+         network_chunk(
+             this_chunk,
+             t_global,
+diff --git a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid.py b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid.py
+index 5220c276c0..e353757924 100644
+--- a/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid.py
++++ b/tvb_library/tvb/tests/library/simulator/backend/test_nb_hybrid.py
+@@ -481,13 +481,17 @@ def test_rejects_mismatched_dt(self):
+         with self.assertRaises(ValueError):
+             NbHybridBackend().run_network(nets, nstep=5)
+ 
+-    def test_rejects_chunk_size_gt_horizon(self):
++    def test_chunk_size_gt_horizon_is_valid(self):
++        # Ported from community PR #784 (author i-Zaak).
++        # tract_length=0.2 mm, cv=1 mm/ms → delay=0.2 ms → horizon=ceil(0.2/0.1)+1=3 steps
++        # chunk_size=10 > horizon=3: the buffer wraps within a single chunk, but
++        # global step indexing + read-before-write guarantees correctness.
++        # Verified by comparing final states from chunk_size=1 vs chunk_size=10.
+         m = MontbrioPazoRoxin()
+         m.configure()
+         integ = HeunDeterministic(dt=0.1)
+         sn = Subnetwork(name="sn", model=m, scheme=integ, nnodes=3)
+         sn.configure()
+-        # tract_length=0.2 mm, cv=1 mm/ms → delay=0.2 ms → horizon=ceil(0.2/0.1)+1=3 steps
+         W = sp.csr_matrix(np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.float32))
+         L = sp.csr_matrix(np.full((3, 3), 0.2))
+         proj = IntraProjection(
+@@ -504,8 +508,24 @@ def test_rejects_chunk_size_gt_horizon(self):
+         sn.configure()
+         nets = NetworkSet(subnets=[sn], projections=[])
+         nets.configure()
+-        with self.assertRaises(ValueError):
+-            NbHybridBackend().run_network(nets, nstep=100, chunk_size=10)
++
++        rng = np.random.RandomState(42)
++        x0 = rng.uniform(0.0, 0.2, (m.nvar, 3, 1)).astype(np.float64)
++
++        compiled = NbHybridBackend().compile(nets)
++        _, snap_ref = compiled.run(
++            nstep=30, chunk_size=1, initial_states=[x0.copy()], return_snapshot=True
++        )
++        _, snap_chunked = compiled.run(
++            nstep=30, chunk_size=10, initial_states=[x0.copy()], return_snapshot=True
++        )
++
++        np.testing.assert_allclose(
++            snap_chunked["states"][0],
++            snap_ref["states"][0],
++            rtol=1e-5, atol=1e-6,
++            err_msg="chunk_size=10 final state diverges from chunk_size=1 with horizon=3",
++        )
+ 
+     def test_rejects_subsample_with_chunk_size_gt_1(self):
+         """SubSample monitor must not be used with chunk_size > 1."""
+@@ -526,6 +546,142 @@ def test_rejects_subsample_with_chunk_size_gt_1(self):
+         self.assertIn("chunk_size=1", str(ctx.exception))
+ 
+ 
++class TestNbHybridChunkSizeEquivalence(unittest.TestCase):
++    """Extended coverage for the chunk-size > horizon relaxation (PR #784).
++
++    The original community test covered a single subnetwork, 3 nodes, a
++    horizon of 3 and nstep=30.  These tests widen that to multiple subnetworks
++    and projections, a delay that spans several chunks, an RNG-stream-identity
++    check for stochastic integrators, and a loud failure when the delay-buffer
++    horizon does not satisfy the modulo-wrap invariant.
++    """
++
++    def _intra(self, sn, n, length, weight_seed=1):
++        w = _sparse_weights(n, n, seed=weight_seed)
++        lengths = sp.csr_matrix(w.toarray() * length)
++        proj = IntraProjection(
++            source_cvar=np.array([0], dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=w,
++            lengths=lengths,
++            cv=1.0,
++            dt=DT,
++            scale=1.0,
++            cfun=Linear(),
++        )
++        sn.projections = [proj]
++        return sn
++
++    def _run_states(self, nets, nstep, chunk_size, ic):
++        compiled = NbHybridBackend().compile(nets)
++        _, snap = compiled.run(
++            nstep=nstep,
++            chunk_size=chunk_size,
++            initial_states=[a.copy() for a in ic],
++            return_snapshot=True,
++        )
++        return snap["states"]
++
++    def test_multi_subnet_multi_projection_chunk_gt_min_horizon(self):
++        # Two subnetworks with an inter-projection and an intra-projection.
++        # min horizon = 3 (short intra delay); chunk_size=12 exceeds it and
++        # spans both projections' horizons several times over.
++        sn_a = _mpr_subnetwork("a", 4)
++        sn_b = _mpr_subnetwork("b", 5)
++        # dt=0.01; intra length 0.02 -> idelay 2 -> horizon 3 (the min horizon).
++        # chunk_size=12 exceeds it and spans the inter-projection horizon
++        # (length 5.0 -> idelay 500 -> horizon 501) several times over.
++        self._intra(sn_a, 4, length=0.02, weight_seed=2)
++        sn_a.configure()
++        sn_b.configure()
++
++        w = _sparse_weights(5, 4, seed=3)
++        inter = InterProjection(
++            source=sn_a,
++            target=sn_b,
++            source_cvar=np.array([0], dtype=np.int_),
++            target_cvar=np.array([0], dtype=np.int_),
++            weights=w,
++            lengths=sp.csr_matrix(w.toarray() * 5.0),  # delay 50 -> horizon 51
++            cv=1.0,
++            dt=DT,
++            scale=1.0,
++        )
++        nets = NetworkSet(subnets=[sn_a, sn_b], projections=[inter])
++        nets.configure()
++
++        rng = np.random.RandomState(11)
++        ic = [
++            np.abs(rng.uniform(0.0, 0.2, (2, 4, 1))).astype(np.float64),
++            np.abs(rng.uniform(0.0, 0.2, (2, 5, 1))).astype(np.float64),
++        ]
++        ref = self._run_states(nets, nstep=60, chunk_size=1, ic=ic)
++        chunked = self._run_states(nets, nstep=60, chunk_size=12, ic=ic)
++        for i, (a, b) in enumerate(zip(ref, chunked)):
++            np.testing.assert_allclose(
++                b, a, rtol=1e-5, atol=1e-6,
++                err_msg=f"subnet {i}: chunk_size=12 diverges from chunk_size=1",
++            )
++
++    def test_long_delay_crosses_multiple_chunk_boundaries(self):
++        # dt=0.1, cv=1 mm/ms, length=2.5 mm -> idelay=25, horizon=26.
++        # chunk_size=8 means a single delay spans >3 chunk boundaries.
++        m = MontbrioPazoRoxin()
++        m.configure()
++        sn = Subnetwork(name="sn", model=m, scheme=HeunDeterministic(dt=0.1), nnodes=3)
++        self._intra(sn, 3, length=2.5, weight_seed=4)
++        sn.configure()
++        nets = NetworkSet(subnets=[sn], projections=[])
++        nets.configure()
++
++        rng = np.random.RandomState(5)
++        ic = [np.abs(rng.uniform(0.0, 0.2, (m.nvar, 3, 1))).astype(np.float64)]
++        ref = self._run_states(nets, nstep=80, chunk_size=1, ic=ic)
++        chunked = self._run_states(nets, nstep=80, chunk_size=8, ic=ic)
++        np.testing.assert_allclose(
++            chunked[0], ref[0], rtol=1e-5, atol=1e-6,
++            err_msg="long delay crossing multiple chunk boundaries diverges",
++        )
++
++    def test_rng_stream_identity_across_chunk_sizes(self):
++        # Same seed must produce the same stochastic trajectory for different
++        # chunk sizes: per-chunk draws are sequential and preserve order.
++        sn = _mpr_stochastic_subnetwork("ctx", 4, EulerStochastic, nsig=1e-2, seed=42)
++        nets = NetworkSet(subnets=[sn], projections=[])
++        nets.configure()
++
++        ic = [np.abs(np.random.RandomState(9).uniform(0.1, 0.3, (2, 4, 1))).astype(np.float64)]
++
++        states = {}
++        for cs in (1, 7):
++            sn.scheme.noise.random_stream = np.random.RandomState(42)
++            states[cs] = self._run_states(nets, nstep=40, chunk_size=cs, ic=ic)[0]
++
++        np.testing.assert_allclose(
++            states[7], states[1], rtol=1e-6, atol=1e-7,
++            err_msg="stochastic trajectory depends on chunk_size for a fixed seed",
++        )
++
++    def test_rejects_aliased_delay_horizon(self):
++        # The relaxed guard must still fail loudly when horizon < max(idelay)+1.
++        sn = _mpr_subnetwork("sn", 3)
++        # dt=0.01: length 1.0 -> idelay 100 -> horizon 101.
++        self._intra(sn, 3, length=1.0, weight_seed=6)  # delay 100 -> horizon 101
++        sn.configure()
++        nets = NetworkSet(subnets=[sn], projections=[])
++        nets.configure()
++
++        backend = NbHybridBackend()
++        analysis = backend._analyse(nets)
++        proj = analysis.all_projections[0]
++        proj.horizon = int(np.max(proj.idelays))  # break the invariant
++
++        with self.assertRaises(ValueError) as ctx:
++            backend._run_compiled(None, analysis, nets, nstep=10, chunk_size=5,
++                                  initial_states=None)
++        self.assertIn("max(idelay)+1", str(ctx.exception))
++
++
+ # ---------------------------------------------------------------------------
+ # Coupling function tests
+ # ---------------------------------------------------------------------------

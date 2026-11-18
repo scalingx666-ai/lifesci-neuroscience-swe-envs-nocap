@@ -1,0 +1,245 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2e87a2e..c6629ce 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -42,6 +42,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Rebuild the comp
+ 
+ ### Fixed
+ 
++- The router matches and inserts a sessionless request's text in its prefix trees in a worker thread, not on its event
++  loop, which every relayed stream shares: a 1.1 MB (~250K-token) request stalled the loop for ~300 ms; now ~12 ms.
++  The routing decisions are unchanged.
+ - A non-streaming client that disconnects from the router now aborts its request on the engine. The router kept its
+   own connection to the engine open, so the engine generated to `max_tokens` and held a decode seat.
+ - The router answers a request body that is not a JSON object with 400, as each engine does, instead of 500.
+diff --git a/tests/test_router.py b/tests/test_router.py
+index 09ab084..1e55155 100644
+--- a/tests/test_router.py
++++ b/tests/test_router.py
+@@ -344,6 +344,89 @@ async def ask(c, b) -> tuple[int, str]:
+     asyncio.run(main())
+ 
+ 
++def test_pick_off_loop_routes_as_pick_does():
++    """The same sequence of sessionless requests and loads gives the same workers, routing counters and trees through
++    pick (on the event loop) and pick_off_loop (the trees in a worker thread)."""
++    import asyncio
++
++    rng = random.Random(3)
++    shared = ["".join(rng.choices("abcdefgh", k=rng.randint(200, 40_000))) for _ in range(6)]
++    reqs = []
++    for _ in range(300):
++        text = rng.choice(shared) + "".join(rng.choices("xyz", k=rng.randint(0, 3000)))
++        reqs.append((text, rng.choice((0, 0, 100)), [rng.randint(0, 40) for _ in range(3)]))
++
++    def new() -> Router:
++        return Router(["a", "b", "c"], max_tree_chars=200_000, sticky_chars=1_000)
++
++    a, b = new(), new()
++    want = []
++    for text, head, load in reqs:
++        a.load = list(load)
++        want.append(a.pick(text, head=head))
++
++    async def main() -> list[int]:
++        got = []
++        for text, head, load in reqs:
++            b.load = list(load)
++            got.append(await b.pick_off_loop(text, head=head))
++        return got
++
++    assert asyncio.run(main()) == want
++    assert a.routed == b.routed and [t.size for t in a.trees] == [t.size for t in b.trees]
++    assert len(set(want)) > 1  # the sequence exercises more than one rule
++
++
++def test_the_prefix_trees_are_walked_off_the_event_loop(monkeypatch):
++    """A sessionless request's match and insert walk its text character by character (~300 ms for 1.1 MB, ~250K
++    tokens): on the router's event loop, they stalled every stream it relays. Through the app, both run in another
++    thread than the loop's."""
++    import asyncio
++    import threading
++
++    import httpx
++
++    from trnrt.serve import router as router_mod
++
++    threads: list[tuple[str, int | None]] = []
++    real_match, real_insert = router_mod.PrefixTree.match, router_mod.PrefixTree.insert
++
++    def match(self, s):
++        threads.append(("match", threading.get_ident()))
++        return real_match(self, s)
++
++    def insert(self, s):
++        threads.append(("insert", threading.get_ident()))
++        return real_insert(self, s)
++
++    monkeypatch.setattr(router_mod.PrefixTree, "match", match)
++    monkeypatch.setattr(router_mod.PrefixTree, "insert", insert)
++
++    async def main() -> int:
++        ports = [_free_port() for _ in range(3)]
++        router = Router([f"http://127.0.0.1:{p}" for p in ports[:2]])
++        servers, tasks = await _start(
++            [
++                (_stub_worker(0), ports[0]),
++                (_stub_worker(1), ports[1]),
++                (router_mod.build_router_app(router, poll_s=0), ports[2]),
++            ]
++        )
++        try:
++            async with httpx.AsyncClient(timeout=30) as c:
++                for stream in (False, True):
++                    body = {"messages": [{"role": "user", "content": "hello " * 1000}], "stream": stream}
++                    r = await c.post(f"http://127.0.0.1:{ports[2]}/v1/chat/completions", json=body)
++                    assert r.status_code == 200, r.text
++        finally:
++            await _stop(servers, tasks)
++        return threading.get_ident()
++
++    loop_thread = asyncio.run(main())
++    assert {k for k, _ in threads} == {"match", "insert"}
++    assert all(t != loop_thread for _, t in threads), threads
++
++
+ def test_a_plain_client_that_disconnects_from_the_router_aborts_its_request_on_the_worker():
+     """A non-streaming request: the worker aborts a request whose client disconnects (serve/api.py), but behind the
+     router its client is the router's pooled connection, which stayed open, so the worker generated to max_tokens and
+diff --git a/trnrt/serve/router.py b/trnrt/serve/router.py
+index 907067d..3085e1b 100644
+--- a/trnrt/serve/router.py
++++ b/trnrt/serve/router.py
+@@ -68,6 +68,7 @@
+ import hashlib
+ import json
+ import os
++import threading
+ import time
+ 
+ import httpx
+@@ -220,6 +221,11 @@ def __init__(
+         self.kv_used: list[float | None] = [None] * len(
+             workers
+         )  # KV pages in use / total, from the worker's /v1/stats; None unknown
++        # The prefix trees are matched and inserted in worker threads (pick_off_loop): the threading lock guards the
++        # trees, the asyncio lock orders the requests from match to insert.
++        self._trees_lock = threading.Lock()
++        self._pick_lock: asyncio.Lock | None = None
++        self._pick_loop: asyncio.AbstractEventLoop | None = None
+ 
+     @staticmethod
+     def session_of(body: dict) -> str | None:
+@@ -365,8 +371,41 @@ def pick(
+         request's _session_key and whether it sends tools (pick_keyed)."""
+         if session is not None:
+             return self.pick_keyed(session, key, tools)
++        w = self._decide(text, head, self._matches(text))
++        with self._trees_lock:
++            self.trees[w].insert(text)
++        return w
++
++    async def pick_off_loop(
++        self, text: str, session: str | None = None, head: int = 0, key: tuple | None = None, tools: bool = False
++    ) -> int:
++        """pick, with the prefix trees' match and insert in a worker thread: both walk the request text character by
++        character in Python, 35 ms at 0.14 MB of text and ~300 ms at 1.1 MB (~250K tokens), which on the event loop
++        stalled every stream the router relays. The decision itself stays on the event loop, with the rest of the
++        router's state. One request at a time, in arrival order (_pick_lock), from its match to its insert: the routing
++        is pick's, request for request. A session request touches no tree and is picked at once."""
++        if session is not None:
++            return self.pick_keyed(session, key, tools)
++        loop = asyncio.get_running_loop()
++        if self._pick_lock is None or self._pick_loop is not loop:  # an asyncio lock serves one event loop
++            self._pick_lock, self._pick_loop = asyncio.Lock(), loop
++        async with self._pick_lock:
++            matches = await asyncio.to_thread(self._matches, text)
++            w = self._decide(text, head, matches)
++            await asyncio.to_thread(self._insert, w, text)
++        return w
++
++    def _matches(self, text: str) -> list[int]:
++        with self._trees_lock:
++            return [t.match(text) for t in self.trees]
++
++    def _insert(self, w: int, text: str) -> None:
++        with self._trees_lock:  # a cancelled request's thread may still be running when the next request's starts
++            self.trees[w].insert(text)
++
++    def _decide(self, text: str, head: int, matches: list[int]) -> int:
++        """The sessionless policy (the module docstring), from each worker's tree match."""
+         live = self._live()
+-        matches = [t.match(text) for t in self.trees]
+         best = max(live, key=lambda i: (matches[i], -self.load[i]))
+         lo, hi = min(self.load), max(self.load)
+         if matches[best] >= head + self.sticky_chars:
+@@ -386,7 +425,6 @@ def pick(
+             # worker that receives a request is pruned back below the other one's size, so it wins the next request
+             # too, and only the balance rule (an imbalance over balance_abs) ever sends one elsewhere.
+             w = min(live, key=lambda i: (self.load[i], self.trees[i].size))
+-        self.trees[w].insert(text)
+         return w
+ 
+     def status(self) -> str:
+@@ -457,6 +495,10 @@ def _request_text(path: str, body: dict) -> str:
+     return p if isinstance(p, str) else json.dumps(p)
+ 
+ 
++def _request_text_head(path: str, body: dict) -> tuple[str, int]:
++    return _request_text(path, body), _request_head(path, body)
++
++
+ async def _json_object(http: Request) -> dict:
+     """The request's JSON object; 400 for anything else, as each engine answers (serve/api.py, _body). Without this, a
+     malformed body or a JSON array raised inside the proxy and the router answered 500."""
+@@ -576,13 +618,13 @@ async def proxy(path: str, http: Request):
+         sid = router.session_of(body)
+         key = _session_key(path, body) if sid is not None else None
+         tools = bool(body.get("tools"))
+-        w = router.pick(
+-            _request_text(path, body) if sid is None else "",
+-            session=sid,
+-            head=_request_head(path, body) if sid is None else 0,
+-            key=key,
+-            tools=tools,
+-        )
++        # The request's text (json.dumps of its messages, ~6 ms at 1 MB) is computed off the event loop too.
++        text, head = await asyncio.to_thread(_request_text_head, path, body) if sid is None else ("", 0)
++
++        async def pick() -> int:
++            return await router.pick_off_loop(text, session=sid, head=head, key=key, tools=tools)
++
++        w = await pick()
+         # An unreachable worker, or one that answers 503 (a failed engine refuses every request before it queues it,
+         # serve/api.py): note it, re-pick once (a session fails over if it went down).
+         for attempt in (0, 1):
+@@ -607,13 +649,7 @@ async def proxy(path: str, http: Request):
+                 router.note_failure(w, hard=isinstance(e, httpx.ConnectError))  # refused: a dead port
+                 if attempt == 1 or all(not ok for ok in router.up):
+                     raise HTTPException(status_code=503, detail=f"worker {w} unreachable") from e
+-                w = router.pick(
+-                    _request_text(path, body) if sid is None else "",
+-                    session=sid,
+-                    head=_request_head(path, body) if sid is None else 0,
+-                    key=key,
+-                    tools=tools,
+-                )
++                w = await pick()
+                 continue
+             except BaseException:
+                 router.load[w] -= 1
+@@ -623,13 +659,7 @@ async def proxy(path: str, http: Request):
+                 router.note_failure(w, hard=True)
+                 if attempt == 1 or all(not ok for ok in router.up):
+                     return Response(r.content, status_code=503, media_type=r.headers.get("content-type"))
+-                w = router.pick(
+-                    _request_text(path, body) if sid is None else "",
+-                    session=sid,
+-                    head=_request_head(path, body) if sid is None else 0,
+-                    key=key,
+-                    tools=tools,
+-                )
++                w = await pick()
+                 continue
+             break
+         if body.get("stream"):

@@ -1,0 +1,191 @@
+diff --git a/app/controllers/WKRemoteWorkerController.scala b/app/controllers/WKRemoteWorkerController.scala
+index 45a4a902e0f..aa70e31c0f1 100644
+--- a/app/controllers/WKRemoteWorkerController.scala
++++ b/app/controllers/WKRemoteWorkerController.scala
+@@ -54,14 +54,14 @@ class WKRemoteWorkerController @Inject() (
+ 
+   private def reserveNextJobs(worker: Worker, pendingIterationCount: Int): Fox[Unit] =
+     for {
+-      unfinishedHighPriorityCount <- jobDAO.countUnfinishedByWorker(worker._id, JobCommand.highPriorityJobs)
+-      unfinishedLowPriorityCount <- jobDAO.countUnfinishedByWorker(worker._id, JobCommand.lowPriorityJobs)
+-      pendingHighPriorityCount <- jobDAO.countUnassignedPendingForDataStore(
+-        worker._dataStore,
+-        JobCommand.highPriorityJobs.intersect(worker.supportedJobCommands)
++      (unfinishedHighPriorityCount, unfinishedLowPriorityCount) <- jobDAO.countUnfinishedByWorker(
++        worker._id,
++        JobCommand.highPriorityJobs,
++        JobCommand.lowPriorityJobs
+       )
+-      pendingLowPriorityCount <- jobDAO.countUnassignedPendingForDataStore(
++      (pendingHighPriorityCount, pendingLowPriorityCount) <- jobDAO.countUnassignedPendingForDataStore(
+         worker._dataStore,
++        JobCommand.highPriorityJobs.intersect(worker.supportedJobCommands),
+         JobCommand.lowPriorityJobs.intersect(worker.supportedJobCommands)
+       )
+       mayAssignHighPriorityJob =
+diff --git a/app/models/job/Job.scala b/app/models/job/Job.scala
+index 86114c23441..b35e187eea1 100644
+--- a/app/models/job/Job.scala
++++ b/app/models/job/Job.scala
+@@ -145,9 +145,17 @@ class JobDAO @Inject() (sqlClient: SqlClient)(implicit ec: ExecutionContext)
+       )
+      """
+ 
++  // Own jobs, plus all jobs of the organization the requesting user is admin of.
++  // Phrased as a set of owner ids (instead of looking up each job owner’s organization) so that
++  // the planner can fetch the matching jobs via the _owner index instead of scanning all jobs.
+   private def listAccessQ(requestingUserId: ObjectId, prefix: SqlToken) =
+-    q"""${prefix}_owner = $requestingUserId OR
+-         ((SELECT u._organization FROM webknossos.users_ u WHERE u._id = ${prefix}_owner) IN (SELECT _organization FROM webknossos.users_ WHERE _id = $requestingUserId AND isAdmin))
++    q"""${prefix}_owner IN (
++          SELECT $requestingUserId::TEXT
++          UNION ALL
++          SELECT orgUser._id
++          FROM webknossos.users_ orgUser
++          WHERE orgUser._organization IN (SELECT _organization FROM webknossos.users_ WHERE _id = $requestingUserId AND isAdmin)
++        )
+        """
+ 
+   def findAllCompact(commandOpt: Option[JobCommand], skipForDeletedDatasets: Boolean)(using
+@@ -232,33 +240,43 @@ class JobDAO @Inject() (sqlClient: SqlClient)(implicit ec: ExecutionContext)
+             """.asUpdate)
+     } yield ()
+ 
+-  def countUnassignedPendingForDataStore(dataStoreName: String, jobCommands: Set[JobCommand]): Fox[Int] =
+-    if (jobCommands.isEmpty) Fox.successful(0)
+-    else {
+-      for {
+-        r <- run(q"""SELECT COUNT(*) from $existingCollectionName
+-                   WHERE state = ${JobState.PENDING}
+-                   AND command IN ${SqlToken.tupleFromList(jobCommands)}
+-                   AND manualState IS NULL
+-                   AND _dataStore = $dataStoreName
+-                   AND _worker IS NULL""".as[Int])
+-        head <- r.headOption.toFox
+-      } yield head
+-    }
++  private def commandInQ(jobCommands: Set[JobCommand]): SqlToken =
++    if (jobCommands.isEmpty) q"FALSE" else q"command IN ${SqlToken.tupleFromList(jobCommands)}"
+ 
+-  def countUnfinishedByWorker(workerId: ObjectId, jobCommands: Set[JobCommand]): Fox[Int] =
+-    if (jobCommands.isEmpty) Fox.successful(0)
+-    else {
+-      for {
+-        r <- run(q"""SELECT COUNT(*)
+-                     FROM $existingCollectionName
+-                     WHERE _worker = $workerId
+-                     AND state IN ${SqlToken.tupleFromValues(JobState.PENDING, JobState.STARTED)}
+-                     AND command IN ${SqlToken.tupleFromList(jobCommands)}
+-                     AND manualState IS NULL""".as[Int])
+-        head <- r.headOption.toFox
+-      } yield head
+-    }
++  // Returns the counts for both command sets with a single query
++  def countUnassignedPendingForDataStore(
++      dataStoreName: String,
++      jobCommandsA: Set[JobCommand],
++      jobCommandsB: Set[JobCommand]
++  ): Fox[(Int, Int)] =
++    for {
++      r <- run(q"""SELECT COUNT(*) FILTER (WHERE ${commandInQ(jobCommandsA)}),
++                          COUNT(*) FILTER (WHERE ${commandInQ(jobCommandsB)})
++                 FROM $existingCollectionName
++                 WHERE state = ${JobState.PENDING}
++                 AND ${commandInQ(jobCommandsA ++ jobCommandsB)}
++                 AND manualState IS NULL
++                 AND _dataStore = $dataStoreName
++                 AND _worker IS NULL""".as[(Int, Int)])
++      head <- r.headOption.toFox
++    } yield head
++
++  // Returns the counts for both command sets with a single query
++  def countUnfinishedByWorker(
++      workerId: ObjectId,
++      jobCommandsA: Set[JobCommand],
++      jobCommandsB: Set[JobCommand]
++  ): Fox[(Int, Int)] =
++    for {
++      r <- run(q"""SELECT COUNT(*) FILTER (WHERE ${commandInQ(jobCommandsA)}),
++                          COUNT(*) FILTER (WHERE ${commandInQ(jobCommandsB)})
++                   FROM $existingCollectionName
++                   WHERE _worker = $workerId
++                   AND state IN ${SqlToken.tupleFromValues(JobState.PENDING, JobState.STARTED)}
++                   AND ${commandInQ(jobCommandsA ++ jobCommandsB)}
++                   AND manualState IS NULL""".as[(Int, Int)])
++      head <- r.headOption.toFox
++    } yield head
+ 
+   def findAllUnfinishedByWorker(workerId: ObjectId): Fox[List[Job]] =
+     for {
+diff --git a/schema/evolutions/188-job-query-indices.sql b/schema/evolutions/188-job-query-indices.sql
+new file mode 100644
+index 00000000000..d02bf537260
+--- /dev/null
++++ b/schema/evolutions/188-job-query-indices.sql
+@@ -0,0 +1,15 @@
++START TRANSACTION;
++
++do $$ begin if (select schemaVersion from webknossos.releaseInformation) <> 187 then raise exception 'Previous schema version mismatch'; end if; end; $$ language plpgsql;
++
++-- Job list: fetch the jobs of the requesting user / of their organization’s users instead of scanning all jobs.
++CREATE INDEX ON webknossos.jobs(_owner);
++
++-- Job worker polling: serves the per-worker unfinished/cancelling lookups and the unassigned-pending counts
++-- (_worker IS NULL) with all predicates as index conditions. Supersedes the plain _worker index.
++CREATE INDEX ON webknossos.jobs(_worker, manualState, state);
++DROP INDEX IF EXISTS webknossos.jobs__worker_idx;
++
++UPDATE webknossos.releaseInformation SET schemaVersion = 188;
++
++COMMIT TRANSACTION;
+diff --git a/schema/evolutions/reversions/188-job-query-indices.sql b/schema/evolutions/reversions/188-job-query-indices.sql
+new file mode 100644
+index 00000000000..4e5f7e34ca6
+--- /dev/null
++++ b/schema/evolutions/reversions/188-job-query-indices.sql
+@@ -0,0 +1,11 @@
++START TRANSACTION;
++
++do $$ begin if (select schemaVersion from webknossos.releaseInformation) <> 188 then raise exception 'Previous schema version mismatch'; end if; end; $$ language plpgsql;
++
++CREATE INDEX ON webknossos.jobs(_worker);
++DROP INDEX IF EXISTS webknossos.jobs__worker_manualstate_state_idx;
++DROP INDEX IF EXISTS webknossos.jobs__owner_idx;
++
++UPDATE webknossos.releaseInformation SET schemaVersion = 187;
++
++COMMIT TRANSACTION;
+diff --git a/schema/schema.sql b/schema/schema.sql
+index 97464e5f11b..13ea4aedcf7 100644
+--- a/schema/schema.sql
++++ b/schema/schema.sql
+@@ -21,7 +21,7 @@ CREATE TABLE webknossos.releaseInformation (
+   schemaVersion BIGINT NOT NULL
+ );
+ 
+-INSERT INTO webknossos.releaseInformation(schemaVersion) values(187);
++INSERT INTO webknossos.releaseInformation(schemaVersion) values(188);
+ COMMIT TRANSACTION;
+ 
+ 
+@@ -949,7 +949,8 @@ CREATE INDEX ON webknossos.folder_allowedTeams(_team);
+ CREATE INDEX ON webknossos.annotation_sharedTeams(_team);
+ CREATE INDEX ON webknossos.folder_paths(_descendant);
+ CREATE INDEX ON webknossos.jobs(state, _dataStore, created);
+-CREATE INDEX ON webknossos.jobs(_worker);
++CREATE INDEX ON webknossos.jobs(_worker, manualState, state);
++CREATE INDEX ON webknossos.jobs(_owner);
+ CREATE INDEX ON webknossos.credit_transactions(_paid_job);
+ CREATE INDEX ON webknossos.credit_transactions(_organization);
+ 
+diff --git a/unreleased_changes/10232.md b/unreleased_changes/10232.md
+new file mode 100644
+index 00000000000..a1eeb99d3bf
+--- /dev/null
++++ b/unreleased_changes/10232.md
+@@ -0,0 +1,5 @@
++### Changed
++- Improved the performance of the jobs list and of the job polling by workers.
++
++### Postgres Evolutions
++- [188-job-query-indices.sql](schema/evolutions/188-job-query-indices.sql)

@@ -1,0 +1,244 @@
+diff --git a/src/resolve_attempt_udp.cpp b/src/resolve_attempt_udp.cpp
+index 203e2a64..08e5a9ba 100644
+--- a/src/resolve_attempt_udp.cpp
++++ b/src/resolve_attempt_udp.cpp
+@@ -19,10 +19,11 @@ resolve_attempt_udp::resolve_attempt_udp(asio::io_context &io, const udp &protoc
+ 	const std::vector<udp::endpoint> &targets, const std::string &query, resolver_impl &resolver,
+ 	double cancel_after)
+ 	: io_(io), resolver_(resolver), cancel_after_(cancel_after), cancelled_(false),
+-	  targets_(targets), query_(query), unicast_socket_(io), broadcast_socket_(io),
+-	  multicast_socket_(io), multicast_interfaces(api_config::get_instance()->multicast_interfaces),
+-	  recv_socket_(io), cancel_timer_(io) {
+-	// open the sockets that we might need
++	  targets_(targets), query_(query),
++	  multicast_interfaces(api_config::get_instance()->multicast_interfaces), recv_socket_(io),
++	  cancel_timer_(io) {
++	// Open the single socket used for BOTH sending queries and receiving replies, so that the
++	// query's source port matches the return port we advertise in it (see header / 1a).
+ 	recv_socket_.open(protocol);
+ 	try {
+ 		bind_port_in_range(recv_socket_, protocol);
+@@ -32,20 +33,14 @@ resolve_attempt_udp::resolve_attempt_udp(asio::io_context &io, const udp &protoc
+ 			"%s",
+ 			e.what());
+ 	}
+-	unicast_socket_.open(protocol);
+-	try {
+-		broadcast_socket_.open(protocol);
+-		broadcast_socket_.set_option(asio::socket_base::broadcast(true));
+-	} catch (std::exception &e) {
+-		LOG_F(WARNING, "Cannot open UDP broadcast socket for resolves: %s", e.what());
+-	}
+-	try {
+-		multicast_socket_.open(protocol);
+-		multicast_socket_.set_option(
+-			asio::ip::multicast::hops(api_config::get_instance()->multicast_ttl()));
+-	} catch (std::exception &e) {
+-		LOG_F(WARNING, "Cannot open UDP multicast socket for resolves: %s", e.what());
+-	}
++	// The receive socket must also be able to send to broadcast addresses and to carry the
++	// multicast TTL, since it now sends every flavor of query (unicast / broadcast / multicast).
++	asio::error_code ec;
++	recv_socket_.set_option(asio::socket_base::broadcast(true), ec);
++	if (ec) LOG_F(WARNING, "Cannot enable broadcast on the resolve socket: %s", ec.message().c_str());
++	recv_socket_.set_option(
++		asio::ip::multicast::hops(api_config::get_instance()->multicast_ttl()), ec);
++	if (ec) LOG_F(WARNING, "Cannot set the multicast TTL on the resolve socket: %s", ec.message().c_str());
+ 
+ 	// precalc the query id (hash of the query string, as string)
+ 	query_id_ = std::to_string(std::hash<std::string>()(query));
+@@ -166,21 +161,17 @@ void resolve_attempt_udp::send_next_query(
+ 		if (mcit->addr.is_v4() != (proto == asio::ip::udp::v4()))
+ 			next = targets_.end();
+ 		else
+-			multicast_socket_.set_option(mcit->addr.is_v4() ? outbound_interface(mcit->addr.to_v4())
+-															: outbound_interface(mcit->ifindex));
++			recv_socket_.set_option(mcit->addr.is_v4() ? outbound_interface(mcit->addr.to_v4())
++													   : outbound_interface(mcit->ifindex));
+ 	}
+ 	if (next != targets_.end()) {
+ 		udp::endpoint ep(*next++);
+ 		// endpoint matches our active protocol?
+ 		if (ep.protocol() == recv_socket_.local_endpoint().protocol()) {
+-			// select socket to use
+-			udp_socket &sock =
+-				(ep.address() == asio::ip::address_v4::broadcast())
+-					? broadcast_socket_
+-					: (ep.address().is_multicast() ? multicast_socket_ : unicast_socket_);
+-			// and send the query over it
++			// Send every query (unicast / broadcast / multicast) from the receive socket so the
++			// datagram source port equals the advertised return port (firewall-friendly; 1a).
+ 			auto keepalive(shared_from_this());
+-			sock.async_send_to(asio::buffer(query_msg_), ep,
++			recv_socket_.async_send_to(asio::buffer(query_msg_), ep,
+ 				[shared_this = shared_from_this(), next, mcit](err_t err, size_t /*unused*/) {
+ 					if (!shared_this->cancelled_ && err != asio::error::operation_aborted &&
+ 						err != asio::error::not_connected && err != asio::error::not_socket)
+@@ -197,9 +188,6 @@ void resolve_attempt_udp::send_next_query(
+ void resolve_attempt_udp::do_cancel() {
+ 	try {
+ 		cancelled_ = true;
+-		if (unicast_socket_.is_open()) unicast_socket_.close();
+-		if (multicast_socket_.is_open()) multicast_socket_.close();
+-		if (broadcast_socket_.is_open()) broadcast_socket_.close();
+ 		if (recv_socket_.is_open()) recv_socket_.close();
+ 		cancel_timer_.cancel();
+ 	} catch (std::exception &e) {
+diff --git a/src/resolve_attempt_udp.h b/src/resolve_attempt_udp.h
+index c00181b1..1d75a174 100644
+--- a/src/resolve_attempt_udp.h
++++ b/src/resolve_attempt_udp.h
+@@ -120,15 +120,11 @@ class resolve_attempt_udp final : public cancellable_obj,
+ 	char resultbuf_[65536];
+ 
+ 	// IO objects
+-	/// socket to send data over (for unicasts)
+-	udp_socket unicast_socket_;
+-	/// socket to send data over (for broadcasts)
+-	udp_socket broadcast_socket_;
+-	/// socket to send data over (for multicasts)
+-	udp_socket multicast_socket_;
+ 	/// Interface addresses to send multicast packets from
+ 	const mcast_interface_list &multicast_interfaces;
+-	/// socket to receive replies (always unicast)
++	/// Socket used to BOTH send queries and receive replies. Sending from the receive socket
++	/// ensures the datagram's source port equals the return port advertised in the query, so a
++	/// stateful firewall sees a matching request/reply flow (see NETWORK_FAILURE_MODES.md 1a).
+ 	udp_socket recv_socket_;
+ 	/// timer to schedule the cancel action
+ 	steady_timer cancel_timer_;
+diff --git a/testing/CMakeLists.txt b/testing/CMakeLists.txt
+index 90928601..7a17bd26 100644
+--- a/testing/CMakeLists.txt
++++ b/testing/CMakeLists.txt
+@@ -107,6 +107,17 @@ add_executable(lsl_test_runtime_config int/runtime_config.cpp)
+ target_link_libraries(lsl_test_runtime_config PRIVATE lslobj lslboost common catch_main)
+ target_compile_definitions(lsl_test_runtime_config PRIVATE LIBLSL_EXPORTS)
+ 
++# resolve_query_port test sets the api_config singleton, so it lives in its own executable.
++add_executable(lsl_test_resolve_query_port int/resolve_query_port.cpp)
++target_link_libraries(lsl_test_resolve_query_port PRIVATE lslobj lslboost common catch_main)
++target_compile_definitions(lsl_test_resolve_query_port PRIVATE LIBLSL_EXPORTS)
++# Needs pugixml headers (resolver_impl.h -> stream_info_impl.h includes pugixml)
++if(LSL_PUGIXML_IS_FETCHED)
++    target_include_directories(lsl_test_resolve_query_port PRIVATE ${pugixml_SOURCE_DIR}/src)
++else()
++    target_link_libraries(lsl_test_resolve_query_port PRIVATE pugixml::pugixml)
++endif()
++
+ if(LSL_BENCHMARKS)
+ 	# to get somewhat reproducible performance numbers:
+ 	# /usr/bin/time -v testing/lsl_test_exported --benchmark-samples 100  bounce
+@@ -122,7 +133,7 @@ if(LSL_BENCHMARKS)
+ 	)
+ endif()
+ 
+-set(LSL_TESTS lsl_test_exported lsl_test_internal lsl_test_runtime_config)
++set(LSL_TESTS lsl_test_exported lsl_test_internal lsl_test_runtime_config lsl_test_resolve_query_port)
+ foreach(lsltest ${LSL_TESTS})
+ 	add_test(NAME ${lsltest} COMMAND ${lsltest} --wait-for-keypress never)
+ 	if(LSL_INSTALL)
+diff --git a/testing/int/resolve_query_port.cpp b/testing/int/resolve_query_port.cpp
+new file mode 100644
+index 00000000..d1bb5531
+--- /dev/null
++++ b/testing/int/resolve_query_port.cpp
+@@ -0,0 +1,98 @@
++#include "api_config.h"
++#include "resolver_impl.h"
++#include <asio/buffer.hpp>
++#include <asio/io_context.hpp>
++#include <asio/ip/address.hpp>
++#include <asio/ip/udp.hpp>
++#include <asio/steady_timer.hpp>
++#include <catch2/catch_test_macros.hpp>
++#include <chrono>
++#include <cstdint>
++#include <sstream>
++#include <string>
++#include <thread>
++
++using asio::ip::make_address;
++using asio::ip::udp;
++
++// Regression test for the resolver "firewall asymmetry" (NETWORK_FAILURE_MODES.md 1a).
++//
++// A resolve query advertises a return port in its payload but, before the fix, is
++// transmitted from a *different* socket (unicast_socket_) whose ephemeral source port
++// does not match. A stateful firewall therefore sees the outlet's reply (sent to the
++// advertised return port) as unsolicited inbound and drops it. The fix sends the query
++// *from* recv_socket_ so the datagram source port equals the advertised return port,
++// and the firewall sees a normal request/reply flow.
++//
++// We verify this deterministically, with NO firewall, by standing up a fake responder
++// on loopback :16571, capturing the query, and comparing the datagram source port to
++// the return port embedded in the payload.
++//
++// Sets the api_config singleton, so (like runtime_config) this lives in its own
++// executable to start from a fresh, uninitialized config.
++
++TEST_CASE("resolve query is sent from the advertised return port", "[resolver][network]") {
++	// Point discovery at loopback so the query lands on our fake responder, and pin to
++	// IPv4 so exactly one query stream is produced.
++	lsl::api_config::set_api_config_content(
++		"[ports]\n"
++		"IPv6 = disable\n"
++		"[multicast]\n"
++		"AddressesOverride = {127.0.0.1}\n"
++		"[lab]\n"
++		"SessionID = resolve_query_port_test\n");
++
++	const uint16_t multicast_port = lsl::api_config::get_instance()->multicast_port();
++
++	// --- fake responder bound to loopback :16571 ---
++	asio::io_context resp_io(1);
++	udp::socket responder(resp_io);
++	responder.open(udp::v4());
++	responder.set_option(udp::socket::reuse_address(true));
++	// Bind specifically to 127.0.0.1 so a more-specific match wins over any wildcard-bound
++	// LSL outlet that might already be running on this machine.
++	responder.bind(udp::endpoint(make_address("127.0.0.1"), multicast_port));
++
++	udp::endpoint sender;
++	char buf[2048] = {0};
++	bool received = false;
++	uint16_t datagram_source_port = 0;
++	uint16_t advertised_return_port = 0;
++
++	// Deadline first, so the receive handler can cancel it (declared before the handler
++	// that references it).
++	asio::steady_timer deadline(resp_io, std::chrono::seconds(3));
++	deadline.async_wait([&](const asio::error_code &) { responder.cancel(); });
++
++	responder.async_receive_from(asio::buffer(buf), sender,
++		[&](const asio::error_code &ec, std::size_t len) {
++			if (ec) return;
++			received = true;
++			datagram_source_port = sender.port();
++			// Payload (resolve_attempt_udp):
++			//   LSL:shortinfo\r\n
++			//   <query>\r\n
++			//   <return_port> <query_id>\r\n
++			std::istringstream req(std::string(buf, buf + len));
++			std::string method, query;
++			std::getline(req, method);
++			std::getline(req, query);
++			req >> advertised_return_port;
++			deadline.cancel(); // let resp_io.run() return promptly
++		});
++
++	// Drive a resolve in the background: it sends a query wave to 127.0.0.1:16571 and then
++	// times out (no real outlet to find).
++	std::thread resolver_thread([] {
++		lsl::resolver_impl resolver;
++		resolver.resolve_oneshot("session_id='resolve_query_port_test'", 1, 1.0);
++	});
++
++	resp_io.run(); // returns once a query is captured (or the deadline fires)
++	resolver_thread.join();
++
++	REQUIRE(received); // a query datagram reached our loopback responder
++	// Pre-fix (1a): source port != return port  -> this CHECK fails (pins the bug).
++	// Post-fix:     query sent from recv_socket_ -> they match.
++	CHECK(advertised_return_port == datagram_source_port);
++}

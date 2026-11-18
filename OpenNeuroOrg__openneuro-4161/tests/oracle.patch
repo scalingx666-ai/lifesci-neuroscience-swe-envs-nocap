@@ -1,0 +1,329 @@
+diff --git a/config.env.example b/config.env.example
+index 3e7519c6a..7d09efd25 100644
+--- a/config.env.example
++++ b/config.env.example
+@@ -74,6 +74,7 @@ ANALYSIS_ENABLED=true
+ 
+ DATALAD_WORKERS=1
+ DATALAD_DATASET_PATH=/datalad
++DATALAD_FSCK_MAX_MEMORY=2G
+ 
+ # GitHub user must have admin on the organization
+ DATALAD_GITHUB_EXPORTS_ENABLED=false
+diff --git a/helm/openneuro/templates/configmap.yaml b/helm/openneuro/templates/configmap.yaml
+index c51067c2a..d70ba9666 100644
+--- a/helm/openneuro/templates/configmap.yaml
++++ b/helm/openneuro/templates/configmap.yaml
+@@ -14,6 +14,7 @@ data:
+   GRAPHQL_ENDPOINT: http://{{ .Release.Name }}-api:8111/crn/graphql
+   DATALAD_SERVICE_URI: {{ .Release.Name }}-dataset-worker
+   DATALAD_DATASET_PATH: "/datasets"
++  DATALAD_FSCK_MAX_MEMORY: {{ .Values.dataladFsckMaxMemory | default "2G" | quote }}
+   LOCPATH: ""
+   OPENNEURO_VERSION: {{ .Chart.AppVersion }}
+   SENTRY_DSN: {{ .Values.sentryDsn }}
+diff --git a/helm/openneuro/values-production.yaml b/helm/openneuro/values-production.yaml
+index 09d3d45d2..545d8064a 100644
+--- a/helm/openneuro/values-production.yaml
++++ b/helm/openneuro/values-production.yaml
+@@ -42,6 +42,7 @@ apiMemoryRequests: 1Gi
+ workerCpuRequests: 2
+ workerFalconMemoryRequests: 4Gi
+ workerTaskiqMemoryRequests: 24Gi
++dataladFsckMaxMemory: 8G
+ 
+ # Nginx resource configuration
+ webCpuRequests: 0.1
+diff --git a/helm/openneuro/values.yaml b/helm/openneuro/values.yaml
+index 37ce16193..516a46118 100644
+--- a/helm/openneuro/values.yaml
++++ b/helm/openneuro/values.yaml
+@@ -43,6 +43,7 @@ apiMemoryRequests: 0.5Gi
+ workerCpuRequests: 0.5
+ workerFalconMemoryRequests: 1Gi
+ workerTaskiqMemoryRequests: 4Gi
++dataladFsckMaxMemory: 2G
+ 
+ # Nginx resource configuration
+ webCpuRequests: 0.25
+diff --git a/services/datalad/datalad_service/config.py b/services/datalad/datalad_service/config.py
+index d7241ff79..f55bfd08b 100644
+--- a/services/datalad/datalad_service/config.py
++++ b/services/datalad/datalad_service/config.py
+@@ -9,6 +9,7 @@
+ DATALAD_GITHUB_TOKEN = os.getenv('DATALAD_GITHUB_TOKEN')
+ DATALAD_GITHUB_EXPORTS_ENABLED = os.getenv('DATALAD_GITHUB_EXPORTS_ENABLED')
+ DATALAD_DATASET_PATH = os.getenv('DATALAD_DATASET_PATH')
++DATALAD_FSCK_MAX_MEMORY = os.getenv('DATALAD_FSCK_MAX_MEMORY', '2G')
+ 
+ # Configuration shared with OpenNeuro or AWS CLI
+ AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+diff --git a/services/datalad/datalad_service/tasks/fsck.py b/services/datalad/datalad_service/tasks/fsck.py
+index 1779fcdb7..4fd18a71a 100644
+--- a/services/datalad/datalad_service/tasks/fsck.py
++++ b/services/datalad/datalad_service/tasks/fsck.py
+@@ -1,12 +1,50 @@
+ import json
+ import asyncio
+ import logging
++import re
++import resource
+ 
+ import pygit2
+ 
++from datalad_service import config
+ from datalad_service.broker import broker
+ from datalad_service.common.openneuro import update_file_check
+ 
++_MEMORY_UNITS = {
++    '': 1,
++    'k': 1024,
++    'm': 1024**2,
++    'g': 1024**3,
++    't': 1024**4,
++}
++
++
++def parse_memory_limit(value):
++    """Parse a human-readable memory size (e.g. '2G', '512M', '8Gi') into bytes."""
++    if not value:
++        return None
++    match = re.fullmatch(r'\s*(\d+)\s*([kmgt]?)(?:i?b?)?\s*', str(value), re.IGNORECASE)
++    if not match:
++        raise ValueError(f'Invalid memory limit: {value!r}')
++    amount, unit = match.groups()
++    return int(amount) * _MEMORY_UNITS[unit.lower()]
++
++
++def _memory_limit_preexec():
++    """Return a preexec_fn that sets RLIMIT_DATA for the child process."""
++    limit_bytes = parse_memory_limit(config.DATALAD_FSCK_MAX_MEMORY)
++    if not limit_bytes:
++        return None
++
++    def _apply_rlimit():
++        _, hard = resource.getrlimit(resource.RLIMIT_DATA)
++        new_hard = (
++            limit_bytes if hard == resource.RLIM_INFINITY else min(limit_bytes, hard)
++        )
++        resource.setrlimit(resource.RLIMIT_DATA, (new_hard, new_hard))
++
++    return _apply_rlimit
++
+ 
+ def get_head_commit_and_references(repo):
+     """
+@@ -43,16 +81,25 @@ async def git_annex_fsck_local(dataset_path):
+         '--numcopies=1',
+     ]
+     annex_process = await asyncio.create_subprocess_exec(
+-        *annex_command, cwd=dataset_path, stdout=asyncio.subprocess.PIPE
++        *annex_command,
++        cwd=dataset_path,
++        stdout=asyncio.subprocess.PIPE,
++        preexec_fn=_memory_limit_preexec(),
+     )
+     bad_files = []
+-    async for annexed_file_json in annex_process.stdout:
+-        annexed_file = json.loads(annexed_file_json)
+-        if not annexed_file['success']:
+-            # Rename for GraphQL consistency
+-            annexed_file['errorMessages'] = annexed_file.pop('error-messages')
+-            bad_files.append(annexed_file)
+-    await annex_process.wait()
++    try:
++        async for annexed_file_json in annex_process.stdout:
++            annexed_file = json.loads(annexed_file_json)
++            if not annexed_file['success']:
++                # Rename for GraphQL consistency
++                annexed_file['errorMessages'] = annexed_file.pop('error-messages')
++                bad_files.append(annexed_file)
++    finally:
++        returncode = await annex_process.wait()
++    if returncode not in (0, 1) or (returncode == 1 and len(bad_files) == 0):
++        raise RuntimeError(
++            f'git-annex fsck failed for {dataset_path} with exit code {returncode}'
++        )
+     if len(bad_files) > 0:
+         logging.error(f'missing or corrupt annexed objects found in {dataset_path}')
+     update_file_check(dataset_path, commit, references, bad_files)
+@@ -80,17 +127,26 @@ async def git_annex_fsck_remote(dataset_path, branches, remote='s3-PUBLIC'):
+         '--json',
+         '--json-error-messages',
+         '--incremental-schedule=365d',
++        *[f'--branch={branch}' for branch in branches],
+     ]
+-    annex_command += [f'--branch={branch}' for branch in branches]
+     annex_process = await asyncio.create_subprocess_exec(
+-        *annex_command, cwd=dataset_path, stdout=asyncio.subprocess.PIPE
++        *annex_command,
++        cwd=dataset_path,
++        stdout=asyncio.subprocess.PIPE,
++        preexec_fn=_memory_limit_preexec(),
+     )
+     bad_files = []
+-    async for annexed_file_json in annex_process.stdout:
+-        annexed_file = json.loads(annexed_file_json)
+-        if not annexed_file['success']:
+-            bad_files.append(annexed_file)
+-    await annex_process.wait()
++    try:
++        async for annexed_file_json in annex_process.stdout:
++            annexed_file = json.loads(annexed_file_json)
++            if not annexed_file['success']:
++                bad_files.append(annexed_file)
++    finally:
++        returncode = await annex_process.wait()
++    if returncode not in (0, 1) or (returncode == 1 and len(bad_files) == 0):
++        raise RuntimeError(
++            f'git-annex fsck failed for {dataset_path} (remote={remote}) with exit code {returncode}'
++        )
+     update_file_check(dataset_path, commit, references, bad_files, remote)
+     if len(bad_files) > 0:
+         logging.error(
+diff --git a/services/datalad/tests/test_fsck.py b/services/datalad/tests/test_fsck.py
+new file mode 100644
+index 000000000..b59718d71
+--- /dev/null
++++ b/services/datalad/tests/test_fsck.py
+@@ -0,0 +1,140 @@
++import json
++import resource
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++from datalad_service import config
++from datalad_service.tasks.fsck import (
++    git_annex_fsck_local,
++    git_annex_fsck_remote,
++    parse_memory_limit,
++)
++
++
++class _AsyncLines:
++    def __init__(self, lines):
++        self._iter = iter(lines)
++
++    def __aiter__(self):
++        return self
++
++    async def __anext__(self):
++        try:
++            return next(self._iter)
++        except StopIteration:
++            raise StopAsyncIteration
++
++
++def _make_mock_process(lines, returncode=0):
++    proc = MagicMock()
++    proc.stdout = _AsyncLines(lines)
++    proc.wait = AsyncMock(return_value=returncode)
++    return proc
++
++
++def test_parse_memory_limit():
++    assert parse_memory_limit('2G') == 2 * 1024**3
++    assert parse_memory_limit('8Gi') == 8 * 1024**3
++    assert parse_memory_limit('512M') == 512 * 1024**2
++    assert parse_memory_limit('1024') == 1024
++    assert parse_memory_limit('') is None
++    assert parse_memory_limit(None) is None
++    with pytest.raises(ValueError):
++        parse_memory_limit('invalid')
++
++
++@pytest.mark.asyncio
++async def test_git_annex_fsck_local_sets_rlimit_data(new_dataset, monkeypatch):
++    monkeypatch.setattr(config, 'DATALAD_FSCK_MAX_MEMORY', '4G')
++    proc = _make_mock_process(
++        [json.dumps({'file': 'sub-01/T1w.nii.gz', 'success': True}).encode() + b'\n'],
++        returncode=0,
++    )
++    with (
++        patch(
++            'datalad_service.tasks.fsck.asyncio.create_subprocess_exec',
++            new=AsyncMock(return_value=proc),
++        ) as mock_exec,
++        patch('datalad_service.tasks.fsck.update_file_check') as mock_update,
++        patch(
++            'datalad_service.tasks.fsck.resource.getrlimit',
++            return_value=(resource.RLIM_INFINITY, resource.RLIM_INFINITY),
++        ),
++        patch('datalad_service.tasks.fsck.resource.setrlimit') as mock_setrlimit,
++    ):
++        await git_annex_fsck_local(new_dataset.path)
++        mock_exec.assert_called_once()
++        preexec_fn = mock_exec.call_args.kwargs['preexec_fn']
++        assert callable(preexec_fn)
++        preexec_fn()
++        expected = 4 * 1024**3
++        mock_setrlimit.assert_called_once_with(
++            resource.RLIMIT_DATA, (expected, expected)
++        )
++
++    mock_update.assert_called_once()
++    assert mock_update.call_args.args[3] == []
++
++
++@pytest.mark.asyncio
++async def test_git_annex_fsck_local_bad_files_exit_1(new_dataset):
++    bad_line = json.dumps(
++        {
++            'file': 'sub-01/T1w.nii.gz',
++            'key': 'SHA256E-s10--abc',
++            'success': False,
++            'error-messages': ['checksum mismatch'],
++        }
++    ).encode()
++    proc = _make_mock_process([bad_line], returncode=1)
++    with (
++        patch(
++            'datalad_service.tasks.fsck.asyncio.create_subprocess_exec',
++            new=AsyncMock(return_value=proc),
++        ),
++        patch('datalad_service.tasks.fsck.update_file_check') as mock_update,
++    ):
++        await git_annex_fsck_local(new_dataset.path)
++
++    mock_update.assert_called_once()
++    bad_files = mock_update.call_args.args[3]
++    assert len(bad_files) == 1
++    assert bad_files[0]['errorMessages'] == ['checksum mismatch']
++
++
++@pytest.mark.asyncio
++async def test_git_annex_fsck_local_raises_on_oom_crash(new_dataset):
++    # GHC RTS exits with 251 on out of memory
++    proc = _make_mock_process([], returncode=251)
++    with (
++        patch(
++            'datalad_service.tasks.fsck.asyncio.create_subprocess_exec',
++            new=AsyncMock(return_value=proc),
++        ),
++        patch('datalad_service.tasks.fsck.update_file_check') as mock_update,
++    ):
++        with pytest.raises(RuntimeError, match='exit code 251'):
++            await git_annex_fsck_local(new_dataset.path)
++
++    mock_update.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_git_annex_fsck_remote_sets_rlimit_and_raises_on_oom(
++    new_dataset, monkeypatch
++):
++    monkeypatch.setattr(config, 'DATALAD_FSCK_MAX_MEMORY', '2G')
++    proc = _make_mock_process([], returncode=251)
++    with (
++        patch(
++            'datalad_service.tasks.fsck.asyncio.create_subprocess_exec',
++            new=AsyncMock(return_value=proc),
++        ) as mock_exec,
++        patch('datalad_service.tasks.fsck.update_file_check') as mock_update,
++    ):
++        with pytest.raises(RuntimeError, match='exit code 251'):
++            await git_annex_fsck_remote(new_dataset.path, ['1.0.0'], 's3-PUBLIC')
++
++    assert callable(mock_exec.call_args.kwargs['preexec_fn'])
++    mock_update.assert_not_called()

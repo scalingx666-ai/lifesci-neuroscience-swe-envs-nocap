@@ -1,0 +1,115 @@
+diff --git a/src/stream_outlet_impl.cpp b/src/stream_outlet_impl.cpp
+index 279b3d7c..04e0635f 100644
+--- a/src/stream_outlet_impl.cpp
++++ b/src/stream_outlet_impl.cpp
+@@ -150,6 +150,12 @@ stream_outlet_impl::~stream_outlet_impl() {
+ 					[](const thread_p &thread) { return thread->joinable(); })) {
+ 				for (auto &thread : io_threads_) thread->join();
+ 				DLOG_F(INFO, "All of %s's IO threads were joined succesfully", name);
++				// stop() strands handlers (e.g. aborted async_accept) holding servers that own
++				// their io_context; run them or the outlet's resources leak (#312)
++				for (const auto &io : {io_ctx_data_, io_ctx_service_}) {
++					io->restart();
++					io->poll();
++				}
+ 				break;
+ 			}
+ 		}
+diff --git a/src/tcp_server.cpp b/src/tcp_server.cpp
+index 771b1c09..f6012b54 100644
+--- a/src/tcp_server.cpp
++++ b/src/tcp_server.cpp
+@@ -267,7 +267,8 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ public:
+ 	/// Instantiate a new session & its socket.
+ 	client_session(const tcp_server_p &serv, tcp_socket &&sock)
+-		: io_(serv->io_), serv_(serv), sock_(std::move(sock)), requeststream_(&requestbuf_) {}
++		: io_(serv->io_), factory_(serv->factory_), serv_(serv), sock_(std::move(sock)),
++		  requeststream_(&requestbuf_) {}
+ 
+ 	/// Destructor.
+ 	~client_session();
+@@ -310,6 +311,9 @@ class client_session : public std::enable_shared_from_this<client_session> {
+ 	/// shared pointer to IO service; ensures that the IO is still around by the time the serv_ and
+ 	/// sock_ need to be destroyed
+ 	io_context_p io_;
++	/// keeps the sample factory alive while the transfer thread or a handler still holds queued
++	/// samples, which can outlive the server and the outlet (#312)
++	factory_p factory_;
+ 	/// the server that is associated with this connection
+ 	std::weak_ptr<tcp_server> serv_;
+ 	/// connection socket
+diff --git a/testing/ext/outlet.cpp b/testing/ext/outlet.cpp
+index f183b23b..1d0a2feb 100644
+--- a/testing/ext/outlet.cpp
++++ b/testing/ext/outlet.cpp
+@@ -4,6 +4,10 @@
+ #include <lsl_cpp.h>
+ #include <thread>
+ 
++#ifndef _WIN32
++#include <fcntl.h>
++#endif
++
+ // clazy:excludeall=non-pod-global-static
+ 
+ namespace {
+@@ -136,4 +140,21 @@ TEST_CASE("have_consumers stays true when one of two inlets disconnects", "[outl
+ 	CHECK(wait_until_no_consumers(outlet, 2.0));
+ }
+ 
++#ifndef _WIN32
++TEST_CASE("destroying an outlet releases its io_context (#312)", "[outlet][basic]") {
++	const auto open_fds = []() {
++		int n = 0;
++		for (int fd = 0; fd < 4096; ++fd) n += fcntl(fd, F_GETFD) != -1;
++		return n;
++	};
++	lsl::stream_info info("teardown_leak", "EEG", 1, 100., lsl::cf_float32, "teardown_leak");
++	const auto cycle = [&info]() { lsl::stream_outlet outlet(info); };
++	cycle(); // warm up lazily created singletons
++	const int before = open_fds();
++	for (int i = 0; i < 10; ++i) cycle();
++	// each leaked data io_context keeps ~3 fds (reactor + interrupter) open
++	CHECK(open_fds() < before + 10);
++}
++#endif
++
+ } // namespace
+diff --git a/testing/int/tcpserver.cpp b/testing/int/tcpserver.cpp
+index c197d3a7..f5b9271e 100644
+--- a/testing/int/tcpserver.cpp
++++ b/testing/int/tcpserver.cpp
+@@ -2,6 +2,7 @@
+ #include "sample.h"
+ #include "send_buffer.h"
+ #include "stream_info_impl.h"
++#include "stream_outlet_impl.h"
+ #include "tcp_server.h"
+ #include "util/endian.hpp"
+ #include <asio/read.hpp>
+@@ -223,3 +224,24 @@ TEST_CASE("tcpserver_float", "[network]") {
+ 	tcp_server.run();
+ 	ctx.run();
+ }
++
++TEST_CASE("outlet teardown with a stalled consumer", "[network]") {
++	// A consumer that stops reading leaves the transfer thread waiting on a write with samples
++	// still queued; they must not be released into a destroyed factory (#312)
++	lsl::stream_info_impl info("TCP_stalled", "", 32, 1000., cft_float32, "stalled");
++	auto outlet = std::make_unique<lsl::stream_outlet_impl>(info, 0, 360);
++
++	asio::io_context ctx;
++	sock_t sock(ctx);
++	sock.open(tcp::v4());
++	sock.set_option(asio::socket_base::receive_buffer_size(4096));
++	sock.connect(tcp::endpoint(address_v4(0x7f000001), outlet->info().v4data_port()));
++	asio::write(sock, asio::buffer(std::string("LSL:streamfeed\r\n100000 0\r\n")));
++	REQUIRE(outlet->wait_for_consumers(2.));
++
++	std::vector<float> data(32);
++	for (int i = 0; i < 100000; ++i) outlet->push_sample(data);
++	outlet.reset();
++	// give the detached transfer thread time to drop its queue
++	std::this_thread::sleep_for(std::chrono::milliseconds(200));
++}

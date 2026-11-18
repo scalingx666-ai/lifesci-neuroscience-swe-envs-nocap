@@ -1,0 +1,60 @@
+# Issue
+
+**Title:** fix #258
+
+## Description
+
+- **removed duplicated function**
+- **make link checker happy**
+- **make linter happy**
+- **generalized the test**
+- **added packages to top**
+- **added precompilation**
+- **type stable designmatrix generation**
+- **removed suppressor,didnt work anyway**
+- **downgraded missing warning to info**
+- **removed suppressor**
+- **improve effects-speed by x10 (#310)**
+- **Update all-contributors link in Readme.md**
+- **format**
+- **fixed result_to_table test**
+- **test was broken before, now should be ok, related to #296**
+- **adapted test due to UnfoldSim 0.5 breaking change inhanning position**
+- **mhh... why is manifest checked in in the first place - no wonder it failed**
+- **fixed benchmark, update to UnfoldMixedModel**
+- **added a test that a warning is thrown, #285**
+- **benchmark works locally...**
+- **fix #265, added test for #296**
+- **fix #258 by adding char**
+
+<!--
+Thanks for making a pull request to Unfold.jl.
+We have added this PR template to help you help us.
+Make sure to read the contributing guidelines and abide by the code of conduct.
+See the comments below, fill the required fields, and check the items.
+-->
+
+## Related issues
+
+<!-- We normally work with (i) create issue; (ii) discussion if necessary; (iii) create PR. So, at least one of the following should be true:-->
+
+<!-- Option 1, this closes an existing issue. Fill the number below-->
+Closes #
+
+<!-- Option 2, this is a small fix that arguably won't need an issue. Uncomment below -->
+<!--
+There is no related issue.
+-->
+
+## Checklist
+
+<!-- mark true if NA -->
+<!-- leave PR as draft until all is checked -->
+- [ ] I am following the [contributing guidelines](https://github.com/unfoldtoolbox/Unfold.jl/blob/main/docs/src/90-contributing.md)
+- [ ] Tests are passing
+- [ ] Lint workflow is passing
+- [ ] Docs were updated and workflow is passing
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `6d5bc6f5b1f2`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,415 @@
+diff --git a/e2e_workflow/e2e_workflow.js b/e2e_workflow/e2e_workflow.js
+index 921032826..84a9dc9e6 100644
+--- a/e2e_workflow/e2e_workflow.js
++++ b/e2e_workflow/e2e_workflow.js
+@@ -147,6 +147,15 @@ const HEAD_PROTECT_PCT = parseFloat(A.head_protect_pct != null ? A.head_protect_
+ // integrated/stacked FIRST. Applied ONLY when FAST_MODE is on (see the heads[] construction below);
+ // default '' leaves every mode (default/fast/deep) byte-identical.
+ const HEAD_PRIORITY = String(A.head_priority != null ? A.head_priority : '').trim();
++// Corrective re-author: when a verified-isolated head winner is REJECTED at the e2e gate for a FIXABLE
++// integration reason (it ENGAGED live + beat the isolated oracle, only the integration POSTURE is wrong —
++// e.g. a JIT/DSL kernel lazily compiling in the TP>1 warmup -> NO_BINARY_FOR_GPU / cuda_graph_capture_unsafe,
++// or a host-sync that breaks capture), spend ONE cheap targeted fix-and-retry: optimize the EXISTING kernel
++// (keep the algorithm/iso win, fix only the integration), then re-run the e2e A/B once. This is NOT a new
++// head discovery, so it does NOT consume HEAD_BUDGET; it is bounded per head by HEAD_CORRECTIVE_MAX and is
++// skipped once the kernel-phase wall-clock deadline has fired. head_corrective_max=0 disables it.
++const HEAD_CORRECTIVE_MAX = parseInt(A.head_corrective_max != null ? A.head_corrective_max : 2, 10);
++const FIXABLE_REJECT_RX = /cuda_graph_capture_unsafe|no[_ ]?binary|NO_BINARY_FOR_GPU|hipErrorNoBinaryForGpu|capture[_ ]?(unsafe|hang)|host[_ ]?sync|graph[_ ]?capture/i;
+ // ---- DEEP MODE (opt-in, default OFF) ----------------------------------------------------------------
+ // A long, thorough HeadKernel mode that pursues SOTA per head op via CROSS-BACKEND CO-OPTIMIZATION:
+ // N backends optimize the SAME head op in parallel (one exclusive GPU lane each), continuously
+@@ -556,6 +565,81 @@ async function runIntegrateBothLegs(intro, inputs, label, phaseName) {
+   return integ;
+ }
+ 
++// Reusable CORRECTIVE RE-AUTHOR (general; used by every head-integration site, any mode). A head
++// candidate that PASSED the isolated oracle and ENGAGED live but was REJECTED at the e2e gate for a
++// FIXABLE integration reason (JIT/DSL kernel lazily compiling in TP>1 warmup -> NO_BINARY_FOR_GPU /
++// cuda_graph_capture_unsafe / capture hang / host-sync) earns up to HEAD_CORRECTIVE_MAX cheap fix-and-
++// retries: re-OPTIMIZE the EXISTING kernel (keep the algorithm + isolated win; fix only the integration
++// posture), then re-run the both-legs e2e A/B. This is NOT a new head discovery, so it does NOT consume
++// HEAD_BUDGET; it is bounded per head and skipped once the kernel-phase wall-clock deadline has fired.
++// spec: { short_name, op_kind, shapes, dtype, regime, gpu_id, kernel_eval_dir, task_dir, language,
++//         isolated, base_inputs (the integrate inputs template, carries KERNEL_RESULT), reason,
++//         cur:{overlay,flags,env,tput} }.  Returns { banked, integ, isolated } (banked=false if
++// ineligible or still rejected). See knowledge/learned/method-cudagraph-safe-integration.
++async function tryCorrectiveReauthor(spec) {
++  let reason = spec.reason || '';
++  const eligible = HEAD_CORRECTIVE_MAX > 0 && !((FAST_MODE && FAST_DEADLINE_HIT) || TIME_DEADLINE_HIT)
++    && (spec.kernel_eval_dir || spec.task_dir) && (spec.isolated || 0) > 1.0 && FIXABLE_REJECT_RX.test(reason);
++  if (!eligible) return { banked: false };
++  const curTput = (spec.cur && spec.cur.tput) || 0;
++  for (let cAttempt = 1; cAttempt <= HEAD_CORRECTIVE_MAX; cAttempt++) {
++    log(`  ${spec.short_name}: FIXABLE reject (${reason}) — corrective re-author ${cAttempt}/${HEAD_CORRECTIVE_MAX} (fix-and-retry the iso winner; NOT a new head, NOT charged to head_budget).`);
++    let fix;
++    try {
++      fix = await fastBoundedWorkflow({ scriptPath: KERNEL_WF_SCRIPT }, {
++        kernel_path: spec.kernel_eval_dir || spec.task_dir, workflow_dir: KERNEL_WF_DIR,
++        mode: 'optimize', target_language: spec.language || 'triton',
++        op_spec: { op_kind: spec.op_kind, shapes: spec.shapes || {}, dtype: spec.dtype || 'bf16', regime: spec.regime || '', cuda_graph_safe: true },
++        perf_knowledge_dir: KERNEL_KNOWLEDGE_DIR,
++        use_expert_skills: USE_EXPERT_SKILLS ? 'true' : 'false', expert_skills_dir: EXPERT_SKILLS_DIR,
++        budget: KERNEL_BUDGET, gpu_ids: spec.gpu_id, exp_root: `${EVAL_DIR}/kernels/_exp`,
++        task: `CORRECTIVE FIX — do NOT re-discover the algorithm; KEEP the ${(spec.isolated || 0).toFixed(2)}x isolated win. ` +
++          `This kernel PASSED the isolated oracle and ENGAGED on all live workers but was REJECTED at the e2e serving gate ` +
++          `for: "${reason}". Fix ONLY the integration posture per knowledge/learned/method-cudagraph-safe-integration: ` +
++          `precompile/register EVERY (shape-bucket × config) the LIVE workload hits — PREFILL buckets AND decode buckets, ` +
++          `every per-bucket tile/config the kernel selects — at WARMUP before capture (an *_overlay_precompile(weights, ` +
++          `scales, buckets) hook the integrator calls once, pre-capture) so ALL TP workers load a prebuilt code object ` +
++          `instead of lazily compiling in the multiproc warmup (the cause of NO_BINARY_FOR_GPU / capture hang). If the cause ` +
++          `is a host-sync (.item()/.cpu()/.sum().item()) on the hot path, remove it and cache weight prep by data_ptr(). ` +
++          `Keep the steady-state hot path host-sync-free. Emit a fixed final_patch. ` + GRAPH_REQ + (TASK || ''),
++        apply_to_original: 'false',
++      }, `${spec.short_name}:corrective`);
++    } catch (e) { fix = { authored: false, validation_status: 'error', reason: String(e) }; }
++    if (!fix || fix.authored === false || !(fix.final_geomean > 1.0) || !fix.final_patch) {
++      log(`  ${spec.short_name}: corrective re-author produced no usable kernel (${fix ? fix.reason || fix.validation_status : 'null'}).`);
++      return { banked: false };
++    }
++    // Re-gate the FIXED kernel. Preserve the caller's KERNEL_RESULT SHAPE (head=authored/code_patch,
++    // milestone=editable/final_patch) and only swap in the corrected patch + eval_dir + iso speedup, so the
++    // helper is track-agnostic. Set BOTH patch fields to the new patch — the integrator reads whichever
++    // matches its apply mode; leaving the other stale would re-apply the broken kernel.
++    const base = spec.base_inputs || {};
++    const fixInputs = { ...base,
++      KERNEL_RESULT: { ...(base.KERNEL_RESULT || {}),
++        code_patch: fix.final_patch, final_patch: fix.final_patch,
++        authored_kernel_eval_dir: fix.eval_dir || spec.kernel_eval_dir || (base.KERNEL_RESULT && base.KERNEL_RESULT.authored_kernel_eval_dir) || '',
++        verified_isolated_speedup: fix.final_geomean,
++        corrective_fix_of: reason } };
++    if (spec.cur) {
++      fixInputs.CURRENT_OVERLAY = spec.cur.overlay; fixInputs.CURRENT_FLAGS = spec.cur.flags;
++      fixInputs.CURRENT_ENV = spec.cur.env; fixInputs.CURRENT_THROUGHPUT = spec.cur.tput;
++    }
++    const integ2 = await runIntegrateBothLegs(
++      'Apply the CORRECTIVELY-FIXED kernel winner; gate on e2e throughput.', fixInputs,
++      `integrate ${spec.short_name} corrective`, spec.phase_name || 'HeadKernel');
++    const ab2 = !!(integ2 && integ2.gate !== 'incomplete' && integ2.ab_complete !== false);
++    if (ab2 && (integ2.gate === 'accepted' || integ2.gate === 'stack') && integ2.e2e_throughput_tok_s > curTput) {
++      return { banked: true, integ: integ2, isolated: fix.final_geomean };
++    }
++    reason = (integ2 && (integ2.reason || integ2.gate)) || reason;
++    log(`  ${spec.short_name}: corrective re-author still rejected (${reason}).`);
++    if (!FIXABLE_REJECT_RX.test(reason)) break;   // new failure not in the fixable class -> stop retrying
++    // Progressive: the NEXT attempt builds on this attempt's (partially) fixed kernel, not the original.
++    spec.kernel_eval_dir = fix.eval_dir || spec.kernel_eval_dir;
++  }
++  return { banked: false };
++}
++
+ // --- FAST-MODE wall-clock control (no-op unless FAST_MODE) -------------------------------------------
+ // Date.now()/new Date() are unavailable in workflow scripts (they would break resume), so the budget is
+ // enforced with setTimeout: (1) a one-shot deadline flag that stops the head loop from STARTING new ops,
+@@ -1029,8 +1113,34 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+           log(`  [deep] ${c.uid}: ACCEPTED. e2e now ${curTput} tok/s (+${integ.e2e_delta_pct}%); target ${Math.round(BASELINE_TPUT * DEEP_E2E_TARGET)} tok/s.`);
+           history.ledger.push({ direction: c.uid, isolated_speedup: c.best, e2e_delta_pct: integ.e2e_delta_pct, verdict: 'confirmed', lesson: integ.reason || '' });
+         } else {
+-          log(`  [deep] ${c.uid}: e2e gate ${integ ? integ.gate : 'none'} (${integ ? integ.reason || '' : 'integrate failed'}).`);
+-          history.ledger.push({ direction: c.uid, isolated_speedup: c.best, e2e_delta_pct: integ ? integ.e2e_delta_pct : 0, verdict: 'dead_end', lesson: integ ? integ.reason || 'no e2e gain' : 'integrate failed' });
++          const dreason = integ ? (integ.reason || integ.gate || '') : '';
++          // Corrective re-author (same general helper as the default path) for a FIXABLE deep reject.
++          const dcorr = await tryCorrectiveReauthor({
++            short_name: c.head.short_name, op_kind: c.ext.op_kind, shapes: c.ext.shapes, dtype: c.ext.dtype, regime: c.head.regime,
++            gpu_id: SERVING_GPU, kernel_eval_dir: c.lastEval, task_dir: c.ext.task_dir, language: c.lang,
++            isolated: c.best, reason: dreason,
++            base_inputs: {
++              EVAL_DIR, MODEL_PATH, GPU_ID: SERVING_GPU, WORKLOAD, NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS,
++              KERNEL_RESULT: {
++                short_name: c.head.short_name, task_dir: c.ext.task_dir, op_kind: c.ext.op_kind, lane: c.key,
++                winner_kind: 'patch', winner_backend: c.lang,
++                target_callable: c.ext.target_callable || c.head.target_callable || '',
++                authored_language: c.lang, authored_kernel_eval_dir: c.lastEval, apply_env: '', apply_flags: '',
++                code_patch: c.patch || '', tuning_artifact: '', verified_isolated_speedup: c.best,
++                pct_gpu_time: c.head.pct_gpu_time, parity_note: 'expected_close' },
++              SKILL_DIR: WORKFLOW_DIR, ...ACCURACY_INPUTS,
++            },
++            cur: { overlay: curOverlay, flags: curFlags, env: curEnv, tput: curTput },
++          });
++          if (dcorr.banked) {
++            curOverlay = dcorr.integ.accepted_overlay || curOverlay; curTput = dcorr.integ.e2e_throughput_tok_s; bankedHeads.add(c.head.short_name);
++            acceptedHeads.push({ short_name: c.head.short_name, op_kind: c.ext.op_kind, backend: c.lang, lane: c.key, kind: 'patch', e2e_delta_pct: dcorr.integ.e2e_delta_pct, isolated: dcorr.isolated, corrective: true });
++            log(`  [deep] ${c.uid}: ACCEPTED after corrective re-author. e2e now ${curTput} tok/s (+${dcorr.integ.e2e_delta_pct}%).`);
++            history.ledger.push({ direction: c.uid, isolated_speedup: dcorr.isolated, e2e_delta_pct: dcorr.integ.e2e_delta_pct, verdict: 'confirmed_corrective', lesson: `fixed: ${dreason}` });
++          } else {
++            log(`  [deep] ${c.uid}: e2e gate ${integ ? integ.gate : 'none'} (${integ ? integ.reason || '' : 'integrate failed'}).`);
++            history.ledger.push({ direction: c.uid, isolated_speedup: c.best, e2e_delta_pct: integ ? integ.e2e_delta_pct : 0, verdict: 'dead_end', lesson: integ ? integ.reason || 'no e2e gain' : 'integrate failed' });
++          }
+         }
+       }
+       const fb = await safeAgent(
+@@ -1315,8 +1425,35 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+         log(`  ${h.short_name}: ACCEPTED. e2e now ${curTput} tok/s (+${integ.e2e_delta_pct}%).`);
+         history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ.e2e_delta_pct, verdict: 'confirmed', lesson: integ.reason || '' });
+       } else {
+-        log(`  ${h.short_name}: REJECTED at e2e gate (${integ ? integ.reason || integ.gate : 'none'}).`);
+-        history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ ? integ.e2e_delta_pct : 0, verdict: 'dead_end', lesson: integ ? integ.reason || 'no e2e gain' : 'integrate failed' });
++        const reason = integ ? (integ.reason || integ.gate || '') : '';
++        const corr = (cand.kind === 'authored' && FIXABLE_REJECT_RX.test(reason))
++          ? await tryCorrectiveReauthor({
++              short_name: h.short_name, op_kind: st.ext.op_kind, shapes: st.ext.shapes, dtype: st.ext.dtype, regime: h.regime,
++              gpu_id: SERVING_GPU, kernel_eval_dir: cand.kernel_eval_dir, task_dir: st.ext.task_dir, language: cand.language,
++              isolated: cand.isolated, reason, phase_name: 'HeadKernel',
++              base_inputs: {
++                EVAL_DIR, MODEL_PATH, GPU_ID: SERVING_GPU, WORKLOAD, NOISE_BAND_PCT: NOISE_BAND, E2E_REPEATS,
++                KERNEL_RESULT: { short_name: h.short_name, task_dir: st.ext.task_dir, op_kind: st.ext.op_kind,
++                  winner_kind: cand.winner_kind, winner_backend: cand.source,
++                  target_callable: st.ext.target_callable || h.target_callable || '',
++                  authored_language: cand.language || '', authored_kernel_eval_dir: cand.kernel_eval_dir || '',
++                  apply_env: cand.apply_env || '', apply_flags: cand.apply_flags || '',
++                  code_patch: cand.code_patch || cand.final_patch || '', tuning_artifact: cand.tuning_artifact || '',
++                  verified_isolated_speedup: cand.isolated || 0, pct_gpu_time: h.pct_gpu_time, parity_note: 'expected_close' },
++                SKILL_DIR: WORKFLOW_DIR,
++              },
++              cur: { overlay: curOverlay, flags: curFlags, env: curEnv, tput: curTput },
++            })
++          : { banked: false };
++        if (corr.banked) {
++          curOverlay = corr.integ.accepted_overlay || curOverlay; curTput = corr.integ.e2e_throughput_tok_s;
++          acceptedHeads.push({ short_name: h.short_name, op_kind: st.ext.op_kind, backend: cand.source, kind: 'authored', e2e_delta_pct: corr.integ.e2e_delta_pct, isolated: corr.isolated, corrective: true });
++          log(`  ${h.short_name}: ACCEPTED after corrective re-author (${reason}). e2e now ${curTput} tok/s (+${corr.integ.e2e_delta_pct}%).`);
++          history.ledger.push({ direction: h.short_name, isolated_speedup: corr.isolated, e2e_delta_pct: corr.integ.e2e_delta_pct, verdict: 'confirmed_corrective', lesson: `fixed: ${reason}` });
++        } else {
++          log(`  ${h.short_name}: REJECTED at e2e gate (${reason}).`);
++          history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ ? integ.e2e_delta_pct : 0, verdict: 'dead_end', lesson: reason || 'no e2e gain' });
++        }
+       }
+     }
+   } else {
+@@ -1494,16 +1631,56 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
+       log(`  ${h.short_name}: ACCEPTED. e2e now ${curTput} tok/s (+${integ.e2e_delta_pct}%).`);
+       history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ.e2e_delta_pct, verdict: 'confirmed', lesson: integ.reason || '' });
+     } else if (!abDone) {
+-      pendingIntegrations.push({ track: 'head', short_name: h.short_name, isolated: cand.isolated || 0,
+-        pct_gpu_time: h.pct_gpu_time, inputs: headIntegrateInputs,
+-        winner_kind: cand.winner_kind, apply_env: cand.apply_env || '', apply_flags: cand.apply_flags || '',
+-        op_kind: ext.op_kind, backend: cand.source,
+-        partial: integ ? { gate: integ.gate, ref_med: integ.ref_med, cand_med: integ.cand_med, reason: integ.reason } : null });
+-      log(`  ${h.short_name}: INTEGRATE INCOMPLETE — A/B not finished (${integ ? integ.reason || integ.gate : 'null/timeout'}); kept as PENDING (not a rejection).`);
+-      history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, verdict: 'incomplete', lesson: integ ? integ.reason || 'A/B not finished' : 'integrate timed out/null before A/B completed' });
++      // A FIXABLE crash-during-warmup (the cand server died -> ZERO A/B samples -> ab_complete=false) is the
++      // MOST COMMON corrective case (cuda_graph_capture_unsafe / host-sync / NO_BINARY_FOR_GPU poisons the
++      // HIP context at capture). The integrator still names the cause, so treat a fixable+named crash like a
++      // fixable reject: try the corrective re-author FIRST; only keep PENDING if it is not fixable (a real
++      // transient timeout/hang) or the fix didn't land.
++      const reason = integ ? (integ.reason || integ.gate || '') : '';
++      const corr = (cand.kind === 'authored' && FIXABLE_REJECT_RX.test(reason))
++        ? await tryCorrectiveReauthor({
++            short_name: h.short_name, op_kind: ext.op_kind, shapes: ext.shapes, dtype: ext.dtype, regime: h.regime,
++            gpu_id: h.gpu_id, kernel_eval_dir: cand.kernel_eval_dir, task_dir: ext.task_dir, language: cand.language,
++            isolated: cand.isolated, base_inputs: headIntegrateInputs, reason,
++            cur: { overlay: curOverlay, flags: curFlags, env: curEnv, tput: curTput },
++          })
++        : { banked: false };
++      if (corr.banked) {
++        curOverlay = corr.integ.accepted_overlay || curOverlay; curTput = corr.integ.e2e_throughput_tok_s;
++        acceptedHeads.push({ short_name: h.short_name, op_kind: ext.op_kind, backend: cand.source, kind: 'authored', e2e_delta_pct: corr.integ.e2e_delta_pct, isolated: corr.isolated, corrective: true });
++        log(`  ${h.short_name}: ACCEPTED after corrective re-author (was crash/incomplete: ${reason}). e2e now ${curTput} tok/s (+${corr.integ.e2e_delta_pct}%).`);
++        history.ledger.push({ direction: h.short_name, isolated_speedup: corr.isolated, e2e_delta_pct: corr.integ.e2e_delta_pct, verdict: 'confirmed_corrective', lesson: `fixed crash: ${reason}` });
++      } else {
++        pendingIntegrations.push({ track: 'head', short_name: h.short_name, isolated: cand.isolated || 0,
++          pct_gpu_time: h.pct_gpu_time, inputs: headIntegrateInputs,
++          winner_kind: cand.winner_kind, apply_env: cand.apply_env || '', apply_flags: cand.apply_flags || '',
++          op_kind: ext.op_kind, backend: cand.source,
++          partial: integ ? { gate: integ.gate, ref_med: integ.ref_med, cand_med: integ.cand_med, reason: integ.reason } : null });
++        log(`  ${h.short_name}: INTEGRATE INCOMPLETE — A/B not finished (${integ ? integ.reason || integ.gate : 'null/timeout'}); kept as PENDING (not a rejection).`);
++        history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, verdict: 'incomplete', lesson: integ ? integ.reason || 'A/B not finished' : 'integrate timed out/null before A/B completed' });
++      }
+     } else {
+-      log(`  ${h.short_name}: REJECTED at e2e gate (${integ.reason || integ.gate}).`);
+-      history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ.e2e_delta_pct || 0, verdict: 'dead_end', lesson: integ.reason || 'no e2e gain' });
++      const reason = integ.reason || integ.gate || '';
++      // (h3-fix) Corrective re-author: a FIXABLE reject of an authored, iso-verified winner gets up to
++      // HEAD_CORRECTIVE_MAX cheap fix-and-retries (optimize the EXISTING kernel, no re-discovery; re-gate).
++      // Not a new head -> not charged to HEAD_BUDGET. See tryCorrectiveReauthor.
++      const corr = (cand.kind === 'authored')
++        ? await tryCorrectiveReauthor({
++            short_name: h.short_name, op_kind: ext.op_kind, shapes: ext.shapes, dtype: ext.dtype, regime: h.regime,
++            gpu_id: h.gpu_id, kernel_eval_dir: cand.kernel_eval_dir, task_dir: ext.task_dir, language: cand.language,
++            isolated: cand.isolated, base_inputs: headIntegrateInputs, reason,
++            cur: { overlay: curOverlay, flags: curFlags, env: curEnv, tput: curTput },
++          })
++        : { banked: false };
++      if (corr.banked) {
++        curOverlay = corr.integ.accepted_overlay || curOverlay; curTput = corr.integ.e2e_throughput_tok_s;
++        acceptedHeads.push({ short_name: h.short_name, op_kind: ext.op_kind, backend: cand.source, kind: 'authored', e2e_delta_pct: corr.integ.e2e_delta_pct, isolated: corr.isolated, corrective: true });
++        log(`  ${h.short_name}: ACCEPTED after corrective re-author. e2e now ${curTput} tok/s (+${corr.integ.e2e_delta_pct}%).`);
++        history.ledger.push({ direction: h.short_name, isolated_speedup: corr.isolated, e2e_delta_pct: corr.integ.e2e_delta_pct, verdict: 'confirmed_corrective', lesson: `fixed: ${reason}` });
++      } else {
++        log(`  ${h.short_name}: REJECTED at e2e gate (${reason}).`);
++        history.ledger.push({ direction: h.short_name, isolated_speedup: cand.isolated, e2e_delta_pct: integ.e2e_delta_pct || 0, verdict: 'dead_end', lesson: reason || 'no e2e gain' });
++      }
+     }
+   }
+   } // end serial head track (default path; runs for normal mode and fast-mode-single-GPU)
+@@ -1647,15 +1824,36 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
+       milestoneImproved = true;
+       log(`  ${c.short_name}: ACCEPTED. e2e now ${curTput} tok/s (+${integ.e2e_delta_pct}%).`);
+       history.ledger.push({ direction: c.short_name, isolated_speedup: kl.final_geomean, e2e_delta_pct: integ.e2e_delta_pct, verdict: 'confirmed', lesson: integ.reason || '' });
+-    } else if (!abDone) {
+-      pendingIntegrations.push({ track: 'milestone', short_name: c.short_name, isolated: kl.final_geomean,
+-        pct_gpu_time: c.pct_gpu_time, inputs: mileIntegrateInputs, backend: kl.note || '',
+-        partial: integ ? { gate: integ.gate, ref_med: integ.ref_med, cand_med: integ.cand_med, reason: integ.reason } : null });
+-      log(`  ${c.short_name}: INTEGRATE INCOMPLETE — A/B not finished (${integ ? integ.reason || integ.gate : 'null/timeout'}); kept as PENDING (not a rejection).`);
+-      history.ledger.push({ direction: c.short_name, isolated_speedup: kl.final_geomean, verdict: 'incomplete', lesson: integ ? integ.reason || 'A/B not finished' : 'integrate timed out/null before A/B completed' });
+     } else {
+-      log(`  ${c.short_name}: REJECTED at e2e gate (${integ.reason || integ.gate}).`);
+-      history.ledger.push({ direction: c.short_name, isolated_speedup: kl.final_geomean, e2e_delta_pct: integ.e2e_delta_pct || 0, verdict: 'dead_end', lesson: integ.reason || 'no e2e gain' });
++      // Unified reject/incomplete handling (same as the head track): a FIXABLE reject OR fixable
++      // crash-during-warmup (ab_complete=false) of an iso-verified editable kernel earns a corrective
++      // re-author (re-optimize the EXISTING kernel; NOT charged to HEAD_BUDGET); only keep PENDING if the
++      // A/B was merely incomplete for a NON-fixable reason (real transient timeout/hang). See tryCorrectiveReauthor.
++      const reason = integ ? (integ.reason || integ.gate || '') : '';
++      const corr = FIXABLE_REJECT_RX.test(reason)
++        ? await tryCorrectiveReauthor({
++            short_name: c.short_name, op_kind: ext.op_kind, shapes: ext.shapes, dtype: ext.dtype, regime: c.regime,
++            gpu_id: c.gpu_id, kernel_eval_dir: kl.kernel_eval_dir, task_dir: ext.task_dir, language: kl.language || '',
++            isolated: kl.final_geomean, base_inputs: mileIntegrateInputs, reason, phase_name: 'Milestone',
++            cur: { overlay: curOverlay, flags: curFlags, env: curEnv, tput: curTput },
++          })
++        : { banked: false };
++      if (corr.banked) {
++        curOverlay = corr.integ.accepted_overlay || curOverlay; curTput = corr.integ.e2e_throughput_tok_s;
++        acceptedKernels.push({ short_name: c.short_name, backend: kl.note || '', e2e_delta_pct: corr.integ.e2e_delta_pct, isolated: corr.isolated, corrective: true });
++        milestoneImproved = true;
++        log(`  ${c.short_name}: ACCEPTED after corrective re-author (${reason}). e2e now ${curTput} tok/s (+${corr.integ.e2e_delta_pct}%).`);
++        history.ledger.push({ direction: c.short_name, isolated_speedup: corr.isolated, e2e_delta_pct: corr.integ.e2e_delta_pct, verdict: 'confirmed_corrective', lesson: `fixed: ${reason}` });
++      } else if (!abDone) {
++        pendingIntegrations.push({ track: 'milestone', short_name: c.short_name, isolated: kl.final_geomean,
++          pct_gpu_time: c.pct_gpu_time, inputs: mileIntegrateInputs, backend: kl.note || '',
++          partial: integ ? { gate: integ.gate, ref_med: integ.ref_med, cand_med: integ.cand_med, reason: integ.reason } : null });
++        log(`  ${c.short_name}: INTEGRATE INCOMPLETE — A/B not finished (${integ ? integ.reason || integ.gate : 'null/timeout'}); kept as PENDING (not a rejection).`);
++        history.ledger.push({ direction: c.short_name, isolated_speedup: kl.final_geomean, verdict: 'incomplete', lesson: integ ? integ.reason || 'A/B not finished' : 'integrate timed out/null before A/B completed' });
++      } else {
++        log(`  ${c.short_name}: REJECTED at e2e gate (${reason}).`);
++        history.ledger.push({ direction: c.short_name, isolated_speedup: kl.final_geomean, e2e_delta_pct: integ.e2e_delta_pct || 0, verdict: 'dead_end', lesson: reason || 'no e2e gain' });
++      }
+     }
+   }
+ 
+diff --git a/e2e_workflow/knowledge/learned/method-cudagraph-safe-integration.md b/e2e_workflow/knowledge/learned/method-cudagraph-safe-integration.md
+index 2a5b4dd36..cafd8e68c 100644
+--- a/e2e_workflow/knowledge/learned/method-cudagraph-safe-integration.md
++++ b/e2e_workflow/knowledge/learned/method-cudagraph-safe-integration.md
+@@ -2,17 +2,30 @@
+ key: cuda/HIP-graph integration · any gfx · sglang/vllm decode
+ type: method
+ confidence: ★★★
+-effect: the #1 e2e-integration killer — a kernel can win isolated yet never run live (or net ~0 e2e)
+-confirms: 4
+-last_seen: 2026-06-19
++effect: the #1 e2e-integration killer — a kernel can win isolated yet never run live (or net ~0 e2e), OR crash the server
++confirms: 5
++last_seen: 2026-06-27
+ ---
+ # Make an optimized kernel survive CUDA/HIP-graph capture (or the win vanishes e2e)
+ - lever: sglang/vLLM capture the decode path into a graph. A kernel that JITs, syncs the host, or
+   self-captures inside the captured region FALLS BACK TO EAGER → only static changes survive → ~0 e2e
+   even at large isolated speedup (observed: 1.22–2.7× iso → ~0 / no live forwards).
++- **harder failure (ANY just-in-time-compiled kernel: a DSL like flydsl, an autotuned/authored Triton
++  kernel, a CK-JIT instance, …) — lazy compile in TP>1 multiproc serving can CRASH the server, not just
++  fall back to eager.** Any code path that JIT-compiles a *new* config (a tile/shape variant not yet built)
++  during the live warmup forward can fail the on-device module load (e.g. ROCm `hipModuleLoadData ->
++  hipErrorNoBinaryForGpu`; CUDA equivalent `CUDA_ERROR_NO_BINARY_FOR_GPU`) when no valid code object exists
++  for that config in the worker → poisons the device context → worker dies → server never healthy → ZERO
++  bench samples → gate=rejected `cuda_graph_capture_unsafe`. The single-process isolated unittest compiles
++  & loads FINE, so iso passes (large speedup) and ONLY the e2e serving gate catches it.
+ - apply: author the STEADY-STATE call (2nd call onward) with ZERO host syncs and ZERO compiles:
+-  · precompile/register the kernel for ALL decode M-buckets at WARMUP, before capture (an
+-    `*_overlay_precompile(weight, weight_scale, m_buckets)` hook the integrator calls once, pre-capture).
++  · precompile/register the kernel for **EVERY (shape-bucket × config) the LIVE workload actually hits —
++    PREFILL buckets AND decode buckets, every per-bucket config the kernel selects, not decode-only** — at
++    WARMUP before capture, via an `*_overlay_precompile(weights, scales, buckets)` hook the integrator
++    calls once, pre-capture. This populates the on-disk code-object cache so ALL TP workers load a prebuilt
++    binary instead of each racing a lazy compile (the thing that produces NO_BINARY_FOR_GPU under TP>1).
++    Rule of thumb: anything the kernel can compile at runtime must be compiled at warmup for the full set
++    of live shapes/configs — never lazily on the hot or warmup-forward path.
+   · key any weight cache by `weight.data_ptr()` (pure host int, weights persistent) — NEVER a
+     `w_scale.sum().item()` fingerprint (a host sync that deadlocks capture).
+   · no `.item()/.cpu()/.tolist()/synchronize()`/Python-if-on-GPU-scalar on the hot path.
+@@ -21,3 +34,14 @@ last_seen: 2026-06-19
+   the candidate fits the SAME mem-fraction as the accepted config (a bf16 weight re-materialization can
+   balloon the cache to tens of GB → KV-pool starved → e2e −9% even at +24% GEMM).
+ - source: exp/e2e_*MiniMax-M3-MXFP8*/ (FULL_AND_PIECEWISE) + exp/e2e_*Qwen3.5-27B-FP8*/ flydsl capture runs
++- source: 2026-06-27 grouped-GEMM host-control-flow capture crash (MiniMax-M3-MXFP8, e2e_...T015152Z) —
++  distinct sub-mode of the same killer: authored FlyDSL MXFP8 grouped-GEMM is HOST-DRIVEN
++  (`num_tokens_post_padded.item()`, `eids.tolist()/sorted_ids.tolist()`, a Python for-loop over experts,
++  `w_scale.sum().item()`) → every CAND TP worker crashes at vLLM `capture_model`→`_dummy_run` with
++  `hipErrorStreamCaptureUnsupported` (NOT NO_BINARY; this is host control flow inside the captured region).
++  Rebind/engagement was correct (4 [flydsl-overlay] ENGAGED banners in eager warmup) and iso was 4.011×
++  (director-verified) yet server NEVER healthy, served 0 requests → gate=dead_end `cuda_graph_capture_unsafe`
++  over 3 independent launches. Stock `_grouped_gemm_mxfp8` does on-DEVICE dispatch (`tl.load(num_tokens_
++  post_padded_ptr)`), so a seam wrapper cannot remove the host control flow — the authored kernel needs a
++  kernel-layer rewrite to on-device dispatch to run on the captured decode path. → confirms the on-device-
++  dispatch / no-host-sync rule; install never mutated, overlay-only.
+diff --git a/kernel_workflow/kernel_workflow.js b/kernel_workflow/kernel_workflow.js
+index c13f608c2..1372fc670 100644
+--- a/kernel_workflow/kernel_workflow.js
++++ b/kernel_workflow/kernel_workflow.js
+@@ -69,6 +69,12 @@ const KERNEL_NAME_HINT = KERNEL_PATH_ORIG.replace(/\/+$/, '').split('/').pop();
+ const MODE = String(A.mode != null ? A.mode : 'optimize').trim() || 'optimize';
+ const TARGET_LANGUAGE = String(A.target_language != null ? A.target_language : 'triton').trim() || 'triton';
+ const OP_SPEC = A.op_spec || {};
++// When the op will run on the CUDA/HIP-graph-captured decode path (e2e sets op_spec.cuda_graph_safe=true),
++// the isolated oracle alone CANNOT catch a kernel that passes iso but host-syncs or lazily-compiles under
++// graph capture — the "wins isolated, crashes serving" class (cuda_graph_capture_unsafe / NO_BINARY_FOR_GPU).
++// This turns on an OPTIONAL capture+replay smoke in the verify step so that failure is caught at the cheap
++// isolated stage. Unset (standalone single-kernel runs / non-graph ops) => byte-identical to before.
++const REQUIRE_GRAPH_CAPTURE = !!(OP_SPEC && OP_SPEC.cuda_graph_safe === true);
+ const KERNEL_KNOWLEDGE_DIR = String(A.perf_knowledge_dir ||
+   (WORKFLOW_DIR ? WORKFLOW_DIR.replace(/\/[^/]*$/, '') + '/perf_knowledge' : '')).replace(/\/+$/, '');
+ // Expert skills = human-authored, validated kernel recipes (perf_knowledge/expert_skills/). ADVISORY
+@@ -219,6 +225,7 @@ const VERIFY_SCHEMA = obj({
+   status: { type: 'string' }, correctness: { type: 'string' },
+   verified_geomean: { type: 'number' }, verified_arithmetic: { type: 'number' },
+   per_case: perCase, variance_note: { type: 'string' }, notes: { type: 'string' },
++  graph_safe: { type: 'string' },
+ }, ['status', 'verified_geomean']);
+ 
+ const INTEGRATE_SCHEMA = obj({
+@@ -562,6 +569,7 @@ Return ONLY the worker_result.json structure as StructuredOutput.`,
+           CANONICAL, PATCH: patch, VERIFY_DIR: `${d.out_dir}/verify`,
+           GPU_ID: d.gpu_id, SKILL_DIR: WORKFLOW_DIR, COMMANDMENT, BASELINE_PER_CASE,
+           ...(HARNESS_ADDENDUM ? { HARNESS_ADDENDUM } : {}),
++          ...(REQUIRE_GRAPH_CAPTURE ? { REQUIRE_GRAPH_CAPTURE: '1' } : {}),
+         }),
+         { phase: 'Verify', label: `verify ${d.id}`, schema: VERIFY_SCHEMA }
+       ).then((ver) => ({ d, eng, ver, patch }));
+diff --git a/kernel_workflow/roles/verify_engineer.md b/kernel_workflow/roles/verify_engineer.md
+index e05e7d879..f60688ba9 100644
+--- a/kernel_workflow/roles/verify_engineer.md
++++ b/kernel_workflow/roles/verify_engineer.md
+@@ -36,6 +36,24 @@ absolute per-case latencies. The script trusts only your numbers.
+ 4. Run FULL_BENCHMARK via `bash $SKILL_DIR/scripts/gpu_lock.sh $GPU_ID <cmd>`. Parse per-case
+    latency using the parse hint. Run it **twice** and keep the better/median if the two disagree by
+    >5% (note the variance).
++4b. **(ONLY if `REQUIRE_GRAPH_CAPTURE` is set) CUDA/HIP-graph capture-safety smoke.** This op will be
++   overlaid on the graph-captured decode path, so a kernel that passes iso but host-syncs or lazily
++   compiles UNDER CAPTURE passes here yet CRASHES the live TP>1 server. Catch it now (cheap), in `$WS`
++   via `bash $SKILL_DIR/scripts/gpu_lock.sh $GPU_ID python3 -c '<smoke>'`. The smoke (use the optimized
++   kernel's own callable + the DECODE-regime shape from the harness/oracle — smallest M / per-step batch):
++   - Build the steady-state call ONCE first so any first-call JIT/autotune happens OUTSIDE capture.
++   - Capture the SECOND call into `torch.cuda.graph(g)` (HIP-backed on ROCm) on a side stream; then
++     `g.replay()` 3× and `torch.cuda.synchronize()`; compare the replay output to the eager result.
++   - **FAIL → `status:"correctness_failed"`, `graph_safe:"fail"`, name the offending op in `notes`** if:
++     (a) capture raises — a host sync on the hot path (`.item()/.cpu()/.tolist()/.sum().item()/.numpy()`,
++     `torch.cuda.synchronize()`, or a Python branch on a GPU scalar; usually "operation not permitted when
++     stream is capturing"); (b) the graph won't replay or a NEW kernel JIT-compiles at capture time (no
++     precompile-before-capture hook → NO_BINARY_FOR_GPU under TP>1 multiproc serving); or (c) replay output
++     diverges from eager.
++   - **PASS → `graph_safe:"pass"`** and continue. If the candidate is pure config/flag/env with no callable
++     kernel entry to capture, set `graph_safe:"n/a"` and continue.
++   Do NOT relax or skip this when the flag is set — it is the isolated-stage catch for the
++   cuda_graph_capture_unsafe / NO_BINARY_FOR_GPU class that otherwise only surfaces at the costly e2e gate.
+ 5. Reject if a patch modified the harness/COMMANDMENT/files outside the workspace, or the benchmark
+    shows a regression (geomean ≤ 1.0). Report it as `status:"regression"` with the numbers anyway.
+ 6. Compute per-case speedup = `BASELINE_PER_CASE.latency / your_optimized_ms`; geomean =
+@@ -50,7 +68,8 @@ absolute per-case latencies. The script trusts only your numbers.
+   "verified_arithmetic": 0.0,
+   "per_case": [{"name": "...", "baseline_ms": 0.0, "optimized_ms": 0.0, "speedup": 0.0}],
+   "variance_note": "e.g. run-to-run within 3%",
+-  "notes": "anything suspicious (overfit special-casing, narrow correctness, etc.)"
++  "graph_safe": "pass|fail|n/a (only when REQUIRE_GRAPH_CAPTURE was set; omit otherwise)",
++  "notes": "anything suspicious (overfit special-casing, narrow correctness, graph-capture host-sync, etc.)"
+ }
+ ```
+ Be skeptical and exact. Your number becomes the official round result.

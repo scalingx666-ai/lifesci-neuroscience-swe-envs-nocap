@@ -1,0 +1,204 @@
+diff --git a/src/minisweagent/config/geak.yaml b/src/minisweagent/config/geak.yaml
+index c220031d7..7a403f27e 100644
+--- a/src/minisweagent/config/geak.yaml
++++ b/src/minisweagent/config/geak.yaml
+@@ -57,8 +57,10 @@ run:
+       orchestrator:
+         max_rounds: 5
+ parallel:
+-  num_parallel: null              # null -> ceil(len(gpu_ids) * gpu_oversubscribe)
+-  gpu_oversubscribe: 1.0          # bump to 2.0 once stats validate headroom
++  num_parallel: null              # null -> max(min_parallel, workers_per_gpu * len(gpu_ids))
++  min_parallel: 4                 # floor; env GEAK_MIN_PARALLEL_WORKERS overrides
++  workers_per_gpu: 3              # env GEAK_WORKERS_PER_GPU overrides -> 12 on 4 GPUs
++  gpu_oversubscribe: 1.0          # legacy; unused by resolve_num_parallel
+   max_concurrent_llm: null        # null -> num_parallel
+ gpu_manager:
+   job_timeout_default_s: 900
+diff --git a/src/minisweagent/run/mini.py b/src/minisweagent/run/mini.py
+index ee715c15e..a6c4b4e1a 100644
+--- a/src/minisweagent/run/mini.py
++++ b/src/minisweagent/run/mini.py
+@@ -521,17 +521,20 @@ def main(
+     if num_parallel is None:
+         num_parallel = _as_int(parsed_config.get("num_parallel"))
+     if num_parallel is None and parsed_gpu_ids:
+-        from math import ceil
+-
+-        _oversubscribe = float(
+-            parsed_config.get("gpu_oversubscribe")
+-            or (config.get("parallel") or {}).get("gpu_oversubscribe", 1.0)
++        from minisweagent.run.utils.parallel_helpers import resolve_num_parallel
++
++        _par_cfg = config.get("parallel") or {}
++        _min_w = parsed_config.get("min_parallel") or _par_cfg.get("min_parallel")
++        _wpg = parsed_config.get("workers_per_gpu") or _par_cfg.get("workers_per_gpu")
++        num_parallel = resolve_num_parallel(
++            len(parsed_gpu_ids),
++            min_workers=int(_min_w) if _min_w is not None else None,
++            workers_per_gpu=int(_wpg) if _wpg is not None else None,
+         )
+-        num_parallel = max(1, ceil(len(parsed_gpu_ids) * _oversubscribe))
+         logger.info(
+-            "Auto-setting num_parallel=%s from gpu_ids (oversubscribe=%.1f).",
++            "Auto-setting num_parallel=%s from %d gpu_ids.",
+             num_parallel,
+-            _oversubscribe,
++            len(parsed_gpu_ids),
+         )
+ 
+     kernel_name_for_output = parsed_config.get("kernel_name")
+diff --git a/src/minisweagent/run/utils/parallel_helpers.py b/src/minisweagent/run/utils/parallel_helpers.py
+index a5c365256..87f0c41fa 100644
+--- a/src/minisweagent/run/utils/parallel_helpers.py
++++ b/src/minisweagent/run/utils/parallel_helpers.py
+@@ -31,6 +31,66 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def resolve_num_parallel(
++    gpu_count: int,
++    *,
++    min_workers: int | None = None,
++    workers_per_gpu: int | None = None,
++) -> int:
++    """Default subagent count from allocated GPUs: max(min_workers, workers_per_gpu * gpu_count)."""
++    if min_workers is None:
++        try:
++            min_workers = int(os.environ.get("GEAK_MIN_PARALLEL_WORKERS", "4") or "4")
++        except ValueError:
++            min_workers = 4
++    if workers_per_gpu is None:
++        try:
++            workers_per_gpu = int(os.environ.get("GEAK_WORKERS_PER_GPU", "3") or "3")
++        except ValueError:
++            workers_per_gpu = 3
++    min_workers = max(1, min_workers)
++    workers_per_gpu = max(1, workers_per_gpu)
++    if gpu_count <= 0:
++        return min_workers
++    return max(min_workers, workers_per_gpu * gpu_count)
++
++
++def _softstop_drain_timeout_s() -> float:
++    """Grace window to let in-flight sub-agents finish after SoftStop."""
++    raw = os.environ.get("GEAK_SOFTSTOP_DRAIN_S", "300")
++    try:
++        return max(0.0, float(raw))
++    except (TypeError, ValueError):
++        return 300.0
++
++
++def _task_patch_dir_name(task, task_id: int, has_dup_labels: bool) -> str:
++    if has_dup_labels:
++        return f"{task.label}_{task_id}" if task.label else f"task_{task_id}"
++    return task.label if task.label else f"task_{task_id}"
++
++
++def _inflight_lacks_best_results(
++    pending: set,
++    futures: dict,
++    task_by_id: dict[int, Any],
++    base_patch_dir: Path,
++    has_dup_labels: bool,
++) -> bool:
++    """True when any still-running task has no ``best_results.json`` yet."""
++    for fut in pending:
++        task_id = futures.get(fut)
++        if task_id is None:
++            continue
++        task = task_by_id.get(task_id)
++        if task is None:
++            continue
++        patch_dir = base_patch_dir / _task_patch_dir_name(task, task_id, has_dup_labels)
++        if not (patch_dir / "best_results.json").is_file():
++            return True
++    return False
++
+ # ============================================================================
+ # Thread-local stdout/stderr redirection
+ # ============================================================================
+@@ -871,6 +931,8 @@ def _report_progress():
+     results: list = []
+     executor = concurrent.futures.ThreadPoolExecutor(max_workers=n_tasks)
+     soft_stop_observed = False
++    softstop_drain_until: float | None = None
++    task_by_id = {tid: task for tid, task in sorted_tasks}
+     try:
+         futures: dict[concurrent.futures.Future, int] = {}
+         for tid, task in sorted_tasks:
+@@ -908,6 +970,35 @@ def _report_progress():
+         pending = set(futures.keys())
+         while pending:
+             if soft_stop is not None and soft_stop.is_set():
++                drain_s = _softstop_drain_timeout_s()
++                lacks_results = _inflight_lacks_best_results(
++                    pending,
++                    futures,
++                    task_by_id,
++                    base_patch_dir,
++                    _has_dup_labels,
++                )
++                if lacks_results and drain_s > 0:
++                    if softstop_drain_until is None:
++                        softstop_drain_until = time.monotonic() + drain_s
++                        logger.warning(
++                            "run_pool: SoftStop set with %d in-flight task(s) "
++                            "lacking best_results; draining up to %.0fs before cancel",
++                            len(pending),
++                            drain_s,
++                        )
++                    if time.monotonic() < softstop_drain_until:
++                        done, pending = concurrent.futures.wait(pending, timeout=2.0)
++                        for future in done:
++                            task_id = futures[future]
++                            try:
++                                r = future.result()
++                                results.append(r)
++                            except concurrent.futures.CancelledError:
++                                logger.info("Pool task %d cancelled", task_id)
++                            except Exception as e:
++                                logger.error("Error in pool task %d: %s", task_id, e, exc_info=True)
++                        continue
+                 logger.warning(
+                     "run_pool: SoftStop set during dispatch; cancelling %d in-flight, terminating subprocesses",
+                     len(pending),
+diff --git a/tests/run/test_resolve_num_parallel.py b/tests/run/test_resolve_num_parallel.py
+new file mode 100644
+index 000000000..605f74e9d
+--- /dev/null
++++ b/tests/run/test_resolve_num_parallel.py
+@@ -0,0 +1,32 @@
++"""Tests for resolve_num_parallel default subagent count."""
++
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from minisweagent.run.utils.parallel_helpers import resolve_num_parallel
++
++
++def test_resolve_num_parallel_gpu_counts() -> None:
++    assert resolve_num_parallel(0) == 4
++    assert resolve_num_parallel(1) == 4
++    assert resolve_num_parallel(2) == 6
++    assert resolve_num_parallel(4) == 12
++
++
++def test_resolve_num_parallel_explicit_knobs() -> None:
++    assert resolve_num_parallel(4, min_workers=2, workers_per_gpu=2) == 8
++
++
++def test_resolve_num_parallel_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("GEAK_MIN_PARALLEL_WORKERS", "5")
++    monkeypatch.setenv("GEAK_WORKERS_PER_GPU", "2")
++    assert resolve_num_parallel(4) == 8
++
++
++def test_resolve_num_parallel_empty_env_uses_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("GEAK_MIN_PARALLEL_WORKERS", "")
++    monkeypatch.setenv("GEAK_WORKERS_PER_GPU", "")
++    assert resolve_num_parallel(4) == 12

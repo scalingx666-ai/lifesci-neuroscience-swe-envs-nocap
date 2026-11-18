@@ -1,0 +1,150 @@
+diff --git a/pycbsdk/src/pycbsdk/cli/test_timestamps.py b/pycbsdk/src/pycbsdk/cli/test_timestamps.py
+index 32cb52c6..085efe52 100644
+--- a/pycbsdk/src/pycbsdk/cli/test_timestamps.py
++++ b/pycbsdk/src/pycbsdk/cli/test_timestamps.py
+@@ -262,6 +262,17 @@ def run_scenario(
+             ident = session.proc_ident
+             print(f"  protocol: {proto.name}  ident: {ident!r}")
+ 
++            # Activate a channel before clock sync so the device is already
++            # streaming on our port.  This avoids inflated clock-sync latency
++            # when another device floods the same UDP port (see #165).
++            if mode == "STANDALONE":
++                session.set_channel_sample_group(
++                    n_chans=1,
++                    channel_type=0,  # ChannelType.FRONTEND
++                    rate=SampleRate.SR_RAW,
++                )
++                time.sleep(1)  # Let the receive thread settle
++
+             # Wait for clock sync (best-effort — not available in CENTRAL_COMPAT).
+             has_clock_sync = False
+             try:
+@@ -281,7 +292,7 @@ def run_scenario(
+             print(f"  Collecting {_cfg['packet_count']} packets ...")
+             samples = _collect_packets(
+                 session, _cfg["packet_count"], TIMEOUT_S,
+-                configure=(mode == "STANDALONE"),
++                configure=False,  # Already activated above (or by background process)
+             )
+             print(f"  Collected {len(samples)} packets.")
+ 
+diff --git a/src/cbdev/src/device_session.cpp b/src/cbdev/src/device_session.cpp
+index 7f0e1ee2..1546e515 100644
+--- a/src/cbdev/src/device_session.cpp
++++ b/src/cbdev/src/device_session.cpp
+@@ -516,13 +516,13 @@ Result<int> DeviceSession::receivePacketsRaw(void* buffer, const size_t buffer_s
+         return Result<int>::error("Device not connected");
+     }
+ 
+-    // Receive UDP datagram into provided buffer (non-blocking)
+-    int bytes_recv = recv(m_impl->socket, (char*)buffer, buffer_size, 0);
+-
+-    // Capture host timestamp as early as possible after recv() returns data
+-    if (bytes_recv > 0) {
+-        m_impl->last_recv_timestamp = std::chrono::steady_clock::now();
+-    }
++    // Receive UDP datagram into provided buffer (non-blocking).
++    // Use recvfrom to capture the sender address so we can discard datagrams
++    // from other devices sharing the same port (e.g. NPLAY and HUB1 both use 51002).
++    SOCKADDR_IN sender_addr{};
++    socklen_t addr_len = sizeof(sender_addr);
++    const int bytes_recv = recvfrom(m_impl->socket, (char*)buffer, buffer_size, 0,
++                              reinterpret_cast<SOCKADDR*>(&sender_addr), &addr_len);
+ 
+     if (bytes_recv == SOCKET_ERROR_VALUE) {
+         #ifdef _WIN32
+@@ -539,6 +539,17 @@ Result<int> DeviceSession::receivePacketsRaw(void* buffer, const size_t buffer_s
+         #endif
+     }
+ 
++    // Discard datagrams from unexpected sources.
++    if (bytes_recv > 0 &&
++        sender_addr.sin_addr.s_addr != m_impl->send_addr.sin_addr.s_addr) {
++        return Result<int>::ok(0);
++    }
++
++    // Capture host timestamp as early as possible after accepting a datagram.
++    if (bytes_recv > 0) {
++        m_impl->last_recv_timestamp = std::chrono::steady_clock::now();
++    }
++
+     return Result<int>::ok(bytes_recv);
+ }
+ 
+@@ -694,12 +705,11 @@ void DeviceSession::close() {
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ std::string detectClientAddress(DeviceType type) {
+-    // Loopback devices: INADDR_ANY on all platforms.
+-    // nPlayServer may broadcast to various addresses (127.0.0.255, 255.255.255.0, etc.)
+-    // and binding to a specific loopback address misses broadcast traffic on macOS.
+-    // INADDR_ANY reliably receives both unicast and broadcast on loopback.
++    // nPlayServer sends unicast to 127.0.0.1.  Bind to loopback so the socket
++    // only receives loopback traffic, avoiding cross-talk with Gemini devices
++    // that share the same port (51002) on the network interface.
+     if (type == DeviceType::NPLAY) {
+-        return "0.0.0.0";
++        return "127.0.0.1";
+     }
+ 
+ #ifdef __APPLE__
+diff --git a/src/cbshm/src/shmem_session.cpp b/src/cbshm/src/shmem_session.cpp
+index a8e4e511..b014be28 100644
+--- a/src/cbshm/src/shmem_session.cpp
++++ b/src/cbshm/src/shmem_session.cpp
+@@ -1651,37 +1651,32 @@ Result<bool> ShmemSession::waitForData(uint32_t timeout_ms) const {
+         return Result<bool>::error("Signal event not initialized");
+     }
+ 
+-    timespec ts;
+ #ifdef __APPLE__
+-    struct timeval tv;
+-    gettimeofday(&tv, nullptr);
+-    ts.tv_sec = tv.tv_sec;
+-    ts.tv_nsec = tv.tv_usec * 1000;
++    // macOS lacks sem_timedwait.  Poll with short sleeps (500 µs) to keep
++    // latency under 1 ms while using negligible CPU.  Use mach_absolute_time
++    // for an accurate deadline instead of accumulating sleep-interval error.
++    const uint64_t deadline_us = clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000
++                                 + static_cast<uint64_t>(timeout_ms) * 1000;
++    for (;;) {
++        if (sem_trywait(m_impl->signal_event) == 0) {
++            return Result<bool>::ok(true);
++        }
++        if (clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000 >= deadline_us) {
++            return Result<bool>::ok(false);
++        }
++        usleep(500);
++    }
+ #else
++    // Linux: sem_timedwait with an absolute CLOCK_REALTIME deadline.
++    timespec ts;
+     clock_gettime(CLOCK_REALTIME, &ts);
+-#endif
+-
+     long ns = timeout_ms * 1000000L;
+-    const long NANOSECONDS_PER_SEC = 1000000000L;
++    constexpr long NANOSECONDS_PER_SEC = 1000000000L;
+     ts.tv_nsec += ns;
+     if (ts.tv_nsec >= NANOSECONDS_PER_SEC) {
+         ts.tv_sec += ts.tv_nsec / NANOSECONDS_PER_SEC;
+         ts.tv_nsec = ts.tv_nsec % NANOSECONDS_PER_SEC;
+     }
+-
+-#ifdef __APPLE__
+-    int retries = timeout_ms / 10;
+-    for (int i = 0; i < retries; ++i) {
+-        if (sem_trywait(m_impl->signal_event) == 0) {
+-            return Result<bool>::ok(true);
+-        }
+-        usleep(10000);
+-    }
+-    if (sem_trywait(m_impl->signal_event) == 0) {
+-        return Result<bool>::ok(true);
+-    }
+-    return Result<bool>::ok(false);
+-#else
+     int result = sem_timedwait(m_impl->signal_event, &ts);
+     if (result == 0) {
+         return Result<bool>::ok(true);

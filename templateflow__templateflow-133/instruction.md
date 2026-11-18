@@ -1,0 +1,58 @@
+# Issue
+
+**Title:** MRG: ``tpl-MNI152NLin2009aAsym``
+
+## Description
+
+Name: ICBM 152 Nonlinear Asymmetrical template version 2009a
+## Template description
+```JSON
+{
+  "Authors": [
+    "Fonov V",
+    "Evans AC",
+    "Botteron K",
+    "Almli CR",
+    "McKinstry RC",
+    "Collins DL"
+  ],
+  "BIDSVersion": "1.1.0",
+  "Curators": [
+    "Esteban O"
+  ],
+  "Identifier": "MNI152NLin2009aAsym",
+  "License": "See LICENSE file",
+  "Name": "ICBM 152 Nonlinear Asymmetrical template version 2009a",
+  "RRID": "SCR_008796",
+  "ReferencesAndLinks": [
+    "https://doi.org/10.1016/j.neuroimage.2010.07.033",
+    "https://doi.org/10.1016/S1053-8119(09)70884-5",
+    "http://nist.mni.mcgill.ca/?p=904",
+    "https://doi.org/10.1007/3-540-48714-X_16"
+  ],
+  "Species": "Homo sapiens",
+  "TemplateFlowVersion": "1.0.0",
+  "res": {
+    "01": {
+      "origin": [
+        -96.0,
+        -132.0,
+        -78.0
+      ],
+      "shape": [
+        193,
+        229,
+        193
+      ],
+      "zooms": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  }
+}\`\`\`
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `7839edbbd7e0`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

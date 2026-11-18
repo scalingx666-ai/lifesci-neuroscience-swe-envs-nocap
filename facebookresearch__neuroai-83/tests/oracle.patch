@@ -1,0 +1,716 @@
+diff --git a/neuralbench-repo/neuralbench/aggregator.py b/neuralbench-repo/neuralbench/aggregator.py
+index 4e73fbfc1..2de32b021 100644
+--- a/neuralbench-repo/neuralbench/aggregator.py
++++ b/neuralbench-repo/neuralbench/aggregator.py
+@@ -14,6 +14,7 @@
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ from pathlib import Path
+ 
++from exca import ConfDict
+ from pydantic import Field
+ from tqdm import tqdm
+ 
+@@ -40,6 +41,49 @@ def _default_output_dir() -> str:
+     return str(Path(get_config()["SAVE_DIR"]) / "outputs")
+ 
+ 
++def _experiment_variant(experiment: "Experiment") -> str:
++    """Signature of config axes that vary *independently* of ``brain_model_name``.
++
++    ``brain_model_name`` alone does not uniquely identify a configuration: the
++    same backbone can be run with different downstream wrappers (``-w``),
++    checkpoints (``--checkpoint``), probe layers, or model hyperparameters (a
++    grid sweep, or two YAMLs sharing a config class).  Aggregation groups by
++    model name and collapses seeds, so without an extra discriminator these
++    distinct configs would be silently averaged together.
++
++    The tag is a ``;``-separated set of ``key=value`` components:
++
++    - ``ckpt=<stem>`` -- the downstream checkpoint, when set;
++    - ``cfg=<uid>`` -- exca's own UID for the full ``brain_model_config``
++      (``ConfDict.from_model(...).to_uid()``), which generally disambiguates
++      *any* model-hyperparameter difference without enumerating fields.  Reusing
++      exca's UID keeps this consistent with how exca canonicalises and hashes
++      configs for caching, rather than maintaining a parallel scheme;
++    - the downstream wrapper's non-default fields, rendered readably (the common
++      ``-w`` / probe-layer / aggregation knobs).
++
++    ``build_results_df`` surfaces only the components that actually differ
++    between a model's variants, so the ``cfg`` UID stays invisible unless a
++    model hyperparameter is the thing that varies.
++    """
++    parts: list[str] = []
++    checkpoint = getattr(experiment, "pretrained_weights_fname", None)
++    if checkpoint:
++        parts.append(f"ckpt={Path(checkpoint).stem}")
++    config = getattr(experiment, "brain_model_config", None)
++    if config is not None:
++        parts.append(f"cfg={ConfDict.from_model(config).to_uid()}")
++    wrapper = getattr(experiment, "downstream_model_wrapper", None)
++    if wrapper is not None:
++        # ``exclude_defaults`` keeps only fields overridden from the wrapper's
++        # defaults, so the canonical single-wrapper case stays minimal while any
++        # sweep over wrapper knobs (aggregation, probe_layer, freezing, ...)
++        # produces a distinct tag.
++        overrides = wrapper.model_dump(exclude_defaults=True, exclude_none=True)
++        parts.extend(f"{key}={overrides[key]}" for key in sorted(overrides))
++    return ";".join(parts)
++
++
+ class BenchmarkAggregator(ns.BaseModel):
+     """Orchestrate multiple :class:`Experiment` runs and visualise results.
+ 
+@@ -122,6 +166,7 @@ def _process_one_experiment(
+         else:
+             out["dataset_name"] = type(study).__name__
+         out["brain_model_name"] = experiment.brain_model_name
++        out["model_variant"] = _experiment_variant(experiment)
+         out["loss"] = {"name": type(experiment.loss).__name__}
+         out["seed"] = experiment.seed
+         return out, task, model
+diff --git a/neuralbench-repo/neuralbench/modules.py b/neuralbench-repo/neuralbench/modules.py
+index db473d2f7..5bf724548 100644
+--- a/neuralbench-repo/neuralbench/modules.py
++++ b/neuralbench-repo/neuralbench/modules.py
+@@ -16,6 +16,7 @@
+ import inspect
+ import logging
+ import typing as tp
++import weakref
+ 
+ import pydantic
+ import torch
+@@ -24,6 +25,8 @@
+ from neuraltrain.models.common import ChannelMerger, Mlp
+ from neuraltrain.models.preprocessor import OnTheFlyPreprocessor
+ 
++from .utils import detect_batch_dim, run_probe_hook
++
+ LOGGER = logging.getLogger(__name__)
+ 
+ 
+@@ -382,12 +385,26 @@ class DownstreamWrapper(pydantic.BaseModel):
+         ``"first"`` selects only the first timestep/token;
+         an ``int`` splits into n groups, averages each group, then concatenates;
+         ``None`` performs no aggregation.
++        When ``probe_layer`` is set, the captured activation is canonicalised to
++        batch-first before aggregation (see ``probe_batch_dim``), so these
++        semantics are identical for intermediate and final outputs.
+     probe_config : Mlp | "linear" | None, optional
+         Configuration for the probe layer added on top.
+         ``None`` uses identity (no additional layer), e.g. if the model already
+         has a linear layer of the right output size.
+         ``"linear"`` adds a single linear layer.
+         An ``Mlp`` instance adds a multi-layer perceptron with specified configuration.
++    probe_layer : str | None, optional
++        Dotted submodule name (from ``model.named_modules()``) where a forward
++        hook taps activations for probing.  ``None`` (default) probes the final
++        model output.  Requires ``model_output_key=None`` (intermediate captures
++        are tensors, not dicts).
++    probe_batch_dim : int | "auto", optional
++        Axis of the probed activation that indexes the batch.  ``"auto"``
++        (default) detects it by running the dummy forward at two batch sizes and
++        finding the axis that scales with the batch.  Set explicitly (e.g. ``1``
++        for sequence-first ``(T, B, D)`` transformer outputs) to skip detection
++        or resolve an ambiguous layout.  Only used when ``probe_layer`` is set.
+     """
+ 
+     model_config = pydantic.ConfigDict(extra="forbid")
+@@ -399,6 +416,8 @@ class DownstreamWrapper(pydantic.BaseModel):
+     strict_matching: bool = True
+     aggregation: tp.Literal["flatten", "mean", "first"] | int | None = "flatten"
+     probe_config: Mlp | tp.Literal["linear"] | None = "linear"
++    probe_layer: str | None = None
++    probe_batch_dim: int | tp.Literal["auto"] = "auto"
+ 
+     @property
+     def n_adapter_target_channels(self) -> int | None:
+@@ -417,6 +436,19 @@ def model_post_init(self, __context):
+                 "Only one of layers_to_freeze and layers_to_unfreeze can be specified at once."
+             )
+ 
++        if self.probe_layer is not None and self.model_output_key is not None:
++            raise ValueError(
++                f"probe_layer={self.probe_layer!r} requires model_output_key=None "
++                f"(intermediate captures are tensors, not dicts); "
++                f"got {self.model_output_key!r}."
++            )
++
++        if self.probe_batch_dim != "auto" and self.probe_layer is None:
++            raise ValueError(
++                "probe_batch_dim only applies when probe_layer is set; "
++                f"got probe_batch_dim={self.probe_batch_dim} with probe_layer=None."
++            )
++
+     def build(
+         self,
+         model: nn.Module,
+@@ -458,9 +490,15 @@ def build(
+                 else:
+                     x_adapted = channel_adapter(x)
+                 model_batch = {input_key: x_adapted}
++            else:
++                model_batch = dummy_batch
++            probe_batch_dim = 0
++            if self.probe_layer is None:
+                 orig_output = model(**model_batch)
+             else:
+-                orig_output = model(**dummy_batch)
++                orig_output, probe_batch_dim = self._capture_probe_output(
++                    model, model_batch
++                )
+             if self.model_output_key is not None:
+                 orig_output = orig_output[self.model_output_key]
+             model.train()
+@@ -478,6 +516,8 @@ def build(
+             strict_matching=self.strict_matching,
+             aggregation=self.aggregation,
+             probe_config=self.probe_config,
++            probe_layer=self.probe_layer,
++            probe_batch_dim=probe_batch_dim,
+         )
+ 
+         # Sanity check (wrapper handles preprocessing internally)
+@@ -486,6 +526,41 @@ def build(
+ 
+         return wrapper_model
+ 
++    def _capture_probe_output(
++        self, model: nn.Module, model_batch: dict[str, torch.Tensor | None]
++    ) -> tuple[torch.Tensor, int]:
++        """Capture the activation tapped at ``probe_layer``, canonicalised to batch-first.
++
++        Runs a dummy forward with a temporary hook on the probed submodule,
++        finds the batch axis (via ``probe_batch_dim`` or auto-detection), and
++        returns ``(activation_moved_to_batch_first, detected_batch_dim)``.
++        Raises if the submodule is unreachable or returns a non-tensor.
++        """
++        assert self.probe_layer is not None  # guaranteed by the caller
++        # model_output_key=None is enforced in model_post_init.
++        try:
++            submodule = model.get_submodule(self.probe_layer)
++        except AttributeError as exc:
++            valid = [n for n, _ in model.named_modules() if n]
++            raise AttributeError(
++                f"probe_layer={self.probe_layer!r} not in "
++                f"{type(model).__name__} ({len(valid)} submodules; "
++                f"e.g. {valid[:3]})"
++            ) from exc
++
++        capture = run_probe_hook(model, submodule, model_batch, self.probe_layer)
++        if self.probe_batch_dim == "auto":
++            batch_dim = detect_batch_dim(model, submodule, model_batch, self.probe_layer)
++        else:
++            batch_dim = self.probe_batch_dim
++            if not 0 <= batch_dim < capture.ndim:
++                raise ValueError(
++                    f"probe_batch_dim={batch_dim} is out of range for "
++                    f"probe_layer={self.probe_layer!r} capture of shape "
++                    f"{tuple(capture.shape)}."
++                )
++        return capture.movedim(batch_dim, 0), batch_dim
++
+ 
+ class DownstreamWrapperModel(nn.Module):
+     """Wrapper for downstream evaluation of pretrained models.
+@@ -508,6 +583,8 @@ def __init__(
+         strict_matching: bool = True,
+         aggregation: tp.Literal["flatten", "mean", "first"] | int | None = "flatten",
+         probe_config: Mlp | tp.Literal["linear"] | None = None,
++        probe_layer: str | None = None,
++        probe_batch_dim: int = 0,
+     ):
+         super().__init__()
+ 
+@@ -527,6 +604,33 @@ def __init__(
+         n_inputs = self._build_aggregation(aggregation, brain_model_output_size)
+         self._build_probe(probe_config, n_inputs, wrapper_n_outputs)
+ 
++        # The hook lives on ``self.wrapped_model`` (a submodule of ``self``), so
++        # a strong closure over ``self`` would form a self -> wrapped_model ->
++        # submodule -> hook -> self reference cycle that keeps this wrapper (and
++        # its captured GPU activations) alive past its useful life. A weakref
++        # lets the hook no-op once the wrapper is collected, and
++        # ``weakref.finalize`` deterministically detaches the hook on GC so a
++        # shared backbone doesn't accumulate stale hooks across CV folds.
++        # Single-slot buffer (overwrite, not append): keeps only the last fire
++        # so a submodule that runs many times costs O(1) memory.
++        self._probed_activation: list[torch.Tensor] = []
++        self._probe_handle: torch.utils.hooks.RemovableHandle | None = None
++        # Captured activations are moved to batch-first before aggregation, so
++        # the aggregation semantics match the non-probe path.
++        self._probe_batch_dim = probe_batch_dim
++        if probe_layer is not None:
++            self_ref = weakref.ref(self)
++
++            def _capture(_m, _i, out, _ref=self_ref):
++                s = _ref()
++                if s is not None:
++                    s._probed_activation[:] = [out]
++
++            self._probe_handle = self.wrapped_model.get_submodule(
++                probe_layer
++            ).register_forward_hook(_capture)
++            weakref.finalize(self, self._probe_handle.remove)
++
+     def _apply_freeze(
+         self,
+         layers_to_freeze: list[str] | None,
+@@ -651,7 +755,21 @@ def forward(self, *args, return_embedding: bool = False, **kwargs) -> torch.Tens
+         if not self._inner_accepts_var_kwargs:
+             kwargs = {k: v for k, v in kwargs.items() if k in self._inner_param_names}
+ 
++        # Clear before the forward so an activation captured by a previous
++        # (possibly failed) call cannot leak into this one; clear again after
++        # reading so we don't hold the autograd graph between steps.
++        self._probed_activation.clear()
+         out = self.wrapped_model(*args, **kwargs)
++        if self._probe_handle is not None:
++            if not self._probed_activation:
++                raise RuntimeError(
++                    "probe_layer hook did not fire during forward; the configured "
++                    "submodule was not executed by this forward pass."
++                )
++            out = self._probed_activation[-1]
++            self._probed_activation.clear()
++            if self._probe_batch_dim != 0:
++                out = out.movedim(self._probe_batch_dim, 0)
+         if self.model_output_key is not None:
+             out = out[self.model_output_key]
+         out = self.aggregation(out)
+diff --git a/neuralbench-repo/neuralbench/plots/tables.py b/neuralbench-repo/neuralbench/plots/tables.py
+index 08aef9dd8..2626e4b0c 100644
+--- a/neuralbench-repo/neuralbench/plots/tables.py
++++ b/neuralbench-repo/neuralbench/plots/tables.py
+@@ -57,6 +57,71 @@ def _collapse_feature_based_baselines(df: pd.DataFrame) -> pd.DataFrame:
+     return out
+ 
+ 
++def _disambiguate_model_variants(df: pd.DataFrame) -> pd.DataFrame:
++    """Suffix ``model_name`` with the config variant when one is needed.
++
++    Distinct configs that share a ``brain_model_name`` (e.g. multiple downstream
++    wrappers, probe layers, checkpoints, or model hyperparameters on the same
++    backbone) would otherwise collapse into a single ``model_name`` and be
++    averaged together as if they were seeds.  For each model that carries more
++    than one ``model_variant``, the suffix lists only the ``key=value``
++    components that actually differ across its variants -- so labels stay
++    minimal (shared components, including the opaque ``cfg`` hash, are dropped)
++    and the canonical one-config-per-model case is left unchanged.
++    """
++    if "model_variant" not in df.columns:
++        return df
++    variant = df["model_variant"].fillna("")
++
++    def _components(tag: str) -> set[str]:
++        return {part for part in tag.split(";") if part}
++
++    labels = df["model_name"].copy()
++    for base, idx in df.groupby("model_name").groups.items():
++        tags = variant.loc[idx]
++        if tags.nunique() <= 1:
++            continue  # single config -> keep the clean display name
++        shared = set.intersection(*(_components(t) for t in tags))
++        for i in idx:
++            distinguishing = sorted(_components(variant.loc[i]) - shared)
++            if distinguishing:
++                labels.loc[i] = f"{base} [{';'.join(distinguishing)}]"
++    df["model_name"] = labels
++    return df
++
++
++def _check_no_collisions(df: pd.DataFrame) -> None:
++    """Fail loudly if distinct experiments share one ``(model, ..., seed)`` cell.
++
++    Aggregation averages ``metric_value`` over seeds per
++    ``(model_name, task, dataset, metric)``; two rows that match on those *and*
++    ``seed`` are not seed replicates but distinct configs collapsing into one
++    cell, which would silently corrupt the reported mean/std.  After
++    :func:`_disambiguate_model_variants` this should only trigger for a config
++    axis not captured by ``brain_model_name`` / ``model_variant`` (e.g. a grid
++    sweep field) or a genuine duplicate.
++    """
++    key = [
++        c
++        for c in ("model_name", "task_name", "dataset_name", "metric_name", "seed")
++        if c in df.columns
++    ]
++    dup = df.duplicated(subset=key, keep=False)
++    if not dup.any():
++        return
++    cols = key + (["model_variant"] if "model_variant" in df.columns else [])
++    offenders = df.loc[dup, cols].sort_values(key)
++    raise ValueError(
++        "Distinct experiments collapse into the same aggregation cell "
++        f"(grouping key {key}); their results would be silently averaged.\n"
++        "This happens when configs differ in an axis not reflected in "
++        "brain_model_name or model_variant (e.g. a grid field). Give them "
++        "distinct brain_model_name values or extend the model_variant "
++        "signature in aggregator._experiment_variant.\n"
++        f"Colliding rows:\n{offenders.to_string(index=False)}"
++    )
++
++
+ def build_results_df(
+     results: list[dict[str, tp.Any]],
+     loss_to_metric_mapping: dict[str, str],
+@@ -67,6 +132,7 @@ def build_results_df(
+     df["model_name"] = df["brain_model_name"].map(
+         lambda name: MODEL_DISPLAY_NAMES.get(name, name)
+     )
++    df = _disambiguate_model_variants(df)
+     df["loss_name"] = df.loss.apply(pd.Series).name
+     df["metric_name"] = df.loss_name.map(loss_to_metric_mapping)
+     unmapped = df.loc[df["metric_name"].isna(), "loss_name"].unique().tolist()
+@@ -79,6 +145,7 @@ def build_results_df(
+     df["metric_value"] = df.apply(lambda x: x[x["metric_name"]], axis=1)
+     _SCALE_TO_PERCENT = {"test/bal_acc", "test/full_retrieval/top5_acc_subject-agg"}
+     df.loc[df.metric_name.isin(_SCALE_TO_PERCENT), "metric_value"] *= 100.0
++    _check_no_collisions(df)
+     return df
+ 
+ 
+diff --git a/neuralbench-repo/neuralbench/test_modules.py b/neuralbench-repo/neuralbench/test_modules.py
+index 8d45aa4d3..cc3f0c7f7 100644
+--- a/neuralbench-repo/neuralbench/test_modules.py
++++ b/neuralbench-repo/neuralbench/test_modules.py
+@@ -36,6 +36,109 @@ def test_downstream_wrapper():
+     assert out.shape == (B, Fp)
+ 
+ 
++# ---------------------------------------------------------------------------
++# DownstreamWrapper probe_layer
++# ---------------------------------------------------------------------------
++
++
++def test_downstream_wrapper_probe_layer():
++    B, F, Fp = 8, 10, 3
++    model = nn.Sequential(nn.Linear(F, 16), nn.Linear(16, 4))
++    dummy_batch = {"input": torch.Tensor(B, F)}
++    wrapped = DownstreamWrapper(probe_layer="0").build(model, dummy_batch, Fp)
++
++    # Probe is sized from layer "0"'s output (16) — not the final layer (4).
++    assert wrapped.probe.in_features == 16
++    out = wrapped(**dummy_batch)
++    assert out.shape == (B, Fp)
++
++
++def test_downstream_wrapper_probe_layer_invalid():
++    model = nn.Sequential(nn.Linear(10, 8), nn.Linear(8, 4))
++    with pytest.raises(AttributeError, match="not in Sequential"):
++        DownstreamWrapper(probe_layer="no_such_layer").build(
++            model, {"input": torch.Tensor(2, 10)}, 3
++        )
++
++
++def test_downstream_wrapper_probe_layer_requires_no_output_key():
++    with pytest.raises(ValueError, match="model_output_key"):
++        DownstreamWrapper(probe_layer="0", model_output_key="logits")
++
++
++def test_downstream_wrapper_probe_batch_dim_requires_probe_layer():
++    with pytest.raises(ValueError, match="probe_batch_dim only applies"):
++        DownstreamWrapper(probe_batch_dim=1)
++
++
++def test_downstream_wrapper_probe_layer_rejects_tuple_capture():
++    # nn.RNN returns (output, h_n); probing it must raise.
++    model = nn.RNN(input_size=10, hidden_size=8, batch_first=True)
++    with pytest.raises(TypeError, match="tensor-returning"):
++        DownstreamWrapper(probe_layer="").build(
++            model, {"input": torch.Tensor(2, 5, 10)}, 3
++        )
++
++
++class _SeqFirstEnc(nn.Module):
++    """Emits sequence-first (T, B, D), like a ``batch_first=False`` transformer."""
++
++    def __init__(self, n_in: int, emb: int):
++        super().__init__()
++        self.lin = nn.Linear(n_in, emb)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.lin(x).transpose(0, 1)  # (B, T, F) -> (T, B, D)
++
++
++class _SeqFirstProbeNet(nn.Module):
++    """Probed submodule ``enc`` emits sequence-first (T, B, D)."""
++
++    def __init__(self, n_in: int, emb: int):
++        super().__init__()
++        self.enc = _SeqFirstEnc(n_in, emb)
++        self.head = nn.Linear(emb, 4)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.head(self.enc(x).mean(0))
++
++
++@pytest.mark.parametrize("aggregation", ["mean", "flatten", "first"])
++def test_downstream_wrapper_probe_layer_seq_first(aggregation):
++    # A sequence-first (T, B, D) capture is auto-detected and moved to
++    # batch-first, so the standard aggregations apply with no special-casing.
++    B, T, F, D, Fp = 8, 5, 10, 6, 3
++    model = _SeqFirstProbeNet(F, D)
++    wrapped = DownstreamWrapper(probe_layer="enc", aggregation=aggregation).build(
++        model, {"x": torch.Tensor(B, T, F)}, Fp
++    )
++    expected_in = {"mean": D, "flatten": T * D, "first": D}[aggregation]
++    assert wrapped.probe.in_features == expected_in
++    assert wrapped(x=torch.Tensor(B, T, F)).shape == (B, Fp)
++
++
++def test_downstream_wrapper_probe_layer_batch_seq_collision():
++    # Two-pass detection resolves the batch axis even when batch == seq length.
++    n, F, D, Fp = 5, 10, 6, 3
++    model = _SeqFirstProbeNet(F, D)
++    wrapped = DownstreamWrapper(probe_layer="enc", aggregation="mean").build(
++        model, {"x": torch.Tensor(n, n, F)}, Fp
++    )
++    assert wrapped.probe.in_features == D
++    assert wrapped(x=torch.Tensor(n, n, F)).shape == (n, Fp)
++
++
++def test_downstream_wrapper_probe_layer_batch_dim_override():
++    # Explicit probe_batch_dim=1 skips auto-detection for the (T, B, D) capture.
++    B, T, F, D, Fp = 8, 5, 10, 6, 3
++    model = _SeqFirstProbeNet(F, D)
++    wrapped = DownstreamWrapper(
++        probe_layer="enc", aggregation="mean", probe_batch_dim=1
++    ).build(model, {"x": torch.Tensor(B, T, F)}, Fp)
++    assert wrapped.probe.in_features == D
++    assert wrapped(x=torch.Tensor(B, T, F)).shape == (B, Fp)
++
++
+ class LinearOutDict(nn.Module):
+     """Linear layer whose forward returns ``{"key1": Wx, "key2": 2 * Wx}``.
+ 
+diff --git a/neuralbench-repo/neuralbench/test_utils.py b/neuralbench-repo/neuralbench/test_utils.py
+index 334a8d5ed..3219f0d38 100644
+--- a/neuralbench-repo/neuralbench/test_utils.py
++++ b/neuralbench-repo/neuralbench/test_utils.py
+@@ -13,6 +13,7 @@
+ import numpy as np
+ import pytest
+ import torch
++from torch import nn
+ 
+ from neuralbench.utils import SequenceLabelEncoder
+ from neuralset import utils as ns_utils
+@@ -22,8 +23,10 @@
+ from .data import Data
+ from .utils import (
+     _compute_regression_bin_weights,
++    detect_batch_dim,
+     make_regression_bin_sampler,
+     make_weighted_sampler,
++    run_probe_hook,
+     seed_worker,
+ )
+ 
+@@ -412,3 +415,100 @@ def test_make_weighted_sampler_without_generator_follows_global_rng(
+     indices_b = list(iter(sampler_b))
+ 
+     assert indices_a == indices_b
++
++
++# ---------------------------------------------------------------------------
++# run_probe_hook / detect_batch_dim (probe mechanics, exercised in isolation)
++# ---------------------------------------------------------------------------
++
++
++class _SeqFirstEnc(nn.Module):
++    """Emits sequence-first (T, B, D), like a ``batch_first=False`` transformer."""
++
++    def __init__(self, n_in: int, emb: int):
++        super().__init__()
++        self.lin = nn.Linear(n_in, emb)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.lin(x).transpose(0, 1)  # (B, T, F) -> (T, B, D)
++
++
++class _SeqFirstProbeNet(nn.Module):
++    """Probed submodule ``enc`` emits sequence-first (T, B, D)."""
++
++    def __init__(self, n_in: int, emb: int):
++        super().__init__()
++        self.enc = _SeqFirstEnc(n_in, emb)
++        self.head = nn.Linear(emb, 4)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.head(self.enc(x).mean(0))
++
++
++class _Const(nn.Module):
++    """Emits a fixed-size tensor, independent of the input batch size."""
++
++    def forward(self, _x: torch.Tensor) -> torch.Tensor:
++        return torch.zeros(3, 6)
++
++
++class _BatchInvariantNet(nn.Module):
++    """Probed submodule ``const`` emits a fixed-size tensor, ignoring batch size."""
++
++    def __init__(self, n_in: int):
++        super().__init__()
++        self.const = _Const()
++        self.lin = nn.Linear(n_in, 4)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        self.const(x)  # fire the hook with a batch-independent output
++        return self.lin(x)
++
++
++@pytest.mark.parametrize(
++    "model, probe_layer, batch, expected_shape, expected_dim",
++    [
++        # batch-first (B, D) capture from a Sequential -> batch axis 0
++        (
++            nn.Sequential(nn.Linear(10, 16), nn.Linear(16, 4)),
++            "0",
++            {"input": torch.randn(4, 10)},
++            (4, 16),
++            0,
++        ),
++        # sequence-first (T, B, D) capture -> batch axis 1 (auto-detected)
++        (
++            _SeqFirstProbeNet(10, 6),
++            "enc",
++            {"x": torch.randn(4, 5, 10)},
++            (5, 4, 6),
++            1,
++        ),
++    ],
++)
++def test_run_probe_hook_and_detect_batch_dim(
++    model, probe_layer, batch, expected_shape, expected_dim
++):
++    """run_probe_hook returns the submodule output; detect_batch_dim finds its batch axis."""
++    submodule = model.get_submodule(probe_layer)
++    assert run_probe_hook(model, submodule, batch, probe_layer).shape == expected_shape
++    assert detect_batch_dim(model, submodule, batch, probe_layer) == expected_dim
++
++
++def test_run_probe_hook_rejects_unreachable_and_non_tensor():
++    # A submodule never reached during forward -> RuntimeError.
++    model = nn.Sequential(nn.Linear(10, 8), nn.Linear(8, 4))
++    detached = nn.Linear(4, 4)  # not part of model's forward graph
++    with pytest.raises(RuntimeError, match="did not fire"):
++        run_probe_hook(model, detached, {"input": torch.randn(2, 10)}, "detached")
++    # A tuple-returning submodule (nn.RNN -> (output, h_n)) -> TypeError.
++    rnn = nn.RNN(input_size=10, hidden_size=8, batch_first=True)
++    with pytest.raises(TypeError, match="tensor-returning"):
++        run_probe_hook(rnn, rnn, {"input": torch.randn(2, 5, 10)}, "")
++
++
++def test_detect_batch_dim_raises_when_no_axis_scales():
++    # A capture independent of batch size yields zero candidate axes.
++    model = _BatchInvariantNet(10)
++    with pytest.raises(ValueError, match="batch axis is ambiguous"):
++        detect_batch_dim(model, model.const, {"x": torch.randn(4, 10)}, "const")
+diff --git a/neuralbench-repo/neuralbench/utils.py b/neuralbench-repo/neuralbench/utils.py
+index 6387bc0db..867a18b89 100644
+--- a/neuralbench-repo/neuralbench/utils.py
++++ b/neuralbench-repo/neuralbench/utils.py
+@@ -56,6 +56,101 @@ def model_hash(model: nn.Module) -> str:
+     return hasher.hexdigest()
+ 
+ 
++def run_probe_hook(
++    model: nn.Module,
++    submodule: nn.Module,
++    model_batch: dict[str, torch.Tensor | None],
++    probe_layer: str,
++) -> torch.Tensor:
++    """Run one dummy forward and return the tensor captured at ``submodule``.
++
++    A temporary forward hook on ``submodule`` records its last output during a
++    single ``model(**model_batch)`` pass; the hook is always removed afterwards.
++    ``probe_layer`` is used only to make error messages actionable.
++
++    Raises
++    ------
++    RuntimeError
++        If the hook never fires (submodule unreachable from this input).
++    TypeError
++        If the captured output is not a tensor (e.g. an ``nn.MultiheadAttention``
++        or ``nn.RNN`` that returns a tuple/dict).
++    """
++    # Single-slot buffer: keep only the last fire so a submodule that runs
++    # many times (e.g. recurrent) costs O(1) memory rather than O(n_fires).
++    probed_activation: list[torch.Tensor] = []
++
++    def _hook(_m, _i, out):
++        probed_activation[:] = [out]
++
++    handle = submodule.register_forward_hook(_hook)
++    try:
++        model(**model_batch)
++    finally:
++        handle.remove()
++    if not probed_activation:
++        raise RuntimeError(
++            f"probe_layer={probe_layer!r} hook did not fire during "
++            f"the dummy forward; the submodule is unreachable from this input."
++        )
++    capture = probed_activation[0]
++    if not isinstance(capture, torch.Tensor):
++        raise TypeError(
++            f"probe_layer={probe_layer!r} returned "
++            f"{type(capture).__name__}; only tensor-returning "
++            f"submodules are supported (e.g. probe a parent of "
++            f"nn.MultiheadAttention, not the MHA itself)."
++        )
++    return capture
++
++
++def detect_batch_dim(
++    model: nn.Module,
++    submodule: nn.Module,
++    model_batch: dict[str, torch.Tensor | None],
++    probe_layer: str,
++) -> int:
++    """Find the batch axis of ``submodule``'s output via a doubled-batch forward.
++
++    Captures the activation at the input batch size and again at a doubled batch
++    size: the batch axis is the only one whose size scales with the input batch,
++    while sequence/feature axes stay constant. ``probe_layer`` is used only for
++    the error message.
++
++    Raises
++    ------
++    ValueError
++        When the layout is genuinely ambiguous (zero or multiple candidate
++        axes), suggesting the caller pass an explicit batch dim.
++    """
++    batch_size = next(
++        v.shape[0] for v in model_batch.values() if isinstance(v, torch.Tensor)
++    )
++    capture = run_probe_hook(model, submodule, model_batch, probe_layer)
++    doubled = {
++        k: torch.cat([v, v], dim=0)
++        if isinstance(v, torch.Tensor) and v.ndim and v.shape[0] == batch_size
++        else v
++        for k, v in model_batch.items()
++    }
++    capture2 = run_probe_hook(model, submodule, doubled, probe_layer)
++    candidates = [
++        i
++        for i in range(capture.ndim)
++        if i < capture2.ndim
++        and capture.shape[i] == batch_size
++        and capture2.shape[i] == 2 * batch_size
++    ]
++    if len(candidates) != 1:
++        raise ValueError(
++            f"probe_layer={probe_layer!r} batch axis is ambiguous: "
++            f"capture shape {tuple(capture.shape)} scaled to "
++            f"{tuple(capture2.shape)} when the batch size doubled, giving "
++            f"candidate axes {candidates}. Set probe_batch_dim explicitly."
++        )
++    return candidates[0]
++
++
+ _PACKAGE_DIR = Path(__file__).resolve().parent
+ 
+ 

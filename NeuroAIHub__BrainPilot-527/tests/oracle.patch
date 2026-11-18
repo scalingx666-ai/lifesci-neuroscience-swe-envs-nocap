@@ -1,0 +1,355 @@
+diff --git a/packages/runtime/src/__tests__/event-mapping.test.ts b/packages/runtime/src/__tests__/event-mapping.test.ts
+index 03c69c1b..ad35482f 100644
+--- a/packages/runtime/src/__tests__/event-mapping.test.ts
++++ b/packages/runtime/src/__tests__/event-mapping.test.ts
+@@ -17,6 +17,32 @@ import type { IAgentSession, PiAgentEvent } from "../types.js";
+  * (via parseEvent) and that the expected types appear in order.
+  */
+ describe("event mapping (Pi -> AG-UI via parseEvent)", () => {
++  it("clears SDK follow-up queues on both sides of abort settlement", async () => {
++    const bus = new EventBus();
++    let releasePrompt!: () => void;
++    let streaming = false;
++    let clears = 0;
++    const session: IAgentSession = {
++      sessionId: "clear-follow-ups",
++      subscribe: () => () => {},
++      prompt: () => {
++        streaming = true;
++        return new Promise<void>((resolve) => {
++          releasePrompt = () => { streaming = false; resolve(); };
++        });
++      },
++      abort: async () => releasePrompt(),
++      clearQueue: () => { clears += 1; },
++      dispose: () => {},
++      get isStreaming() { return streaming; },
++    };
++    const agent = new MasAgent({ sessionId: session.sessionId, name: "principal", role: "principal", session, bus });
++    const run = agent.prompt("work");
++    await agent.abort();
++    await run;
++    expect(clears).toBe(2);
++  });
++
+   it("assigns a unique stable transport identity to each emitted event", () => {
+     const first = ev.textMessageContent(
+       { sessionId: "identity", agentName: "principal" },
+diff --git a/packages/runtime/src/__tests__/interrupt-cancel.test.ts b/packages/runtime/src/__tests__/interrupt-cancel.test.ts
+index 2d3e0e0c..b70e7964 100644
+--- a/packages/runtime/src/__tests__/interrupt-cancel.test.ts
++++ b/packages/runtime/src/__tests__/interrupt-cancel.test.ts
+@@ -185,6 +185,31 @@ async function delegateToExpert(m: SessionManager, sid: string, expert: string):
+ }
+ 
+ describe("interrupt cancels the active run without a follow-up notice run (#101 / #327)", () => {
++  it("marks the interrupted request cancelled for the next model turn while preserving the visible user text", async () => {
++    const observe = { prompts: [] as Array<{ agent: string; text: string }> };
++    const m = new SessionManager({ persist: false, agentFactory: gatedPrincipalFactory(observe) });
++    const s = await m.createSession();
++    const events: AgUiEvent[] = [];
++    m.subscribe(s.id, (event) => events.push(event));
++
++    await m.sendMessage(s.id, "run the obsolete command");
++    await waitFor(() => observe.prompts.length === 1);
++    await m.interrupt(s.id);
++    await m.sendMessage(s.id, "only answer RECOVERED");
++    await waitFor(() => observe.prompts.length === 2);
++
++    expect(observe.prompts[1]?.text).toContain("[SYSTEM-MESSAGE:interruption]");
++    expect(observe.prompts[1]?.text).toContain("Treat every unfinished instruction");
++    expect(observe.prompts[1]?.text).toContain("only answer RECOVERED");
++    expect(observe.prompts[1]?.text).not.toContain("run the obsolete command");
++
++    const visibleUserMessages = events.filter(
++      (event) => event.type === "TEXT_MESSAGE_CHUNK" && (event as AgUiEvent & { role?: string }).role === "user",
++    ) as Array<AgUiEvent & { delta: string }>;
++    expect(visibleUserMessages.at(-1)?.delta).toBe("only answer RECOVERED");
++    expect(visibleUserMessages.at(-1)?.delta).not.toContain("SYSTEM-MESSAGE");
++  });
++
+   it("does not emit RUN_ERROR or start a second principal prompt after interrupt", async () => {
+     const observe = { prompts: [] as Array<{ agent: string; text: string }> };
+     const m = new SessionManager({ persist: false, agentFactory: gatedPrincipalFactory(observe) });
+diff --git a/packages/runtime/src/agent-factory.ts b/packages/runtime/src/agent-factory.ts
+index 508bf0b7..5328bfe9 100644
+--- a/packages/runtime/src/agent-factory.ts
++++ b/packages/runtime/src/agent-factory.ts
+@@ -337,6 +337,9 @@ class RealAgentSession implements IAgentSession {
+   abort(): Promise<void> {
+     return this.s.abort();
+   }
++  clearQueue(): unknown {
++    return this.s.clearQueue();
++  }
+   interruptTool(toolCallId: string): boolean {
+     const controller = this.bashControllers.get(toolCallId);
+     if (!controller || controller.signal.aborted) return false;
+@@ -356,6 +359,7 @@ interface PiSession {
+   prompt(text: string, opts?: { streamingBehavior?: "steer" | "followUp" }): Promise<void>;
+   setThinkingLevel(level: import("@brainpilot/protocol").ThinkingLevel): void;
+   abort(): Promise<void>;
++  clearQueue(): unknown;
+   dispose(): void;
+ }
+ interface PiSdk {
+diff --git a/packages/runtime/src/mas-agent.ts b/packages/runtime/src/mas-agent.ts
+index a0493d0f..21e9bffe 100644
+--- a/packages/runtime/src/mas-agent.ts
++++ b/packages/runtime/src/mas-agent.ts
+@@ -692,6 +692,11 @@ export class MasAgent {
+       tool.interruptionReason ??= "task_interrupted";
+     }
+     if (this.activeToolCalls.size > 0) this.emitStateUpdate();
++    // Stop means queued steering/follow-up work is abandoned too. In
++    // particular, agent_end extensions can have a hidden Trace reminder queued
++    // behind the visible answer; leaving it in Pi makes the next explicit user
++    // prompt execute that reminder instead (#522).
++    this.session.clearQueue?.();
+     try {
+       await this.session.abort();
+     } catch {
+@@ -704,6 +709,9 @@ export class MasAgent {
+     } catch {
+       /* prompt() is error-isolated; nothing to surface */
+     }
++    // agent_end handlers may race the first clear while abort() unwinds. Fence
++    // them after the prompt has fully settled as well.
++    this.session.clearQueue?.();
+     this.finishDanglingTools("task_interrupted");
+     this.pendingFollowUps = [];
+     // Keep abortRequested true until prompt() has fully unwound so both Pi's
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index 6369906d..f060274d 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -122,6 +122,10 @@ import { MonitorManager, type MonitorEventBatch } from "./monitor-manager.js";
+ 
+ const MAX_MONITOR_EVENT_LINES = 100;
+ const TRACE_ACK_TIMEOUT_MS = 60_000;
++const INTERRUPTED_TURN_BOUNDARY =
++  "[SYSTEM-MESSAGE:interruption] The previous user turn was explicitly stopped. " +
++  "Treat every unfinished instruction, requested tool call, and requested output from that turn as cancelled. " +
++  "Follow only the new user message below. This is internal context; do not mention it. [/SYSTEM-MESSAGE]";
+ 
+ interface Deferred<T> {
+   promise: Promise<T>;
+@@ -1925,7 +1929,11 @@ export class SessionManager {
+     // exhausted principal/trace notification run. Other targets may resume
+     // immediately; this target waits until its direct turn settles so prompts
+     // never overlap.
++    const resumedAfterWholeSessionStop = entry.taskLedger.isDeliveryPausedGlobally();
+     const resumeTargetAfterRun = await this.resumeTaskDelivery(entry, agentName);
++    const modelInput = resumedAfterWholeSessionStop
++      ? `${INTERRUPTED_TURN_BOUNDARY}\n\n${content}`
++      : content;
+ 
+     // A substantive follow-up extends the current Principal workflow epoch.
+     // Exempt follow-ups never turn an already-required epoch off.
+@@ -1945,7 +1953,7 @@ export class SessionManager {
+     // broadcast (so SSE replay stays complete) correlated to the CURRENT run.
+     if (agent.isStreaming) {
+       const runId = entry.activeRunId ?? undefined;
+-      void agent.followUp(content, opts.uuid ?? randomUUID(), { messageRunId: runId }).finally(() => {
++      void agent.followUp(modelInput, opts.uuid ?? randomUUID(), { messageRunId: runId }).finally(() => {
+         if (resumeTargetAfterRun && entry.taskLedger.count(agentName) > 0) {
+           this.wakeAgent(sessionId, agentName);
+         }
+@@ -1990,7 +1998,7 @@ export class SessionManager {
+     );
+     // Fire-and-track: don't block the HTTP response on the full run.
+     // #167: the principal's own turn also counts against the session provider cap.
+-    void this.withProviderSlot(sessionId, () => agent.prompt(content))
++    void this.withProviderSlot(sessionId, () => agent.prompt(modelInput))
+       .catch((err) => {
+         entry.bus.emit(
+           ev.systemMessage(sessionId, "error", `发送消息失败: ${(err as Error).message}`, { agent: agentName }),
+diff --git a/packages/runtime/src/task-ledger.ts b/packages/runtime/src/task-ledger.ts
+index 6eb7d541..a555545d 100644
+--- a/packages/runtime/src/task-ledger.ts
++++ b/packages/runtime/src/task-ledger.ts
+@@ -406,6 +406,10 @@ export class TaskLedger {
+     return this.deliveryPaused || this.pausedAgents.size > 0;
+   }
+ 
++  isDeliveryPausedGlobally(): boolean {
++    return this.deliveryPaused;
++  }
++
+   isPaused(agent: string): boolean {
+     return this.deliveryPaused || this.pausedAgents.has(agent);
+   }
+diff --git a/packages/runtime/src/types.ts b/packages/runtime/src/types.ts
+index 41c3aeab..3529819f 100644
+--- a/packages/runtime/src/types.ts
++++ b/packages/runtime/src/types.ts
+@@ -51,6 +51,8 @@ export interface IAgentSession {
+    * run should await this (see `MasAgent.abort`, #101).
+    */
+   abort(): Promise<void>;
++  /** Drop SDK steering/follow-up messages that must not survive Stop. */
++  clearQueue?(): unknown;
+   /** Cancel one locally-running tool without aborting the enclosing agent turn. */
+   interruptTool?(toolCallId: string): boolean;
+   /** Tear down; release resources. */
+diff --git a/packages/web/src/__tests__/demoTruncatedExport.test.ts b/packages/web/src/__tests__/demoTruncatedExport.test.ts
+index 002085f0..e8a8b654 100644
+--- a/packages/web/src/__tests__/demoTruncatedExport.test.ts
++++ b/packages/web/src/__tests__/demoTruncatedExport.test.ts
+@@ -79,6 +79,35 @@ describe("demo replay tolerates truncated/orphaned events", () => {
+     // Entire delta was a NO-RENDER wrapper → nothing to render, no message created.
+     expect(msgs).toHaveLength(0);
+   });
++
++  it("never renders a NO-RENDER wrapper split across model stream chunks", () => {
++    let msgs: ChatMessage[] = [];
++    const deltas = ["<!--NO", "-RENDER", "-->trace", " reminder handled", "<!--/", "NO", "-RENDER", "-->"];
++    for (const delta of deltas) {
++      msgs = reduceMessagesForEvent(msgs, {
++        type: "TEXT_MESSAGE_CONTENT",
++        messageId: "split-internal",
++        delta,
++        agentName: "principal",
++      } as WebSocketEvent);
++      expect(msgs.every((message) => message.content === "")).toBe(true);
++    }
++    msgs = reduceMessagesForEvent(msgs, {
++      type: "TEXT_MESSAGE_END",
++      messageId: "split-internal",
++    } as WebSocketEvent);
++    expect(msgs).toHaveLength(0);
++  });
++
++  it("drops an atomic NO-RENDER chat chunk", () => {
++    const msgs = reduceMessagesForEvent([], {
++      type: "TEXT_MESSAGE_CHUNK",
++      messageId: "atomic-internal",
++      role: "assistant",
++      delta: "<!--NO-RENDER-->workflow reminder handled<!--/NO-RENDER-->",
++    } as WebSocketEvent);
++    expect(msgs).toHaveLength(0);
++  });
+ });
+ 
+ describe("normalizeAgUiEvent preserves transport metadata keys", () => {
+diff --git a/packages/web/src/contexts/messageReducer.ts b/packages/web/src/contexts/messageReducer.ts
+index 3b2b1259..2b79b7af 100644
+--- a/packages/web/src/contexts/messageReducer.ts
++++ b/packages/web/src/contexts/messageReducer.ts
+@@ -11,6 +11,26 @@ import {
+   markLatestPrincipalAnswerPartial,
+ } from "./errorRecovery";
+ 
++const NO_RENDER_OPEN = "<!--NO-RENDER-->";
++
++function splitNoRenderContent(raw: string): { visible: string; pending?: string } {
++  let visible = raw.replace(/<!--NO-RENDER-->[\s\S]*?<!--\/NO-RENDER-->/g, "");
++  const openIndex = visible.indexOf(NO_RENDER_OPEN);
++  if (openIndex >= 0) {
++    return { visible: visible.slice(0, openIndex), pending: visible.slice(openIndex) };
++  }
++  // Hold a partial opening marker so split model chunks never flash internal
++  // control text before the complete wrapper arrives.
++  const maxPrefix = Math.min(NO_RENDER_OPEN.length - 1, visible.length);
++  for (let length = maxPrefix; length > 0; length -= 1) {
++    const suffix = visible.slice(-length);
++    if (NO_RENDER_OPEN.startsWith(suffix)) {
++      return { visible: visible.slice(0, -length), pending: suffix };
++    }
++  }
++  return { visible };
++}
++
+ /**
+  * AG-UI event → message-list reducer, extracted from SessionContext so both the
+  * live session and the demo replay player fold the same way. Keeping a single
+@@ -244,9 +264,6 @@ export function reduceMessagesForEvent(existing: ChatMessage[], event: WebSocket
+       const id = event.messageId;
+       let delta = typeof event.delta === "string" ? event.delta : "";
+       if (!id || !delta) return existing;
+-      // Strip NO-RENDER wrapper used by record_trace "Message Complete" hint
+-      delta = delta.replace(/<!--NO-RENDER-->[\s\S]*?<!--\/NO-RENDER-->/g, "");
+-      if (!delta) return existing;
+       const key = streamAppendKey(event, id, delta);
+       // Orphaned CONTENT (no matching START) — recover gracefully instead of
+       // dropping it. This happens when a demo bundle was exported from a
+@@ -254,6 +271,8 @@ export function reduceMessagesForEvent(existing: ChatMessage[], event: WebSocket
+       // and a plain `.map` here would no-op, silently swallowing the opening
+       // replies. Synthesize the message so the content still renders.
+       if (!existing.some((m) => m.id === id)) {
++        const next = splitNoRenderContent(delta);
++        if (!next.visible && !next.pending) return existing;
+         return [
+           ...existing,
+           withAppliedStreamKey(
+@@ -261,7 +280,8 @@ export function reduceMessagesForEvent(existing: ChatMessage[], event: WebSocket
+               id,
+               runId: event.runId,
+               role: "assistant",
+-              content: delta,
++              content: next.visible,
++              suppressedContent: next.pending,
+               createdAt: eventTimestamp(event),
+               agent,
+               streaming: true,
+@@ -276,7 +296,13 @@ export function reduceMessagesForEvent(existing: ChatMessage[], event: WebSocket
+         // Finalized message: history/SSE replay must not re-append (#314).
+         if (m.streaming === false) return m;
+         if (key && m.appliedStreamKeys?.includes(key)) return m;
+-        return withAppliedStreamKey({ ...m, content: (m.content ?? "") + delta }, key);
++        const raw = (m.content ?? "") + (m.suppressedContent ?? "") + delta;
++        const next = splitNoRenderContent(raw);
++        return withAppliedStreamKey({
++          ...m,
++          content: next.visible,
++          suppressedContent: next.pending,
++        }, key);
+       });
+     }
+ 
+@@ -285,8 +311,12 @@ export function reduceMessagesForEvent(existing: ChatMessage[], event: WebSocket
+       if (!id) return existing;
+       // Drop messages whose entire content was a NO-RENDER wrapper
+       return existing
+-        .filter((m) => !(m.id === id && (m.content ?? "").trim() === ""))
+-        .map((m) => (m.id === id ? finalizeStreamMessage(m) : m));
++        .map((m) => {
++          if (m.id !== id) return m;
++          const next = splitNoRenderContent((m.content ?? "") + (m.suppressedContent ?? ""));
++          return finalizeStreamMessage({ ...m, content: next.visible, suppressedContent: undefined });
++        })
++        .filter((m) => !(m.id === id && (m.content ?? "").trim() === ""));
+     }
+ 
+     case "TEXT_MESSAGE_CHUNK": {
+@@ -308,13 +338,16 @@ export function reduceMessagesForEvent(existing: ChatMessage[], event: WebSocket
+           : message);
+       }
+       const role = event.role === "assistant" || event.role === "system" ? event.role : "user";
++      const rawContent = typeof event.delta === "string" ? event.delta : "";
++      const content = splitNoRenderContent(rawContent).visible;
++      if (!content.trim() && rawContent.includes(NO_RENDER_OPEN)) return existing;
+       return [
+         ...existing,
+         {
+           id,
+           runId: event.runId,
+           role,
+-          content: typeof event.delta === "string" ? event.delta : "",
++          content,
+           createdAt: eventTimestamp(event),
+           agent: role === "user" ? "user" : agent,
+           streaming: false,
+diff --git a/packages/web/src/contracts/backend.ts b/packages/web/src/contracts/backend.ts
+index 56714515..6097b809 100644
+--- a/packages/web/src/contracts/backend.ts
++++ b/packages/web/src/contracts/backend.ts
+@@ -241,6 +241,8 @@ export interface ChatMessage {
+    * not concatenate the same delta twice (#314). Not rendered.
+    */
+   appliedStreamKeys?: string[];
++  /** Reducer-only buffer for a split NO-RENDER block; never rendered. */
++  suppressedContent?: string;
+ }
+ 
+ /** View-model for a `system_message` AG-UI event (post-normalize). */

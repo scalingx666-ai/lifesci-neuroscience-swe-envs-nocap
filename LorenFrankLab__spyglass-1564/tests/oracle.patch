@@ -1,0 +1,218 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 38e7edef8c..c6598a34dd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -221,6 +221,10 @@ for label, interval_data in results.groupby("interval_labels"):
+     - Improve get_recording efficiency #1522
+     - Raise error if `FigURLCurationSelection` finds no curation label #1531
+     - Allow `CurationV1` to save without any spikes #1533
++    - Drop spike sample indices that exceed the recording length in
++        `CurationV1.get_sorting` and `SpikeSorting.get_sorting`, fixing a
++        SpikeInterface `ValueError` caused by floating-point round-trip
++        in the seconds-to-samples conversion #1564
+ 
+ ## [0.5.5] (Aug 6, 2025)
+ 
+diff --git a/src/spyglass/spikesorting/v1/curation.py b/src/spyglass/spikesorting/v1/curation.py
+index 97c3bf2593..66afe7472c 100644
+--- a/src/spyglass/spikesorting/v1/curation.py
++++ b/src/spyglass/spikesorting/v1/curation.py
+@@ -14,7 +14,11 @@
+     SpikeSortingRecording,
+     SpikeSortingRecordingSelection,
+ )
+-from spyglass.spikesorting.v1.sorting import SpikeSorting, SpikeSortingSelection
++from spyglass.spikesorting.v1.sorting import (
++    SpikeSorting,
++    SpikeSortingSelection,
++    spike_times_to_valid_samples,
++)
+ from spyglass.utils import SpyglassMixin, logger
+ 
+ schema = dj.schema("spikesorting_v1_curation")
+@@ -213,8 +217,11 @@ def get_sorting(cls, key: dict, as_dataframe=False) -> si.BaseSorting:
+         sampling_frequency = recording.get_sampling_frequency()
+ 
+         recording_times = recording.get_times()
++        n_samples = recording.get_num_samples()
+         units_dict = {
+-            unit.Index: np.searchsorted(recording_times, unit.spike_times)
++            unit.Index: spike_times_to_valid_samples(
++                recording_times, unit.spike_times, n_samples, unit.Index
++            )
+             for unit in units.itertuples()
+         }
+ 
+diff --git a/src/spyglass/spikesorting/v1/sorting.py b/src/spyglass/spikesorting/v1/sorting.py
+index 7ab3334f06..df67045e64 100644
+--- a/src/spyglass/spikesorting/v1/sorting.py
++++ b/src/spyglass/spikesorting/v1/sorting.py
+@@ -27,6 +27,59 @@
+ schema = dj.schema("spikesorting_v1_sorting")
+ 
+ 
++def spike_times_to_valid_samples(
++    recording_times: np.ndarray,
++    spike_times: np.ndarray,
++    n_samples: int,
++    unit_id,
++) -> np.ndarray:
++    """Convert spike times (seconds) to sample indices within recording bounds.
++
++    Spike times are persisted in absolute seconds in NWB. On readback,
++    floating-point rounding in the seconds-to-samples round-trip can cause
++    ``np.searchsorted`` to return an index equal to ``n_samples`` (one past
++    the last valid sample) for spikes at or near the end of the recording.
++    SpikeInterface rejects such a sorting with ``ValueError: "The sorting
++    object has spikes exceeding the recording duration"``. This helper drops
++    those out-of-bounds indices and emits a warning identifying the affected
++    unit and the count removed.
++
++    ``np.searchsorted`` is called with the default ``side='left'``: a spike
++    that exactly equals ``recording_times[-1]`` maps to index ``n_samples - 1``
++    (valid). Switching to ``side='right'`` would map the same spike to
++    ``n_samples`` and reintroduce the bug.
++
++    Parameters
++    ----------
++    recording_times : np.ndarray, shape (n_samples,)
++        Recording timestamps in seconds, monotonically increasing.
++    spike_times : np.ndarray, shape (n_spikes,)
++        Spike times for a single unit in seconds.
++    n_samples : int
++        Total number of samples in the recording.
++    unit_id : int or str
++        Identifier of the unit, used only in the warning message.
++
++    Returns
++    -------
++    spike_samples : np.ndarray, shape (n_valid_spikes,)
++        Sample indices in ``[0, n_samples)`` corresponding to ``spike_times``,
++        with any out-of-bounds indices removed. ``n_valid_spikes <= n_spikes``.
++    """
++    spike_samples = np.searchsorted(recording_times, spike_times)
++    excess_mask = spike_samples >= n_samples
++    n_excess = int(excess_mask.sum())
++    if n_excess > 0:
++        logger.warning(
++            f"Unit {unit_id} has {n_excess} spike(s) exceeding the "
++            "recording duration. Removing excess spikes. This may be "
++            "caused by floating-point rounding during the seconds-to-"
++            "samples conversion."
++        )
++        spike_samples = spike_samples[~excess_mask]
++    return spike_samples
++
++
+ @schema
+ class SpikeSorterParameters(SpyglassMixin, dj.Lookup):
+     """Parameters for spike sorting algorithms.
+@@ -480,17 +533,18 @@ def get_sorting(cls, key: dict) -> si.BaseSorting:
+         ) as io:
+             nwbf = io.read()
+             units = nwbf.units.to_dataframe()
+-        units_dict_list = [
+-            {
+-                unit_id: np.searchsorted(recording.get_times(), spike_times)
+-                for unit_id, spike_times in zip(
+-                    units.index, units["spike_times"]
+-                )
+-            }
+-        ]
++
++        recording_times = recording.get_times()
++        n_samples = recording.get_num_samples()
++        units_dict = {
++            unit_id: spike_times_to_valid_samples(
++                recording_times, spike_times, n_samples, unit_id
++            )
++            for unit_id, spike_times in zip(units.index, units["spike_times"])
++        }
+ 
+         sorting = si.NumpySorting.from_unit_dict(
+-            units_dict_list, sampling_frequency=sampling_frequency
++            [units_dict], sampling_frequency=sampling_frequency
+         )
+ 
+         return sorting
+diff --git a/tests/spikesorting/v1/test_curation.py b/tests/spikesorting/v1/test_curation.py
+index 4237e1dcbf..5b78f6447b 100644
+--- a/tests/spikesorting/v1/test_curation.py
++++ b/tests/spikesorting/v1/test_curation.py
+@@ -271,3 +271,76 @@ def test_empty_units_nwb_readable(empty_units_nwb):
+         assert nwbf.units is not None
+         units_df = nwbf.units.to_dataframe()
+         assert len(units_df) == 0
++
++
++# ============================================================================
++# Excess Spike Removal Tests (invalid spike_times from float precision)
++# ============================================================================
++
++
++def test_spike_times_to_valid_samples_drops_out_of_bounds():
++    """The shared helper used by CurationV1.get_sorting() and
++    SpikeSorting.get_sorting() must drop spike sample indices >= n_samples.
++
++    Reproduces the floating-point round-trip scenario where
++    np.searchsorted returns an index equal to n_samples for a spike just
++    beyond the last recording timestamp, which would otherwise cause
++    SpikeInterface to raise ValueError on the resulting sorting.
++    """
++    import spikeinterface as si
++
++    from spyglass.spikesorting.v1.sorting import (
++        spike_times_to_valid_samples,
++    )
++
++    sampling_frequency = 30000.0
++    n_samples = 300  # 10 ms recording
++    recording_times = np.arange(n_samples, dtype=float) / sampling_frequency
++
++    # 10 valid spikes, plus one just beyond the last timestamp
++    spike_times = np.append(
++        recording_times[:10].copy(), recording_times[-1] + 1e-9
++    )
++
++    # Precondition: searchsorted does produce an out-of-bounds index here
++    raw = np.searchsorted(recording_times, spike_times)
++    assert (raw >= n_samples).any(), (
++        "Test precondition failed: expected at least one out-of-bounds "
++        "index from np.searchsorted"
++    )
++
++    valid = spike_times_to_valid_samples(
++        recording_times, spike_times, n_samples, unit_id=0
++    )
++
++    assert valid.shape == (10,), (
++        f"Expected 10 valid samples after dropping 1 excess, "
++        f"got {valid.shape[0]}"
++    )
++    assert (valid < n_samples).all()
++
++    # Resulting NumpySorting must be accepted by SpikeInterface
++    sorting = si.NumpySorting.from_unit_dict(
++        [{0: valid}], sampling_frequency=sampling_frequency
++    )
++    assert isinstance(sorting, si.BaseSorting)
++
++
++def test_spike_times_to_valid_samples_passthrough():
++    """When all spike times are in bounds, the helper returns sample indices
++    identical to ``np.searchsorted`` and drops nothing."""
++    from spyglass.spikesorting.v1.sorting import (
++        spike_times_to_valid_samples,
++    )
++
++    sampling_frequency = 30000.0
++    n_samples = 300
++    recording_times = np.arange(n_samples, dtype=float) / sampling_frequency
++    spike_times = recording_times[[0, 5, 100, 299]]
++
++    valid = spike_times_to_valid_samples(
++        recording_times, spike_times, n_samples, unit_id=42
++    )
++    expected = np.searchsorted(recording_times, spike_times)
++    np.testing.assert_array_equal(valid, expected)
++    assert (valid < n_samples).all()

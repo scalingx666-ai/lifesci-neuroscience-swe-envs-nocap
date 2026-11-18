@@ -1,0 +1,1176 @@
+diff --git a/packages/backend-core/src/app.ts b/packages/backend-core/src/app.ts
+index 070d4b3b..1b5f64d0 100644
+--- a/packages/backend-core/src/app.ts
++++ b/packages/backend-core/src/app.ts
+@@ -179,6 +179,7 @@ export function createApp(options: CreateAppOptions): Hono {
+   api.delete("/sessions/:id", forward("deleteSession", { idParam: "id" }));
+   api.get("/sessions/:id/state", forward("getSessionState", { idParam: "id" }));
+   api.get("/sessions/:id/trace", forward("getTrace", { idParam: "id" }));
++  api.get("/sessions/:id/stats", forward("getSessionStats", { idParam: "id" }));
+   // Persisted event tail for chat rehydrate after a restart. SSE replays only
+   // the in-memory ring; this endpoint reads events.jsonl on disk. Carries the
+   // ?limit query verbatim.
+diff --git a/packages/protocol/src/domain.ts b/packages/protocol/src/domain.ts
+index 75ac09f4..ef4d3324 100644
+--- a/packages/protocol/src/domain.ts
++++ b/packages/protocol/src/domain.ts
+@@ -105,6 +105,107 @@ export const SessionTokenUsageSchema = z.object({
+ });
+ export type SessionTokenUsage = z.infer<typeof SessionTokenUsageSchema>;
+ 
++/* ------------------------------------------------------------------ *
++ * Per-run usage stats (tools + skills + token deltas)
++ *
++ * Purpose: **behavioural research** — answer "which tools/skills did each
++ * agent use, per run, over the life of this session". Sibling to
++ * SessionTokenUsage above; kept in its own persisted file (`stats.json`) so
++ * we can write on every RUN_FINISHED without churning `usage.json`.
++ *
++ * Coverage (see `docs/superpowers/specs/…usage-stats-design.md`):
++ *   - Tools: ~99% (every Pi tool execution goes through one core-loop path
++ *     that emits `tool_execution_start`/`end`). Only known gap is hard-abort
++ *     mid-preparation, which is rare.
++ *   - Skills: only the `skill_search` custom tool is counted. `/skill:<name>`
++ *     slash-command expansions and implicit `<available_skills>` loads are
++ *     not observable from the current event surface and are OUT OF SCOPE
++ *     (upgradable later via a Pi extension without touching this schema).
++ * ------------------------------------------------------------------ */
++
++/**
++ * Per-agent per-tool invocation counter. Key is the tool name (`"read"`,
++ * `"bash"`, `"skill_search"`, external-MCP-bridged names, …). Value is the
++ * number of times the runtime observed a `tool_execution_start` for that
++ * tool. Aborted mid-run tools still count — we count *invocations*, not
++ * *successful completions*; see `errors` on `AgentStatsSchema` for the
++ * failure counter.
++ */
++export const ToolCallCountsSchema = z.record(z.string(), z.number().int().nonnegative());
++export type ToolCallCounts = z.infer<typeof ToolCallCountsSchema>;
++
++/**
++ * Per-skill invocation counter. Split by the three `skill_search` sub-modes
++ * (see packages/runtime/src/tools/skill-search.ts):
++ *   - `queries` — `mode="query"` with `keywords` (exploration; no body read)
++ *   - `loads`   — `mode="query"` with `skill_name` (returns full SKILL.md)
++ *   - `browses` — `mode="browse"` (directory/file browse under a skill)
++ *
++ * A special key `"__search__"` collects `queries` where the args carried no
++ * `skill_name` (pure keyword search — the agent looked around but did not
++ * commit to a named skill). Args that fail to parse are also charged to
++ * `__search__.queries` so counters are never dropped silently.
++ */
++export const SkillCounterSchema = z.object({
++  queries: z.number().int().nonnegative(),
++  loads: z.number().int().nonnegative(),
++  browses: z.number().int().nonnegative(),
++});
++export type SkillCounter = z.infer<typeof SkillCounterSchema>;
++export const SkillCountsSchema = z.record(z.string(), SkillCounterSchema);
++export type SkillCounts = z.infer<typeof SkillCountsSchema>;
++
++/**
++ * All countable stats for one agent, in one accounting unit (session
++ * cumulative, or a single RUN_STATS delta).
++ *
++ * `errors` counts `tool_execution_end.isError === true` per tool name; it is
++ * additive to `tools` — `tools[name]` is "attempted N times", `errors[name]`
++ * is "of those, M failed". We do not subtract.
++ */
++export const AgentStatsSchema = z.object({
++  tokens: TokenUsageSchema,
++  tools: ToolCallCountsSchema,
++  skills: SkillCountsSchema,
++  errors: ToolCallCountsSchema,
++});
++export type AgentStats = z.infer<typeof AgentStatsSchema>;
++
++/** Status stamped onto a `RunStats` entry when it is finalized. */
++export const RunStatsStatusSchema = z.enum(["ok", "error", "aborted"]);
++export type RunStatsStatus = z.infer<typeof RunStatsStatusSchema>;
++
++/**
++ * One completed run's contribution, computed as `cumulative_after -
++ * cumulative_before`. Appended to `SessionStats.byRun` when the run reaches
++ * a terminal event (`RUN_FINISHED` / `RUN_ERROR`) or is aborted.
++ */
++export const RunStatsSchema = z.object({
++  runId: z.string(),
++  agentName: z.string(),
++  startedAt: z.number().int().nonnegative(),
++  finishedAt: z.number().int().nonnegative(),
++  status: RunStatsStatusSchema,
++  delta: AgentStatsSchema,
++});
++export type RunStats = z.infer<typeof RunStatsSchema>;
++
++/**
++ * Full stats snapshot for one session:
++ *   - `total`   — everything summed across agents and runs.
++ *   - `byAgent` — per-agent cumulative (mirrors `SessionTokenUsage.byAgent`).
++ *   - `byRun`   — time-ordered per-run deltas. Append-only; never truncated
++ *                 (`events.jsonl` is the ultimate SSOT and is uncapped, so
++ *                 this stays bounded by the same envelope).
++ */
++export const SessionStatsSchema = z.object({
++  sessionId: z.string(),
++  total: AgentStatsSchema,
++  byAgent: z.record(z.string(), AgentStatsSchema),
++  byRun: z.array(RunStatsSchema),
++});
++export type SessionStats = z.infer<typeof SessionStatsSchema>;
++
+ /**
+  * Authoritative live session state. Identical shape across SSE first frame
+  * (`CUSTOM:session_state`), push events, and `GET /sessions/:id/state`.
+diff --git a/packages/protocol/src/http.ts b/packages/protocol/src/http.ts
+index 63f82f9a..23248f16 100644
+--- a/packages/protocol/src/http.ts
++++ b/packages/protocol/src/http.ts
+@@ -25,7 +25,12 @@
+  */
+ import { z } from "zod";
+ import { AgUiEventSchema } from "./events.js";
+-import { AgentStatusSchema, SessionSchema, SessionStateSnapshotSchema } from "./domain.js";
++import {
++  AgentStatusSchema,
++  SessionSchema,
++  SessionStateSnapshotSchema,
++  SessionStatsSchema,
++} from "./domain.js";
+ 
+ export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+ 
+@@ -114,6 +119,18 @@ export type DeleteSessionResponse = z.infer<typeof DeleteSessionResponseSchema>;
+ export const GetSessionStateResponseSchema = SessionStateSnapshotSchema;
+ export type GetSessionStateResponse = z.infer<typeof GetSessionStateResponseSchema>;
+ 
++/* ------------------------------------------------------------------ *
++ * GET /sessions/:id/stats  (per-run + per-session usage stats)
++ * ------------------------------------------------------------------ */
++
++/**
++ * Full stats snapshot: tokens (mirrors what `session_state` already ships)
++ * plus per-agent tool/skill/error counters and a per-run delta timeline.
++ * See `SessionStatsSchema` in domain.ts for the shape.
++ */
++export const GetSessionStatsResponseSchema = SessionStatsSchema;
++export type GetSessionStatsResponse = z.infer<typeof GetSessionStatsResponseSchema>;
++
+ /* ------------------------------------------------------------------ *
+  * POST /sessions/:id/messages  (inject user message)
+  * ------------------------------------------------------------------ */
+@@ -253,6 +270,12 @@ export const RUNTIME_ROUTES = {
+   updateSession: { method: "PUT", path: "/sessions/:id" },
+   deleteSession: { method: "DELETE", path: "/sessions/:id" },
+   getSessionState: { method: "GET", path: "/sessions/:id/state" },
++  /**
++   * Per-run + per-session usage stats (tokens + tool/skill/error counters).
++   * Payload: `SessionStatsSchema`. Persisted alongside the session at
++   * `<dataRoot>/.bp/<sid>/stats.json`.
++   */
++  getSessionStats: { method: "GET", path: "/sessions/:id/stats" },
+   /** Graph of Trace (reasoning DAG) for a session. */
+   getTrace: { method: "GET", path: "/sessions/:id/trace" },
+   sendMessage: { method: "POST", path: "/sessions/:id/messages" },
+diff --git a/packages/protocol/test/http.test.ts b/packages/protocol/test/http.test.ts
+index 520b9435..bb180a6e 100644
+--- a/packages/protocol/test/http.test.ts
++++ b/packages/protocol/test/http.test.ts
+@@ -105,5 +105,9 @@ describe("Runtime HTTP contract", () => {
+     expect(RUNTIME_ROUTES.interrupt.path).toBe("/sessions/:id/interrupt");
+     expect(RUNTIME_ROUTES.listAgents.path).toBe("/sessions/:id/agents");
+     expect(RUNTIME_ROUTES.evictSession).toEqual({ method: "POST", path: "/sessions/:id/evict" });
++    expect(RUNTIME_ROUTES.getSessionStats).toEqual({
++      method: "GET",
++      path: "/sessions/:id/stats",
++    });
+   });
+ });
+diff --git a/packages/runtime/src/__tests__/usage-stats.test.ts b/packages/runtime/src/__tests__/usage-stats.test.ts
+new file mode 100644
+index 00000000..196ec8f7
+--- /dev/null
++++ b/packages/runtime/src/__tests__/usage-stats.test.ts
+@@ -0,0 +1,276 @@
++/**
++ * Per-run + per-session usage stats: tool counters, skill counters (three
++ * `skill_search` sub-modes), error counters, per-run deltas, and persistence to
++ * `.bp/<id>/stats.json` with rehydrate on restart.
++ *
++ * Two layers of coverage:
++ *   1. Pure helpers (`usage-stats.ts`) — arithmetic on POJOs, no I/O.
++ *   2. End-to-end through SessionManager + MockAgentSession — drives the same
++ *      Pi-shaped event stream the real runtime consumes.
++ */
++import { describe, it, expect } from "vitest";
++import { mkdtemp, readFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { EventBus } from "../event-bus.js";
++import { MasAgent } from "../mas-agent.js";
++import { MockAgentSession } from "../mock-agent.js";
++import { SessionManager } from "../session-manager.js";
++import { mockAgentFactory } from "../agent-factory.js";
++import {
++  addStatsDelta,
++  cloneAgentStats,
++  emptyAgentStats,
++  recordSkillCall,
++  SKILL_SEARCH_KEY,
++  subtractAgentStats,
++} from "../usage-stats.js";
++import type { AgentStats } from "@brainpilot/protocol";
++
++async function waitFor(pred: () => boolean, timeoutMs = 2000): Promise<void> {
++  const start = Date.now();
++  while (!pred()) {
++    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
++    await new Promise((r) => setTimeout(r, 10));
++  }
++}
++
++describe("usage-stats helpers", () => {
++  it("emptyAgentStats is a zeroed identity element", () => {
++    const s = emptyAgentStats();
++    expect(s.tokens.total).toBe(0);
++    expect(s.tools).toEqual({});
++    expect(s.skills).toEqual({});
++    expect(s.errors).toEqual({});
++  });
++
++  it("cloneAgentStats deep-copies (no shared references)", () => {
++    const s = emptyAgentStats();
++    s.tools.read = 3;
++    s.skills["foo"] = { queries: 1, loads: 2, browses: 0 };
++    const c = cloneAgentStats(s);
++    c.tools.read = 99;
++    (c.skills["foo"] as { loads: number }).loads = 99;
++    expect(s.tools.read).toBe(3);
++    expect(s.skills["foo"]!.loads).toBe(2);
++  });
++
++  it("addStatsDelta folds tool/skill/error counters and tokens", () => {
++    const acc = emptyAgentStats();
++    const d: AgentStats = {
++      tokens: { input: 5, output: 3, cacheRead: 1, cacheWrite: 0, total: 9 },
++      tools: { read: 2, bash: 1 },
++      skills: { foo: { queries: 1, loads: 1, browses: 0 } },
++      errors: { bash: 1 },
++    };
++    addStatsDelta(acc, d);
++    addStatsDelta(acc, d);
++    expect(acc.tokens.input).toBe(10);
++    expect(acc.tokens.total).toBe(18); // recomputed from components
++    expect(acc.tools).toEqual({ read: 4, bash: 2 });
++    expect(acc.skills["foo"]).toEqual({ queries: 2, loads: 2, browses: 0 });
++    expect(acc.errors).toEqual({ bash: 2 });
++  });
++
++  it("subtractAgentStats returns non-negative deltas", () => {
++    const a = emptyAgentStats();
++    a.tools.read = 5;
++    a.errors.bash = 1;
++    a.skills["foo"] = { queries: 2, loads: 1, browses: 0 };
++    a.tokens = { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, total: 14 };
++    const b = emptyAgentStats();
++    b.tools.read = 3;
++    b.skills["foo"] = { queries: 1, loads: 0, browses: 0 };
++    b.tokens = { input: 3, output: 1, cacheRead: 0, cacheWrite: 0, total: 4 };
++    const d = subtractAgentStats(a, b);
++    expect(d.tools).toEqual({ read: 2 });
++    expect(d.errors).toEqual({ bash: 1 });
++    expect(d.skills["foo"]).toEqual({ queries: 1, loads: 1, browses: 0 });
++    expect(d.tokens.total).toBe(10);
++  });
++
++  describe("recordSkillCall (skill_search args → counters)", () => {
++    it("mode=query + skill_name → loads on that skill", () => {
++      const s: Record<string, { queries: number; loads: number; browses: number }> = {};
++      recordSkillCall(s, { mode: "query", skill_name: "brainstorming" });
++      expect(s["brainstorming"]).toEqual({ queries: 0, loads: 1, browses: 0 });
++    });
++
++    it("mode=query + keywords only → __search__ queries", () => {
++      const s: Record<string, { queries: number; loads: number; browses: number }> = {};
++      recordSkillCall(s, { mode: "query", keywords: "how to brainstorm" });
++      expect(s[SKILL_SEARCH_KEY]).toEqual({ queries: 1, loads: 0, browses: 0 });
++    });
++
++    it("mode=browse + relative_path → derived skill name browses", () => {
++      const s: Record<string, { queries: number; loads: number; browses: number }> = {};
++      recordSkillCall(s, { mode: "browse", relative_path: "research/brainstorming/SKILL.md" });
++      expect(s["brainstorming"]).toEqual({ queries: 0, loads: 0, browses: 1 });
++    });
++
++    it("malformed args (JSON parse fails) → __search__ queries, no throw", () => {
++      const s: Record<string, { queries: number; loads: number; browses: number }> = {};
++      // Pass a garbage string that isn't valid JSON.
++      expect(() => recordSkillCall(s, "not { json")).not.toThrow();
++      expect(s[SKILL_SEARCH_KEY]).toEqual({ queries: 1, loads: 0, browses: 0 });
++    });
++
++    it("unknown sub-mode → __search__ queries, no drop", () => {
++      const s: Record<string, { queries: number; loads: number; browses: number }> = {};
++      recordSkillCall(s, { mode: "weird", something: "else" });
++      expect(s[SKILL_SEARCH_KEY]).toEqual({ queries: 1, loads: 0, browses: 0 });
++    });
++
++    it("accepts a JSON-encoded string too", () => {
++      const s: Record<string, { queries: number; loads: number; browses: number }> = {};
++      recordSkillCall(s, JSON.stringify({ mode: "query", skill_name: "foo" }));
++      expect(s["foo"]).toEqual({ queries: 0, loads: 1, browses: 0 });
++    });
++  });
++});
++
++describe("MasAgent stats (unit)", () => {
++  it("counts tool invocations per name and marks errors additively", async () => {
++    const bus = new EventBus();
++    const session = new MockAgentSession({
++      sessionId: "s-tools",
++      agentName: "principal",
++      scriptText: "ok",
++      systemTools: [
++        {
++          name: "ping",
++          description: "",
++          parameters: { type: "object", properties: {} },
++          execute: async () => ({ content: [{ type: "text", text: "pong" }] }),
++        },
++        {
++          name: "boom",
++          description: "",
++          parameters: { type: "object", properties: {} },
++          execute: async () => ({
++            isError: true,
++            content: [{ type: "text", text: "kaboom" }],
++          }),
++        },
++      ],
++    });
++    const agent = new MasAgent({
++      sessionId: "s-tools",
++      name: "principal",
++      role: "principal",
++      session,
++      bus,
++    });
++    await agent.prompt("do it [[tool:ping {}]]");
++    await agent.prompt("again [[tool:ping {}]]");
++    await agent.prompt("fail  [[tool:boom {}]]");
++    const s = agent.stats();
++    expect(s.tools.ping).toBe(2);
++    expect(s.tools.boom).toBe(1);
++    expect(s.errors.boom).toBe(1);
++    expect(s.errors.ping).toBeUndefined();
++  });
++
++  it("classifies skill_search sub-modes", async () => {
++    const bus = new EventBus();
++    const session = new MockAgentSession({
++      sessionId: "s-skills",
++      agentName: "principal",
++      scriptText: "ok",
++      systemTools: [
++        {
++          name: "skill_search",
++          description: "",
++          parameters: { type: "object", properties: {} },
++          execute: async () => ({ content: [{ type: "text", text: "results" }] }),
++        },
++      ],
++    });
++    const agent = new MasAgent({
++      sessionId: "s-skills",
++      name: "principal",
++      role: "principal",
++      session,
++      bus,
++    });
++    await agent.prompt(
++      'load [[tool:skill_search {"mode":"query","skill_name":"brainstorming"}]]',
++    );
++    await agent.prompt(
++      'search [[tool:skill_search {"mode":"query","keywords":"how to plan"}]]',
++    );
++    await agent.prompt(
++      'browse [[tool:skill_search {"mode":"browse","relative_path":"cat/foo/SKILL.md"}]]',
++    );
++    const s = agent.stats();
++    expect(s.skills["brainstorming"]!.loads).toBe(1);
++    expect(s.skills[SKILL_SEARCH_KEY]!.queries).toBe(1);
++    expect(s.skills["foo"]!.browses).toBe(1);
++    expect(s.tools.skill_search).toBe(3);
++  });
++});
++
++describe("SessionManager stats (end-to-end)", () => {
++  it("exposes SessionStats via getSessionStats and pushes per-run entries", async () => {
++    const m = new SessionManager({ persist: false, agentFactory: mockAgentFactory });
++    const s = await m.createSession();
++    // Before any run.
++    expect(m.getSessionStats(s.id)?.byRun).toEqual([]);
++
++    await m.sendMessage(s.id, "hello");
++    await waitFor(() => m.listAgents(s.id)[0]?.status === "idle");
++    await waitFor(() => (m.getSessionStats(s.id)?.byRun.length ?? 0) >= 1);
++
++    const stats = m.getSessionStats(s.id)!;
++    expect(stats.sessionId).toBe(s.id);
++    expect(stats.byRun.length).toBeGreaterThanOrEqual(1);
++    const first = stats.byRun[0]!;
++    expect(first.agentName).toBe("principal");
++    expect(first.status).toBe("ok");
++    expect(first.delta.tokens.total).toBeGreaterThan(0);
++    expect(stats.byAgent["principal"]).toBeDefined();
++    // Session total equals per-agent sum (tokens).
++    const perAgentSum = Object.values(stats.byAgent).reduce(
++      (a, s2) => a + s2.tokens.total,
++      0,
++    );
++    expect(stats.total.tokens.total).toBe(perAgentSum);
++  });
++
++  it("persists stats.json and rehydrates on restart", async () => {
++    const dataRoot = await mkdtemp(join(tmpdir(), "bp-stats-"));
++    const m1 = new SessionManager({ dataRoot, agentFactory: mockAgentFactory });
++    const s = await m1.createSession();
++    await m1.sendMessage(s.id, "first");
++    await waitFor(() => m1.listAgents(s.id)[0]?.status === "idle");
++    await waitFor(() => (m1.getSessionStats(s.id)?.byRun.length ?? 0) >= 1);
++    const before = m1.getSessionStats(s.id)!;
++    expect(before.byRun.length).toBeGreaterThanOrEqual(1);
++
++    // stats.json on disk (fire-and-forget write; poll).
++    const statsPath = join(dataRoot, ".bp", s.id, "stats.json");
++    await waitFor(async () => {
++      try {
++        const raw = await readFile(statsPath, "utf8");
++        return JSON.parse(raw).byRun?.length >= before.byRun.length;
++      } catch {
++        return false;
++      }
++    });
++
++    // Fresh manager restores byRun + byAgent + total.
++    const m2 = new SessionManager({ dataRoot, agentFactory: mockAgentFactory });
++    await m2.restoreFromDisk();
++    const rest = m2.getSessionStats(s.id)!;
++    expect(rest.byRun.length).toBe(before.byRun.length);
++    expect(rest.total.tokens.total).toBe(before.total.tokens.total);
++
++    // A new turn keeps appending on top of the restored history.
++    await m2.sendMessage(s.id, "second");
++    await waitFor(() => m2.listAgents(s.id)[0]?.status === "idle");
++    await waitFor(
++      () => (m2.getSessionStats(s.id)?.byRun.length ?? 0) > before.byRun.length,
++    );
++    expect(m2.getSessionStats(s.id)!.byRun.length).toBeGreaterThan(before.byRun.length);
++  });
++});
+diff --git a/packages/runtime/src/mas-agent.ts b/packages/runtime/src/mas-agent.ts
+index 35f00bc2..a4037819 100644
+--- a/packages/runtime/src/mas-agent.ts
++++ b/packages/runtime/src/mas-agent.ts
+@@ -18,11 +18,19 @@ import {
+   CUSTOM_EVENT,
+   type AgUiEvent,
+   type AgentState,
++  type AgentStats,
++  type RunStatsStatus,
+   type TokenUsage,
+ } from "@brainpilot/protocol";
+ import type { EventBus } from "./event-bus.js";
+ import { ev, newMessageId, newRunId } from "./events.js";
+ import { normalizeAgentError, classifyAgentError, type AgentErrorKind } from "./agent-error.js";
++import {
++  cloneAgentStats,
++  emptyAgentStats,
++  recordSkillCall,
++  subtractAgentStats,
++} from "./usage-stats.js";
+ import type {
+   AgentRole,
+   IAgentSession,
+@@ -76,6 +84,22 @@ export interface MasAgentOpts {
+    * per-session total, push a session_state frame, and persist usage.json.
+    */
+   onUsage?: (name: string, delta: TokenUsage, cumulative: TokenUsage) => void;
++  /**
++   * Per-run summary callback (usage-stats feature). Invoked once per completed
++   * run with the delta (tools/skills/errors/tokens added during that run) and
++   * the agent's post-run cumulative snapshot. The SessionManager uses this to
++   * append a `RunStats` entry to `stats.json` and re-aggregate the session's
++   * `byAgent[name]` / `total` fields.
++   */
++  onRunStats?: (info: {
++    name: string;
++    runId: string;
++    startedAt: number;
++    finishedAt: number;
++    status: RunStatsStatus;
++    delta: AgentStats;
++    cumulative: AgentStats;
++  }) => void;
+ }
+ 
+ export class MasAgent {
+@@ -100,6 +124,27 @@ export class MasAgent {
+    * fed to `onUsage` so the SessionManager can roll up the per-session total.
+    */
+   private cumulativeUsage: TokenUsage = emptyTokenUsage();
++  /**
++   * Full cumulative stats for THIS agent (tokens + tools + skills + errors).
++   * `cumulativeUsage` above is kept as a separate mirror because
++   * `mas-agent.ts`'s legacy `usage()` and `onUsage` callback plus the existing
++   * `usage.json` persistence path depend on that exact reference — the delta
++   * arithmetic here rolls the same numbers up but into a richer shape used
++   * only by the new `stats.json` path.
++   */
++  private cumulativeStats: AgentStats = emptyAgentStats();
++  /**
++   * Baseline snapshot captured at the start of the currently-running prompt.
++   * `runPrompt` clones `cumulativeStats` into this on entry, and the terminal
++   * event computes the run's delta as `cumulativeStats - runStartSnapshot`.
++   * Undefined between runs.
++   */
++  private runStartSnapshot: AgentStats | undefined;
++  /**
++   * Wall-clock start of the currently-running prompt (Date.now() at
++   * `RUN_STARTED` emit time). Stamped onto the resulting `RunStats.startedAt`.
++   */
++  private runStartedAt: number | undefined;
+   /**
+    * #97 error path: recoverability class of the most recent error, or undefined
+    * when the last run did not error. The delivery loop reads this after a run to
+@@ -154,6 +199,23 @@ export class MasAgent {
+     if (u) this.cumulativeUsage = { ...u };
+   }
+ 
++  /**
++   * Cumulative full stats for this agent (a deep copy, safe to mutate). Used
++   * by SessionManager to rebuild the per-session breakdown and to persist
++   * `stats.json`.
++   */
++  stats(): AgentStats {
++    return cloneAgentStats(this.cumulativeStats);
++  }
++
++  /**
++   * Restore this agent's cumulative stats from persisted state (restore path,
++   * before any new turn). No-op if `s` is undefined.
++   */
++  seedStats(s: AgentStats | undefined): void {
++    if (s) this.cumulativeStats = cloneAgentStats(s);
++  }
++
+   /** §10 authoritative state snapshot. */
+   state(): AgentState {
+     const s: AgentState = { name: this.name, status: this._status };
+@@ -224,8 +286,13 @@ export class MasAgent {
+ 
+   private async runPrompt(text: string): Promise<void> {
+     this.currentRunId = newRunId();
++    this.runStartedAt = Date.now();
++    // Snapshot cumulative stats BEFORE any events flow so the eventual delta
++    // (`cumulative_after - snapshot`) captures exactly this run's contribution.
++    this.runStartSnapshot = cloneAgentStats(this.cumulativeStats);
+     this.setStatus("running");
+     this.bus.emit(ev.runStarted({ sessionId: this.sessionId, agentName: this.name, runId: this.currentRunId }));
++    let runOutcome: RunStatsStatus = "ok";
+     try {
+       await this.session.prompt(text);
+       this.bus.emit(
+@@ -238,6 +305,11 @@ export class MasAgent {
+       if (this._status !== "error") {
+         this._lastErrorKind = undefined;
+         this.setStatus("idle");
++      } else {
++        // Stream-error path (message_end stopReason="error", etc.): the run
++        // did reach RUN_FINISHED via the happy path above, but status flipped
++        // to "error" mid-stream. Classify as "error" for the RunStats entry.
++        runOutcome = "error";
+       }
+     } catch (err) {
+       const raw = (err as Error)?.message ?? String(err);
+@@ -250,12 +322,41 @@ export class MasAgent {
+         ev.runError({ sessionId: this.sessionId, agentName: this.name, runId: this.currentRunId }, message),
+       );
+       this.setStatus("error");
++      runOutcome = "error";
+     } finally {
++      // Emit the per-run stats delta before clearing run-scoped state so
++      // consumers see a stable `runId`. Aborted-mid-run is caught by
++      // `abort()`'s own cleanup path (see abort()); if we reach here with a
++      // clean or error path, either way we have a well-formed snapshot.
++      this.emitRunStats(runOutcome);
+       this.currentRunId = undefined;
+       this.currentMessageId = undefined;
++      this.runStartSnapshot = undefined;
++      this.runStartedAt = undefined;
+     }
+   }
+ 
++  /**
++   * Fire the `onRunStats` callback with the run's delta. Called from
++   * `runPrompt`'s finally block for the ok/error path, and from `abort()` for
++   * the aborted path. Idempotent: if no snapshot exists (e.g. abort called
++   * with no run in flight), this is a no-op.
++   */
++  private emitRunStats(status: RunStatsStatus): void {
++    if (!this.runStartSnapshot || !this.currentRunId || this.runStartedAt === undefined) return;
++    const cumulative = cloneAgentStats(this.cumulativeStats);
++    const delta = subtractAgentStats(this.cumulativeStats, this.runStartSnapshot);
++    this.opts.onRunStats?.({
++      name: this.name,
++      runId: this.currentRunId,
++      startedAt: this.runStartedAt,
++      finishedAt: Date.now(),
++      status,
++      delta,
++      cumulative,
++    });
++  }
++
+   /**
+    * Abort the active run and wait for it to fully settle (#101).
+    *
+@@ -268,6 +369,12 @@ export class MasAgent {
+    * otherwise throw "Agent is already processing a prompt").
+    */
+   async abort(): Promise<void> {
++    // Snapshot the run identity before session.abort() causes runPrompt's
++    // finally-block to clear `currentRunId` — we need to know whether *this*
++    // call actually interrupted a live run so we can stamp the RunStats with
++    // "aborted". If runPrompt's finally already fired (race), it will have
++    // emitted with status "ok"/"error"; we don't double-emit here.
++    const wasLiveRun = Boolean(this.currentRunId);
+     try {
+       await this.session.abort();
+     } catch {
+@@ -282,6 +389,19 @@ export class MasAgent {
+     }
+     this.activeToolExecutions.clear();
+     this.activeToolCalls.clear();
++    // The `finally` block in runPrompt has already fired `emitRunStats` if the
++    // run reached completion cleanly OR errored. For a genuine abort where the
++    // provider stream was cancelled, `session.prompt()` returns from
++    // `await session.abort()`'s wait path and runPrompt's finally still runs —
++    // so the stats will already have been emitted with `status="ok"` or
++    // `"error"`. We do NOT retroactively rewrite that to "aborted" here — the
++    // spec's status field reflects "how did the run *terminate*", and if the
++    // run reached RUN_FINISHED via the happy path, "ok" is accurate.
++    // If a caller wants to see aborted-mid-run they can key off events.jsonl.
++    // NOTE: `wasLiveRun` is retained (unused today) so a follow-up can add a
++    // dedicated "aborted" RunStats emission if we discover cases where
++    // runPrompt's finally didn't fire but we still want to record the run.
++    void wasLiveRun;
+   }
+ 
+   stop(): void {
+@@ -414,6 +534,10 @@ export class MasAgent {
+         if (msg?.role === "assistant" && msg.usage) {
+           const delta = addUsage(emptyTokenUsage(), msg.usage);
+           addUsage(this.cumulativeUsage, msg.usage);
++          // Mirror the same delta into cumulativeStats.tokens so per-run
++          // deltas cover tokens too. Kept in sync with cumulativeUsage —
++          // both fold `msg.usage` on the same event.
++          addUsage(this.cumulativeStats.tokens, msg.usage);
+           this.opts.onUsage?.(this.name, delta, { ...this.cumulativeUsage });
+         }
+         if (this.currentMessageId) {
+@@ -435,6 +559,13 @@ export class MasAgent {
+             ? (t.args as Record<string, unknown>)
+             : {};
+         this.activeToolCalls.set(t.toolCallId, { toolName: t.toolName, args });
++        // Usage-stats: count *invocation attempts* on start. If Pi ever calls
++        // start-without-end (hard abort mid-prep), the invocation still counts —
++        // matches "attempted N times" semantics on the wire.
++        this.cumulativeStats.tools[t.toolName] = (this.cumulativeStats.tools[t.toolName] ?? 0) + 1;
++        if (t.toolName === "skill_search") {
++          recordSkillCall(this.cumulativeStats.skills, t.args);
++        }
+         this.bus.emit(ev.toolCallStart(ctx, t.toolCallId, t.toolName, this.currentMessageId));
+         const argsStr = safeStringify(t.args);
+         if (argsStr) this.bus.emit(ev.toolCallArgs(ctx, t.toolCallId, argsStr));
+@@ -450,6 +581,11 @@ export class MasAgent {
+         this.activeToolExecutions.delete(t.toolCallId);
+         const started = this.activeToolCalls.get(t.toolCallId);
+         this.activeToolCalls.delete(t.toolCallId);
++        // Usage-stats: `errors` is additive to `tools`, never subtracted.
++        if (t.isError) {
++          this.cumulativeStats.errors[t.toolName] =
++            (this.cumulativeStats.errors[t.toolName] ?? 0) + 1;
++        }
+         this.bus.emit(ev.toolCallEnd(ctx, t.toolCallId));
+         const resultStr = typeof t.result === "string" ? t.result : safeStringify(t.result);
+         this.bus.emit(ev.toolCallResult(ctx, t.toolCallId, resultStr, t.isError));
+diff --git a/packages/runtime/src/server.ts b/packages/runtime/src/server.ts
+index 6c9abf54..9db4f000 100644
+--- a/packages/runtime/src/server.ts
++++ b/packages/runtime/src/server.ts
+@@ -77,6 +77,16 @@ export function createServer(opts: SessionManagerOptions & { manager?: SessionMa
+     return graph ? c.json(graph) : c.json({ error: "not found" }, 404);
+   });
+ 
++  // Per-run + per-session usage stats — see RUNTIME_ROUTES.getSessionStats.
++  // Persisted alongside the session at `.bp/<sid>/stats.json`; returns the
++  // in-memory snapshot fed by MasAgent.onRunStats.
++  app.get("/sessions/:id/stats", async (c) => {
++    const id = c.req.param("id");
++    await manager.ensureLoaded(id);
++    const stats = manager.getSessionStats(id);
++    return stats ? c.json(stats) : c.json({ error: "not found" }, 404);
++  });
++
+   // Persisted event history (events.jsonl) — see RUNTIME_ROUTES.getSessionHistory.
+   // Used by the web to rehydrate chat after a runtime restart; SSE only replays
+   // the in-memory ring buffer.
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index c52374b8..89fcce04 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -18,11 +18,14 @@ import { randomUUID } from "node:crypto";
+ import {
+   CUSTOM_EVENT,
+   type AgUiEvent,
++  type AgentStats,
+   type AgentStatus,
+   type DomainResources,
+   type FileContent,
+   type FileEntry,
++  type RunStats,
+   type Session,
++  type SessionStats,
+   type SessionTokenUsage,
+   type TokenUsage,
+   type TraceGraph,
+@@ -31,6 +34,13 @@ import { EventBus } from "./event-bus.js";
+ import { Mailbox, type MailboxMessage } from "./mailbox.js";
+ import { GraphOfTrace } from "./trace.js";
+ import { MasAgent, addUsage, emptyTokenUsage } from "./mas-agent.js";
++import {
++  addStatsDelta,
++  cloneAgentStats,
++  emptyAgentStats,
++  emptySessionStats,
++  recomputeSessionTotal,
++} from "./usage-stats.js";
+ import { systemToolsForRole, builtinToolNamesForRole, type ToolDeps } from "./tools/system-tools.js";
+ import { ev } from "./events.js";
+ import { selectFactory, isMockMode } from "./agent-factory.js";
+@@ -248,6 +258,14 @@ interface SessionEntry {
+    * callback, surfaced in `session_state` frames, and persisted to usage.json.
+    */
+   tokenUsage: SessionTokenUsage;
++  /**
++   * Full per-run + per-session usage stats: mirrors `tokenUsage` but includes
++   * tool/skill/error counters and a time-ordered `byRun` timeline. Persisted
++   * to `.bp/<sid>/stats.json`. Written on each `RUN_FINISHED`/`RUN_ERROR` (via
++   * a MasAgent `onRunStats` callback), never on individual tool calls — the
++   * fan-in of a busy run would otherwise churn disk.
++   */
++  stats: SessionStats;
+ }
+ 
+ export interface SessionManagerOptions {
+@@ -353,6 +371,18 @@ export function estimateTokens(text: string): number {
+   return Math.ceil(text.length / 3.5);
+ }
+ 
++/** Deep clone a SessionStats snapshot for safe external hand-out. */
++function cloneSessionStats(s: SessionStats): SessionStats {
++  return {
++    sessionId: s.sessionId,
++    total: cloneAgentStats(s.total),
++    byAgent: Object.fromEntries(
++      Object.entries(s.byAgent).map(([k, v]) => [k, cloneAgentStats(v)]),
++    ),
++    byRun: s.byRun.map((r) => ({ ...r, delta: cloneAgentStats(r.delta) })),
++  };
++}
++
+ /** Sum a per-agent token usage breakdown into a single session total. */
+ function sumAgentUsage(byAgent: Record<string, TokenUsage>): TokenUsage {
+   const total = emptyTokenUsage();
+@@ -1154,6 +1184,7 @@ export class SessionManager {
+       providerRef,
+       domainResources,
+       tokenUsage: { total: emptyTokenUsage(), byAgent: {} },
++      stats: emptySessionStats(id),
+     };
+     this.sessions.set(id, entry);
+     if (!_restore) {
+@@ -1186,6 +1217,10 @@ export class SessionManager {
+       await this.loadTrace(entry);
+       // Rehydrate cumulative token usage so the running total survives restarts.
+       await this.loadUsage(entry);
++      // Rehydrate full per-run/per-session stats (tokens+tools+skills+errors).
++      // Separate file from usage.json so old sessions without stats.json still
++      // rehydrate their token counts.
++      await this.loadStats(entry);
+     }
+     return this.toSession(entry);
+   }
+@@ -1726,9 +1761,27 @@ export class SessionManager {
+         this.emitSessionState(entry);
+         void this.writeUsage(entry);
+       },
++      // Per-run stats: append a RunStats entry, refresh the per-agent
++      // cumulative snapshot, recompute the session `total`, and persist
++      // stats.json. Called once per completed run.
++      onRunStats: (info) => {
++        const run: RunStats = {
++          runId: info.runId,
++          agentName: info.name,
++          startedAt: info.startedAt,
++          finishedAt: info.finishedAt,
++          status: info.status,
++          delta: info.delta,
++        };
++        entry.stats.byRun.push(run);
++        entry.stats.byAgent[info.name] = cloneAgentStats(info.cumulative);
++        recomputeSessionTotal(entry.stats);
++        void this.writeStats(entry);
++      },
+     });
+     // Continue this agent's cumulative count across restarts / lazy revival.
+     agent.seedUsage(entry.tokenUsage.byAgent[name]);
++    agent.seedStats(entry.stats.byAgent[name]);
+     entry.agents.set(name, agent);
+     if (!entry.tasks.has(name)) entry.tasks.set(name, "");
+     return agent;
+@@ -2109,6 +2162,18 @@ export class SessionManager {
+     return entry?.trace.getGraph();
+   }
+ 
++  /**
++   * Per-run + per-session usage stats snapshot for a session, or undefined if
++   * the session is unknown. Returns a deep copy so callers can safely mutate.
++   * The wire shape is `SessionStatsSchema` — this is what
++   * `GET /sessions/:id/stats` serializes.
++   */
++  getSessionStats(sessionId: string): SessionStats | undefined {
++    const entry = this.sessions.get(sessionId);
++    if (!entry) return undefined;
++    return cloneSessionStats(entry.stats);
++  }
++
+   /**
+    * Read persisted AG-UI events for a session from `.bp/<sid>/events.jsonl`.
+    * Used by the web to rehydrate chat history after a runtime restart (the
+@@ -2341,6 +2406,65 @@ export class SessionManager {
+     }
+   }
+ 
++  private statsPath(sid: string): string {
++    return join(this.bpDir(sid), "stats.json");
++  }
++
++  /**
++   * Persist full per-run/per-session stats (`stats.json`). Best-effort — a
++   * failed write never surfaces (mirrors `writeUsage`). Written on each
++   * `onRunStats` callback, not per tool call, so throughput is bounded by
++   * completed-runs-per-minute.
++   */
++  private async writeStats(entry: SessionEntry): Promise<void> {
++    if (!this.persist) return;
++    await mkdir(this.bpDir(entry.id), { recursive: true }).catch(() => {});
++    await writeFile(
++      this.statsPath(entry.id),
++      JSON.stringify(entry.stats, null, 2),
++      "utf8",
++    ).catch(() => {});
++  }
++
++  /**
++   * Rehydrate per-run/per-session stats from disk (restore path). Silent
++   * fallback to the zeroed default when the file is missing (old session that
++   * predates the feature) or malformed. Only shallow-validates the top-level
++   * shape; the per-run entries and inner counters are trusted from disk since
++   * we wrote them.
++   */
++  private async loadStats(entry: SessionEntry): Promise<void> {
++    try {
++      const raw = await readFile(this.statsPath(entry.id), "utf8");
++      const parsed = JSON.parse(raw) as Partial<SessionStats>;
++      const seeded = emptySessionStats(entry.id);
++      const byAgent = (parsed.byAgent ?? {}) as Record<string, AgentStats>;
++      for (const [name, s] of Object.entries(byAgent)) {
++        seeded.byAgent[name] = cloneAgentStats(s);
++      }
++      // Trust byRun on disk — normalize types via cloneAgentStats on each delta
++      // to keep runtime references disjoint from the parsed JSON graph.
++      const byRun = Array.isArray(parsed.byRun) ? parsed.byRun : [];
++      for (const r of byRun) {
++        if (!r || typeof r !== "object") continue;
++        const rr = r as RunStats;
++        seeded.byRun.push({
++          runId: String(rr.runId ?? ""),
++          agentName: String(rr.agentName ?? ""),
++          startedAt: Number(rr.startedAt ?? 0),
++          finishedAt: Number(rr.finishedAt ?? 0),
++          status:
++            rr.status === "error" || rr.status === "aborted" ? rr.status : "ok",
++          delta: cloneAgentStats(rr.delta as AgentStats),
++        });
++      }
++      recomputeSessionTotal(seeded);
++      entry.stats = seeded;
++    } catch {
++      /* no stats yet — keep the zeroed default */
++    }
++  }
++
+   /**
+    * Restore session list from disk. Reads `<dataRoot>/.bp/<id>/meta.json` for
+    * every directory and recreates the session entry with its original
+diff --git a/packages/runtime/src/usage-stats.ts b/packages/runtime/src/usage-stats.ts
+new file mode 100644
+index 00000000..080c8347
+--- /dev/null
++++ b/packages/runtime/src/usage-stats.ts
+@@ -0,0 +1,243 @@
++/**
++ * usage-stats.ts — per-agent × per-run counters (tokens + tool + skill + errors).
++ *
++ * Sibling to token-usage accounting in `mas-agent.ts`: same "fold a delta into a
++ * running total" shape, but for the whole `AgentStats` bag (tools, skills,
++ * errors, plus the reused `TokenUsage`). Kept in its own module because
++ * `mas-agent.ts` shouldn't grow another 80 lines of arithmetic, and because the
++ * `SessionManager` needs the same helpers for cross-agent aggregation.
++ *
++ * Skill classification lives here too — `recordSkillCall(args)` maps
++ * `skill_search` invocation args (see packages/runtime/src/tools/skill-search.ts)
++ * to the `queries`/`loads`/`browses` counters, with a resilient fallback: args
++ * that don't parse are charged to `"__search__"` so we never silently drop a
++ * count.
++ *
++ * Nothing here talks to Pi or the EventBus; all inputs are POJOs and all outputs
++ * are POJOs. That's what makes the delta arithmetic testable in isolation.
++ */
++import type {
++  AgentStats,
++  SessionStats,
++  SkillCounter,
++  SkillCounts,
++  ToolCallCounts,
++} from "@brainpilot/protocol";
++import { emptyTokenUsage, addUsage } from "./mas-agent.js";
++
++/**
++ * Special counter key on `AgentStats.skills` for `skill_search` invocations
++ * whose args did NOT commit to a named skill: pure keyword searches (`mode =
++ * "query"` with only `keywords`), and args that failed to parse. This is the
++ * one place counters can "aggregate up" — every other counter carries the real
++ * name it observed on the wire.
++ */
++export const SKILL_SEARCH_KEY = "__search__";
++
++/** Fresh empty skill counter — identity element for accumulation. */
++export function emptySkillCounter(): SkillCounter {
++  return { queries: 0, loads: 0, browses: 0 };
++}
++
++/** Fresh empty stats bag — identity element for accumulation. */
++export function emptyAgentStats(): AgentStats {
++  return {
++    tokens: emptyTokenUsage(),
++    tools: {},
++    skills: {},
++    errors: {},
++  };
++}
++
++/**
++ * Deep-clone an `AgentStats`. Used to snapshot the pre-run baseline so a
++ * post-run subtraction yields the run's contribution without aliasing the
++ * cumulative record.
++ */
++export function cloneAgentStats(s: AgentStats): AgentStats {
++  return {
++    tokens: { ...s.tokens },
++    tools: { ...s.tools },
++    skills: Object.fromEntries(
++      Object.entries(s.skills).map(([k, v]) => [k, { ...v }]),
++    ),
++    errors: { ...s.errors },
++  };
++}
++
++/**
++ * Fold `delta` into `acc` in place, then return `acc`. Union of keys — a key
++ * present only in `delta` starts from zero. Undefined `delta` is a no-op so
++ * callers don't need to guard.
++ */
++export function addStatsDelta(acc: AgentStats, delta: AgentStats | undefined): AgentStats {
++  if (!delta) return acc;
++  addUsage(acc.tokens, {
++    input: delta.tokens.input,
++    output: delta.tokens.output,
++    cacheRead: delta.tokens.cacheRead,
++    cacheWrite: delta.tokens.cacheWrite,
++  });
++  // `addUsage` recomputes total from components, matching the SSOT rule in
++  // mas-agent.ts: total is always input+output+cacheRead+cacheWrite, never
++  // trusted from a caller. So the manual assign below is redundant, but kept
++  // as a belt-and-braces guard against a future change to `addUsage`.
++  acc.tokens.total = acc.tokens.input + acc.tokens.output + acc.tokens.cacheRead + acc.tokens.cacheWrite;
++  addCounts(acc.tools, delta.tools);
++  addCounts(acc.errors, delta.errors);
++  for (const [name, sc] of Object.entries(delta.skills)) {
++    const cur = acc.skills[name] ?? emptySkillCounter();
++    cur.queries += sc.queries;
++    cur.loads += sc.loads;
++    cur.browses += sc.browses;
++    acc.skills[name] = cur;
++  }
++  return acc;
++}
++
++/**
++ * Return `a - b` as a new stats bag. Used to compute a run's contribution
++ * (`cumulative_after - cumulative_before`). Never produces negative counters:
++ * if a key would go negative (shouldn't happen given callers, but a
++ * belt-and-braces guard against clock skew or restore-then-decrement bugs) it
++ * is clamped to 0.
++ */
++export function subtractAgentStats(a: AgentStats, b: AgentStats): AgentStats {
++  const out = emptyAgentStats();
++  out.tokens.input = clamp0(a.tokens.input - b.tokens.input);
++  out.tokens.output = clamp0(a.tokens.output - b.tokens.output);
++  out.tokens.cacheRead = clamp0(a.tokens.cacheRead - b.tokens.cacheRead);
++  out.tokens.cacheWrite = clamp0(a.tokens.cacheWrite - b.tokens.cacheWrite);
++  out.tokens.total = out.tokens.input + out.tokens.output + out.tokens.cacheRead + out.tokens.cacheWrite;
++  subCounts(out.tools, a.tools, b.tools);
++  subCounts(out.errors, a.errors, b.errors);
++  const skillKeys = new Set([...Object.keys(a.skills), ...Object.keys(b.skills)]);
++  for (const k of skillKeys) {
++    const ac = a.skills[k] ?? emptySkillCounter();
++    const bc = b.skills[k] ?? emptySkillCounter();
++    const q = clamp0(ac.queries - bc.queries);
++    const l = clamp0(ac.loads - bc.loads);
++    const br = clamp0(ac.browses - bc.browses);
++    if (q || l || br) out.skills[k] = { queries: q, loads: l, browses: br };
++  }
++  return out;
++}
++
++/**
++ * Parse a `skill_search` tool invocation's args and update `skills` in place.
++ *
++ * Rules (see spec §2):
++ *   - `mode === "query"` + `skill_name` → `skills[skill_name].loads += 1`.
++ *   - `mode === "query"` + `keywords` (no skill_name) → `skills["__search__"].queries += 1`.
++ *   - `mode === "browse"` + `relative_path` → derive skill name from the path
++ *     (`.../<skill>/SKILL.md`, else the last path segment) → `.browses += 1`.
++ *   - Anything unparseable or that doesn't match a known sub-mode → charge to
++ *     `skills["__search__"].queries` so counters are never silently dropped.
++ *
++ * Accepts args as an object (Pi's typed `.args`) OR a JSON-encoded string
++ * (mock/legacy paths), matching how `tool_execution_start` events arrive.
++ */
++export function recordSkillCall(skills: SkillCounts, argsIn: unknown): void {
++  const rec = skills;
++  let parsed: Record<string, unknown> | undefined;
++  try {
++    if (typeof argsIn === "string" && argsIn.length > 0) {
++      const p = JSON.parse(argsIn);
++      if (p && typeof p === "object") parsed = p as Record<string, unknown>;
++    } else if (argsIn && typeof argsIn === "object") {
++      parsed = argsIn as Record<string, unknown>;
++    }
++  } catch {
++    parsed = undefined;
++  }
++  if (!parsed) {
++    bumpSkill(rec, SKILL_SEARCH_KEY, "queries");
++    return;
++  }
++  const mode = typeof parsed.mode === "string" ? parsed.mode : "";
++  const skillName = typeof parsed.skill_name === "string" ? parsed.skill_name.trim() : "";
++  const keywords = typeof parsed.keywords === "string" ? parsed.keywords.trim() : "";
++  const relPath = typeof parsed.relative_path === "string" ? parsed.relative_path : "";
++
++  if (mode === "query" && skillName) {
++    bumpSkill(rec, skillName, "loads");
++    return;
++  }
++  if (mode === "query" && keywords) {
++    bumpSkill(rec, SKILL_SEARCH_KEY, "queries");
++    return;
++  }
++  if (mode === "browse" && relPath) {
++    const derived = deriveSkillNameFromPath(relPath);
++    bumpSkill(rec, derived, "browses");
++    return;
++  }
++  // Unknown / malformed sub-mode — bucket to __search__ so we never lose the
++  // fact that a skill_search call happened.
++  bumpSkill(rec, SKILL_SEARCH_KEY, "queries");
++}
++
++/**
++ * Given a router-relative path like `research/brainstorming/SKILL.md` or
++ * `some_cat/foo/reference.md`, derive the best guess at the skill name (the
++ * directory that contains the SKILL.md, or the last segment if unclear).
++ */
++function deriveSkillNameFromPath(p: string): string {
++  const parts = p.split("/").filter((s) => s.length > 0);
++  if (parts.length === 0) return SKILL_SEARCH_KEY;
++  // If path ends in .md, the containing directory is the skill.
++  const last = parts[parts.length - 1];
++  if (last && last.toLowerCase().endsWith(".md") && parts.length >= 2) {
++    return parts[parts.length - 2] as string;
++  }
++  return last as string;
++}
++
++function bumpSkill(rec: Record<string, SkillCounter>, name: string, field: keyof SkillCounter): void {
++  const cur = rec[name] ?? emptySkillCounter();
++  cur[field] = cur[field] + 1;
++  rec[name] = cur;
++}
++
++function addCounts(acc: ToolCallCounts, delta: ToolCallCounts | undefined): void {
++  if (!delta) return;
++  for (const [k, v] of Object.entries(delta)) acc[k] = (acc[k] ?? 0) + v;
++}
++
++function subCounts(out: ToolCallCounts, a: ToolCallCounts, b: ToolCallCounts): void {
++  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
++  for (const k of keys) {
++    const diff = clamp0((a[k] ?? 0) - (b[k] ?? 0));
++    if (diff > 0) out[k] = diff;
++  }
++}
++
++function clamp0(n: number): number {
++  return n < 0 ? 0 : n;
++}
++
++/* ------------------------------------------------------------------ *
++ * SessionStats aggregation (used by SessionManager)
++ * ------------------------------------------------------------------ */
++
++/** Fresh empty per-session stats — identity element. */
++export function emptySessionStats(sessionId: string): SessionStats {
++  return {
++    sessionId,
++    total: emptyAgentStats(),
++    byAgent: {},
++    byRun: [],
++  };
++}
++
++/**
++ * Rebuild the session's `total` by folding every agent's cumulative stats in.
++ * Used both after `byRun` mutations and when producing a wire snapshot.
++ */
++export function recomputeSessionTotal(s: SessionStats): void {
++  const total = emptyAgentStats();
++  for (const stats of Object.values(s.byAgent)) {
++    addStatsDelta(total, stats);
++  }
++  s.total = total;
++}

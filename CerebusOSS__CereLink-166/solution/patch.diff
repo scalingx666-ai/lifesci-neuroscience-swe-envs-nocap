@@ -1,0 +1,864 @@
+diff --git a/pycbsdk/src/pycbsdk/cli/test_timestamps.py b/pycbsdk/src/pycbsdk/cli/test_timestamps.py
+new file mode 100644
+index 00000000..32cb52c6
+--- /dev/null
++++ b/pycbsdk/src/pycbsdk/cli/test_timestamps.py
+@@ -0,0 +1,398 @@
++"""Test timestamp correctness across device types and connection modes.
++
++Scenarios (run on macOS with NPLAY on localhost and HUB1 on network):
++
++  NPLAY (non-Gemini 4.2) x STANDALONE
++  NPLAY (non-Gemini 4.2) x CLIENT
++  HUB1  (Gemini 4.2)     x STANDALONE
++  HUB1  (Gemini 4.2)     x CLIENT
++
++For each scenario:
++  1. Verify received packet timestamps (nanoseconds) are close to
++     steady_clock via clock sync offset.
++  2. Verify device_to_monotonic() produces values close to time.monotonic().
++
++Usage::
++
++    # Run all scenarios (requires NPLAY on localhost + HUB1 on network):
++    python -m pycbsdk.cli.test_timestamps
++
++    # Run a single device:
++    python -m pycbsdk.cli.test_timestamps --device NPLAY
++    python -m pycbsdk.cli.test_timestamps --device HUB1
++
++    # Skip CLIENT mode tests:
++    python -m pycbsdk.cli.test_timestamps --standalone-only
++"""
++
++from __future__ import annotations
++
++import argparse
++import subprocess
++import sys
++import time
++import threading
++from dataclasses import dataclass, field
++
++from pycbsdk import DeviceType, SampleRate, Session
++from pycbsdk.session import ProtocolVersion
++
++
++# ---------------------------------------------------------------------------
++# Configuration
++# ---------------------------------------------------------------------------
++
++# Mutable config so CLI args can override defaults.
++_cfg = {
++    # Maximum acceptable abs(arrival_monotonic - device_to_monotonic(pkt.time)).
++    # Covers clock sync error + network latency + scheduling jitter.
++    "tolerance_ms": 50.0,
++    # How many packets to collect per test.
++    "packet_count": 50,
++}
++
++# Seconds to wait for clock sync / packets.
++TIMEOUT_S = 15.0
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++@dataclass
++class PacketSample:
++    device_ns: int
++    arrival_mono: float  # time.monotonic()
++    converted_mono: float  # session.device_to_monotonic(device_ns)
++
++
++@dataclass
++class TestResult:
++    name: str
++    passed: bool
++    detail: str
++    samples: list[PacketSample] = field(default_factory=list)
++
++
++def _wait_for_clock_sync(session: Session, timeout: float) -> None:
++    deadline = time.monotonic() + timeout
++    while session.clock_offset_ns is None:
++        if time.monotonic() > deadline:
++            raise TimeoutError("Clock sync did not arrive within timeout")
++        session.send_clock_probe()
++        time.sleep(0.25)
++
++
++def _collect_packets(
++    session: Session, n: int, timeout: float, *, configure: bool = True
++) -> list[PacketSample]:
++    """Register a group callback on RAW and collect n packet samples.
++
++    If *configure* is False (CLIENT mode), skip channel activation —
++    the background STANDALONE process is responsible for that.
++    """
++    samples: list[PacketSample] = []
++    done = threading.Event()
++
++    @session.on_group(SampleRate.SR_RAW)
++    def _on_group(header, data):
++        if done.is_set():
++            return
++        arrival = time.monotonic()
++        try:
++            converted = session.device_to_monotonic(header.time)
++        except RuntimeError:
++            converted = float("nan")
++        samples.append(PacketSample(header.time, arrival, converted))
++        if len(samples) >= n:
++            done.set()
++
++    if configure:
++        # Activate one FRONTEND channel on RAW to guarantee traffic.
++        session.set_channel_sample_group(
++            n_chans=1,
++            channel_type=0,  # ChannelType.FRONTEND
++            rate=SampleRate.SR_RAW,
++        )
++
++    if not done.wait(timeout):
++        raise TimeoutError(
++            f"Only received {len(samples)}/{n} packets within {timeout}s"
++        )
++    return samples
++
++
++# ---------------------------------------------------------------------------
++# Individual checks
++# ---------------------------------------------------------------------------
++
++def check_timestamps_are_nanoseconds(
++    session: Session, samples: list[PacketSample]
++) -> TestResult:
++    """Verify that header.time values look like nanoseconds, not raw ticks.
++
++    Uses the inter-packet time delta to distinguish units.  RAW group packets
++    arrive at ~30 kHz.  If timestamps are nanoseconds the delta should be
++    ~33 333 ns.  If they are unconverted 30 kHz ticks the delta would be ~1.
++    We check that the median delta is in the plausible nanosecond range
++    (1 000 .. 10 000 000 ns, i.e. 1 us .. 10 ms).
++    """
++    name = "timestamps are nanoseconds"
++
++    if len(samples) < 2:
++        return TestResult(name, False, "need at least 2 samples")
++
++    deltas = [
++        samples[i].device_ns - samples[i - 1].device_ns
++        for i in range(1, len(samples))
++    ]
++    deltas.sort()
++    median_delta = deltas[len(deltas) // 2]
++
++    # Check monotonicity.
++    for i in range(1, len(samples)):
++        if samples[i].device_ns < samples[i - 1].device_ns:
++            return TestResult(
++                name, False,
++                f"non-monotonic: sample[{i}]={samples[i].device_ns} "
++                f"< sample[{i-1}]={samples[i-1].device_ns}",
++                samples,
++            )
++
++    # Plausible range for nanosecond deltas between RAW group packets.
++    if not (1_000 <= median_delta <= 10_000_000):
++        # Dump first few samples for diagnosis.
++        diag_lines = [f"  [{i}] time={s.device_ns}  delta={s.device_ns - samples[i-1].device_ns if i else 0}"
++                      for i, s in enumerate(samples[:10])]
++        diag = "\n".join(diag_lines)
++        return TestResult(
++            name, False,
++            f"median inter-packet delta {median_delta} ns outside plausible range "
++            f"[1us, 10ms] — timestamps may be raw ticks\n"
++            f"  First 10 samples:\n{diag}",
++            samples,
++        )
++
++    first_ns = samples[0].device_ns
++    last_ns = samples[-1].device_ns
++    span_s = (last_ns - first_ns) / 1e9
++    return TestResult(
++        name, True,
++        f"median delta {median_delta} ns (~{median_delta / 1e6:.2f} ms), "
++        f"span {span_s:.4f}s over {len(samples)} pkts",
++        samples,
++    )
++
++
++def check_device_to_monotonic(
++    session: Session, samples: list[PacketSample]
++) -> TestResult:
++    """Verify device_to_monotonic(pkt.time) is close to time.monotonic()."""
++    name = "device_to_monotonic accuracy"
++
++    if not samples:
++        return TestResult(name, False, "no samples")
++
++    latencies_ms = [
++        (s.arrival_mono - s.converted_mono) * 1000 for s in samples
++    ]
++    mean_ms = sum(latencies_ms) / len(latencies_ms)
++    min_ms = min(latencies_ms)
++    max_ms = max(latencies_ms)
++
++    passed = all(abs(l) < _cfg["tolerance_ms"] for l in latencies_ms)
++    detail = (
++        f"latency (arrival - converted): "
++        f"min={min_ms:+.3f} ms  mean={mean_ms:+.3f} ms  max={max_ms:+.3f} ms  "
++        f"(tolerance: {_cfg['tolerance_ms']} ms)"
++    )
++    return TestResult(name, passed, detail, samples)
++
++
++# ---------------------------------------------------------------------------
++# Scenario runner
++# ---------------------------------------------------------------------------
++
++def run_scenario(
++    device_type: DeviceType, mode: str
++) -> list[TestResult]:
++    """Run all checks for one (device_type, mode) combination.
++
++    mode is "STANDALONE" or "CLIENT".
++    For CLIENT, a STANDALONE session is launched as a subprocess first.
++    """
++    results: list[TestResult] = []
++    label = f"{device_type.name} / {mode}"
++    print(f"\n{'=' * 60}")
++    print(f"  {label}")
++    print(f"{'=' * 60}")
++
++    bg_proc = None
++    try:
++        if mode == "CLIENT":
++            # Launch a STANDALONE session in the background.
++            # Configure 1 FRONTEND channel on RAW so group traffic flows
++            # before the CLIENT connects.
++            bg_proc = subprocess.Popen(
++                [
++                    sys.executable, "-c",
++                    "import time; "
++                    f"from pycbsdk import Session, DeviceType, SampleRate; "
++                    f"s = Session(DeviceType.{device_type.name}); "
++                    "time.sleep(3); "
++                    "s.set_channel_sample_group(1, 0, SampleRate.SR_RAW); "
++                    "time.sleep(120)",
++                ],
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.PIPE,
++            )
++            # Give the STANDALONE process time to connect, populate shmem,
++            # and configure a channel on RAW.
++            print(f"  Waiting for background STANDALONE process (pid {bg_proc.pid}) ...")
++            time.sleep(6)
++            if bg_proc.poll() is not None:
++                stderr = bg_proc.stderr.read().decode() if bg_proc.stderr else ""
++                raise RuntimeError(
++                    f"Background STANDALONE exited early (rc={bg_proc.returncode}): {stderr}"
++                )
++
++        print(f"  Connecting as {mode} ...")
++        with Session(device_type=device_type) as session:
++            proto = session.protocol_version
++            ident = session.proc_ident
++            print(f"  protocol: {proto.name}  ident: {ident!r}")
++
++            # Wait for clock sync (best-effort — not available in CENTRAL_COMPAT).
++            has_clock_sync = False
++            try:
++                print("  Waiting for clock sync ...")
++                _wait_for_clock_sync(session, TIMEOUT_S)
++                has_clock_sync = True
++                offset_ns = session.clock_offset_ns
++                uncert_ns = session.clock_uncertainty_ns
++                print(
++                    f"  Clock offset: {offset_ns / 1e6 if offset_ns else 0:+.3f} ms  "
++                    f"uncertainty: {uncert_ns / 1e6 if uncert_ns else 0:.3f} ms"
++                )
++            except (TimeoutError, RuntimeError) as e:
++                print(f"  Clock sync unavailable ({e}) — skipping device_to_monotonic check")
++
++            # Collect packets.
++            print(f"  Collecting {_cfg['packet_count']} packets ...")
++            samples = _collect_packets(
++                session, _cfg["packet_count"], TIMEOUT_S,
++                configure=(mode == "STANDALONE"),
++            )
++            print(f"  Collected {len(samples)} packets.")
++
++            # Run checks.
++            results.append(check_timestamps_are_nanoseconds(session, samples))
++            if has_clock_sync:
++                results.append(check_device_to_monotonic(session, samples))
++            else:
++                results.append(TestResult(
++                    "device_to_monotonic accuracy", True,
++                    "SKIPPED — no clock sync in CENTRAL_COMPAT CLIENT mode",
++                ))
++
++    except Exception as e:
++        results.append(TestResult(f"scenario setup ({label})", False, str(e)))
++    finally:
++        if bg_proc is not None:
++            bg_proc.terminate()
++            bg_proc.wait(timeout=5)
++            print(f"  Background STANDALONE process terminated.")
++
++    # Print results for this scenario.
++    for r in results:
++        status = "PASS" if r.passed else "FAIL"
++        print(f"  [{status}] {r.name}: {r.detail}")
++
++    return results
++
++
++# ---------------------------------------------------------------------------
++# Main
++# ---------------------------------------------------------------------------
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(
++        prog="python -m pycbsdk.cli.test_timestamps",
++        description="Test timestamp correctness across device types and modes.",
++    )
++    parser.add_argument(
++        "--device", "-d", nargs="*", default=None,
++        help="Device type(s) to test (default: NPLAY HUB1). "
++             f"Choices: {', '.join(dt.name for dt in DeviceType if dt != DeviceType.CUSTOM)}",
++    )
++    parser.add_argument(
++        "--standalone-only", action="store_true",
++        help="Skip CLIENT mode tests.",
++    )
++    parser.add_argument(
++        "--client-only", action="store_true",
++        help="Skip STANDALONE mode tests.",
++    )
++    parser.add_argument(
++        "--tolerance", type=float, default=_cfg["tolerance_ms"],
++        help=f"Latency tolerance in ms (default: {_cfg['tolerance_ms']})",
++    )
++    parser.add_argument(
++        "--packets", type=int, default=_cfg["packet_count"],
++        help=f"Packets to collect per scenario (default: {_cfg['packet_count']})",
++    )
++    args = parser.parse_args(argv)
++
++    _cfg["tolerance_ms"] = args.tolerance
++    _cfg["packet_count"] = args.packets
++
++    # Determine devices.
++    if args.device:
++        try:
++            devices = [DeviceType[d.upper()] for d in args.device]
++        except KeyError as e:
++            names = ", ".join(dt.name for dt in DeviceType if dt != DeviceType.CUSTOM)
++            parser.error(f"Unknown device: {e}. Choices: {names}")
++            return 1
++    else:
++        devices = [DeviceType.NPLAY, DeviceType.HUB1]
++
++    # Determine modes.
++    modes = []
++    if not args.client_only:
++        modes.append("STANDALONE")
++    if not args.standalone_only:
++        modes.append("CLIENT")
++
++    if not modes:
++        parser.error("Cannot use both --standalone-only and --client-only")
++        return 1
++
++    # Run scenarios.
++    all_results: list[tuple[str, list[TestResult]]] = []
++    for device in devices:
++        for mode in modes:
++            label = f"{device.name} / {mode}"
++            results = run_scenario(device, mode)
++            all_results.append((label, results))
++
++    # Summary.
++    print(f"\n{'=' * 60}")
++    print("  SUMMARY")
++    print(f"{'=' * 60}")
++    total = 0
++    passed = 0
++    for label, results in all_results:
++        for r in results:
++            total += 1
++            if r.passed:
++                passed += 1
++            status = "PASS" if r.passed else "FAIL"
++            print(f"  [{status}] {label} / {r.name}")
++
++    print(f"\n  {passed}/{total} passed")
++    return 0 if passed == total else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/pycbsdk/src/pycbsdk/session.py b/pycbsdk/src/pycbsdk/session.py
+index 7dfe5379..76d73867 100644
+--- a/pycbsdk/src/pycbsdk/session.py
++++ b/pycbsdk/src/pycbsdk/session.py
+@@ -1088,11 +1088,9 @@ def load_ccf(self, filename: str):
+ 
+     @property
+     def time(self) -> int:
+-        """Most recent device timestamp from shared memory.
+-
+-        On Gemini (protocol 4.0+) this is PTP nanoseconds.
+-        On legacy NSP (protocol 3.x) this is 30kHz ticks.
++        """Most recent device timestamp from shared memory, in nanoseconds.
+ 
++        Non-Gemini clock ticks are converted using sysfreq automatically.
+         To convert to host ``time.monotonic()``, use :meth:`device_to_monotonic`.
+         """
+         _lib = _get_lib()
+diff --git a/src/cbdev/CMakeLists.txt b/src/cbdev/CMakeLists.txt
+index e436aa3f..c3696eb9 100644
+--- a/src/cbdev/CMakeLists.txt
++++ b/src/cbdev/CMakeLists.txt
+@@ -59,5 +59,6 @@ install(FILES
+     include/cbdev/connection.h
+     include/cbdev/device_session.h
+     include/cbdev/device_factory.h
++    include/cbdev/clock_sync.h
+     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cbdev
+ )
+diff --git a/src/cbdev/src/clock_sync.h b/src/cbdev/include/cbdev/clock_sync.h
+similarity index 100%
+rename from src/cbdev/src/clock_sync.h
+rename to src/cbdev/include/cbdev/clock_sync.h
+diff --git a/src/cbdev/src/clock_sync.cpp b/src/cbdev/src/clock_sync.cpp
+index 7775fbf8..8c89124e 100644
+--- a/src/cbdev/src/clock_sync.cpp
++++ b/src/cbdev/src/clock_sync.cpp
+@@ -7,7 +7,7 @@
+ ///
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-#include "clock_sync.h"
++#include "cbdev/clock_sync.h"
+ #include <algorithm>
+ #include <cmath>
+ 
+diff --git a/src/cbdev/src/device_session.cpp b/src/cbdev/src/device_session.cpp
+index 7a3f2062..7f0e1ee2 100644
+--- a/src/cbdev/src/device_session.cpp
++++ b/src/cbdev/src/device_session.cpp
+@@ -37,7 +37,7 @@
+ #endif
+ 
+ #include "device_session_impl.h"
+-#include "clock_sync.h"
++#include "cbdev/clock_sync.h"
+ #include <cbproto/cbproto.h>
+ #include <cbproto/config.h>
+ #include <cstdio>
+@@ -578,6 +578,17 @@ Result<void> DeviceSession::sendPacket(const cbPKT_GENERIC& pkt) {
+         return Result<void>::error("Device not connected");
+     }
+ 
++    // Non-Gemini: convert nanosecond timestamp back to device clock ticks.
++    // This is the inverse of the ticks→ns conversion in receivePackets().
++    if (!m_impl->timestamps_are_nanoseconds && m_impl->ts_convert_den > 1 &&
++        pkt.cbpkt_header.time != 0) {
++        cbPKT_GENERIC converted = pkt;
++        converted.cbpkt_header.time =
++            pkt.cbpkt_header.time * m_impl->ts_convert_den / m_impl->ts_convert_num;
++        const size_t packet_size = cbPKT_HEADER_SIZE + (converted.cbpkt_header.dlen * 4);
++        return sendRaw(&converted, packet_size);
++    }
++
+     // Calculate actual packet size from header
+     // dlen is in quadlets (4-byte units), so packet size = header + (dlen * 4)
+     const size_t packet_size = cbPKT_HEADER_SIZE + (pkt.cbpkt_header.dlen * 4);
+diff --git a/src/cbsdk/include/cbsdk/cbsdk.h b/src/cbsdk/include/cbsdk/cbsdk.h
+index 4d73cca9..96828466 100644
+--- a/src/cbsdk/include/cbsdk/cbsdk.h
++++ b/src/cbsdk/include/cbsdk/cbsdk.h
+@@ -845,11 +845,10 @@ CBSDK_API cbsdk_result_t cbsdk_session_load_ccf(cbsdk_session_t session, const c
+ // Instrument Time
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-/// Get most recent device timestamp from shared memory
+-/// On Gemini (protocol 4.0+) this is PTP nanoseconds.
+-/// On legacy NSP (protocol 3.x) this is 30kHz ticks.
++/// Get most recent device timestamp from shared memory (always nanoseconds).
++/// Non-Gemini clock ticks are converted using sysfreq automatically.
+ /// @param session Session handle (must not be NULL)
+-/// @param[out] time Pointer to receive raw device timestamp (must not be NULL)
++/// @param[out] time Pointer to receive device timestamp in nanoseconds (must not be NULL)
+ /// @return CBSDK_RESULT_SUCCESS on success, error code on failure
+ CBSDK_API cbsdk_result_t cbsdk_session_get_time(cbsdk_session_t session, uint64_t* time);
+ 
+diff --git a/src/cbsdk/include/cbsdk/sdk_session.h b/src/cbsdk/include/cbsdk/sdk_session.h
+index fff2867f..be9bad5e 100644
+--- a/src/cbsdk/include/cbsdk/sdk_session.h
++++ b/src/cbsdk/include/cbsdk/sdk_session.h
+@@ -449,10 +449,9 @@ class SdkSession {
+     /// @return Result indicating success or error
+     Result<void> setSpikeLength(uint32_t spikelen, uint32_t spikepre);
+ 
+-    /// Get most recent device timestamp from shared memory
+-    /// On Gemini (protocol 4.0+) this is PTP nanoseconds.
+-    /// On legacy NSP (protocol 3.x, CBPROTO_311) this is 30kHz ticks.
+-    /// @return Raw device timestamp, or 0 if not available
++    /// Get most recent device timestamp from shared memory (always nanoseconds).
++    /// Non-Gemini clock ticks are converted using sysfreq automatically.
++    /// @return Device timestamp in nanoseconds, or 0 if not available
+     uint64_t getTime() const;
+ 
+     ///--------------------------------------------------------------------------------------------
+diff --git a/src/cbsdk/src/sdk_session.cpp b/src/cbsdk/src/sdk_session.cpp
+index 08860e3b..29902a56 100644
+--- a/src/cbsdk/src/sdk_session.cpp
++++ b/src/cbsdk/src/sdk_session.cpp
+@@ -28,6 +28,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <vector>
++#include "cbdev/clock_sync.h"
+ 
+ namespace cbsdk {
+ 
+@@ -152,9 +153,18 @@ struct SdkSession::Impl {
+     /// Get chaninfo pointer for a 0-based channel index (works for both STANDALONE and CLIENT)
+     const cbPKT_CHANINFO* getChanInfoPtr(uint32_t idx) const;
+ 
+-    // Clock sync periodic probing (STANDALONE mode)
++    // Clock sync periodic probing
+     std::chrono::steady_clock::time_point last_clock_probe_time{};
+ 
++    // CLIENT-mode clock sync (used when no device_session is available)
++    cbdev::ClockSync client_clock_sync;
++    struct PendingClockProbe {
++        std::chrono::steady_clock::time_point t1_local;
++        bool active = false;
++    };
++    PendingClockProbe pending_clock_probe;
++    std::mutex clock_probe_mutex;
++
+     // Statistics — atomic counters, no mutex needed (Phase 2, Fix 9)
+     struct AtomicStats {
+         std::atomic<uint64_t> packets_received_from_device{0};
+@@ -961,14 +971,58 @@ Result<void> SdkSession::start() {
+                     }
+ 
+                     if (packets_read > 0) {
++                        auto t4 = std::chrono::steady_clock::now();
+                         impl->stats.packets_delivered_to_callback.fetch_add(packets_read, std::memory_order_relaxed);
+-                        // CLIENT mode: apply CMP position overlay for CHANREP packets
++                        // CLIENT mode: scan packets for clock sync replies and CMP overlays
+                         for (size_t i = 0; i < packets_read; i++) {
++                            if (packets[i].cbpkt_header.type == cbPKTTYPE_NPLAYREP) {
++                                // Complete pending clock sync probe
++                                constexpr uint64_t STALENESS_CORRECTION_NS = 165000;
++                                std::lock_guard<std::mutex> lock(impl->clock_probe_mutex);
++                                if (impl->pending_clock_probe.active) {
++                                    // Use header.time as T3 — already converted to ns
++                                    // by readReceiveBuffer for all device types.
++                                    // Add staleness correction (header.time is from the
++                                    // device's previous main-loop iteration).
++                                    uint64_t device_time_ns = packets[i].cbpkt_header.time
++                                                              + STALENESS_CORRECTION_NS;
++                                    impl->client_clock_sync.addProbeSample(
++                                        impl->pending_clock_probe.t1_local,
++                                        device_time_ns, t4);
++                                    impl->pending_clock_probe.active = false;
++                                }
++                            }
+                             if ((packets[i].cbpkt_header.type & 0xF0) == cbPKTTYPE_CHANREP) {
+                                 const auto* chaninfo = reinterpret_cast<const cbPKT_CHANINFO*>(&packets[i]);
+                                 impl->applyCmpOverlay(*chaninfo);
+                             }
+                         }
++
++                        // Periodic clock sync probing (~every 5 seconds)
++                        if (t4 - impl->last_clock_probe_time > std::chrono::seconds(5)) {
++                            // Build and enqueue probe via shmem xmt buffer.
++                            // Can't call sendClockProbe() (needs SdkSession*), so inline it.
++                            {
++                                std::lock_guard<std::mutex> lock(impl->clock_probe_mutex);
++                                impl->pending_clock_probe.t1_local = t4;
++                                impl->pending_clock_probe.active = true;
++                            }
++                            cbPKT_NPLAY probe{};
++                            probe.cbpkt_header.chid = cbPKTCHAN_CONFIGURATION;
++                            probe.cbpkt_header.type = cbPKTTYPE_NPLAYSET;
++                            probe.cbpkt_header.dlen = cbPKTDLEN_NPLAY;
++                            probe.mode = 0xFFFF;
++                            probe.stime = static_cast<uint64_t>(
++                                std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                    t4.time_since_epoch()).count());
++                            // Stamp with current device time (enqueuePacket needs non-zero time)
++                            PROCTIME last_t = impl->shmem_session->getLastTime();
++                            probe.cbpkt_header.time = (last_t != 0) ? last_t : 1;
++                            impl->shmem_session->enqueuePacket(
++                                *reinterpret_cast<const cbPKT_GENERIC*>(&probe));
++                            impl->last_clock_probe_time = t4;
++                        }
++
+                         // Dispatch batch (fires batch group callbacks, then per-packet callbacks)
+                         impl->dispatchBatch(packets, packets_read);
+                     }
+@@ -1834,12 +1888,35 @@ SdkSession::toDeviceTime(std::chrono::steady_clock::time_point local_time) const
+ }
+ 
+ Result<void> SdkSession::sendClockProbe() {
+-    if (!m_impl->device_session)
+-        return Result<void>::error("sendClockProbe() only available in STANDALONE mode");
+-    auto r = m_impl->device_session->sendClockProbe();
+-    if (r.isError())
+-        return Result<void>::error(r.error());
+-    return Result<void>::ok();
++    if (m_impl->device_session) {
++        // STANDALONE: send via device session (direct UDP)
++        auto r = m_impl->device_session->sendClockProbe();
++        if (r.isError())
++            return Result<void>::error(r.error());
++        return Result<void>::ok();
++    }
++
++    // CLIENT: send via shmem xmt buffer (Central forwards to device)
++    if (!m_impl->shmem_session)
++        return Result<void>::error("sendClockProbe: no session available");
++
++    auto now = std::chrono::steady_clock::now();
++    {
++        std::lock_guard<std::mutex> lock(m_impl->clock_probe_mutex);
++        m_impl->pending_clock_probe.t1_local = now;
++        m_impl->pending_clock_probe.active = true;
++    }
++
++    cbPKT_NPLAY pkt{};
++    pkt.cbpkt_header.chid = cbPKTCHAN_CONFIGURATION;
++    pkt.cbpkt_header.type = cbPKTTYPE_NPLAYSET;
++    pkt.cbpkt_header.dlen = cbPKTDLEN_NPLAY;
++    pkt.mode = 0xFFFF;
++    pkt.stime = static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(
++            now.time_since_epoch()).count());
++
++    return sendPacket(*reinterpret_cast<const cbPKT_GENERIC*>(&pkt));
+ }
+ 
+ std::optional<int64_t> SdkSession::getClockOffsetNs() const {
+@@ -1847,11 +1924,15 @@ std::optional<int64_t> SdkSession::getClockOffsetNs() const {
+     if (m_impl->device_session)
+         return m_impl->device_session->getOffsetNs();
+ 
+-    // CLIENT: read from shmem
+-    if (m_impl->shmem_session)
+-        return m_impl->shmem_session->getClockOffsetNs();
++    // CLIENT: try shmem clock sync fields (NATIVE layout)
++    if (m_impl->shmem_session) {
++        auto offset = m_impl->shmem_session->getClockOffsetNs();
++        if (offset.has_value())
++            return offset;
++    }
+ 
+-    return std::nullopt;
++    // CLIENT fallback: use local ClockSync (CENTRAL_COMPAT — no shmem clock fields)
++    return m_impl->client_clock_sync.getOffsetNs();
+ }
+ 
+ std::optional<int64_t> SdkSession::getClockUncertaintyNs() const {
+@@ -1859,11 +1940,15 @@ std::optional<int64_t> SdkSession::getClockUncertaintyNs() const {
+     if (m_impl->device_session)
+         return m_impl->device_session->getUncertaintyNs();
+ 
+-    // CLIENT: read from shmem
+-    if (m_impl->shmem_session)
+-        return m_impl->shmem_session->getClockUncertaintyNs();
++    // CLIENT: try shmem clock sync fields (NATIVE layout)
++    if (m_impl->shmem_session) {
++        auto uncert = m_impl->shmem_session->getClockUncertaintyNs();
++        if (uncert.has_value())
++            return uncert;
++    }
+ 
+-    return std::nullopt;
++    // CLIENT fallback: use local ClockSync (CENTRAL_COMPAT)
++    return m_impl->client_clock_sync.getUncertaintyNs();
+ }
+ 
+ Result<void> SdkSession::sendPacket(const cbPKT_GENERIC& pkt) {
+@@ -1878,7 +1963,9 @@ Result<void> SdkSession::sendPacket(const cbPKT_GENERIC& pkt) {
+         return Result<void>::error("sendPacket: shmem_session is null");
+     }
+ 
+-    // Stamp packet time from receive buffer (Central's xmt consumer skips packets with time=0)
++    // Stamp packet with a nanosecond timestamp (Central's xmt consumer skips packets with time=0).
++    // Use getLastTime() (always nanoseconds) so that enqueuePacket's per-protocol translation
++    // can convert to the format each consumer expects (e.g. 30kHz ticks for 3.11 CENTRAL_COMPAT).
+     cbPKT_GENERIC stamped = pkt;
+     PROCTIME t = m_impl->shmem_session->getLastTime();
+     stamped.cbpkt_header.time = (t != 0) ? t : 1;
+diff --git a/src/cbshm/include/cbshm/shmem_session.h b/src/cbshm/include/cbshm/shmem_session.h
+index 9cdad75b..d38f54ca 100644
+--- a/src/cbshm/include/cbshm/shmem_session.h
++++ b/src/cbshm/include/cbshm/shmem_session.h
+@@ -486,13 +486,14 @@ class ShmemSession {
+     /// @return Result indicating success or failure
+     Result<void> resetSignal();
+ 
+-    /// @brief Get last timestamp from receive buffer
++    /// @brief Get last timestamp from receive buffer (always nanoseconds)
+     ///
+     /// Returns the most recent packet timestamp written to the receive buffer.
+-    /// Used by sendPacket to stamp outgoing packets with a non-zero time
+-    /// (Central's xmt consumer skips packets with time=0).
++    /// In CENTRAL_COMPAT mode with a non-Gemini device the raw value (clock
++    /// ticks) is converted to nanoseconds using sysfreq, so callers always
++    /// receive a uniform nanosecond timestamp.
+     ///
+-    /// @return Last timestamp, or 0 if receive buffer not initialized
++    /// @return Last timestamp in nanoseconds, or 0 if receive buffer not initialized
+     PROCTIME getLastTime() const;
+ 
+     /// @}
+diff --git a/src/cbshm/src/shmem_session.cpp b/src/cbshm/src/shmem_session.cpp
+index b2815ca7..a8e4e511 100644
+--- a/src/cbshm/src/shmem_session.cpp
++++ b/src/cbshm/src/shmem_session.cpp
+@@ -30,6 +30,7 @@
+ #include <cbshm/native_types.h>
+ #include <cbproto/packet_translator.h>
+ #include <cstring>
++#include <numeric>  // std::gcd
+ 
+ namespace cbshm {
+ 
+@@ -1163,6 +1164,15 @@ Result<void> ShmemSession::enqueuePacket(const cbPKT_GENERIC& pkt) {
+             // Translate header: current (16 bytes) → 4.0 (16 bytes, different field layout)
+             auto& dest_hdr = *reinterpret_cast<cbproto::cbPKT_HEADER_400*>(translated_buf);
+             dest_hdr.time = pkt.cbpkt_header.time;
++            // Non-Gemini: convert nanosecond timestamp back to device clock ticks.
++            // Central's xmt consumer expects device-native format.
++            auto gemini = isGeminiSystem();
++            if (gemini.isOk() && !gemini.value() && dest_hdr.time != 0) {
++                uint32_t sysfreq = m_impl->legacyCfg()->sysinfo.sysfreq;
++                if (sysfreq == 0) sysfreq = 30000;
++                uint64_t g = std::gcd(uint64_t(1000000000), uint64_t(sysfreq));
++                dest_hdr.time = dest_hdr.time * (sysfreq / g) / (1000000000 / g);
++            }
+             dest_hdr.chid = pkt.cbpkt_header.chid;
+             dest_hdr.type = static_cast<uint8_t>(pkt.cbpkt_header.type);
+             dest_hdr.dlen = pkt.cbpkt_header.dlen;
+@@ -1178,9 +1188,33 @@ Result<void> ShmemSession::enqueuePacket(const cbPKT_GENERIC& pkt) {
+             size_t dest_dlen = cbproto::PacketTranslator::translatePayload_current_to_410(pkt, translated_buf);
+             auto& dest_hdr = *reinterpret_cast<cbPKT_HEADER*>(translated_buf);
+             dest_hdr.dlen = static_cast<uint16_t>(dest_dlen);
++            // Non-Gemini: convert nanosecond timestamp back to device clock ticks.
++            auto gemini = isGeminiSystem();
++            if (gemini.isOk() && !gemini.value() && dest_hdr.time != 0) {
++                uint32_t sysfreq = m_impl->legacyCfg()->sysinfo.sysfreq;
++                if (sysfreq == 0) sysfreq = 30000;
++                uint64_t g = std::gcd(uint64_t(1000000000), uint64_t(sysfreq));
++                dest_hdr.time = dest_hdr.time * (sysfreq / g) / (1000000000 / g);
++            }
+             write_size_bytes = cbPKT_HEADER_SIZE + dest_dlen * 4;
+         }
+         write_data = translated_buf;
++    } else if (m_impl->layout == ShmemLayout::CENTRAL_COMPAT && m_impl->status_buffer_raw) {
++        // Protocol is CURRENT but device may be non-Gemini — still need ns→ticks conversion.
++        auto gemini = isGeminiSystem();
++        if (gemini.isOk() && !gemini.value() && pkt.cbpkt_header.time != 0) {
++            std::memcpy(translated_buf, &pkt,
++                        (cbPKT_HEADER_32SIZE + pkt.cbpkt_header.dlen) * sizeof(uint32_t));
++            auto& dest_hdr = *reinterpret_cast<cbPKT_HEADER*>(translated_buf);
++            uint32_t sysfreq = m_impl->legacyCfg()->sysinfo.sysfreq;
++            if (sysfreq == 0) sysfreq = 30000;
++            uint64_t g = std::gcd(uint64_t(1000000000), uint64_t(sysfreq));
++            dest_hdr.time = dest_hdr.time * (sysfreq / g) / (1000000000 / g);
++            write_data = translated_buf;
++        } else {
++            write_data = reinterpret_cast<const uint8_t*>(&pkt);
++        }
++        write_size_bytes = (cbPKT_HEADER_32SIZE + pkt.cbpkt_header.dlen) * sizeof(uint32_t);
+     } else {
+         write_data = reinterpret_cast<const uint8_t*>(&pkt);
+         write_size_bytes = (cbPKT_HEADER_32SIZE + pkt.cbpkt_header.dlen) * sizeof(uint32_t);
+@@ -1712,7 +1746,20 @@ PROCTIME ShmemSession::getLastTime() const {
+     if (!m_impl || !m_impl->is_open || !m_impl->rec_buffer_raw) {
+         return 0;
+     }
+-    return m_impl->recLasttime();
++    PROCTIME t = m_impl->recLasttime();
++    // In CENTRAL_COMPAT mode, Central writes lasttime using the device's native
++    // timestamp unit.  Non-Gemini devices use clock ticks; convert to nanoseconds
++    // for consistency with readReceiveBuffer() which translates packet timestamps.
++    if (t != 0 && m_impl->layout == ShmemLayout::CENTRAL_COMPAT) {
++        auto gemini = isGeminiSystem();
++        if (gemini.isOk() && !gemini.value()) {
++            uint32_t sysfreq = m_impl->legacyCfg()->sysinfo.sysfreq;
++            if (sysfreq == 0) sysfreq = 30000;
++            uint64_t g = std::gcd(uint64_t(1000000000), uint64_t(sysfreq));
++            t = t * (1000000000 / g) / (sysfreq / g);
++        }
++    }
++    return t;
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -1758,6 +1805,26 @@ Result<void> ShmemSession::readReceiveBuffer(cbPKT_GENERIC* packets, size_t max_
+     const bool needs_translation = (m_impl->layout == ShmemLayout::CENTRAL_COMPAT &&
+                                      m_impl->compat_protocol != CBPROTO_PROTOCOL_CURRENT);
+ 
++    // For non-Gemini systems, header timestamps are in clock ticks and need
++    // conversion to nanoseconds.  This applies regardless of protocol version —
++    // a non-Gemini device with protocol 4.2+ still uses tick-based timestamps.
++    // (Protocol 3.11 handles conversion inline with its hardcoded 30 kHz factor.)
++    uint64_t ts_num = 1, ts_den = 1;
++    bool needs_ts_conversion = false;
++    if (m_impl->layout == ShmemLayout::CENTRAL_COMPAT &&
++        m_impl->compat_protocol != CBPROTO_PROTOCOL_311 &&
++        m_impl->status_buffer_raw) {
++        auto gemini = isGeminiSystem();
++        if (gemini.isOk() && !gemini.value()) {
++            uint32_t sysfreq = m_impl->legacyCfg()->sysinfo.sysfreq;
++            if (sysfreq == 0) sysfreq = 30000;
++            uint64_t g = std::gcd(uint64_t(1000000000), uint64_t(sysfreq));
++            ts_num = 1000000000 / g;
++            ts_den = sysfreq / g;
++            needs_ts_conversion = (ts_den > 1);
++        }
++    }
++
+     uint8_t raw_buf[cbPKT_MAX_SIZE];
+ 
+     while (packets_read < max_packets) {
+@@ -1873,6 +1940,13 @@ Result<void> ShmemSession::readReceiveBuffer(cbPKT_GENERIC* packets, size_t max_
+             }
+         }
+ 
++        // Non-Gemini CENTRAL_COMPAT: convert header timestamp from clock ticks to nanoseconds.
++        // Applied after both translation and non-translation paths.
++        if (needs_ts_conversion) {
++            packets[packets_read].cbpkt_header.time =
++                packets[packets_read].cbpkt_header.time * ts_num / ts_den;
++        }
++
+         // Advance tail past this packet (consumed from ring buffer regardless of filter)
+         m_impl->rec_tailindex += pkt_size_dwords;
+         if (m_impl->rec_tailindex >= buflen) {
+diff --git a/tests/unit/test_clock_sync.cpp b/tests/unit/test_clock_sync.cpp
+index 4abb265c..abaa3f6f 100644
+--- a/tests/unit/test_clock_sync.cpp
++++ b/tests/unit/test_clock_sync.cpp
+@@ -8,7 +8,7 @@
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ #include <gtest/gtest.h>
+-#include "clock_sync.h"
++#include "cbdev/clock_sync.h"
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>

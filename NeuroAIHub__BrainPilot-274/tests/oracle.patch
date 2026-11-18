@@ -1,0 +1,1014 @@
+diff --git a/packages/web/src/__tests__/demoBundleCollect.test.ts b/packages/web/src/__tests__/demoBundleCollect.test.ts
+new file mode 100644
+index 00000000..4dd5f53e
+--- /dev/null
++++ b/packages/web/src/__tests__/demoBundleCollect.test.ts
+@@ -0,0 +1,107 @@
++import { describe, expect, it, vi, beforeEach } from "vitest";
++
++/**
++ * Coverage for buildDemoBundle's file collection (#5 concurrent fetch,
++ * deterministic budget; #9 abort). The api module is mocked so we can drive
++ * trace artifacts and sandbox reads without a backend.
++ */
++
++const getTrace = vi.fn();
++const getHistory = vi.fn();
++const state = vi.fn();
++const getVersion = vi.fn();
++const readFile = vi.fn();
++const readRawFile = vi.fn();
++
++vi.mock("../utils/api", () => ({
++  api: {
++    getVersion: () => getVersion(),
++    sessions: {
++      getTrace: (id: string) => getTrace(id),
++      getHistory: (id: string, opts: unknown) => getHistory(id, opts),
++      state: (id: string) => state(id),
++    },
++    sandbox: {
++      readFile: (sid: string, path: string) => readFile(sid, path),
++      readRawFile: (sid: string, path: string) => readRawFile(sid, path),
++    },
++  },
++}));
++
++// Imported after the mock is registered.
++const { buildDemoBundle, PackAbortedError } = await import("../components/demo/demoBundle");
++
++function traceWith(paths: string[]) {
++  return {
++    nodes: [
++      {
++        id: "n1",
++        artifacts: paths.map((p) => ({ path: p, type: "file" })),
++        parents: [],
++        parentIds: [],
++        childIds: [],
++      },
++    ],
++  };
++}
++
++beforeEach(() => {
++  vi.clearAllMocks();
++  getVersion.mockResolvedValue({ version: "test" });
++  getHistory.mockResolvedValue({ events: [{ type: "X", _ts: "t" }], total: 1, truncated: false });
++  state.mockResolvedValue({ agents: [] });
++});
++
++describe("buildDemoBundle file collection", () => {
++  it("marks all files unreadable when no sandbox is available", async () => {
++    getTrace.mockResolvedValue(traceWith(["a.txt", "b.png"]));
++    const bundle = await buildDemoBundle({
++      session: { id: "s", title: "S" },
++      filesUnavailableDetail: "no sandbox",
++    });
++    expect(bundle.packedWithSandbox).toBe(false);
++    expect(bundle.files).toHaveLength(2);
++    expect(bundle.files.every((f) => f.truncated && f.reason === "unreadable")).toBe(true);
++    expect(readFile).not.toHaveBeenCalled();
++  });
++
++  it("fetches files concurrently but preserves path order in the result", async () => {
++    getTrace.mockResolvedValue(traceWith(["1.txt", "2.txt", "3.txt"]));
++    let inFlight = 0;
++    let maxInFlight = 0;
++    readFile.mockImplementation(async (_sid: string, path: string) => {
++      inFlight += 1;
++      maxInFlight = Math.max(maxInFlight, inFlight);
++      await new Promise((r) => setTimeout(r, 5));
++      inFlight -= 1;
++      return { content: path, size: path.length };
++    });
++    const bundle = await buildDemoBundle({ session: { id: "s", title: "S" }, sandboxId: "sb" });
++    expect(bundle.files.map((f) => f.path)).toEqual(["1.txt", "2.txt", "3.txt"]);
++    expect(bundle.files.map((f) => f.data)).toEqual(["/workspace/1.txt", "/workspace/2.txt", "/workspace/3.txt"]);
++    expect(maxInFlight).toBeGreaterThan(1); // genuinely concurrent
++  });
++
++  it("records a read failure as unreadable, not tooLarge", async () => {
++    getTrace.mockResolvedValue(traceWith(["ok.txt", "bad.txt"]));
++    readFile.mockImplementation(async (_sid: string, path: string) => {
++      if (path.endsWith("bad.txt")) {
++        throw new Error("boom");
++      }
++      return { content: "hi", size: 2 };
++    });
++    const bundle = await buildDemoBundle({ session: { id: "s", title: "S" }, sandboxId: "sb" });
++    const bad = bundle.files.find((f) => f.path === "bad.txt")!;
++    expect(bad.reason).toBe("unreadable");
++    expect(bad.detail).toBe("boom");
++  });
++
++  it("throws PackAbortedError when the signal is already aborted", async () => {
++    getTrace.mockResolvedValue(traceWith(["a.txt"]));
++    const controller = new AbortController();
++    controller.abort();
++    await expect(
++      buildDemoBundle({ session: { id: "s", title: "S" }, sandboxId: "sb", signal: controller.signal }),
++    ).rejects.toBeInstanceOf(PackAbortedError);
++  });
++});
+diff --git a/packages/web/src/__tests__/demoFoldCache.test.ts b/packages/web/src/__tests__/demoFoldCache.test.ts
+new file mode 100644
+index 00000000..26c8c13e
+--- /dev/null
++++ b/packages/web/src/__tests__/demoFoldCache.test.ts
+@@ -0,0 +1,91 @@
++import { describe, expect, it } from "vitest";
++import type { ChatMessage, WebSocketEvent } from "../contracts/backend";
++import { reduceMessagesForEvent } from "../contexts/messageReducer";
++import { foldUpTo, type FoldEntry } from "../components/demo/foldCache";
++
++/**
++ * The incremental fold cache must produce EXACTLY what a from-scratch fold of
++ * every event ≤ cursor would produce, for any cursor and any sequence of cursor
++ * moves (forward during playback, backward on scrub/restart). These tests pin
++ * that equivalence plus the incremental behaviour (#2 replay perf).
++ */
++
++function startEnd(id: string, text: string, ms: number): FoldEntry[] {
++  return [
++    { ms, ev: { type: "TEXT_MESSAGE_START", messageId: id, role: "assistant" } as unknown as WebSocketEvent },
++    { ms, ev: { type: "TEXT_MESSAGE_CONTENT", messageId: id, delta: text } as unknown as WebSocketEvent },
++  ];
++}
++
++const sorted: FoldEntry[] = [
++  ...startEnd("a", "hello", 10),
++  ...startEnd("b", "world", 20),
++  ...startEnd("c", "again", 30),
++];
++
++/** Reference implementation: fold everything ≤ cursor from scratch. */
++function foldFromScratch(entries: FoldEntry[], cursor: number): ChatMessage[] {
++  let acc: ChatMessage[] = [];
++  for (const { ev, ms } of entries) {
++    if (ms > cursor) break;
++    acc = reduceMessagesForEvent(acc, ev);
++  }
++  return acc;
++}
++
++/**
++ * The reducer stamps `createdAt` with the wall clock at fold time, so two folds
++ * of the same events run a millisecond apart differ only on that field. Strip it
++ * before comparing the incremental fold against the from-scratch reference.
++ */
++function stable(messages: ChatMessage[]): Array<Omit<ChatMessage, "createdAt">> {
++  return messages.map(({ createdAt: _createdAt, ...rest }) => rest);
++}
++
++describe("foldUpTo (incremental demo replay fold)", () => {
++  it("matches a from-scratch fold at every cursor value", () => {
++    for (const cursor of [0, 5, 10, 15, 20, 25, 30, 100]) {
++      const { messages } = foldUpTo(sorted, cursor, null);
++      expect(stable(messages)).toEqual(stable(foldFromScratch(sorted, cursor)));
++    }
++  });
++
++  it("advances incrementally without re-folding the whole prefix", () => {
++    let cache = foldUpTo(sorted, 10, null).cache;
++    expect(cache.count).toBe(2); // both events at ms=10 folded
++    const step = foldUpTo(sorted, 20, cache);
++    expect(step.cache.count).toBe(4); // only the two ms=20 events added
++    expect(stable(step.messages)).toEqual(stable(foldFromScratch(sorted, 20)));
++    cache = step.cache;
++  });
++
++  it("reuses the cache (no growth) when the cursor does not cross a new event", () => {
++    const first = foldUpTo(sorted, 20, null);
++    const again = foldUpTo(sorted, 22, first.cache);
++    expect(again.cache.count).toBe(first.cache.count);
++    expect(stable(again.messages)).toEqual(stable(first.messages));
++  });
++
++  it("rebuilds correctly when the cursor moves backward", () => {
++    const forward = foldUpTo(sorted, 30, null);
++    expect(forward.cache.count).toBe(6);
++    const backward = foldUpTo(sorted, 10, forward.cache);
++    expect(backward.cache.count).toBe(2);
++    expect(stable(backward.messages)).toEqual(stable(foldFromScratch(sorted, 10)));
++  });
++
++  it("drops to empty when the cursor rewinds before the first event", () => {
++    const forward = foldUpTo(sorted, 30, null);
++    const rewound = foldUpTo(sorted, 0, forward.cache);
++    expect(rewound.messages).toEqual([]);
++    expect(rewound.cache.count).toBe(0);
++  });
++
++  it("restarts from scratch when the timeline identity changes", () => {
++    const cache = foldUpTo(sorted, 30, null).cache;
++    const other: FoldEntry[] = startEnd("z", "new", 5);
++    const res = foldUpTo(other, 30, cache);
++    expect(stable(res.messages)).toEqual(stable(foldFromScratch(other, 30)));
++    expect(res.cache.sorted).toBe(other);
++  });
++});
+diff --git a/packages/web/src/__tests__/demoNodeTimeline.test.ts b/packages/web/src/__tests__/demoNodeTimeline.test.ts
+new file mode 100644
+index 00000000..20bf0989
+--- /dev/null
++++ b/packages/web/src/__tests__/demoNodeTimeline.test.ts
+@@ -0,0 +1,102 @@
++import { describe, expect, it } from "vitest";
++import type { TraceNode } from "../contracts/backend";
++import { computeNodeMs, nodeTimeMs } from "../components/demo/nodeTimeline";
++
++function node(overrides: Partial<TraceNode>): TraceNode {
++  return {
++    id: overrides.id ?? "n",
++    title: "t",
++    type: "step",
++    status: "done",
++    parents: [],
++    artifacts: [],
++    parentIds: [],
++    childIds: [],
++    timestamp: {},
++    ...overrides,
++  } as TraceNode;
++}
++
++/** node.timestamp.completedAt / startedAt / createdAt in ISO. */
++function withTimes(ids: string[], isos: (string | undefined)[]): TraceNode[] {
++  return ids.map((id, i) => node({ id, timestamp: { createdAt: isos[i] } }));
++}
++
++const T0 = 1000;
++const T1 = 2000;
++
++describe("computeNodeMs (#6 node/conversation clock alignment)", () => {
++  it("returns [] for no nodes", () => {
++    expect(computeNodeMs([], T0, T1)).toEqual([]);
++  });
++
++  it("uses real times when finite, non-decreasing, and spanning a range", () => {
++    const nodes = withTimes(
++      ["a", "b", "c"],
++      ["1970-01-01T00:00:01.200Z", "1970-01-01T00:00:01.500Z", "1970-01-01T00:00:01.800Z"],
++    );
++    // 1200, 1500, 1800 all inside [1000, 2000] → used verbatim.
++    expect(computeNodeMs(nodes, T0, T1)).toEqual([1200, 1500, 1800]);
++  });
++
++  it("clamps real times into the timeline bounds", () => {
++    const nodes = withTimes(
++      ["a", "b", "c"],
++      ["1970-01-01T00:00:00.500Z", "1970-01-01T00:00:01.500Z", "1970-01-01T00:00:09.000Z"],
++    );
++    // 500 < t0 → 1000; 9000 > t1 → 2000. Still non-decreasing.
++    expect(computeNodeMs(nodes, T0, T1)).toEqual([1000, 1500, 2000]);
++  });
++
++  it("falls back to even spacing when a timestamp is missing", () => {
++    const nodes = withTimes(["a", "b", "c"], ["1970-01-01T00:00:01.200Z", undefined, "1970-01-01T00:00:01.800Z"]);
++    expect(computeNodeMs(nodes, T0, T1)).toEqual([1000, 1500, 2000]);
++  });
++
++  it("falls back to even spacing when times are non-monotonic in array order", () => {
++    const nodes = withTimes(
++      ["a", "b", "c"],
++      ["1970-01-01T00:00:01.800Z", "1970-01-01T00:00:01.200Z", "1970-01-01T00:00:01.500Z"],
++    );
++    expect(computeNodeMs(nodes, T0, T1)).toEqual([1000, 1500, 2000]);
++  });
++
++  it("falls back to even spacing when all times are identical (no real range)", () => {
++    const same = "1970-01-01T00:00:01.500Z";
++    const nodes = withTimes(["a", "b", "c"], [same, same, same]);
++    expect(computeNodeMs(nodes, T0, T1)).toEqual([1000, 1500, 2000]);
++  });
++
++  it("always returns a non-decreasing series (the reveal-slice invariant)", () => {
++    const cases: TraceNode[][] = [
++      withTimes(["a", "b", "c", "d"], ["x", "y", "z", "w"]), // all unparseable → even
++      withTimes(["a", "b"], ["1970-01-01T00:00:01.100Z", "1970-01-01T00:00:01.900Z"]),
++    ];
++    for (const nodes of cases) {
++      const ms = computeNodeMs(nodes, T0, T1);
++      for (let i = 1; i < ms.length; i += 1) {
++        expect(ms[i]).toBeGreaterThanOrEqual(ms[i - 1]);
++      }
++    }
++  });
++
++  it("puts a single node at t1", () => {
++    expect(computeNodeMs([node({ id: "solo" })], T0, T1)).toEqual([T1]);
++  });
++
++  it("nodeTimeMs prefers completedAt > startedAt > createdAt", () => {
++    expect(
++      nodeTimeMs(
++        node({
++          timestamp: {
++            createdAt: "1970-01-01T00:00:01.000Z",
++            startedAt: "1970-01-01T00:00:02.000Z",
++            completedAt: "1970-01-01T00:00:03.000Z",
++          },
++        }),
++      ),
++    ).toBe(3000);
++    expect(nodeTimeMs(node({ timestamp: {}, createdAt: "1970-01-01T00:00:04.000Z" }))).toBe(4000);
++    expect(Number.isNaN(nodeTimeMs(node({ timestamp: {} })))).toBe(true);
++  });
++});
+diff --git a/packages/web/src/components/demo/DemoView.tsx b/packages/web/src/components/demo/DemoView.tsx
+index 0f005aa5..e8df38c3 100644
+--- a/packages/web/src/components/demo/DemoView.tsx
++++ b/packages/web/src/components/demo/DemoView.tsx
+@@ -5,7 +5,6 @@ import type { ChatMessage, TraceNode, WebSocketEvent } from "../../contracts/bac
+ import { normalizeWebSocketEvent } from "../../contracts/backend";
+ import { DemoBundle, DemoFile } from "../../contracts/demoBundle";
+ import { applyMessageFilters, defaultFilterRules } from "../../contexts/messageFilters";
+-import { reduceMessagesForEvent } from "../../contexts/messageReducer";
+ import { useSandbox } from "../../contexts/SandboxContext";
+ import { useSessions } from "../../contexts/SessionContext";
+ import { useT } from "../../i18n/useT";
+@@ -16,9 +15,11 @@ import { getPreviewKind, isMarkdown } from "../files/filePreview";
+ import { IconButton } from "../primitives/IconButton";
+ import { TraceGraphView } from "../session/TraceGraphView";
+ import { getNodeKindLabelKey } from "../session/traceLayout";
+-import { buildDemoBundle, parseDemoBundle } from "./demoBundle";
++import { buildDemoBundle, PackAbortedError, parseDemoBundle } from "./demoBundle";
+ import { getCachedBundle, setCachedBundle } from "./demoCache";
+ import { shouldResetDemo } from "./demoReset";
++import { foldUpTo, type FoldCache } from "./foldCache";
++import { computeNodeMs } from "./nodeTimeline";
+ import { DemoFileTree } from "./DemoFileTree";
+ import { TraceNodeModal } from "./TraceNodeModal";
+ 
+@@ -143,12 +144,19 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+   };
+ 
+   const fileInputRef = useRef<HTMLInputElement | null>(null);
+-  const decodedRef = useRef<Map<string, DecodedFile>>(new Map());
++  // Incremental fold cache for timestamped replay (see foldCache.ts).
++  const foldCacheRef = useRef<FoldCache | null>(null);
++  // Aborts an in-flight pack when the user navigates away / re-selects / the
++  // component unmounts, so a slow buildDemoBundle can't resolve into a stale or
++  // unmounted view.
++  const packAbortRef = useRef<AbortController | null>(null);
+ 
+   // Decode embedded files into preview sources (lazy blob URLs for binaries).
++  // Pure builder: it must NOT revoke prior URLs here — a useMemo factory can run
++  // for a render React later discards (concurrent rendering), which would revoke
++  // URLs the currently-committed render still points at, breaking image/PDF
++  // previews. Revocation happens in the effect below, keyed on the map identity.
+   const decoded = useMemo(() => {
+-    // Revoke URLs from the previous bundle.
+-    decodedRef.current.forEach((d) => d.objectUrl && URL.revokeObjectURL(d.objectUrl));
+     const map = new Map<string, DecodedFile>();
+     for (const file of bundle?.files ?? []) {
+       if (file.truncated || file.data === undefined) {
+@@ -169,13 +177,15 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+         map.set(file.path, { source: { kind: "download" } });
+       }
+     }
+-    decodedRef.current = map;
+     return map;
+   }, [bundle]);
+ 
++  // Revoke the *previous* map's blob URLs only after a new decoded map has been
++  // committed (and on unmount). Keying the cleanup on `decoded` guarantees we
++  // never revoke URLs the live render still references.
+   useEffect(() => () => {
+-    decodedRef.current.forEach((d) => d.objectUrl && URL.revokeObjectURL(d.objectUrl));
+-  }, []);
++    decoded.forEach((d) => d.objectUrl && URL.revokeObjectURL(d.objectUrl));
++  }, [decoded]);
+ 
+   const nodes = bundle?.trace.nodes ?? [];
+ 
+@@ -202,19 +212,19 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+           return { ev: normalized, ms };
+         })
+         .sort((a, b) => a.ms - b.ms);
+-      const all = sorted.map((s) => s.ms).filter(Number.isFinite);
+-      const t0 = all.length ? Math.min(...all) : 0;
+-      const t1 = all.length ? Math.max(...all) : 1;
+-      const span = t1 > t0 ? t1 - t0 : 1;
+-      // Reveal trace nodes evenly across the timeline in creation (array) order.
+-      // Bundle node timestamps are unreliable — often missing, equal, or
+-      // clustered — which previously made the graph pop in all at once or out of
+-      // order (filter-≤-cursor count diverged from the array slice). Even
+-      // spacing keeps nodeMs monotonic in array order, so nodes stream in one by
+-      // one, in order, paced across the replay.
+-      const nodeMs = nodes.map((_, j) =>
+-        nodes.length <= 1 ? t1 : t0 + (j / (nodes.length - 1)) * span,
+-      );
++      // `ms` is always finite (falls back to the previous value above) and the
++      // list is sorted ascending, so the endpoints are the min/max. Read them
++      // directly instead of spreading into Math.min/Math.max, which throws
++      // RangeError once the event count exceeds the engine's argument limit
++      // (large sessions packed with `limit: 0`).
++      const t0 = sorted.length ? sorted[0].ms : 0;
++      const t1 = sorted.length ? sorted[sorted.length - 1].ms : 1;
++      // Reveal nodes at their real times when those are trustworthy (finite,
++      // non-decreasing in array order, spanning a real range) so the graph tracks
++      // the conversation panel; otherwise fall back to even spacing. computeNodeMs
++      // always returns a non-decreasing series, which the filter-≤-cursor / slice
++      // reveal relies on. (see nodeTimeline.ts)
++      const nodeMs = computeNodeMs(nodes, t0, t1);
+       return { t0, t1: t1 > t0 ? t1 : t0 + 1, sorted, nodeMs, ordered: [] as ChatMessage[] };
+     }
+     const ordered = bundle.messages ?? [];
+@@ -233,11 +243,17 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+   useEffect(() => {
+     if (shouldResetDemo(prevResetSignal.current, resetSignal)) {
+       prevResetSignal.current = resetSignal;
++      // Cancel any pack in flight so it can't resolve into the landing we just
++      // returned to.
++      packAbortRef.current?.abort();
+       setBundle(null);
+       setError(null);
+     }
+   }, [resetSignal]);
+ 
++  // Abort an in-flight pack if the component unmounts mid-build.
++  useEffect(() => () => packAbortRef.current?.abort(), []);
++
+   // Reset transport on new bundle (start fully revealed, paused, default file).
+   useEffect(() => {
+     if (!bundle) {
+@@ -276,14 +292,14 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+       return [];
+     }
+     if (bundle.timeline === "timestamped") {
+-      let acc: ChatMessage[] = [];
+-      for (const { ev, ms } of timeline.sorted) {
+-        if (ms > cursor) {
+-          break;
+-        }
+-        acc = reduceMessagesForEvent(acc, ev);
+-      }
+-      return acc;
++      // Incremental prefix fold (see foldCache.ts): only the newly-crossed events
++      // are folded as the cursor advances, so the play loop stays O(1) per tick
++      // instead of re-folding the whole event log every TICK_MS. Correct even if
++      // React double-invokes this memo under concurrent rendering — the cache
++      // always holds a real event prefix, so a repeat call just resumes from it.
++      const { messages, cache } = foldUpTo(timeline.sorted, cursor, foldCacheRef.current);
++      foldCacheRef.current = cache;
++      return messages;
+     }
+     const count = Math.max(0, Math.min(timeline.ordered.length, Math.floor(cursor) + 1));
+     return timeline.ordered.slice(0, count);
+@@ -346,8 +362,12 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+   }, [revealedNodes, pinnedFile, bundle]);
+ 
+   const previewFile = bundle?.files.find((f) => f.path === currentArtifactPath) ?? null;
++  // A produced artifact may be referenced by the trace but never collected into
++  // `bundle.files` (e.g. a directory, or a path the packer skipped). In that case
++  // there is no decoded entry — report it as "missing", not "tooLarge", which
++  // would be a misleading size claim about a file we simply don't have.
+   const previewSource: PreviewSource | null = currentArtifactPath
+-    ? decoded.get(currentArtifactPath)?.source ?? { kind: "tooLarge" }
++    ? decoded.get(currentArtifactPath)?.source ?? { kind: "missing" }
+     : null;
+ 
+   const modalNode = useMemo<TraceNode | null>(
+@@ -423,19 +443,25 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+   };
+ 
+   const handlePackSession = async (sessionId: string, title: string, updatedAt?: string) => {
++    // A running sandbox lets us embed produced files; without one we still pack
++    // the conversation, trace and events (all host-persisted) and mark the
++    // files unreadable. So the export is never hard-blocked on the sandbox.
++    const runningSandbox =
++      currentSandbox && currentSandbox.status === "running" ? currentSandbox : null;
+     // Page-lifetime cache: re-opening the same (unchanged) session is instant
+-    // and issues no requests.
++    // and issues no requests. But a bundle packed without a sandbox recorded all
++    // produced files as unreadable; if a sandbox is now running we must re-pack
++    // to embed the real bytes instead of serving that stale file-less bundle.
+     const cached = getCachedBundle(sessionId, updatedAt);
+-    if (cached) {
++    if (cached && !(runningSandbox && cached.packedWithSandbox === false)) {
+       setError(null);
+       setBundle(cached);
+       return;
+     }
+-    // A running sandbox lets us embed produced files; without one we still pack
+-    // the conversation, trace and events (all host-persisted) and mark the
+-    // files unreadable. So the export is never hard-blocked on the sandbox.
+-    const runningSandbox =
+-      currentSandbox && currentSandbox.status === "running" ? currentSandbox : null;
++    // Cancel any earlier in-flight pack and start a fresh one.
++    packAbortRef.current?.abort();
++    const controller = new AbortController();
++    packAbortRef.current = controller;
+     setBusy(true);
+     setError(null);
+     setProgress(t("demo.packing"));
+@@ -451,18 +477,31 @@ export function DemoView({ resetSignal }: DemoViewProps = {}) {
+         filesUnavailableDetail: runningSandbox ? undefined : t("demo.files.noSandbox"),
+         fallbackMessages: currentSession?.id === sessionId ? messages : undefined,
+         onProgress: setProgress,
++        signal: controller.signal,
+       });
++      if (controller.signal.aborted) {
++        return;
++      }
+       setCachedBundle(sessionId, updatedAt, built);
+       setBundle(built);
+     } catch (err) {
++      // A cancelled pack is expected (navigated away / re-selected) — not an error.
++      if (err instanceof PackAbortedError || controller.signal.aborted) {
++        return;
++      }
+       setError(err instanceof Error ? err.message : t("demo.error.build"));
+     } finally {
+-      setBusy(false);
+-      setProgress("");
++      if (packAbortRef.current === controller) {
++        packAbortRef.current = null;
++        setBusy(false);
++        setProgress("");
++      }
+     }
+   };
+ 
+   const handleImportFile = async (file: File) => {
++    // Importing supersedes any pack still in flight.
++    packAbortRef.current?.abort();
+     setBusy(true);
+     setError(null);
+     try {
+diff --git a/packages/web/src/components/demo/demoBundle.ts b/packages/web/src/components/demo/demoBundle.ts
+index 552a262d..82541cdf 100644
+--- a/packages/web/src/components/demo/demoBundle.ts
++++ b/packages/web/src/components/demo/demoBundle.ts
+@@ -25,6 +25,50 @@ export interface BuildDemoOptions {
+   filesUnavailableDetail?: string;
+   /** Progress notices for the UI (e.g. "packing 3 files…"). */
+   onProgress?: (message: string) => void;
++  /** Aborts the in-flight pack (e.g. the user navigated away). */
++  signal?: AbortSignal;
++}
++
++/** Thrown when a pack is cancelled via its AbortSignal. */
++export class PackAbortedError extends Error {
++  constructor() {
++    super("Demo pack aborted.");
++    this.name = "PackAbortedError";
++  }
++}
++
++function throwIfAborted(signal?: AbortSignal): void {
++  if (signal?.aborted) {
++    throw new PackAbortedError();
++  }
++}
++
++/** Max concurrent sandbox file reads while packing. */
++const FILE_FETCH_CONCURRENCY = 6;
++
++/**
++ * Map `items` through `worker` with at most `limit` in flight at once. Results
++ * preserve input order. Stops launching new work once `signal` is aborted.
++ */
++async function mapWithConcurrency<T, R>(
++  items: T[],
++  limit: number,
++  worker: (item: T, index: number) => Promise<R>,
++  signal?: AbortSignal,
++): Promise<R[]> {
++  const results = new Array<R>(items.length);
++  let next = 0;
++  const run = async (): Promise<void> => {
++    while (next < items.length) {
++      const current = next;
++      next += 1;
++      throwIfAborted(signal);
++      results[current] = await worker(items[current], current);
++    }
++  };
++  const workers = Array.from({ length: Math.min(limit, items.length) }, () => run());
++  await Promise.all(workers);
++  return results;
+ }
+ 
+ /** Normalize a trace artifact path to a sandbox `/workspace/...` path. */
+@@ -45,7 +89,14 @@ async function blobToBase64(blob: Blob): Promise<string> {
+   let binary = "";
+   const chunk = 0x8000;
+   for (let i = 0; i < bytes.length; i += chunk) {
+-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
++    const end = Math.min(i + chunk, bytes.length);
++    // Build the chunk with an explicit loop rather than
++    // String.fromCharCode(...subarray): the spread pushes every byte as a
++    // separate argument, and a 32 KB chunk sits close to some engines' argument
++    // limit — a per-byte loop has no such ceiling and is allocation-free.
++    for (let j = i; j < end; j += 1) {
++      binary += String.fromCharCode(bytes[j]);
++    }
+   }
+   return btoa(binary);
+ }
+@@ -54,90 +105,119 @@ function utf8ByteLength(text: string): number {
+   return new TextEncoder().encode(text).length;
+ }
+ 
++/**
++ * Outcome of fetching + encoding a single file, before the total-size budget is
++ * applied. An "ok" candidate carries the embeddable `data` (utf8 text or base64)
++ * and its `encodedLen`; the caller decides whether it fits the total budget.
++ */
++type FileCandidate =
++  | { path: string; mime: string; encoding: "utf8" | "base64"; status: "ok"; size: number; encodedLen: number; data: string }
++  | { path: string; mime: string; encoding: "utf8" | "base64"; status: "tooLarge"; size: number }
++  | { path: string; mime: string; encoding: "utf8" | "base64"; status: "unreadable"; detail?: string };
++
++/** Fetch + encode one file, applying only the per-file cap (not the total). */
++async function fetchCandidate(sandboxId: string, rawPath: string): Promise<FileCandidate> {
++  const path = toWorkspacePath(rawPath);
++  const name = path.split("/").pop() ?? path;
++  const mime = mimeFromName(name);
++  const isText = getPreviewKind(name) === "text";
++  const encoding: "utf8" | "base64" = isText ? "utf8" : "base64";
++  try {
++    if (isText) {
++      const content = await api.sandbox.readFile(sandboxId, path);
++      const size = content.size ?? utf8ByteLength(content.content);
++      const encodedLen = utf8ByteLength(content.content);
++      if (size > MAX_FILE_BYTES) {
++        return { path: rawPath, mime, encoding, status: "tooLarge", size };
++      }
++      return { path: rawPath, mime, encoding, status: "ok", size, encodedLen, data: content.content };
++    }
++    const blob = await api.sandbox.readRawFile(sandboxId, path);
++    const size = blob.size;
++    if (size > MAX_FILE_BYTES) {
++      return { path: rawPath, mime, encoding, status: "tooLarge", size };
++    }
++    const data = await blobToBase64(blob);
++    return { path: rawPath, mime, encoding, status: "ok", size, encodedLen: data.length, data };
++  } catch (err) {
++    // Read failed (missing, path rejected, outside workspace, wrong sandbox).
++    // Record it as unreadable — NOT as "too large" — so the player can show an
++    // honest reason instead of a misleading size notice.
++    return { path: rawPath, mime, encoding, status: "unreadable", detail: err instanceof Error ? err.message : String(err) };
++  }
++}
++
+ /**
+  * Collect the produced-file set referenced by the trace, fetch each, and embed
+  * it (utf8 for text, base64 for binary) honoring per-file and total size caps.
++ *
++ * Files are fetched + encoded concurrently (bounded by FILE_FETCH_CONCURRENCY)
++ * for speed, but the total-size budget is then applied in deterministic path
++ * order so the same session always packs to the same bundle regardless of which
++ * read finished first.
+  */
+ async function collectFiles(
+   sandboxId: string | undefined,
+   paths: string[],
+   onProgress?: (message: string) => void,
+   unavailableDetail?: string,
++  signal?: AbortSignal,
+ ): Promise<DemoFile[]> {
+-  const files: DemoFile[] = [];
+-  let totalEncoded = 0;
+-  let index = 0;
+-  for (const rawPath of paths) {
+-    index += 1;
+-    onProgress?.(`packing ${index}/${paths.length}: ${rawPath.split("/").pop() ?? rawPath}`);
+-    const path = toWorkspacePath(rawPath);
+-    const name = path.split("/").pop() ?? path;
+-    const mime = mimeFromName(name);
+-    const isText = getPreviewKind(name) === "text";
+-    // No running sandbox to read from: the file bytes live in a sandbox
+-    // workspace we can't reach right now. Record each as unreadable (with an
+-    // honest reason) instead of failing the whole export — the conversation,
+-    // trace and events still pack fine from host-persisted storage.
+-    if (!sandboxId) {
+-      files.push({
++  // No running sandbox to read from: the file bytes live in a sandbox workspace
++  // we can't reach right now. Record each as unreadable (with an honest reason)
++  // instead of failing the whole export — the conversation, trace and events
++  // still pack fine from host-persisted storage.
++  if (!sandboxId) {
++    return paths.map((rawPath) => {
++      const name = toWorkspacePath(rawPath).split("/").pop() ?? rawPath;
++      return {
+         path: rawPath,
+-        mime,
+-        encoding: isText ? "utf8" : "base64",
++        mime: mimeFromName(name),
++        encoding: getPreviewKind(name) === "text" ? "utf8" : "base64",
+         size: 0,
+         truncated: true,
+-        reason: "unreadable",
++        reason: "unreadable" as const,
+         detail: unavailableDetail,
+-      });
+-      continue;
++      };
++    });
++  }
++
++  let done = 0;
++  const candidates = await mapWithConcurrency(
++    paths,
++    FILE_FETCH_CONCURRENCY,
++    async (rawPath) => {
++      const candidate = await fetchCandidate(sandboxId, rawPath);
++      done += 1;
++      onProgress?.(`packing ${done}/${paths.length}: ${rawPath.split("/").pop() ?? rawPath}`);
++      return candidate;
++    },
++    signal,
++  );
++
++  // Apply the total embed budget in path order (deterministic, fetch-order
++  // independent). A file that would push past the budget is recorded tooLarge.
++  let totalEncoded = 0;
++  return candidates.map((c): DemoFile => {
++    if (c.status === "unreadable") {
++      return { path: c.path, mime: c.mime, encoding: c.encoding, size: 0, truncated: true, reason: "unreadable", detail: c.detail };
+     }
+-    try {
+-      if (isText) {
+-        const content = await api.sandbox.readFile(sandboxId, path);
+-        const size = content.size ?? utf8ByteLength(content.content);
+-        const encodedLen = utf8ByteLength(content.content);
+-        if (size > MAX_FILE_BYTES || totalEncoded + encodedLen > MAX_TOTAL_BYTES) {
+-          files.push({ path: rawPath, mime, encoding: "utf8", size, truncated: true, reason: "tooLarge" });
+-          continue;
+-        }
+-        totalEncoded += encodedLen;
+-        files.push({ path: rawPath, mime, encoding: "utf8", size, truncated: false, data: content.content });
+-      } else {
+-        const blob = await api.sandbox.readRawFile(sandboxId, path);
+-        const size = blob.size;
+-        if (size > MAX_FILE_BYTES) {
+-          files.push({ path: rawPath, mime, encoding: "base64", size, truncated: true, reason: "tooLarge" });
+-          continue;
+-        }
+-        const data = await blobToBase64(blob);
+-        if (totalEncoded + data.length > MAX_TOTAL_BYTES) {
+-          files.push({ path: rawPath, mime, encoding: "base64", size, truncated: true, reason: "tooLarge" });
+-          continue;
+-        }
+-        totalEncoded += data.length;
+-        files.push({ path: rawPath, mime, encoding: "base64", size, truncated: false, data });
+-      }
+-    } catch (err) {
+-      // Read failed (missing, path rejected, outside workspace, wrong sandbox).
+-      // Record it as unreadable — NOT as "too large" — so the player can show
+-      // an honest reason instead of a misleading size notice.
+-      files.push({
+-        path: rawPath,
+-        mime,
+-        encoding: isText ? "utf8" : "base64",
+-        size: 0,
+-        truncated: true,
+-        reason: "unreadable",
+-        detail: err instanceof Error ? err.message : String(err),
+-      });
++    if (c.status === "tooLarge") {
++      return { path: c.path, mime: c.mime, encoding: c.encoding, size: c.size, truncated: true, reason: "tooLarge" };
+     }
+-  }
+-  return files;
++    if (totalEncoded + c.encodedLen > MAX_TOTAL_BYTES) {
++      return { path: c.path, mime: c.mime, encoding: c.encoding, size: c.size, truncated: true, reason: "tooLarge" };
++    }
++    totalEncoded += c.encodedLen;
++    return { path: c.path, mime: c.mime, encoding: c.encoding, size: c.size, truncated: false, data: c.data };
++  });
+ }
+ 
+ /** Build a portable demo bundle for an arbitrary session. */
+ export async function buildDemoBundle(opts: BuildDemoOptions): Promise<DemoBundle> {
+-  const { session, sandboxId, fallbackMessages, filesUnavailableDetail, onProgress } = opts;
++  const { session, sandboxId, fallbackMessages, filesUnavailableDetail, onProgress, signal } = opts;
+ 
++  throwIfAborted(signal);
+   onProgress?.("reading reasoning trace…");
+   const trace = await api.sessions.getTrace(session.id);
+ 
+@@ -155,6 +235,7 @@ export async function buildDemoBundle(opts: BuildDemoOptions): Promise<DemoBundl
+     agents = [];
+   }
+ 
++  throwIfAborted(signal);
+   onProgress?.("reading conversation timeline…");
+   let timeline: DemoBundle["timeline"] = "timestamped";
+   // Pull the persisted event timeline from the new history endpoint (the
+@@ -190,8 +271,9 @@ export async function buildDemoBundle(opts: BuildDemoOptions): Promise<DemoBundl
+     }
+   }
+ 
+-  const files = await collectFiles(sandboxId, paths, onProgress, filesUnavailableDetail);
++  const files = await collectFiles(sandboxId, paths, onProgress, filesUnavailableDetail, signal);
+ 
++  throwIfAborted(signal);
+   onProgress?.("assembling bundle…");
+   return {
+     format: DEMO_BUNDLE_FORMAT,
+@@ -199,6 +281,7 @@ export async function buildDemoBundle(opts: BuildDemoOptions): Promise<DemoBundl
+     exportedAt: new Date().toISOString(),
+     appVersion,
+     timeline,
++    packedWithSandbox: !!sandboxId,
+     session: {
+       id: session.id,
+       title: session.title,
+diff --git a/packages/web/src/components/demo/foldCache.ts b/packages/web/src/components/demo/foldCache.ts
+new file mode 100644
+index 00000000..e01b3ed2
+--- /dev/null
++++ b/packages/web/src/components/demo/foldCache.ts
+@@ -0,0 +1,59 @@
++import type { ChatMessage, WebSocketEvent } from "../../contracts/backend";
++import { reduceMessagesForEvent } from "../../contexts/messageReducer";
++
++/**
++ * Incremental prefix-fold cache for the timestamped Live Demo replay.
++ *
++ * The player's play loop nudges the cursor every TICK_MS, and folding every
++ * event ≤ cursor from scratch on each tick is O(events) per tick → O(events ×
++ * frames) across a replay, which drops frames on large sessions. Instead we
++ * cache the folded prefix and how many timeline entries it covers, then only
++ * fold the newly-crossed events when the cursor advances. When the cursor moves
++ * backward (scrub / restart — reduceMessagesForEvent is not reversible) we reset
++ * to empty and rebuild once.
++ *
++ * Extracted as a pure function so the incremental logic is unit-testable without
++ * rendering the component (the monorepo has no jsdom / @testing-library).
++ */
++
++/** One timeline entry: a normalized event and its resolved timestamp (ms). */
++export interface FoldEntry {
++  ev: WebSocketEvent;
++  ms: number;
++}
++
++export interface FoldCache {
++  /** Identity of the timeline this cache belongs to (reference-compared). */
++  sorted: FoldEntry[];
++  /** Number of leading entries already folded into `acc`. */
++  count: number;
++  /** The folded messages covering the first `count` entries. */
++  acc: ChatMessage[];
++}
++
++/**
++ * Fold all timeline entries with `ms <= cursor`, reusing `prev` when possible.
++ * Returns the folded messages plus the next cache to store. Pass the returned
++ * cache back as `prev` on the following call to keep the fold incremental.
++ */
++export function foldUpTo(
++  sorted: FoldEntry[],
++  cursor: number,
++  prev: FoldCache | null,
++): { messages: ChatMessage[]; cache: FoldCache } {
++  const fresh = prev?.sorted === sorted;
++  let count = fresh ? prev!.count : 0;
++  let acc: ChatMessage[] = fresh ? prev!.acc : [];
++  // The last-folded event now lies past the cursor → the cursor moved backward;
++  // the reducer can't undo, so drop back to empty and rebuild from the start.
++  if (count > 0 && sorted[count - 1].ms > cursor) {
++    count = 0;
++    acc = [];
++  }
++  while (count < sorted.length && sorted[count].ms <= cursor) {
++    acc = reduceMessagesForEvent(acc, sorted[count].ev);
++    count += 1;
++  }
++  const cache: FoldCache = { sorted, count, acc };
++  return { messages: acc, cache };
++}
+diff --git a/packages/web/src/components/demo/nodeTimeline.ts b/packages/web/src/components/demo/nodeTimeline.ts
+new file mode 100644
+index 00000000..5b0fdd71
+--- /dev/null
++++ b/packages/web/src/components/demo/nodeTimeline.ts
+@@ -0,0 +1,61 @@
++import type { TraceNode } from "../../contracts/backend";
++
++/**
++ * Compute the reveal time (ms) for each trace node in the Live Demo replay.
++ *
++ * The player reveals nodes by taking `nodeMs.filter((ms) => ms <= cursor).length`
++ * and slicing `nodes.slice(0, count)`. For that slice to equal the set of nodes
++ * with `ms <= cursor`, `nodeMs` MUST be non-decreasing in array order.
++ *
++ * Trace node timestamps are frequently missing, all-equal, or non-monotonic, so
++ * we only trust them when every node has a finite time, the sequence is
++ * non-decreasing in array order, and it spans a real range. When it does, using
++ * the real times aligns the reasoning graph with the conversation panel (which
++ * folds by real event time). Otherwise we fall back to even spacing across the
++ * timeline — nodes stream in one by one, in creation order, paced across the
++ * replay — which is always safely monotonic.
++ *
++ * Extracted as a pure function so the trust check is unit-testable without
++ * rendering the component (the monorepo has no jsdom / @testing-library).
++ */
++
++/** Best-effort single timestamp for a node, in ms since epoch, or NaN. */
++export function nodeTimeMs(node: TraceNode): number {
++  const raw =
++    node.timestamp?.completedAt ??
++    node.timestamp?.startedAt ??
++    node.timestamp?.createdAt ??
++    node.createdAt ??
++    node.updatedAt;
++  return raw ? Date.parse(String(raw)) : NaN;
++}
++
++/** Even-spacing fallback: node j lands at fraction j/(n-1) of [t0, t1]. */
++function evenlySpaced(count: number, t0: number, t1: number): number[] {
++  const span = t1 > t0 ? t1 - t0 : 1;
++  return Array.from({ length: count }, (_, j) =>
++    count <= 1 ? t1 : t0 + (j / (count - 1)) * span,
++  );
++}
++
++export function computeNodeMs(nodes: TraceNode[], t0: number, t1: number): number[] {
++  if (nodes.length === 0) {
++    return [];
++  }
++  const times = nodes.map(nodeTimeMs);
++  const allFinite = times.every(Number.isFinite);
++  let nonDecreasing = true;
++  for (let i = 1; i < times.length; i += 1) {
++    if (times[i] < times[i - 1]) {
++      nonDecreasing = false;
++      break;
++    }
++  }
++  const spansRange = allFinite && times[times.length - 1] > times[0];
++  if (allFinite && nonDecreasing && spansRange) {
++    // Real times are trustworthy — clamp into the timeline bounds (preserves the
++    // non-decreasing invariant the slice relies on).
++    return times.map((ms) => Math.min(Math.max(ms, t0), t1));
++  }
++  return evenlySpaced(nodes.length, t0, t1);
++}
+diff --git a/packages/web/src/components/files/FilePreviewView.tsx b/packages/web/src/components/files/FilePreviewView.tsx
+index a7eb02de..655dc68e 100644
+--- a/packages/web/src/components/files/FilePreviewView.tsx
++++ b/packages/web/src/components/files/FilePreviewView.tsx
+@@ -23,6 +23,7 @@ export type PreviewSource =
+   | { kind: "pdf"; blobUrl?: string }
+   | { kind: "download"; blobUrl?: string }
+   | { kind: "tooLarge" }
++  | { kind: "missing" }
+   | { kind: "unreadable"; detail?: string };
+ 
+ interface FilePreviewViewProps {
+@@ -93,6 +94,9 @@ export function FilePreviewView({
+       />
+     );
+   }
++  if (source.kind === "missing") {
++    return <p className="file-preview__notice">{t("files.preview.missing")}</p>;
++  }
+   if (source.kind === "unreadable") {
+     return (
+       <p className="file-preview__notice">
+diff --git a/packages/web/src/contracts/demoBundle.ts b/packages/web/src/contracts/demoBundle.ts
+index a0d76959..6799e0b8 100644
+--- a/packages/web/src/contracts/demoBundle.ts
++++ b/packages/web/src/contracts/demoBundle.ts
+@@ -47,6 +47,14 @@ export interface DemoBundle {
+   appVersion?: string;
+   /** "timestamped" = real `events`; "ordered" = pre-folded `messages` fallback. */
+   timeline: "timestamped" | "ordered";
++  /**
++   * Whether a running sandbox was available at pack time to read produced files.
++   * When false, every produced file is recorded as `unreadable` — re-packing
++   * later with a sandbox running yields the real bytes, so the cache must not
++   * serve such a bundle once a sandbox becomes available (see DemoView cache
++   * lookup). Optional for backward compatibility with older bundles.
++   */
++  packedWithSandbox?: boolean;
+ 
+   session: {
+     id: string;
+diff --git a/packages/web/src/i18n/messages/files.ts b/packages/web/src/i18n/messages/files.ts
+index 9da9bea5..dc2e5ff1 100644
+--- a/packages/web/src/i18n/messages/files.ts
++++ b/packages/web/src/i18n/messages/files.ts
+@@ -42,6 +42,7 @@ export default defineMessages(
+     "files.preview.modified": "修改时间",
+     "files.preview.mode": "权限",
+     "files.preview.tooLarge": "该文件超过内嵌预览大小上限，可下载后查看。",
++    "files.preview.missing": "该文件未包含在本次演示包中。",
+     "files.preview.unreadable": "打包时无法读取该文件（可能路径无效或不在当前沙箱中）。",
+     "files.preview.loadingImage": "正在加载图片…",
+     "files.preview.loadingPdf": "正在加载 PDF…",
+@@ -89,6 +90,7 @@ export default defineMessages(
+     "files.preview.modified": "Modified",
+     "files.preview.mode": "Mode",
+     "files.preview.tooLarge": "This file is larger than the inline preview limit; download it to view.",
++    "files.preview.missing": "This file is not included in this demo bundle.",
+     "files.preview.unreadable": "This file could not be read when the demo was packaged (path invalid or not in the current sandbox).",
+     "files.preview.loadingImage": "Loading image...",
+     "files.preview.loadingPdf": "Loading PDF...",

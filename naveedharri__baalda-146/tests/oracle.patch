@@ -1,0 +1,500 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a6d86be9..e357cbfa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -53,6 +53,45 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+   builds now use thin LTO, one codegen unit and a stripped binary.
+ 
+ ### Fixed
++- **Switching between two locked notes took the whole app down to a blank
++  window.** `ReactWidget.toDOM`/`updateDOM` call `flushSync` from inside a
++  CodeMirror DOM update (deliberately — it is what makes CM6 measure a widget's
++  real height on the first frame), and React answers a `flushSync` by flushing
++  the WHOLE app root's pending passive effects, not just the widget's own tree.
++  So `Editor`'s `[readOnly]` effect re-entered the update it had itself started
++  and CodeMirror threw `Calls to EditorView.update are not allowed while an
++  update is in progress`. Only locked notes reached it: opening the first one
++  populates the `locks` store (via the `read-only` status → `refreshLocks`), so
++  every locked note after it is built read-only from frame one, and the
++  teardown's transient vault-channel `"synced"` then flipped `readOnly`
++  false→true — two reconfigures, each rebuilding the note-header widgets whose
++  decorations key off `state.readOnly`. All three compartment reconfigures now
++  go through `lib/editor/effectDispatch.ts`, which defers to a microtask (after
++  the update unwinds, still before paint) and drops the transaction if the note
++  was switched meanwhile. `<Editor>` is additionally wrapped in an
++  `ErrorBoundary` — it had none, which is why a single throw cost the entire
++  window with no message anywhere, in a release build that carries no logging.
++- **The teardown's phantom `"synced"` granted edit access to a note that never
++  had it.** `syncManager.closeCurrent()` nulls its own status and re-emits, so
++  between one note's teardown and the next note's `openDoc` the badge falls back
++  to the vault channel's — normally `"synced"`. `Editor`'s `[syncStatus]` effect
++  read that as a grant and set `hadEditAccessRef`, which permanently disabled the
++  pre-verdict keystroke rollback for the rest of the session: anything typed on a
++  later locked note before its read-only verdict landed stayed in the local
++  Y.Doc, egested to the `.md` and forked against the server. Now gated on
++  `bridgeRef.current`, which is null for exactly that window.
++- **The note loading skeleton only covered the second half of an open.** The
++  editor column branched on `openNote`, which `openNoteByPath` sets only after
++  `getNoteMeta` and `registerNote`; `openingNotePath` — set on the click — was
++  read by the sidebar row and the tab bar but never by the editor. On a first
++  open there was no `<Editor>` mounted at all, so the column showed "Select a
++  note" for the whole wait. Both now render the skeleton. Its hold also drops
++  from 180ms to 90ms: that number was tuned against a dev build, where
++  StrictMode double-invokes the open effect and the pane therefore sits empty
++  about twice as long as in a release build — an open landing between the two
++  painted a bare pane and then the text, which is the "loader works locally, not
++  in production" report. `[data-immediate]` now zeroes the delay instead of
++  killing the animation, so the bars no longer snap to full opacity mid-fade.
+ - **A client reauthed itself over its own registry writes.** Every
+   `registry-changed` ran `refreshAcl({ reauth: "if-changed" })` with no origin
+   self-exclusion, so a client's own pull registering notes grew its own readable
+diff --git a/app/apps/desktop/src/App.tsx b/app/apps/desktop/src/App.tsx
+index fc4e2559..435a9cbd 100644
+--- a/app/apps/desktop/src/App.tsx
++++ b/app/apps/desktop/src/App.tsx
+@@ -676,6 +676,7 @@ function PromptedAuthDialog() {
+ export default function App() {
+   const vault = useStore((s) => s.vault);
+   const openNote = useStore((s) => s.openNote);
++  const openingNotePath = useStore((s) => s.openingNotePath);
+   const switchingVault = useStore((s) => s.switchingVault);
+   // Version history is a synced-vault feature: it needs the note's docId on the
+   // server. No mapping (local vault, unregistered note) → no history button.
+@@ -1187,8 +1188,25 @@ export default function App() {
+                   </div>
+                 }
+               >
+-                <Editor />
++                {/* The editor is the one subtree that binds React to
++                    CodeMirror, and a throw anywhere in it used to unmount the
++                    WHOLE app to a blank window with no message — the crash that
++                    `lib/editor/effectDispatch.ts` describes reached users that
++                    way, undiagnosable because release builds carry no logging.
++                    `resetKeys` on the note path means switching notes (or
++                    reopening this one) clears the fallback and tries again. */}
++                <ErrorBoundary label="Editor" resetKeys={[openNote.path]}>
++                  <Editor />
++                </ErrorBoundary>
+               </Suspense>
++            ) : openingNotePath ? (
++              // First open of the session: there is no `<Editor>` mounted yet to
++              // draw its own skeleton, and the registration round trip happens
++              // before `openNote` exists — so without this the very first click
++              // showed "Select a note" for the whole wait.
++              <div className="editor-column" style={editorMeasureStyle(editorMeasure)}>
++                <EditorSkeleton />
++              </div>
+             ) : (
+               <EditorEmpty />
+             )}
+diff --git a/app/apps/desktop/src/components/Editor.tsx b/app/apps/desktop/src/components/Editor.tsx
+index 66cb4acf..879e351f 100644
+--- a/app/apps/desktop/src/components/Editor.tsx
++++ b/app/apps/desktop/src/components/Editor.tsx
+@@ -10,6 +10,7 @@ import { createEditorState, lineNumberExtension } from "../lib/editor";
+ import { foldEffectsFor, parseNoteUiState, persistFolds } from "../lib/editor/folding";
+ import { propertiesMode as propertiesModeFacet } from "../lib/editor/frontmatter";
+ import { loadTypes } from "../lib/frontmatter/types";
++import { dispatchAfterCommit } from "../lib/editor/effectDispatch";
+ import { setActiveNote } from "../lib/editor/activeView";
+ import { bindActiveNote } from "../lib/editor/activeNoteBinding";
+ import { saveAttachment } from "../lib/attachments";
+@@ -328,6 +329,14 @@ export function Editor() {
+   const viewRef = useRef<EditorView | null>(null);
+ 
+   const openNote = useStore((s) => s.openNote);
++  // The note the user has CLICKED, which is not yet the open one. `openNoteByPath`
++  // registers the note server-side before it sets `openNote`, and that is a
++  // network round trip — ~0ms against a local server, hundreds against the
++  // managed one. Until this was read here, the editor column ignored the whole
++  // window: the click painted nothing, the previous note just sat there, and the
++  // loading skeleton only appeared for the (fast, local) half that came after.
++  // That is why the loader looked broken in production and fine in dev.
++  const openingNotePath = useStore((s) => s.openingNotePath);
+   const syncEnabled = useStore((s) => s.syncEnabled);
+   const locks = useStore((s) => s.locks);
+   const lifts = useStore((s) => s.lifts);
+@@ -675,6 +684,17 @@ export function Editor() {
+   // token on reconnect and the status flips to "read-only" here — no reopen
+   // needed. Also refresh the lock list so the tree badge appears for us too.
+   useEffect(() => {
++    // Only the OPEN note's grant is being reported here, and between one note's
++    // teardown and the next note's `openDoc` there is no open note at all:
++    // `syncManager.closeCurrent()` nulls its own status and re-emits, so the
++    // badge falls back to the VAULT CHANNEL's — normally "synced". Acting on
++    // that phantom "synced" set `hadEditAccessRef` on a note that never had
++    // edit access (killing the pre-verdict rollback below for the rest of the
++    // session) and flipped `readOnly` false, which is the reconfigure storm the
++    // locked→locked switch used to crash on. The bridge ref is the liveness
++    // signal: the cleanup clears it before `closeCurrent`, and the open path
++    // sets it before any status can arrive.
++    if (!bridgeRef.current) return;
+     if (syncStatus === "read-only" || syncStatus === "no-access") {
+       setReadOnly(true);
+       if (syncStatus === "read-only") void useStore.getState().refreshLocks();
+@@ -696,13 +716,18 @@ export function Editor() {
+   }, [syncStatus]);
+ 
+   // Push the Properties display mode into the live view when it changes.
++  // Every reconfigure below goes through `dispatchAfterCommit`: a synchronous
++  // `view.dispatch` from a passive effect can be re-entered inside a CodeMirror
++  // update (see `lib/editor/effectDispatch.ts`) and throws.
+   useEffect(() => {
+     const view = viewRef.current;
+     const compartment = propsModeRef.current;
+     if (!view || !compartment) return;
+-    view.dispatch({
+-      effects: compartment.reconfigure(propertiesModeFacet.of(propertiesMode)),
+-    });
++    return dispatchAfterCommit(
++      view,
++      { effects: compartment.reconfigure(propertiesModeFacet.of(propertiesMode)) },
++      { isLive: () => viewRef.current === view },
++    );
+   }, [propertiesMode]);
+ 
+   // Push the line-number gutter setting into the live view.
+@@ -710,7 +735,11 @@ export function Editor() {
+     const view = viewRef.current;
+     const compartment = lineNumbersRef.current;
+     if (!view || !compartment) return;
+-    view.dispatch({ effects: compartment.reconfigure(lineNumberExtension(lineNumbers)) });
++    return dispatchAfterCommit(
++      view,
++      { effects: compartment.reconfigure(lineNumberExtension(lineNumbers)) },
++      { isLive: () => viewRef.current === view },
++    );
+   }, [lineNumbers]);
+ 
+   // Push the current read-only state into the live CodeMirror view.
+@@ -718,8 +747,16 @@ export function Editor() {
+     const view = viewRef.current;
+     const editable = editableRef.current;
+     if (!view || !editable) return;
+-    view.dispatch({ effects: editable.reconfigure(editableExtensions(readOnly)) });
+-    if (!readOnly) view.focus();
++    return dispatchAfterCommit(
++      view,
++      { effects: editable.reconfigure(editableExtensions(readOnly)) },
++      {
++        isLive: () => viewRef.current === view,
++        then: (v) => {
++          if (!readOnly) v.focus();
++        },
++      },
++    );
+   }, [readOnly]);
+ 
+   // Hover preview of a past version: a SECOND, throwaway CodeMirror over the
+@@ -774,6 +811,9 @@ export function Editor() {
+   };
+ 
+   const showToolbar = peers.length > 0;
++  // A different note is on its way in. Reopening the SAME path (a tab click) is
++  // not "opening another" — `!viewMounted` already covers that one.
++  const isOpeningAnother = openingNotePath != null && openingNotePath !== notePath;
+   // "from 2h ago" for the pill. The panel holds the metadata; the preview state
+   // carries only the id + text, so look the timestamp back up here.
+   const previewedAt =
+@@ -874,7 +914,15 @@ export function Editor() {
+           </div>
+         )}
+       </div>
+-      {!viewMounted && <EditorSkeleton immediate={switchingNoteRef.current} />}
++      {/* One continuous loading state, from the click to the first painted line.
++          `openingNotePath` covers the registration round trip (the old note is
++          still on screen, so the bars fade in over it); `!viewMounted` covers
++          the bridge open and the CodeMirror build that follow. Both render the
++          same element in the same place, so the swap is one animation rather
++          than the old note → bare pane → bars → text flicker. */}
++      {(!viewMounted || isOpeningAnother) && (
++        <EditorSkeleton immediate={switchingNoteRef.current} />
++      )}
+     </div>
+   );
+ }
+diff --git a/app/apps/desktop/src/components/editor.css b/app/apps/desktop/src/components/editor.css
+index e0ce2c2b..2ee029dd 100644
+--- a/app/apps/desktop/src/components/editor.css
++++ b/app/apps/desktop/src/components/editor.css
+@@ -512,16 +512,26 @@
+   gap: var(--sp-3);
+   background: var(--bg-surface);
+   pointer-events: none;
+-  /* Held back ~180ms. A note served from the local SQLite index opens in tens of
++  /* Held back ~90ms. A note served from the local SQLite index opens in tens of
+      milliseconds, and a skeleton that flashes for one frame reads as a rendering
+-     fault rather than as loading. */
+-  animation: skeleton-in 0.2s var(--ease) 0.18s both;
++     fault rather than as loading — so there is still a hold, and a 40ms open
++     still shows nothing at all.
++     It was 180ms, which was tuned against a dev build: React StrictMode
++     double-invokes the open effect in development ONLY, so the pane sits empty
++     about twice as long there and the bars always cleared the hold. A release
++     build runs the effect once, and an open that lands between those two
++     numbers painted a bare pane for its whole duration and then the text —
++     which is the "no loader in production, loader in dev" report. */
++  animation: skeleton-in 0.2s var(--ease) 0.09s both;
+ }
+ /* Switching between notes: the outgoing view is already gone, so the bars take
+-   its place on the same frame — no delay, no fade — and the swap reads as
+-   "text → loading → text" instead of "text → blank → text". */
++   its place at once. Only the HOLD is dropped, not the fade — `animation: none`
++   here used to snap the bars to full opacity, and because the skeleton now
++   appears at click time (while the old note is still painted) that snap landed
++   mid-fade and read as a flicker. Zeroing the delay keeps one continuous
++   animation from the click through to the text. */
+ .editor-skeleton[data-immediate] {
+-  animation: none;
++  animation-delay: 0s;
+ }
+ /* `.editor-column` is the positioning context for the overlay above. */
+ .editor-column {
+diff --git a/app/apps/desktop/src/lib/devConsole.ts b/app/apps/desktop/src/lib/devConsole.ts
+index ddf71684..848f6fa4 100644
+--- a/app/apps/desktop/src/lib/devConsole.ts
++++ b/app/apps/desktop/src/lib/devConsole.ts
+@@ -40,6 +40,23 @@ function install(info: Sink, warn: Sink, error: Sink): void {
+   wrap("log", info);
+   wrap("info", info);
+   wrap("warn", warn);
++  // React 19 reports an UNCAUGHT render error through `reportError()`, which
++  // raises a window `error` event — it never reaches `console.error`. Without
++  // this listener the terminal gets React's "An error occurred in the <X>
++  // component" warning and nothing else: no message, no stack, no throw site.
++  // That is exactly the state the locked-note crash was diagnosed in.
++  window.addEventListener("error", (e) => {
++    const err = e.error;
++    const detail =
++      err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err ?? e.message);
++    void error(`[uncaught] ${detail}`.slice(0, 4000)).catch(() => {});
++  });
++  window.addEventListener("unhandledrejection", (e) => {
++    const r = e.reason;
++    const detail =
++      r instanceof Error ? `${r.name}: ${r.message}\n${r.stack ?? ""}` : String(r);
++    void error(`[unhandled-rejection] ${detail}`.slice(0, 4000)).catch(() => {});
++  });
+   // Boot marks logged before this mirror was installed: replay them now so the
+   // terminal timeline starts at the first line of JS, not at the mirror.
+   attachEarlySink((line) => void info(line).catch(() => {}));
+diff --git a/app/apps/desktop/src/lib/editor/effectDispatch.test.ts b/app/apps/desktop/src/lib/editor/effectDispatch.test.ts
+new file mode 100644
+index 00000000..f2b68064
+--- /dev/null
++++ b/app/apps/desktop/src/lib/editor/effectDispatch.test.ts
+@@ -0,0 +1,138 @@
++// @vitest-environment jsdom
++//
++// The locked-note switch crash, reduced to its mechanism.
++//
++// `ReactWidget.toDOM` calls `flushSync` from inside a CodeMirror update, and
++// React answers by flushing the app root's pending passive effects — so an
++// effect that dispatches lands inside the update CodeMirror is still running.
++// The first test proves CodeMirror really does throw there (guarding the claim,
++// not our code); the rest pin the fix.
++import { Compartment, EditorState } from "@codemirror/state";
++import { EditorView, WidgetType, Decoration } from "@codemirror/view";
++import { StateField } from "@codemirror/state";
++import { describe, expect, it } from "vitest";
++import { dispatchAfterCommit } from "./effectDispatch";
++
++/** A widget that re-enters the view from `toDOM`, exactly as `flushSync` does. */
++function reentrantWidgetField(reenter: (view: EditorView) => void) {
++  const marker = new Compartment();
++  class Reentrant extends WidgetType {
++    constructor(readonly ro: boolean) {
++      super();
++    }
++    eq(other: Reentrant) {
++      return other.ro === this.ro;
++    }
++    toDOM(view: EditorView) {
++      // Stand-in for React's flushSync flushing a pending passive effect.
++      reenter(view);
++      return document.createElement("div");
++    }
++  }
++  const field = StateField.define({
++    create: (state) =>
++      Decoration.set([
++        Decoration.widget({ widget: new Reentrant(state.readOnly), block: true, side: -1 }).range(0),
++      ]),
++    update: (value, tr) =>
++      tr.startState.readOnly !== tr.state.readOnly
++        ? Decoration.set([
++            Decoration.widget({
++              widget: new Reentrant(tr.state.readOnly),
++              block: true,
++              side: -1,
++            }).range(0),
++          ])
++        : value,
++    provide: (f) => EditorView.decorations.from(f),
++  });
++  return { marker, field };
++}
++
++function mount(reenter: (view: EditorView) => void) {
++  const parent = document.createElement("div");
++  document.body.appendChild(parent);
++  const editable = new Compartment();
++  const { field } = reentrantWidgetField(reenter);
++  const view = new EditorView({
++    state: EditorState.create({
++      doc: "body text",
++      extensions: [field, editable.of([])],
++    }),
++    parent,
++  });
++  return { view, editable };
++}
++
++describe("dispatching into a live view from a React passive effect", () => {
++  it("throws when the dispatch is synchronous and re-entrant (the crash)", () => {
++    let inner: ((view: EditorView) => void) | null = null;
++    const { view, editable } = mount((v) => inner?.(v));
++    // The second, re-entrant reconfigure — what React's flushSync triggered.
++    inner = (v) => {
++      v.dispatch({ effects: editable.reconfigure([EditorState.readOnly.of(true)]) });
++    };
++    expect(() =>
++      view.dispatch({ effects: editable.reconfigure([EditorState.readOnly.of(true)]) }),
++    ).toThrow(/not allowed while an update is in progress/);
++    view.destroy();
++  });
++
++  it("does not throw when the re-entrant dispatch goes through dispatchAfterCommit", async () => {
++    let inner: ((view: EditorView) => void) | null = null;
++    const { view, editable } = mount((v) => inner?.(v));
++    inner = (v) => {
++      dispatchAfterCommit(
++        v,
++        { effects: editable.reconfigure([EditorState.readOnly.of(true)]) },
++        { isLive: () => true },
++      );
++    };
++    expect(() =>
++      view.dispatch({ effects: editable.reconfigure([EditorState.readOnly.of(true)]) }),
++    ).not.toThrow();
++    await Promise.resolve();
++    expect(view.state.readOnly).toBe(true);
++    view.destroy();
++  });
++
++  it("drops a queued dispatch when the view is no longer the live one", async () => {
++    const { view, editable } = mount(() => {});
++    let live = true;
++    dispatchAfterCommit(
++      view,
++      { effects: editable.reconfigure([EditorState.readOnly.of(true)]) },
++      { isLive: () => live },
++    );
++    live = false; // the note was switched before the microtask ran
++    await Promise.resolve();
++    expect(view.state.readOnly).toBe(false);
++    view.destroy();
++  });
++
++  it("cancels on effect cleanup", async () => {
++    const { view, editable } = mount(() => {});
++    const cancel = dispatchAfterCommit(
++      view,
++      { effects: editable.reconfigure([EditorState.readOnly.of(true)]) },
++      { isLive: () => true },
++    );
++    cancel();
++    await Promise.resolve();
++    expect(view.state.readOnly).toBe(false);
++    view.destroy();
++  });
++
++  it("runs `then` after the transaction lands", async () => {
++    const { view, editable } = mount(() => {});
++    let sawReadOnly: boolean | null = null;
++    dispatchAfterCommit(
++      view,
++      { effects: editable.reconfigure([EditorState.readOnly.of(true)]) },
++      { isLive: () => true, then: (v) => (sawReadOnly = v.state.readOnly) },
++    );
++    await Promise.resolve();
++    expect(sawReadOnly).toBe(true);
++    view.destroy();
++  });
++});
+diff --git a/app/apps/desktop/src/lib/editor/effectDispatch.ts b/app/apps/desktop/src/lib/editor/effectDispatch.ts
+new file mode 100644
+index 00000000..a8069425
+--- /dev/null
++++ b/app/apps/desktop/src/lib/editor/effectDispatch.ts
+@@ -0,0 +1,60 @@
++/**
++ * Dispatching into a live `EditorView` from a React **passive effect**.
++ *
++ * Never do it synchronously. `ReactWidget.toDOM`/`updateDOM` call `flushSync`
++ * from inside a CodeMirror DOM update (that is deliberate — it is what makes
++ * CM6 measure a widget's real height on the first frame, see `reactWidget.ts`),
++ * and React answers a `flushSync` by flushing every pending passive effect on
++ * the app root, not just the widget's own tree. So an effect that calls
++ * `view.dispatch` can be re-entered in the middle of the very update that is
++ * building the widget, and CodeMirror throws
++ *
++ *     Calls to EditorView.update are not allowed while an update is in progress
++ *
++ * which unmounts the editor — and, with no error boundary above it, the whole
++ * app.
++ *
++ * That is the locked-note switch crash. Opening a locked note populates the
++ * `locks` store, so the NEXT locked note is built read-only from frame one; the
++ * teardown's transient "synced" then flips `readOnly` false and the token
++ * verdict flips it back. Each flip runs the `[readOnly]` effect, which
++ * reconfigures the editable Compartment; the reconfigure rebuilds the
++ * note-header widgets (their decorations key off `state.readOnly`); `toDOM`
++ * flushes React; and the same effect runs again inside the update.
++ *
++ * A microtask is the smallest delay guaranteed to run after the update has
++ * unwound, and it still lands before paint — so nothing flickers. The returned
++ * function is the effect's cleanup: it cancels a dispatch that has not run yet,
++ * so a note switch can never push the old note's transaction into the new
++ * note's view.
++ */
++
++import type { TransactionSpec } from "@codemirror/state";
++import type { EditorView } from "@codemirror/view";
++
++export interface EffectDispatchOptions {
++  /**
++   * Is `view` still the one the component is bound to? Read at dispatch time,
++   * never captured: between the effect and the microtask the user may have
++   * switched notes, which destroys this view and builds another.
++   */
++  isLive: () => boolean;
++  /** Run after the transaction lands (e.g. restoring focus). */
++  then?: (view: EditorView) => void;
++}
++
++export function dispatchAfterCommit(
++  view: EditorView,
++  spec: TransactionSpec,
++  opts: EffectDispatchOptions,
++): () => void {
++  let cancelled = false;
++  queueMicrotask(() => {
++    if (cancelled || !opts.isLive()) return;
++    view.dispatch(spec);
++    opts.then?.(view);
++  });
++  return () => {
++    cancelled = true;
++  };
++}
+diff --git a/docs/RELEASE_NOTES.md b/docs/RELEASE_NOTES.md
+index 1b7def08..9c26d6b8 100644
+--- a/docs/RELEASE_NOTES.md
++++ b/docs/RELEASE_NOTES.md
+@@ -1,3 +1,5 @@
++- Fixed a crash that emptied the whole window. Opening one locked or view-only note and then clicking another could take the entire app down to a blank screen — the note area, the sidebar and everything else — and it happened every time. The editor is also now walled off, so if anything in it does go wrong you get a message and can carry on working instead of losing the window
++- The loading bars now appear as soon as you click a note, not once it has already opened. Clicking a note used to show a bare pane for a moment and then the text, especially on a big vault, and the very first note you opened showed "Select a note" for the whole wait
+ - Baalda now connects to your vault almost as soon as it opens. The connection used to wait for the whole vault to be checked over first; now it starts straight away and the two happen together, so the sync light settles in about a second instead of five — on launch and when you switch vaults
+ - Opening a note no longer says "Syncing". The light at the top now describes your vault's connection, not whichever note you happen to have open, so it stops flickering every time you click a file
+ - Fixed a loop where notes that were already synced kept syncing again: switching vaults could quietly drop incoming changes, and a note shared with you as view-only could never finish. Both now settle for good

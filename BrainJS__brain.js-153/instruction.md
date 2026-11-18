@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** fix #152 and bump version number
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `6df3f9014afd`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

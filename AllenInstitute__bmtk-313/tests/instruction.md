@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** updating ecp module to allow multiple modules to run simultaneously
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `09099f0567e9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

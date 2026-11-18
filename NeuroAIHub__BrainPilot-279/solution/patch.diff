@@ -1,0 +1,712 @@
+diff --git a/packages/backend-core/src/create-orchestrator.ts b/packages/backend-core/src/create-orchestrator.ts
+index 6843aba7..8678424d 100644
+--- a/packages/backend-core/src/create-orchestrator.ts
++++ b/packages/backend-core/src/create-orchestrator.ts
+@@ -36,7 +36,13 @@ export function createOrchestrator(
+   const mode = options.mode ?? resolveOrchestratorMode(env);
+ 
+   if (mode === "docker") {
+-    return new DockerOrchestrator(options.docker);
++    // #261: the container gets a fresh env, so the cross-user shared root must
++    // be passed in explicitly (from BP_SHARED_DIR) — it's then bind-mounted
++    // read-only and re-exported to the container as BP_SHARED_DIR. (Local/static
++    // modes inherit the parent env, so the runtime reads BP_SHARED_DIR directly.)
++    const sharedRaw = options.docker?.sharedDir ?? env.BP_SHARED_DIR ?? "";
++    const sharedDir = sharedRaw.trim() === "" ? undefined : sharedRaw;
++    return new DockerOrchestrator({ ...options.docker, sharedDir });
+   }
+ 
+   if (mode === "static") {
+diff --git a/packages/backend-core/src/docker-orchestrator.ts b/packages/backend-core/src/docker-orchestrator.ts
+index be87ad10..28f6a3eb 100644
+--- a/packages/backend-core/src/docker-orchestrator.ts
++++ b/packages/backend-core/src/docker-orchestrator.ts
+@@ -50,6 +50,15 @@ export interface DockerOrchestratorOptions {
+   dataDir?: string;
+   /** Container path BP_DATA_DIR points at. Default `/root/.bp-root`. */
+   containerDataDir?: string;
++  /**
++   * #261: host dir bind-mounted READ-ONLY as the cross-user shared root. When
++   * set, it is mounted at `containerSharedDir` with `ReadOnly:true` and its
++   * container path is injected as `BP_SHARED_DIR` so the runtime exposes it at
++   * the `/shared` prefix. Omitted → no shared mount (feature off).
++   */
++  sharedDir?: string;
++  /** Container path the shared root is mounted at (= `BP_SHARED_DIR`). Default `/shared`. */
++  containerSharedDir?: string;
+   /** Injectable dockerode-like instance (for tests / advanced callers). */
+   docker?: DockerLike;
+   /** Injectable lazy loader (for tests). Defaults to dynamic import("dockerode"). */
+@@ -87,10 +96,12 @@ export class DockerOrchestrator implements Orchestrator {
+   private readonly hostPort: number;
+   private readonly host: string;
+   private readonly containerDataDir: string;
++  private readonly containerSharedDir: string;
+   private readonly healthProbe: (baseUrl: string) => Promise<boolean>;
+   private readonly healthTimeoutMs: number;
+   private readonly sleep: (ms: number) => Promise<void>;
+   private dataDir?: string;
++  private sharedDir?: string;
+   private env: Record<string, string>;
+   private container: DockerContainerLike | null = null;
+ 
+@@ -102,7 +113,9 @@ export class DockerOrchestrator implements Orchestrator {
+     this.hostPort = options.hostPort ?? this.containerPort;
+     this.host = options.host ?? "127.0.0.1";
+     this.containerDataDir = options.containerDataDir ?? "/root/.bp-root";
++    this.containerSharedDir = options.containerSharedDir ?? "/shared";
+     this.dataDir = options.dataDir;
++    this.sharedDir = options.sharedDir;
+     this.env = options.env ?? {};
+     this.healthProbe = options.healthProbe ?? defaultHealthProbe;
+     this.healthTimeoutMs = options.healthTimeoutMs ?? 30_000;
+@@ -131,6 +144,7 @@ export class DockerOrchestrator implements Orchestrator {
+ 
+   async ensureRuntime(opts?: EnsureRuntimeOptions): Promise<RuntimeHandle> {
+     if (opts?.dataDir) this.dataDir = opts.dataDir;
++    if (opts?.sharedDir) this.sharedDir = opts.sharedDir;
+     if (opts?.env) this.env = { ...this.env, ...opts.env };
+ 
+     if (this.container && (await this.health())) {
+@@ -140,38 +154,49 @@ export class DockerOrchestrator implements Orchestrator {
+     const portKey = `${this.containerPort}/tcp`;
+     const envList = Object.entries({
+       BP_DATA_DIR: this.containerDataDir,
++      // #261: when a shared root is mounted, tell the runtime its container path
++      // so it exposes the `/shared` prefix. Injected before `...this.env` so an
++      // explicit caller-provided BP_SHARED_DIR still wins.
++      ...(this.sharedDir ? { BP_SHARED_DIR: this.containerSharedDir } : {}),
+       PORT: String(this.containerPort),
+       AGENT_RUNTIME_PORT: String(this.containerPort),
+       ...this.env,
+     }).map(([k, v]) => `${k}=${v}`);
+ 
++    // Cross-platform (#1): the legacy `Binds: ["src:dst:mode"]` colon-delimited
++    // form is unparseable when `src` is a Windows path that already contains a
++    // colon after the drive letter (`C:\Users\foo\bp` → `...:/root/...:rw`),
++    // causing dockerode/Docker Engine to mis-split the spec. Use the structured
++    // `Mounts` API (Docker Engine ≥1.25) instead — Source / Target / ReadOnly
++    // are separate fields, so Engine's own Windows-aware path translation does
++    // the right thing.
++    const mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> = [];
++    if (this.dataDir) {
++      mounts.push({
++        Type: "bind",
++        Source: this.dataDir,
++        Target: this.containerDataDir,
++        ReadOnly: false,
++      });
++    }
++    // #261: the cross-user shared root is mounted READ-ONLY (legacy `/shared:ro`
++    // parity), so no user's container can mutate the shared library.
++    if (this.sharedDir) {
++      mounts.push({
++        Type: "bind",
++        Source: this.sharedDir,
++        Target: this.containerSharedDir,
++        ReadOnly: true,
++      });
++    }
++
+     const createSpec = {
+       Image: this.image,
+       Env: envList,
+       ExposedPorts: { [portKey]: {} },
+       HostConfig: {
+         PortBindings: { [portKey]: [{ HostPort: String(this.hostPort) }] },
+-        // Cross-platform (#1): the legacy `Binds: ["src:dst:mode"]` colon-
+-        // delimited form is unparseable when `src` is a Windows path that
+-        // already contains a colon after the drive letter
+-        // (`C:\Users\foo\bp` → `C:\Users\foo\bp:/root/...:rw`), causing
+-        // dockerode/Docker Engine to mis-split the spec and either 422 the
+-        // container create or mount a host directory named just `C`. Use the
+-        // structured `Mounts` API (Docker Engine ≥1.25) instead — Source /
+-        // Target / ReadOnly are separate fields, so Engine's own
+-        // Windows-aware path translation does the right thing.
+-        ...(this.dataDir
+-          ? {
+-              Mounts: [
+-                {
+-                  Type: "bind",
+-                  Source: this.dataDir,
+-                  Target: this.containerDataDir,
+-                  ReadOnly: false,
+-                },
+-              ],
+-            }
+-          : {}),
++        ...(mounts.length > 0 ? { Mounts: mounts } : {}),
+       },
+     };
+ 
+diff --git a/packages/backend-core/src/orchestrator.ts b/packages/backend-core/src/orchestrator.ts
+index 13f36e36..364c3ff6 100644
+--- a/packages/backend-core/src/orchestrator.ts
++++ b/packages/backend-core/src/orchestrator.ts
+@@ -21,6 +21,12 @@ export interface RuntimeHandle {
+ export interface EnsureRuntimeOptions {
+   /** Host data dir injected as BP_DATA_DIR (§11A.2). */
+   readonly dataDir?: string;
++  /**
++   * #261: host dir for the cross-user READ-ONLY shared root. Docker mode
++   * bind-mounts it read-only and injects `BP_SHARED_DIR`; other orchestrators
++   * forward it as env so the runtime exposes it at the `/shared` prefix.
++   */
++  readonly sharedDir?: string;
+   /** Force a specific runtime port; otherwise the orchestrator picks one. */
+   readonly port?: number;
+   /** Extra env vars forwarded to the runtime process/container. */
+diff --git a/packages/backend-core/test/create-orchestrator.test.ts b/packages/backend-core/test/create-orchestrator.test.ts
+index 88acb02e..8d93673c 100644
+--- a/packages/backend-core/test/create-orchestrator.test.ts
++++ b/packages/backend-core/test/create-orchestrator.test.ts
+@@ -71,6 +71,28 @@ describe("createOrchestrator factory", () => {
+     });
+     expect(orch).toBeInstanceOf(StaticRuntimeOrchestrator);
+   });
++  it("forwards BP_SHARED_DIR from env into the Docker orchestrator's read-only mount (#261)", async () => {
++    const container = {
++      start: vi.fn(async () => {}),
++      stop: vi.fn(async () => {}),
++      remove: vi.fn(async () => {}),
++    };
++    const docker = { createContainer: vi.fn(async () => container) } as never;
++    const orch = createOrchestrator({
++      mode: "docker",
++      env: { BP_SHARED_DIR: "/host/shared" },
++      docker: { docker, dataDir: "/host/bp", healthProbe: async () => true, sleep: async () => {} },
++    });
++    await orch.ensureRuntime();
++    const createArg = (docker as { createContainer: ReturnType<typeof vi.fn> })
++      .createContainer.mock.calls[0]![0] as { HostConfig?: Record<string, unknown> };
++    expect(createArg.HostConfig!.Mounts).toContainEqual({
++      Type: "bind",
++      Source: "/host/shared",
++      Target: "/shared",
++      ReadOnly: true,
++    });
++  });
+ });
+ 
+ describe("DockerOrchestrator (stubbed dockerode)", () => {
+@@ -167,6 +189,69 @@ describe("DockerOrchestrator (stubbed dockerode)", () => {
+     expect(hostConfig.Mounts).toBeUndefined();
+   });
+ 
++  // #261: the cross-user shared root is bind-mounted READ-ONLY alongside the
++  // dataDir mount, and its container path is injected as BP_SHARED_DIR so the
++  // runtime exposes the `/shared` prefix.
++  it("adds a read-only /shared bind + BP_SHARED_DIR env when sharedDir is set (#261)", async () => {
++    const container = {
++      start: vi.fn(async () => {}),
++      stop: vi.fn(async () => {}),
++      remove: vi.fn(async () => {}),
++    };
++    const docker = {
++      createContainer: vi.fn(async () => container),
++    } as never;
++    const orch = new DockerOrchestrator({
++      docker,
++      image: "brainpilot-sandbox:test",
++      containerPort: 8081,
++      hostPort: 18081,
++      dataDir: "/host/bp",
++      containerDataDir: "/root/.bp-root",
++      sharedDir: "/host/shared",
++      healthProbe: async () => true,
++      sleep: async () => {},
++    });
++    await orch.ensureRuntime();
++    const createArg = (docker as { createContainer: ReturnType<typeof vi.fn> })
++      .createContainer.mock.calls[0]![0] as {
++      Env?: string[];
++      HostConfig?: Record<string, unknown>;
++    };
++    const hostConfig = createArg.HostConfig!;
++    expect(hostConfig.Mounts).toEqual([
++      { Type: "bind", Source: "/host/bp", Target: "/root/.bp-root", ReadOnly: false },
++      { Type: "bind", Source: "/host/shared", Target: "/shared", ReadOnly: true },
++    ]);
++    expect(createArg.Env).toContain("BP_SHARED_DIR=/shared");
++  });
++
++  it("emits no /shared mount and no BP_SHARED_DIR when sharedDir is unset (#261)", async () => {
++    const container = {
++      start: vi.fn(async () => {}),
++      stop: vi.fn(async () => {}),
++      remove: vi.fn(async () => {}),
++    };
++    const docker = {
++      createContainer: vi.fn(async () => container),
++    } as never;
++    const orch = new DockerOrchestrator({
++      docker,
++      image: "brainpilot-sandbox:test",
++      dataDir: "/host/bp",
++      healthProbe: async () => true,
++      sleep: async () => {},
++    });
++    await orch.ensureRuntime();
++    const createArg = (docker as { createContainer: ReturnType<typeof vi.fn> })
++      .createContainer.mock.calls[0]![0] as {
++      Env?: string[];
++      HostConfig?: Record<string, unknown>;
++    };
++    expect(createArg.HostConfig!.Mounts as unknown[]).toHaveLength(1);
++    expect((createArg.Env ?? []).some((e) => e.startsWith("BP_SHARED_DIR="))).toBe(false);
++  });
++
+   it("auto-pulls the image when createContainer reports it is missing", async () => {
+     const container = {
+       start: vi.fn(async () => {}),
+diff --git a/packages/protocol/src/http.ts b/packages/protocol/src/http.ts
+index 32d09c92..3156c592 100644
+--- a/packages/protocol/src/http.ts
++++ b/packages/protocol/src/http.ts
+@@ -270,11 +270,14 @@ export const RUNTIME_ROUTES = {
+   listAgents: { method: "GET", path: "/sessions/:id/agents" },
+   evictSession: { method: "POST", path: "/sessions/:id/evict" },
+   /**
+-   * Workspace files. `?path=` addresses one of two roots (#257):
++   * Workspace files. `?path=` addresses one of several roots by prefix:
+    *  - `/workspace[/...]` (or a bare relative path) → per-session workspace
+    *    `workspaces/:id/` (the agent's cwd);
+    *  - `/data[/...]` → the shared per-user persistent root `data/<userId>/`,
+-   *    reusable across sessions. Each root is traversal-guarded independently.
++   *    reusable across sessions (#257);
++   *  - `/shared[/...]` → the cross-user READ-ONLY shared root (#261), when the
++   *    deployment configures one (`BP_SHARED_DIR`); writes/deletes are rejected.
++   * Each root is traversal-guarded independently.
+    */
+   listFiles: { method: "GET", path: "/sessions/:id/files" },
+   readFile: { method: "GET", path: "/sessions/:id/files/content" },
+diff --git a/packages/runtime/src/__tests__/personas.test.ts b/packages/runtime/src/__tests__/personas.test.ts
+index dc6fc946..f0ad8dd8 100644
+--- a/packages/runtime/src/__tests__/personas.test.ts
++++ b/packages/runtime/src/__tests__/personas.test.ts
+@@ -1,5 +1,11 @@
+ import { describe, it, expect } from "vitest";
+-import { PERSONAS, BUILTIN_PERSONA_NAMES, personaFor } from "../personas.js";
++import {
++  PERSONAS,
++  BUILTIN_PERSONA_NAMES,
++  personaFor,
++  sharedRootDirective,
++  withSharedRootDirective,
++} from "../personas.js";
+ 
+ describe("personas", () => {
+   const EXPECTED = [
+@@ -185,3 +191,20 @@ describe("personas", () => {
+     expect(personaFor("engineer", "expert")).toBe(PERSONAS.engineer);
+   });
+ });
++
++describe("sharedRootDirective (#261)", () => {
++  it("interpolates the absolute path and states the read-only constraint", () => {
++    const d = sharedRootDirective("/srv/shared");
++    expect(d).toContain("/srv/shared");
++    expect(d).toContain("READ-ONLY");
++    // It must NOT invite writes — the whole point is a read-only cross-user root.
++    expect(d.toLowerCase()).toMatch(/cannot write|read-only/);
++  });
++
++  it("withSharedRootDirective appends the directive to a persona", () => {
++    const base = personaFor("engineer", "expert");
++    const out = withSharedRootDirective(base, "/srv/shared");
++    expect(out.startsWith(base)).toBe(true);
++    expect(out).toContain("/srv/shared");
++  });
++});
+diff --git a/packages/runtime/src/__tests__/session-manager.test.ts b/packages/runtime/src/__tests__/session-manager.test.ts
+index 22e96465..d1d225dd 100644
+--- a/packages/runtime/src/__tests__/session-manager.test.ts
++++ b/packages/runtime/src/__tests__/session-manager.test.ts
+@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { parseEvent, type AgUiEvent } from "@brainpilot/protocol";
+-import { SessionManager, resolvePersistentUserId } from "../session-manager.js";
++import { SessionManager, resolvePersistentUserId, resolveSharedDir } from "../session-manager.js";
+ import { mockAgentFactory } from "../agent-factory.js";
+ import { PERSONAS } from "../personas.js";
+ 
+@@ -367,6 +367,107 @@ describe("resolvePersistentUserId (#257)", () => {
+   });
+ });
+ 
++describe("resolveSharedDir (#261)", () => {
++  it("is undefined (feature off) when unset or blank", () => {
++    expect(resolveSharedDir(undefined, {})).toBeUndefined();
++    expect(resolveSharedDir("   ", {})).toBeUndefined();
++    expect(resolveSharedDir(undefined, { BP_SHARED_DIR: "" })).toBeUndefined();
++  });
++  it("reads BP_SHARED_DIR from env when no explicit option", () => {
++    expect(resolveSharedDir(undefined, { BP_SHARED_DIR: "/srv/shared" })).toBe("/srv/shared");
++  });
++  it("explicit option wins over env", () => {
++    expect(resolveSharedDir("/opt/lib", { BP_SHARED_DIR: "/srv/shared" })).toBe("/opt/lib");
++  });
++});
++
++describe("SessionManager cross-user shared root (#261)", () => {
++  let root: string; // dataRoot (per-user)
++  let shared: string; // cross-user shared dir, OUTSIDE dataRoot
++  beforeEach(async () => {
++    root = await mkdtemp(join(tmpdir(), "bp-shroot-"));
++    shared = await mkdtemp(join(tmpdir(), "bp-shared-"));
++  });
++  const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
++  const mkMgr = () =>
++    new SessionManager({
++      dataRoot: root,
++      sharedDir: shared,
++      persist: false,
++      agentFactory: mockAgentFactory,
++    });
++
++  it("reads a file from the shared root via the /shared prefix", async () => {
++    await writeFile(join(shared, "atlas.csv"), "x,y,z");
++    const m = mkMgr();
++    const s = await m.createSession({ title: "S" });
++    const read = await m.readSessionFile(s.id, "/shared/atlas.csv");
++    expect(read.content).toBe("x,y,z");
++  });
++
++  it("is shared across sessions AND users (same bytes for any session)", async () => {
++    await writeFile(join(shared, "ref.txt"), "public");
++    const m = mkMgr();
++    const a = await m.createSession({ title: "A" });
++    const b = await m.createSession({ title: "B" });
++    expect((await m.readSessionFile(a.id, "/shared/ref.txt")).content).toBe("public");
++    expect((await m.readSessionFile(b.id, "/shared/ref.txt")).content).toBe("public");
++  });
++
++  it("lists the shared root via /shared", async () => {
++    await writeFile(join(shared, "one.txt"), "1");
++    await writeFile(join(shared, "two.txt"), "2");
++    const m = mkMgr();
++    const s = await m.createSession({ title: "S" });
++    const names = (await m.listSessionFiles(s.id, "/shared")).map((e) => e.name).sort();
++    expect(names).toEqual(["one.txt", "two.txt"]);
++  });
++
++  it("rejects writes to the shared root (read-only)", async () => {
++    const m = mkMgr();
++    const s = await m.createSession({ title: "S" });
++    await expect(m.writeSessionFile(s.id, "/shared/nope.txt", b64("x"))).rejects.toThrow(
++      /read-only/,
++    );
++  });
++
++  it("rejects streamed writes to the shared root (read-only)", async () => {
++    const m = mkMgr();
++    const s = await m.createSession({ title: "S" });
++    const { Readable } = await import("node:stream");
++    await expect(
++      m.writeSessionFileStream(s.id, "/shared/nope.txt", Readable.from([Buffer.from("x")])),
++    ).rejects.toThrow(/read-only/);
++  });
++
++  it("rejects deletes in the shared root (read-only)", async () => {
++    await writeFile(join(shared, "keep.txt"), "safe");
++    const m = mkMgr();
++    const s = await m.createSession({ title: "S" });
++    await expect(m.deleteSessionFile(s.id, "/shared/keep.txt")).rejects.toThrow(/read-only/);
++    // The file is untouched.
++    expect(await readFile(join(shared, "keep.txt"), "utf8")).toBe("safe");
++  });
++
++  it("guards the shared boundary against traversal", async () => {
++    const m = mkMgr();
++    const s = await m.createSession({ title: "S" });
++    await expect(m.readSessionFile(s.id, "/shared/../../etc/passwd")).rejects.toThrow(/escapes/);
++  });
++
++  it("does NOT recognize /shared when unconfigured (backward-compatible)", async () => {
++    // No sharedDir → `/shared/...` falls through to the session workspace, so a
++    // write is allowed and lands under workspaces/<sid>/shared/.
++    const m = new SessionManager({ dataRoot: root, persist: false, agentFactory: mockAgentFactory });
++    const s = await m.createSession({ title: "S" });
++    const wrote = await m.writeSessionFile(s.id, "/shared/plain.txt", b64("ok"));
++    // Emitted prefix-less (workspace path), NOT as /shared/...
++    expect(wrote.path).toBe("shared/plain.txt");
++    const onDisk = await readFile(join(root, "workspaces", s.id, "shared", "plain.txt"), "utf8");
++    expect(onDisk).toBe("ok");
++  });
++});
++
+ describe("SessionManager memory watchdog (§R-4 / #20)", () => {
+   it("is fully opt-out when no budget is set (identical to today)", async () => {
+     const m = new SessionManager({ persist: false, agentFactory: mockAgentFactory });
+diff --git a/packages/runtime/src/personas.ts b/packages/runtime/src/personas.ts
+index a6ff381d..e4ac873e 100644
+--- a/packages/runtime/src/personas.ts
++++ b/packages/runtime/src/personas.ts
+@@ -105,6 +105,36 @@ export function withPersistentRootDirective(persona: string, absPath: string): s
+   return `${persona}\n\n${persistentRootDirective(absPath)}`;
+ }
+ 
++/**
++ * Cross-user shared-root directive (#261). A separate, READ-ONLY root shared
++ * across ALL users of the deployment (public datasets, reference material),
++ * given as an absolute path. `${absPath}` is interpolated at load time. Only
++ * injected when a shared root is configured (`BP_SHARED_DIR`).
++ */
++export function sharedRootDirective(absPath: string): string {
++  return `## Shared read-only library (cross-user)
++
++Besides your session workspace and the persistent per-user storage, there is a
++READ-ONLY shared library at this absolute path:
++
++    ${absPath}
++
++Files here (public datasets, reference documents, common resources) are shared
++across ALL users of this deployment. You may \`read\` them and use them with
++\`bash\` as inputs, but this root is READ-ONLY: you CANNOT write, edit, move, or
++delete anything under it, and attempts to do so will fail. Copy a file into your
++workspace or the persistent \`/data\` root first if you need to modify it.`;
++}
++
++/**
++ * Append the shared-root directive to a resolved persona (#261). Applied at
++ * persona load time (non-trace roles), after the persistent-root directive,
++ * only when a shared root is configured.
++ */
++export function withSharedRootDirective(persona: string, absPath: string): string {
++  return `${persona}\n\n${sharedRootDirective(absPath)}`;
++}
++
+ /** A2A messaging contract — identical mechanics for every non-trace agent. */
+ const A2A_EXPERT = `## Communicating back to the Principal
+ 
+diff --git a/packages/runtime/src/session-manager.ts b/packages/runtime/src/session-manager.ts
+index e386d572..38e8eb40 100644
+--- a/packages/runtime/src/session-manager.ts
++++ b/packages/runtime/src/session-manager.ts
+@@ -33,7 +33,12 @@ import { MasAgent, addUsage, emptyTokenUsage } from "./mas-agent.js";
+ import { systemToolsForRole, builtinToolNamesForRole, type ToolDeps } from "./tools/system-tools.js";
+ import { ev } from "./events.js";
+ import { selectFactory, isMockMode } from "./agent-factory.js";
+-import { personaFor, withLanguageDirective, withPersistentRootDirective } from "./personas.js";
++import {
++  personaFor,
++  withLanguageDirective,
++  withPersistentRootDirective,
++  withSharedRootDirective,
++} from "./personas.js";
+ import { renderAgentStatusBlock, collectAgentStatusLines } from "./extensions/agent-status.js";
+ import { McpBridge, loadMcpServersConfig } from "./mcp-bridge.js";
+ import { loadToolToggles, type ToolToggles } from "./tool-toggles.js";
+@@ -117,6 +122,20 @@ export function resolvePersistentUserId(opt?: string, env = process.env): string
+   return safe === "" || safe === "." ? DEFAULT_PERSISTENT_USER_ID : safe;
+ }
+ 
++/**
++ * Cross-user shared root (#261, legacy parity: `users/shared → /shared:ro`).
++ * Unlike the per-user persistent root (`data/<userId>/`, #257), this directory
++ * lives OUTSIDE any user's dataRoot and is shared READ-ONLY across ALL users —
++ * a public library of datasets / reference material. Resolution: explicit
++ * option wins, else `BP_SHARED_DIR`, else `undefined` (feature off — the
++ * `/shared` prefix is then not recognized and the deployment behaves exactly as
++ * before). A blank value counts as unset. Exported for tests.
++ */
++export function resolveSharedDir(opt?: string, env = process.env): string | undefined {
++  const raw = (opt ?? env.BP_SHARED_DIR ?? "").trim();
++  return raw === "" ? undefined : raw;
++}
++
+ /**
+  * A minimal FIFO counting semaphore. `acquire()` resolves with a `release` fn
+  * once a slot is free; excess acquirers queue in order. Used per-session to
+@@ -279,6 +298,16 @@ export interface SessionManagerOptions {
+    * and treats every tool as enabled (default-on).
+    */
+   toolToggles?: ToolToggles | null;
++  /**
++   * #261: cross-user shared root — an absolute directory, OUTSIDE this runtime's
++   * dataRoot, exposed READ-ONLY at the `/shared` path prefix and shared across
++   * ALL users (public datasets / reference material). Legacy parity with the
++   * old `users/shared → /shared:ro` bind mount. Default `undefined` (feature
++   * off); env override `BP_SHARED_DIR`. In Docker mode the host dir is bind-
++   * mounted read-only and its container path is passed here via env. Tests
++   * inject directly.
++   */
++  sharedDir?: string;
+ }
+ 
+ /** Roles inferred from agent name. */
+@@ -392,6 +421,11 @@ export class SessionManager {
+   // the parsed shape.
+   private toolToggles: ToolToggles | null | undefined = undefined;
+ 
++  // #261: cross-user read-only shared root, addressed by the `/shared` prefix.
++  // An absolute dir OUTSIDE dataRoot, shared across ALL users. `undefined` =
++  // feature off (the `/shared` prefix is not recognized). Env `BP_SHARED_DIR`.
++  private readonly sharedDir?: string;
++
+   constructor(opts: SessionManagerOptions = {}) {
+     this.dataRoot = opts.dataRoot ?? process.env.BP_DATA_DIR ?? join(process.cwd(), ".bp-data");
+     this.agentFactory = opts.agentFactory ?? selectFactory();
+@@ -418,6 +452,7 @@ export class SessionManager {
+     this.maxConcurrentAgents = resolveMaxConcurrentAgents(opts.maxConcurrentAgents);
+     this.uploadMaxBytes = resolveUploadMaxBytes(opts.uploadMaxBytes);
+     this.persistentUserId = resolvePersistentUserId(opts.persistentUserId);
++    this.sharedDir = resolveSharedDir(opts.sharedDir);
+ 
+     // Test-only injection path: if callers pass `toolToggles`, use it verbatim
+     // and skip the disk read altogether. `undefined` (the field is absent from
+@@ -568,7 +603,7 @@ export class SessionManager {
+    * escapes its declared root (path-traversal guard). This is the single
+    * enforcement point for all file routes.
+    *
+-   * THREE roots are addressable, by path prefix:
++   * FOUR roots are addressable, by path prefix:
+    *  - `/workspace[/...]` → the per-session workspace `workspaces/<sid>/`
+    *    (the agent's cwd; default when no prefix is given, for backward compat).
+    *  - `/data[/...]`      → the shared per-user persistent root
+@@ -577,6 +612,10 @@ export class SessionManager {
+    *    message, kept in the hidden `workspaces/<sid>/.attachments/` subdir so
+    *    they are scoped to the session but visually separate from agent-produced
+    *    workspace files. The agent reads them from its cwd as `.attachments/<f>`.
++   *  - `/shared[/...]`    → the cross-user READ-ONLY shared root (#261), an
++   *    absolute dir OUTSIDE dataRoot shared across ALL users. Only recognized
++   *    when `sharedDir` is configured; writes/deletes against it are rejected by
++   *    the callers (see writeSessionFile / deleteSessionFile).
+    * Each is guarded WITHIN ITS OWN boundary: paths can never cross between roots
+    * and none can escape via `..`. (Attachments sit under the workspace on disk,
+    * but the `/attachments` boundary is the `.attachments/` subdir itself.)
+@@ -587,18 +626,19 @@ export class SessionManager {
+   private resolveManagedPath(
+     sid: string,
+     rawPath: string,
+-  ): { abs: string; root: string; prefix: "/workspace" | "/data" | "/attachments" } {
++  ): { abs: string; root: string; prefix: "/workspace" | "/data" | "/attachments" | "/shared" } {
+     let rel = rawPath ?? "";
+     // Cross-platform (#5): accept `\` on the way in (an LLM/pre-#5 client may
+     // round-trip a `\` path we handed out). `\` is not a legal filename char.
+     rel = rel.replace(/\\/g, "/");
+ 
+     // Pick the root by prefix. `/data` → persistent library; `/attachments` →
+-    // the session's hidden attachments subdir; anything else defaults to the
++    // the session's hidden attachments subdir; `/shared` → the cross-user
++    // read-only root (only when configured); anything else defaults to the
+     // session workspace (bare relative paths included, so existing callers keep
+     // working unchanged).
+     let root: string;
+-    let prefix: "/workspace" | "/data" | "/attachments";
++    let prefix: "/workspace" | "/data" | "/attachments" | "/shared";
+     if (rel === "/data" || rel.startsWith("/data/")) {
+       root = this.persistentDir();
+       prefix = "/data";
+@@ -607,6 +647,12 @@ export class SessionManager {
+       root = this.attachmentsDir(sid);
+       prefix = "/attachments";
+       rel = rel === "/attachments" ? "" : rel.slice("/attachments/".length);
++    } else if (this.sharedDir && (rel === "/shared" || rel.startsWith("/shared/"))) {
++      // #261: only recognized when configured; otherwise `/shared/...` falls
++      // through to the workspace branch below (backward-compatible no-op).
++      root = this.sharedDir;
++      prefix = "/shared";
++      rel = rel === "/shared" ? "" : rel.slice("/shared/".length);
+     } else {
+       root = this.workspaceDir(sid);
+       prefix = "/workspace";
+@@ -618,7 +664,13 @@ export class SessionManager {
+     const abs = resolve(root, rel);
+     if (abs !== root && !abs.startsWith(root + sep)) {
+       const label =
+-        prefix === "/data" ? "data root" : prefix === "/attachments" ? "attachments" : "workspace";
++        prefix === "/data"
++          ? "data root"
++          : prefix === "/attachments"
++            ? "attachments"
++            : prefix === "/shared"
++              ? "shared root"
++              : "workspace";
+       throw new Error(`path escapes ${label}: ${rawPath}`);
+     }
+     return { abs, root, prefix };
+@@ -700,7 +752,8 @@ export class SessionManager {
+ 
+   /** Delete a workspace file. Returns false if it was already gone. */
+   async deleteSessionFile(sid: string, rel: string): Promise<boolean> {
+-    const abs = this.resolveWorkspacePath(sid, rel);
++    const { abs, prefix } = this.resolveManagedPath(sid, rel);
++    this.assertWritable(prefix, rel); // #261: the shared root is read-only
+     try {
+       await rm(abs, { recursive: true });
+       return true;
+@@ -709,6 +762,21 @@ export class SessionManager {
+     }
+   }
+ 
++  /**
++   * #261: reject mutations targeting the cross-user shared root. The `/shared`
++   * root is exposed read-only (legacy `/shared:ro` parity); in Docker mode the
++   * bind mount is `ReadOnly:true` too, but local/static modes have no OS-level
++   * barrier, so this runtime check is the enforcement point there.
++   */
++  private assertWritable(
++    prefix: "/workspace" | "/data" | "/attachments" | "/shared",
++    rawPath: string,
++  ): void {
++    if (prefix === "/shared") {
++      throw new Error(`shared root is read-only: ${rawPath}`);
++    }
++  }
++
+   /**
+    * #47: write an uploaded file into a managed root. Content arrives
+    * base64-encoded (binary-safe over the JSON byte chain). The
+@@ -732,6 +800,7 @@ export class SessionManager {
+       throw new Error(`file too large: ${buf.byteLength} bytes exceeds limit of ${maxBytes}`);
+     }
+     const { abs, root, prefix } = this.resolveManagedPath(sid, rel);
++    this.assertWritable(prefix, rel); // #261: the shared root is read-only
+     await mkdir(dirname(abs), { recursive: true });
+     await writeFile(abs, buf);
+     return { path: this.relManagedPath(abs, root, prefix), size: buf.byteLength };
+@@ -759,6 +828,7 @@ export class SessionManager {
+     maxBytes = this.uploadMaxBytes,
+   ): Promise<{ path: string; size: number }> {
+     const { abs, root, prefix } = this.resolveManagedPath(sid, rel);
++    this.assertWritable(prefix, rel); // #261: the shared root is read-only
+     await mkdir(dirname(abs), { recursive: true });
+ 
+     // Normalize either stream flavor to a Node Readable.
+@@ -798,17 +868,17 @@ export class SessionManager {
+   }
+ 
+   /**
+-   * Root-relative form of an absolute managed path, carrying the `/data` or
+-   * `/attachments` prefix back for non-workspace writes so the path round-trips.
+-   * Cross-platform (#5): always emit POSIX `/` so the API contract is identical
+-   * across hosts; the frontend embeds this in URL query strings
++   * Root-relative form of an absolute managed path, carrying the `/data`,
++   * `/attachments`, or `/shared` prefix back for non-workspace paths so the path
++   * round-trips. Cross-platform (#5): always emit POSIX `/` so the API contract
++   * is identical across hosts; the frontend embeds this in URL query strings
+    * (`?path=foo/bar.txt`) and the model echoes it back via `read_file`. A bare
+    * workspace path is emitted prefix-less for backward compatibility.
+    */
+   private relManagedPath(
+     abs: string,
+     root: string,
+-    prefix: "/workspace" | "/data" | "/attachments",
++    prefix: "/workspace" | "/data" | "/attachments" | "/shared",
+   ): string {
+     const relPart = abs === root ? "" : abs.slice(root.length + 1).split(sep).join("/");
+     if (prefix === "/workspace") return relPart;
+@@ -919,6 +989,11 @@ export class SessionManager {
+     // language directive) so it reaches on-disk personas too.
+     if (role !== "trace") {
+       persona = withPersistentRootDirective(persona, this.persistentDir());
++      // #261: when a cross-user read-only shared root is configured, tell working
++      // agents where it lives (absolute path) so they can read/use it as input.
++      if (this.sharedDir) {
++        persona = withSharedRootDirective(persona, this.sharedDir);
++      }
+     }
+     return persona;
+   }

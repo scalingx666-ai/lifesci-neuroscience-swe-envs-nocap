@@ -1,0 +1,533 @@
+diff --git a/docs/source/whats_new.rst b/docs/source/whats_new.rst
+index 29757fa9ea..8c3560fd75 100644
+--- a/docs/source/whats_new.rst
++++ b/docs/source/whats_new.rst
+@@ -65,6 +65,7 @@ Bugs
+ - Retag :class:`moabb.datasets.Kaneshiro2015` from ``p300`` to ``imagery`` so its declared default paradigm accepts it: its six visual object categories carry no Target/NonTarget pair, so the P300 paradigm rejected every subject. The catalog row and documentation grouping move with it (:gh:`1143` by `Bruno Aristimunha`_)
+ - Allow :class:`moabb.paradigms.RestingStateToP300Adapter` to be constructed with defaults: ``events=None`` now means all of the dataset's events, matching how every in-repo usage builds it (:gh:`1143` by `Bruno Aristimunha`_)
+ - Fix :class:`moabb.datasets.Lee2024` silently dropping 345 upstream files. ``data_path`` no longer guesses filenames and skips failures: it downloads a real inventory -- the NEMAR deposit's provenance manifest when the sourcedata store is in use (so the NEMAR path never contacts the upstream host), or the upstream git tree otherwise -- through the shared :func:`moabb.datasets.download.data_dl`, which also serves the files from the NEMAR store. Subject 8's unpadded upstream names (``sub8_*``) are normalized to the padded names the loader reads, mixtures of combined and per-block training files and ``param.mat`` are covered by the inventory, and any download failure now raises instead of leaving a silently incomplete directory (:gh:`1142` by `Bruno Aristimunha`_)
++- Read XDF recordings with a built-in minimal reader (``moabb.datasets._xdf``) instead of the optional ``pyxdf`` dependency, for all four XDF datasets: :class:`moabb.datasets.AguileraRodriguez2025`, :class:`moabb.datasets.Chen2017SingleFlicker`, :class:`moabb.datasets.Rozado2015` and :class:`moabb.datasets.Schrag2026Pediatric`. The immediate defect: AguileraRodriguez2025's recorder wrote a non-conforming XDF footer (float ``sample_count``), which makes ``pyxdf`` 1.17.5 raise ``ValueError`` for every gamified session; the built-in reader ignores footers entirely. It returns ``pyxdf``-shaped streams and applies the same per-segment linear dejittering to regular-rate streams, and applies ``pyxdf``'s clock-offset synchronization (Huber-ADMM robust fit, ported, BSD-2-Clause) before dejittering, in ``pyxdf``'s order. Validated against ``pyxdf`` on real recordings of each dataset: **bit-identical** loaded data for all four. The ``moabb[xdf]`` extra is kept as an empty no-op so existing install commands still work (by `Bruno Aristimunha`_)
+ - Prefetch the NEMAR sourcedata store inside :meth:`moabb.datasets.base.BaseDataset.get_data`: the store introduced in :gh:`1146` was only filled by an explicit :meth:`~moabb.datasets.base.BaseDataset.download` call, so a plain ``get_data()`` on a fresh machine still fetched from the upstream host even with the provider pinned to ``"nemar"``. The requested subjects' ``sourcedata/`` is now fetched before loading, with the provider policy ``download`` already implements: ``"upstream"`` skips NEMAR, ``"nemar"`` treats a failure as fatal, ``"auto"`` warns per subject and leaves that subject to the dataset's own downloader. Also fix the store fill in the deprecated :func:`moabb.datasets.download.data_path`: ``pooch.retrieve`` treats its destination as a *directory* holding ``<md5(url)>-<basename>``, and loaders such as :class:`moabb.datasets.Rodrigues2017`'s ``os.listdir()`` it, so a store hit written as a plain file at the destination raised ``NotADirectoryError``; the hit now lands inside the wrapper directory under pooch's unique name (by `Bruno Aristimunha`_)
+ - Wire the NEMAR sourcedata store into loading (:gh:`1147`): ``data_dl`` and the deprecated ``data_path`` now serve a requested file from the dataset's ``NEMAR/<nemar_id>/sourcedata/`` store before consulting the URL-derived layout, probing the store by the trailing segments of the URL path since it keeps the upstream filenames. ``dataset.download()`` followed by ``get_data()`` therefore no longer re-contacts the upstream host -- verified live against ``Schirrmeister2017``, whose host is currently unreachable. The URL-derived trees remain as lookups so nothing already downloaded is fetched again; ``force_update`` still refetches upstream and pinning the provider to ``"upstream"`` opts loading out of the store (:gh:`1146` by `Bruno Aristimunha`_)
+ - Store :class:`moabb.datasets.ErpCore2021` as the single combined BIDS dataset it is, with components separated by the ``task-`` entity in one shared ``MNE-erpcore2021-data`` root, instead of seven standalone per-component BIDS datasets; likewise store Dreyer2023 in one shared ``MNE-dreyer2023-data`` root, since the A/B/C classes only select subject ranges of one globally numbered dataset. Pre-existing downloads in the legacy separated layouts are still read without re-fetching (:gh:`1146` by `Bruno Aristimunha`_)
+diff --git a/moabb/datasets/_xdf.py b/moabb/datasets/_xdf.py
+new file mode 100644
+index 0000000000..3bffcab5f3
+--- /dev/null
++++ b/moabb/datasets/_xdf.py
+@@ -0,0 +1,236 @@
++"""Minimal XDF reader.
++
++Covers what MOABB's XDF-based datasets need: regular numeric streams and
++irregular string-marker streams, returned in ``pyxdf``'s result shape so
++loaders can switch between the two without logic changes. Regular-rate
++streams get ``pyxdf``'s dejittering (per-segment linear fit of timestamps),
++so sample-index lookups like ``np.searchsorted`` place events exactly where
++``pyxdf`` would; clock
++synchronization is applied exactly as ``pyxdf`` does (Huber-ADMM robust fit
++of the recorded clock offsets, ported from pyxdf, BSD-2-Clause), so results
++are interchangeable with pyxdf's. The stream footer is ignored
++entirely, so recorders that write non-conforming footers (e.g.
++AguileraRodriguez2025's float ``sample_count``, which makes ``pyxdf``
++1.17.5 raise ``ValueError``) load fine.
++"""
++
++import struct
++from xml.etree import ElementTree
++
++import numpy as np
++
++
++_FMT = {
++    "float32": ("<f4", 4),
++    "double64": ("<f8", 8),
++    "int8": ("<i1", 1),
++    "int16": ("<i2", 2),
++    "int32": ("<i4", 4),
++    "int64": ("<i8", 8),
++}
++
++
++def _varlen(f):
++    n = f.read(1)[0]
++    return int.from_bytes(f.read(n), "little")
++
++
++def _xml2dict(element):
++    """Nest an XML element the way ``pyxdf`` does: children as lists."""
++    out = {}
++    for child in element:
++        out.setdefault(child.tag, []).append(
++            _xml2dict(child) if len(child) else child.text
++        )
++    return out
++
++
++def _robust_fit(A, y, rho=1, iters=1000):
++    """Huber-loss linear regression via ADMM. Ported from pyxdf (BSD-2)."""
++    A = np.copy(A)
++    offset = np.min(A[:, 1])
++    A[:, 1] -= offset
++    Aty = np.dot(A.T, y)
++    L = np.linalg.cholesky(np.dot(A.T, A))
++    U = L.T
++    z = np.zeros_like(y)
++    u = z
++    x = z
++    for _ in range(iters):
++        x = np.linalg.solve(U, (np.linalg.solve(L, Aty + np.dot(A.T, z - u))))
++        d = np.dot(A, x) - y + u
++        d_inv = np.zeros_like(d)
++        np.divide(1, d, out=d_inv, where=d != 0)
++        tmp = np.maximum(0, (1 - (1 + 1 / rho) * np.abs(d_inv)))
++        z = rho / (1 + rho) * d + 1 / (1 + rho) * tmp * d
++        u = d - z
++    x[0] -= x[1] * offset
++    return x
++
++
++def _segment_clock_diff(diff, thresh_stds, thresh_secs):
++    """MAD-standardised glitch detection. Ported from pyxdf (BSD-2)."""
++    median = np.median(diff)
++    diffs_shift = diff - median
++    diffs_shift_abs = np.abs(diffs_shift)
++    mad = np.median(diffs_shift_abs) + np.finfo(float).eps
++    diffs_std = diffs_shift / mad
++    return (np.abs(diffs_std) > thresh_stds) & (diffs_shift_abs > thresh_secs)
++
++
++def _clock_reset_ranges(clock_times, clock_values):
++    """Inclusive index ranges between clock resets. Ported from pyxdf (BSD-2)."""
++    time_diff = np.diff(clock_times)
++    value_diff = np.diff(clock_values)
++    resets_at = (time_diff < 0) | (
++        _segment_clock_diff(time_diff, 5, 5) & _segment_clock_diff(value_diff, 10, 1)
++    )
++    break_inds = np.where(resets_at)[0]
++    starts = np.hstack(([0], break_inds + 1))
++    ends = np.hstack((break_inds, len(resets_at)))
++    return list(zip(starts.tolist(), ends.tolist()))
++
++
++def _clock_sync(stamps, clock_times, clock_values, winsor_threshold=0.0001):
++    """Apply pyxdf's clock-offset correction to one stream's timestamps."""
++    if not len(stamps) or not clock_times:
++        return stamps
++    if len(clock_times) > 1:
++        ranges = _clock_reset_ranges(clock_times, clock_values)
++    else:
++        ranges = [(0, 0)]
++    coef = []
++    for start, stop_inclusive in ranges:
++        if start != stop_inclusive:
++            stop = stop_inclusive + 1
++            X = np.column_stack(
++                [
++                    np.ones(stop - start),
++                    np.array(clock_times[start:stop]) / winsor_threshold,
++                ]
++            )
++            y = np.array(clock_values[start:stop]) / winsor_threshold
++            try:
++                coefs = _robust_fit(X, y)
++                coefs[0] *= winsor_threshold
++            except np.linalg.LinAlgError:
++                coefs = [0, 0]
++            coef.append(coefs)
++        else:
++            coef.append((clock_values[start], 0))
++    if len(ranges) == 1:
++        stamps += coef[0][0] + (coef[0][1] * stamps)
++        return stamps
++    ts_start = 0
++    for coef_i, range_i in zip(coef, ranges):
++        stop = range_i[1] + 1
++        if stop < len(clock_times):
++            current_end_t = clock_times[range_i[1]]
++            next_start_t = clock_times[stop]
++            cond = np.less(
++                np.abs(stamps[ts_start:] - current_end_t),
++                np.abs(stamps[ts_start:] - next_start_t),
++            )
++            ts_stop = ts_start + (len(cond) if all(cond) else np.argmin(cond).item())
++        else:
++            ts_stop = len(stamps)
++        if ts_start != ts_stop:
++            ts_slice = slice(ts_start, ts_stop)
++            stamps[ts_slice] += coef_i[0] + coef_i[1] * stamps[ts_slice]
++        ts_start = ts_stop
++    return stamps
++
++
++def _dejitter(stamps, srate, threshold_seconds=1.0, threshold_samples=500):
++    """Replace timestamps with per-segment linear fits, as ``pyxdf`` does."""
++    tdiff = 1.0 / srate
++    breaks = np.abs(np.diff(stamps)) > max(threshold_seconds, threshold_samples * tdiff)
++    bounds = [0, *np.flatnonzero(breaks) + 1, len(stamps)]
++    for start, stop in zip(bounds[:-1], bounds[1:]):
++        idx = np.arange(start, stop, 1)[:, None]
++        X = np.concatenate((np.ones_like(idx), idx), axis=1)
++        mapping = np.linalg.lstsq(X, stamps[idx], rcond=-1)[0]
++        stamps[idx] = mapping[0] + mapping[1] * idx
++    return stamps
++
++
++def read_xdf(path):
++    """Read an XDF file.
++
++    Returns
++    -------
++    streams : list of dict
++        One dict per stream in file order, shaped like ``pyxdf.load_xdf``'s:
++        ``info`` (XML fields as lists, including nested ``desc``),
++        ``time_series`` (``ndarray (n_samples, n_channels)`` for numeric
++        formats, list of per-sample string lists otherwise) and
++        ``time_stamps`` (``ndarray`` of raw LSL seconds).
++    header : dict
++        The file header's ``info`` fields, same nesting.
++    """
++    streams, order, header = {}, [], {}
++    with open(path, "rb") as f:
++        if f.read(4) != b"XDF:":
++            raise ValueError(f"{path} is not an XDF file")
++        while True:
++            head = f.read(1)
++            if not head:
++                break
++            length = int.from_bytes(f.read(head[0]), "little")
++            tag = struct.unpack("<H", f.read(2))[0]
++            body_len = length - 2
++            if tag == 1:  # FileHeader
++                header = _xml2dict(ElementTree.fromstring(f.read(body_len).decode()))
++            elif tag == 2:  # StreamHeader
++                sid = struct.unpack("<I", f.read(4))[0]
++                xml = ElementTree.fromstring(f.read(body_len - 4).decode())
++                streams[sid] = {
++                    "info": _xml2dict(xml),
++                    "time_series": [],
++                    "time_stamps": [],
++                    "clock_times": [],
++                    "clock_values": [],
++                }
++                order.append(sid)
++            elif tag == 3:  # Samples
++                sid = struct.unpack("<I", f.read(4))[0]
++                s = streams[sid]
++                info = s["info"]
++                fmt = info["channel_format"][0]
++                n_ch = int(info["channel_count"][0])
++                srate = float(info["nominal_srate"][0] or 0)
++                dt = 1.0 / srate if srate else 0.0
++                last = s["time_stamps"][-1] if s["time_stamps"] else 0.0
++                for _ in range(_varlen(f)):
++                    stamp = (
++                        struct.unpack("<d", f.read(8))[0] if f.read(1)[0] else last + dt
++                    )
++                    last = stamp
++                    s["time_stamps"].append(stamp)
++                    if fmt == "string":
++                        s["time_series"].append(
++                            [f.read(_varlen(f)).decode() for _ in range(n_ch)]
++                        )
++                    else:
++                        s["time_series"].append(f.read(n_ch * _FMT[fmt][1]))
++            elif tag == 4:  # ClockOffset
++                sid = struct.unpack("<I", f.read(4))[0]
++                t, off = struct.unpack("<dd", f.read(16))
++                streams[sid]["clock_times"].append(t)
++                streams[sid]["clock_values"].append(off)
++            else:  # Boundary, StreamFooter -- not needed
++                f.seek(body_len, 1)
++    for s in streams.values():
++        fmt = s["info"]["channel_format"][0]
++        if fmt != "string":
++            n_ch = int(s["info"]["channel_count"][0])
++            s["time_series"] = np.frombuffer(
++                b"".join(s["time_series"]), dtype=_FMT[fmt][0]
++            ).reshape(-1, n_ch)
++        s["time_stamps"] = _clock_sync(
++            np.asarray(s["time_stamps"]), s.pop("clock_times"), s.pop("clock_values")
++        )
++        srate = float(s["info"]["nominal_srate"][0] or 0)
++        if srate > 0 and len(s["time_stamps"]) > 1:
++            s["time_stamps"] = _dejitter(s["time_stamps"], srate)
++    return [streams[sid] for sid in order], header
+diff --git a/moabb/datasets/aguilera_rodriguez2025.py b/moabb/datasets/aguilera_rodriguez2025.py
+index a1c25244a3..f99ec9f0d3 100644
+--- a/moabb/datasets/aguilera_rodriguez2025.py
++++ b/moabb/datasets/aguilera_rodriguez2025.py
+@@ -9,9 +9,9 @@
+ 
+ import mne
+ import numpy as np
+-from mne.utils import _soft_import
+ 
+ from . import download as dl
++from ._xdf import read_xdf
+ from .base import BaseDataset
+ from .metadata.schema import (
+     AcquisitionMetadata,
+@@ -146,7 +146,6 @@ class AguileraRodriguez2025(BaseDataset):
+ 
+     .. note::
+         Session 2 (gamified paradigm) is distributed as XDF and requires the
+-        optional ``pyxdf`` dependency (install with ``pip install moabb[xdf]``).
+         Session 1 (traditional paradigm, EDF) works without it — restrict with
+         ``AguileraRodriguez2025(sessions=[1])``.
+     """
+@@ -306,13 +305,9 @@ def _get_single_subject_data(self, subject):
+                 sessions[session_name]["0"] = raw
+ 
+             elif session == 2:
+-                # Gamified (XDF) — pyxdf is an optional dependency
+-                # (install via `pip install moabb[xdf]`).
+-                pyxdf = _soft_import(
+-                    "pyxdf",
+-                    "loading XDF gamified-paradigm data for AguileraRodriguez2025",
+-                )
+-                streams, _ = pyxdf.load_xdf(fpath)
++                # Gamified (XDF), via MOABB's built-in reader: these files'
++                # non-conforming footer (float sample_count) crashes pyxdf.
++                streams, _ = read_xdf(fpath)
+                 eeg_stream = None
+                 marker_stream = None
+                 for stream in streams:
+diff --git a/moabb/datasets/rozado2015.py b/moabb/datasets/rozado2015.py
+index 43411f5e77..c1e4d87856 100644
+--- a/moabb/datasets/rozado2015.py
++++ b/moabb/datasets/rozado2015.py
+@@ -5,7 +5,6 @@
+ Data DOI: 10.7910/DVN/28932
+ """
+ 
+-import importlib
+ import logging
+ from pathlib import Path
+ 
+@@ -15,6 +14,7 @@
+ from mne.io import RawArray
+ 
+ from . import download as dl
++from ._xdf import read_xdf
+ from .base import BaseDataset
+ from .metadata.schema import (
+     AcquisitionMetadata,
+@@ -73,7 +73,7 @@ class Rozado2015(BaseDataset):
+     - 6-12 s: micro-break
+ 
+     Data is stored as XDF (eXtensible Data Format) files inside two RAR
+-    archives on Harvard Dataverse. Loading requires the ``pyxdf`` library
++    archives on Harvard Dataverse.
+     (install with ``pip install moabb[xdf]``) and a RAR extraction tool
+     (``unar``, ``unrar``, or ``7z``).
+ 
+@@ -226,15 +226,7 @@ def _load_xdf_run(self, xdf_path):
+ 
+         Events are placed on a stim channel aligned to EEG timestamps.
+         """
+-        try:
+-            pyxdf = importlib.import_module("pyxdf")
+-        except ImportError as exc:
+-            raise ImportError(
+-                "The 'pyxdf' package is required to load XDF data for "
+-                "Rozado2015. Install it with `pip install moabb[xdf]`."
+-            ) from exc
+-
+-        streams, _ = pyxdf.load_xdf(str(xdf_path))
++        streams, _ = read_xdf(str(xdf_path))
+ 
+         # Find EEG and marker streams
+         eeg_stream = None
+diff --git a/moabb/datasets/schrag2026.py b/moabb/datasets/schrag2026.py
+index bdb78718f8..c4219d4bc1 100644
+--- a/moabb/datasets/schrag2026.py
++++ b/moabb/datasets/schrag2026.py
+@@ -14,9 +14,9 @@
+ 
+ import mne
+ import numpy as np
+-from mne.utils import _soft_import
+ 
+ from . import download as dl
++from ._xdf import read_xdf
+ from .base import BaseDataset
+ from .metadata.schema import (
+     AcquisitionMetadata,
+@@ -125,7 +125,7 @@ class Schrag2026Pediatric(BaseDataset):
+ 
+     .. note::
+         The dataset ships as a single ~1.2 GB ``DatasetData.zip`` on
+-        Zenodo. Subjects are extracted on demand; ``pyxdf`` is required
++        Zenodo. Subjects are extracted on demand.
+         (``pip install moabb[xdf]``).
+ 
+     References
+@@ -349,12 +349,7 @@ def _load_xdf_streams(fpath):
+     empty ``gUSBamp-1Markers`` stream that wins a type-based ``"Markers"``
+     match in some files (it appears first in the XDF stream order).
+     """
+-    pyxdf = _soft_import("pyxdf", "loading XDF data for Schrag2026Pediatric")
+-    streams, _ = pyxdf.load_xdf(
+-        str(fpath),
+-        select_streams=[{"type": "EEG"}, {"name": "UnityMarkerStream"}],
+-        verbose=False,
+-    )
++    streams, _ = read_xdf(str(fpath))
+     eeg_stream = marker_stream = None
+     for s in streams:
+         if s["info"]["type"][0] == "EEG":
+diff --git a/moabb/datasets/ssvep_chen2017.py b/moabb/datasets/ssvep_chen2017.py
+index d3e7fe6e07..6cc229faab 100644
+--- a/moabb/datasets/ssvep_chen2017.py
++++ b/moabb/datasets/ssvep_chen2017.py
+@@ -4,7 +4,6 @@
+ DOI: 10.1371/journal.pone.0178385
+ """
+ 
+-import importlib
+ import logging
+ import zipfile
+ from pathlib import Path
+@@ -16,6 +15,7 @@
+ from scipy.io import loadmat
+ 
+ from . import download as dl
++from ._xdf import read_xdf
+ from .base import BaseDataset
+ from .metadata.schema import (
+     AcquisitionMetadata,
+@@ -57,7 +57,6 @@ class Chen2017SingleFlicker(BaseDataset):
+     - **Session "0" (training)**: Structured calibration data from ``.xdf``
+       files recorded at 2048 Hz. Each subject has 2 runs of 100 trials
+       (50 per direction, 200 total), with ~3.5 s per trial. Requires
+-      ``pyxdf`` (install with ``pip install moabb[xdf]``).
+     - **Session "1" (online)**: Adaptive BCI game data from ``.mat`` files
+       recorded at 512 Hz. Variable-length trials from approximately 16 game
+       rounds per subject.
+@@ -199,7 +198,7 @@ def __init__(self, subjects=None, sessions=None):
+     def _get_single_subject_data(self, subject):
+         """Return data for one subject with training and online sessions.
+ 
+-        Session "0" (training): XDF calibration data at 2048 Hz (requires pyxdf).
++        Session "0" (training): XDF calibration data at 2048 Hz.
+         Session "1" (online): MAT game data at 512 Hz.
+         """
+         file_paths = self.data_path(subject)
+@@ -230,15 +229,7 @@ def _load_xdf_run(self, xdf_path):
+         stream with direction labels ("N", "E", "W", "S", "0").
+         Channels 1:33 (A1-A32) are extracted as EEG.
+         """
+-        try:
+-            pyxdf = importlib.import_module("pyxdf")
+-        except ImportError as exc:
+-            raise ImportError(
+-                "The 'pyxdf' package is required to load XDF training data for "
+-                "Chen2017SingleFlicker. Install it with `pip install moabb[xdf]`."
+-            ) from exc
+-
+-        streams, _ = pyxdf.load_xdf(str(xdf_path))
++        streams, _ = read_xdf(str(xdf_path))
+ 
+         # Find EEG and Marker streams
+         eeg_stream = None
+diff --git a/moabb/tests/test_xdf.py b/moabb/tests/test_xdf.py
+new file mode 100644
+index 0000000000..e453f48d77
+--- /dev/null
++++ b/moabb/tests/test_xdf.py
+@@ -0,0 +1,74 @@
++"""Tests for moabb.datasets._xdf, the built-in minimal XDF reader."""
++
++import struct
++
++import numpy as np
++
++from moabb.datasets._xdf import read_xdf
++
++
++def _chunk(tag, body):
++    length = len(body) + 2
++    return bytes([4]) + struct.pack("<I", length) + struct.pack("<H", tag) + body
++
++
++def _write_xdf(path):
++    eeg_xml = (
++        b"<info><name>gUSBamp</name><type>EEG</type>"
++        b"<channel_count>2</channel_count><nominal_srate>500</nominal_srate>"
++        b"<channel_format>float32</channel_format>"
++        b"<desc><channels><channel><label>C3</label></channel>"
++        b"<channel><label>C4</label></channel></channels></desc></info>"
++    )
++    mark_xml = (
++        b"<info><name>Game</name><type>Markers</type><channel_count>1"
++        b"</channel_count><nominal_srate>0</nominal_srate>"
++        b"<channel_format>string</channel_format></info>"
++    )
++    # non-conforming footer, as AguileraRodriguez2025's recorder writes it:
++    # sample_count is a float string, which crashes pyxdf 1.17.5
++    footer_xml = b"<info><sample_count>4.0</sample_count></info>"
++
++    eeg_samples = struct.pack("<I", 1) + bytes([1, 4])  # stream 1, 4 samples
++    values = np.arange(8, dtype="<f4").reshape(4, 2)
++    for i, row in enumerate(values):
++        eeg_samples += bytes([8]) + struct.pack("<d", 10.0 + i / 500)
++        eeg_samples += row.tobytes()
++
++    marker_samples = struct.pack("<I", 2) + bytes([1, 2])  # stream 2, 2 samples
++    for stamp, text in ((10.004, b"AVANZAR"), (10.006, b"Spoken AVANZAR")):
++        marker_samples += bytes([8]) + struct.pack("<d", stamp)
++        marker_samples += bytes([1, len(text)]) + text
++
++    blob = b"XDF:"
++    blob += _chunk(1, b"<info><version>1.0</version></info>")
++    blob += _chunk(2, struct.pack("<I", 1) + eeg_xml)
++    blob += _chunk(2, struct.pack("<I", 2) + mark_xml)
++    blob += _chunk(3, eeg_samples)
++    blob += _chunk(3, marker_samples)
++    blob += _chunk(4, struct.pack("<I", 1) + struct.pack("<dd", 10.0, 0.001))
++    blob += _chunk(6, struct.pack("<I", 1) + footer_xml)
++    path.write_bytes(blob)
++
++
++def test_read_xdf_numeric_string_and_quirky_footer(tmp_path):
++    path = tmp_path / "rec.xdf"
++    _write_xdf(path)
++
++    streams, header = read_xdf(str(path))
++
++    assert header == {"version": ["1.0"]}
++    eeg, markers = streams
++    assert eeg["info"]["type"] == ["EEG"]
++    np.testing.assert_array_equal(
++        eeg["time_series"], np.arange(8, dtype="<f4").reshape(4, 2)
++    )
++    # the single recorded clock offset (+0.001) is applied, as pyxdf does
++    np.testing.assert_allclose(eeg["time_stamps"], 10.001 + np.arange(4) / 500)
++    # nested desc, pyxdf-shaped (used by Schrag2026 for channel labels)
++    channels = eeg["info"]["desc"][0]["channels"][0]["channel"]
++    assert [c["label"][0] for c in channels] == ["C3", "C4"]
++
++    assert markers["info"]["name"] == ["Game"]
++    assert [row[0] for row in markers["time_series"]] == ["AVANZAR", "Spoken AVANZAR"]
++    np.testing.assert_allclose(markers["time_stamps"], [10.004, 10.006])
+diff --git a/pyproject.toml b/pyproject.toml
+index 1a6f941796..d82d7621f7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -100,7 +100,7 @@ Changelog = "https://moabb.neurotechx.com/docs/whats_new.html"
+ carbonemission = ["codecarbon>=2.1.4"]
+ deeplearning = ["braindecode>=0.8.1"]
+ optuna = ["optuna>=3.6.1", "optuna-integration>=3.6.0"]
+-xdf = ["pyxdf>=1.16.4"]
++xdf = []  # XDF reading is built in now (moabb.datasets._xdf); kept so `moabb[xdf]` installs still work
+ interactive = ["plotly>=5.18.0"]
+ tests = [
+     "pytest>=8.3.5,<9.1",  # pytest 9.1.0 changed IdMaker's signature, which breaks pytest_cases 3.10.1 (crash at collection time). Remove the cap once pytest_cases supports pytest >=9.1.
+@@ -131,7 +131,6 @@ all = [
+     "moabb[carbonemission]",
+     "moabb[deeplearning]",
+     "moabb[optuna]",
+-    "moabb[xdf]",
+     "moabb[interactive]",
+     "moabb[tests]",
+     "moabb[docs]",

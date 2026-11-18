@@ -1,0 +1,458 @@
+diff --git a/docs/cli.md b/docs/cli.md
+index 8550dacb..771b50df 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -503,8 +503,9 @@ Available for automation, scripting, and debugging. Skills call some of these in
+ | `graph-analyse <vault> [--top N] [--snapshot] [--diff-against FILE]` | Graph analysis in pure Python (the graphify algorithm family): god nodes (degree), bridge pages (Brandes betweenness centrality), communities with cohesion scores, cross-community surprising connections, suggested questions, and — with `--diff-against` a previous `_insights.md` — a graph diff. Vault bookkeeping files (`index`, `log`, `hot`, `_insights`) are excluded. |
+ | `graph-analyse <vault> --path A B` / `--around PAGE --depth N [--direction in\|out\|both]` | Query modes: shortest link path between two pages; N-hop neighbourhood of a page (`--direction in` = blast radius) |
+ | `batch-plan <vault> <source_dir>` | Split a source directory into parallel-ingest batches, skipping unchanged files |
+-| `cache-check <vault> <sources...>` | Which sources are new / modified / unchanged vs. `.manifest.json`. Vault-local sources no longer on disk are reported as `missing`; machine-local sources absent on this host (e.g. synced from another machine) are reported separately as `unavailable` |
++| `cache-check <vault> <sources...>` | Which sources are new / modified / unchanged vs. `.manifest.json`. Vault-local sources no longer on disk are reported as `missing`; machine-local sources absent on this host (e.g. synced from another machine) are reported separately as `unavailable`. Covers hashed **file** sources only — a git repo is tracked under `projects` by commit, not by hash, so use `projects-check` for those |
+ | `cache-update <vault> <source> [--key <pseudo-key>] [--pages <page>...]` | Record a source's SHA-256 in `.manifest.json` after ingest. The stored key is normalised to a portable form; `--key` sets it explicitly (`repo:`/`url:`/`agent:`) for sources outside the vault and `$HOME`. If `_raw/_archived/<basename>` exists, that is the stored key and the file that is hashed — even when you pass a staging `_raw/<name>.md` path |
++| `projects-check <vault> [--pretty]` | How far each `.manifest.json` `projects` entry has drifted from its checkout: `behind` (with a commit count), `current`, `unreachable` (the recorded sha no longer resolves or is no longer an ancestor — history was rewritten), `unsynced` (no `last_commit_synced` yet), `unavailable` (no usable checkout on this machine). Exits **2** when anything is `behind` or `unreachable`, so a scheduled run can branch on it; `unavailable`/`unsynced` exit 0, because an absent checkout is an absence of evidence, not a finding |
+ | `cache-hash <path>` | Compute a file or directory hash (no manifest I/O) |
+ | `ast-extract <path>` | Extract classes, functions, and imports from code — no LLM, no API calls |
+ | `code-understand --project <dir> [--backend auto\|builtin\|codegraph] [--since <sha>] [--changed <file>...] [--max-symbols N] [--pretty]` | Emit a ranked code-understanding focus map (symbols + file:line citations) for a project; CodeGraph when available, built-in AST + rg otherwise. `--backend` beats the resolved `CODE_UNDERSTANDING_*` config (env → project `.env` → global config). Used by wiki-update Step 3b. |
+@@ -522,6 +523,7 @@ obsidian-wiki batch-plan /path/to/vault ~/research --max-mb 4 --max-files 30
+ obsidian-wiki cache-check /path/to/vault ~/research/*.pdf
+ obsidian-wiki cache-update /path/to/vault ~/research/paper.pdf --pages concepts/attention.md
+ obsidian-wiki cache-update /path/to/vault /srv/data/report.pdf --key repo:github.com/acme/reports
++obsidian-wiki projects-check /path/to/vault --pretty
+ obsidian-wiki ast-extract ./src --pretty
+ obsidian-wiki code-understand --project . --since <last_commit_synced> --pretty
+ ```
+diff --git a/obsidian_wiki/cache.py b/obsidian_wiki/cache.py
+index 0c86511c..c2f9b731 100644
+--- a/obsidian_wiki/cache.py
++++ b/obsidian_wiki/cache.py
+@@ -31,6 +31,7 @@
+ import json
+ import os
+ import re
++import subprocess
+ import sys
+ import time
+ from contextlib import contextmanager
+@@ -626,3 +627,139 @@ def _rekey_stale_raw_to_archive(old_key: str | None, new_key: str) -> bool:
+ def hash_file(path: Path) -> str:
+     """Just compute and return the hash — no manifest I/O."""
+     return compute_hash(path)
++
++
++# --- project (git) staleness ------------------------------------------------
++# `check_sources` answers "did this source file's bytes change?". It cannot
++# answer the same question for a project, because a git repo is not stored as a
++# hashed source: wiki-update records it under `projects` keyed by `source_repo`
++# with a `last_commit_synced` bookmark. Nothing compared that bookmark to HEAD,
++# so a vault could be arbitrarily far behind a repo with no signal at all.
++
++_GIT_TIMEOUT = 15
++
++
++class ProjectStatus(TypedDict, total=False):
++    project: str
++    commits: int
++    last_commit_synced: str
++    path: str
++    reason: str
++
++
++class ProjectCheckResult(TypedDict):
++    behind: list[ProjectStatus]       # checkout has moved past last_commit_synced
++    current: list[str]                # last_commit_synced == HEAD
++    unreachable: list[ProjectStatus]  # stored sha not usable (rebase/force-push/gc)
++    unsynced: list[str]               # entry exists but no last_commit_synced yet
++    unavailable: list[ProjectStatus]  # no usable checkout on this machine
++
++
++def _git_in(path: Path, *args: str) -> subprocess.CompletedProcess | None:
++    """Run git in *path*; None when git itself is unusable (absent, hung)."""
++    try:
++        return subprocess.run(
++            ["git", "-C", str(path), *args],
++            capture_output=True, text=True, timeout=_GIT_TIMEOUT,
++        )
++    except (OSError, subprocess.SubprocessError):
++        return None
++
++
++def check_projects(vault: Path) -> ProjectCheckResult:
++    """Classify each manifest ``projects`` entry by how far its checkout has
++    moved past the recorded ``last_commit_synced``.
++
++    Mirrors :func:`check_sources`' vocabulary deliberately: a project whose
++    checkout is not on this machine is ``unavailable``, not stale.
++    ``source_cwd_hint`` is a *hint* — the manifest is portable across machines
++    by design, so a missing checkout is an absence of evidence, never a finding.
++
++    Read-only: never runs a git command that can write, and never fails the
++    whole call because one entry is malformed.
++    """
++    raw = _load_raw(vault).get("projects")
++    projects = raw if isinstance(raw, dict) else {}
++    result: ProjectCheckResult = {
++        "behind": [], "current": [], "unreachable": [], "unsynced": [], "unavailable": []
++    }
++
++    for name in sorted(projects):
++        entry = projects[name]
++        if not isinstance(entry, dict):
++            result["unavailable"].append({"project": name, "reason": "malformed_entry"})
++            continue
++
++        hint = entry.get("source_cwd_hint")
++        if not isinstance(hint, str) or not hint.strip():
++            result["unavailable"].append({"project": name, "reason": "no_source_cwd_hint"})
++            continue
++        path = Path(hint.strip()).expanduser()
++        if not path.is_dir():
++            result["unavailable"].append(
++                {"project": name, "reason": "checkout_not_found", "path": str(path)}
++            )
++            continue
++
++        # `rev-parse --git-dir` rather than a `.git` directory test: a linked
++        # worktree's `.git` is a file, and the hint may point below the root.
++        probe = _git_in(path, "rev-parse", "--git-dir")
++        if probe is None:
++            result["unavailable"].append(
++                {"project": name, "reason": "git_unavailable", "path": str(path)}
++            )
++            continue
++        if probe.returncode != 0:
++            result["unavailable"].append(
++                {"project": name, "reason": "not_a_git_repo", "path": str(path)}
++            )
++            continue
++
++        sha = entry.get("last_commit_synced")
++        if not isinstance(sha, str) or not sha.strip():
++            result["unsynced"].append(name)
++            continue
++        sha = sha.strip()
++
++        ancestor = _git_in(path, "merge-base", "--is-ancestor", sha, "HEAD")
++        if ancestor is None:
++            result["unavailable"].append(
++                {"project": name, "reason": "git_unavailable", "path": str(path)}
++            )
++            continue
++        if ancestor.returncode != 0:
++            # 1 = resolves but is not an ancestor (history was rewritten);
++            # anything else (128) = the object is not in this repo at all.
++            result["unreachable"].append({
++                "project": name,
++                "reason": "not_ancestor" if ancestor.returncode == 1 else "unknown_commit",
++                "last_commit_synced": sha,
++                "path": str(path),
++            })
++            continue
++
++        counted = _git_in(path, "rev-list", "--count", f"{sha}..HEAD")
++        if counted is None or counted.returncode != 0:
++            result["unavailable"].append(
++                {"project": name, "reason": "count_failed", "path": str(path)}
++            )
++            continue
++        try:
++            commits = int(counted.stdout.strip())
++        except ValueError:
++            result["unavailable"].append(
++                {"project": name, "reason": "count_unparsable", "path": str(path)}
++            )
++            continue
++
++        if commits == 0:
++            result["current"].append(name)
++        else:
++            result["behind"].append({
++                "project": name,
++                "commits": commits,
++                "last_commit_synced": sha,
++                "path": str(path),
++            })
++
++    return result
+diff --git a/obsidian_wiki/cli.py b/obsidian_wiki/cli.py
+index e9fc919e..83564a9f 100644
+--- a/obsidian_wiki/cli.py
++++ b/obsidian_wiki/cli.py
+@@ -1488,6 +1488,16 @@ def cmd_cache_check(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def cmd_projects_check(args: argparse.Namespace) -> int:
++    from obsidian_wiki.cache import check_projects
++    vault = Path(args.vault).expanduser().resolve()
++    result = check_projects(vault)
++    print(json.dumps(result, indent=2) if args.pretty else json.dumps(result))
++    # Exit 2 on a real staleness finding so a scheduled run can branch on it;
++    # unavailable/unsynced are absences of evidence, not findings.
++    return 2 if (result["behind"] or result["unreachable"]) else 0
++
++
+ def cmd_cache_update(args: argparse.Namespace) -> int:
+     from obsidian_wiki.cache import stored_key, update_source
+     from obsidian_wiki.provenance import prefer_archive_write_path
+@@ -2929,6 +2939,14 @@ def build_parser() -> argparse.ArgumentParser:
+     cc.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
+     cc.set_defaults(func=cmd_cache_check)
+ 
++    pc = sub.add_parser(
++        "projects-check",
++        help="check how far each project's checkout has moved past last_commit_synced",
++    )
++    pc.add_argument("vault", help="path to the Obsidian vault")
++    pc.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
++    pc.set_defaults(func=cmd_projects_check)
++
+     cu = sub.add_parser(
+         "cache-update",
+         help="record a source's current SHA-256 hash in .manifest.json after ingestion",
+diff --git a/tests/test_project_staleness.py b/tests/test_project_staleness.py
+new file mode 100644
+index 00000000..da5fd8c1
+--- /dev/null
++++ b/tests/test_project_staleness.py
+@@ -0,0 +1,241 @@
++"""Tests for `check_projects` — git-repo staleness against last_commit_synced.
++
++`check_sources` hashes file sources and so is structurally blind to a repo
++whose HEAD moved. These cover the branch that closes that gap, including the
++cases where the answer must be "no evidence" rather than "stale".
++"""
++
++from __future__ import annotations
++
++import json
++import subprocess
++from pathlib import Path
++
++from obsidian_wiki.cache import check_projects
++
++from conftest import _git, _run_cli, make_project, make_repo_two_commits
++
++
++def write_manifest(vault: Path, projects: dict) -> None:
++    vault.mkdir(parents=True, exist_ok=True)
++    (vault / ".manifest.json").write_text(
++        json.dumps({"projects": projects}), encoding="utf-8"
++    )
++
++
++def entry(project: Path, sha: str | None, **extra) -> dict:
++    e = {"source_repo": "github.com/owner/project", "source_cwd_hint": str(project)}
++    if sha is not None:
++        e["last_commit_synced"] = sha
++    e.update(extra)
++    return e
++
++
++def test_behind_reports_commit_count(tmp_path: Path) -> None:
++    project, sha_first = make_repo_two_commits(tmp_path)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, sha_first)})
++
++    result = check_projects(vault)
++
++    assert result["behind"] == [{
++        "project": "proj",
++        "commits": 1,
++        "last_commit_synced": sha_first,
++        "path": str(project),
++    }]
++    assert result["current"] == []
++
++
++def test_head_synced_is_current(tmp_path: Path) -> None:
++    project, _ = make_repo_two_commits(tmp_path)
++    head = _git(project, "rev-parse", "HEAD").stdout.strip()
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, head)})
++
++    result = check_projects(vault)
++
++    assert result["current"] == ["proj"]
++    assert result["behind"] == []
++
++
++def test_short_sha_is_accepted(tmp_path: Path) -> None:
++    """wiki-update's documented manifest example records an abbreviated sha."""
++    project, sha_first = make_repo_two_commits(tmp_path)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, sha_first[:7])})
++
++    result = check_projects(vault)
++
++    assert [p["commits"] for p in result["behind"]] == [1]
++
++
++def test_rewritten_history_is_unreachable_not_behind(tmp_path: Path) -> None:
++    """A sha that resolves but is no longer an ancestor must not be counted."""
++    project, sha_first = make_repo_two_commits(tmp_path)
++    # Record the tip we are about to abandon, then branch off its parent and
++    # commit — the force-push/rebase case wiki-update warns about. The recorded
++    # sha still resolves, but is no longer an ancestor of HEAD.
++    abandoned = _git(project, "rev-parse", "HEAD").stdout.strip()
++    _git(project, "checkout", "-q", "-b", "rewritten", sha_first)
++    (project / "src/foo.py").write_text("def foo():\n    return 99\n", encoding="utf-8")
++    _git(project, "add", "-A")
++    _git(project, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "rewritten")
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, abandoned)})
++
++    result = check_projects(vault)
++
++    assert result["behind"] == []
++    assert len(result["unreachable"]) == 1
++    assert result["unreachable"][0]["project"] == "proj"
++    assert result["unreachable"][0]["reason"] == "not_ancestor"
++    assert result["unreachable"][0]["last_commit_synced"] == abandoned
++
++
++def test_unknown_commit_is_distinguished_from_not_ancestor(tmp_path: Path) -> None:
++    project, _ = make_repo_two_commits(tmp_path)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, "0" * 40)})
++
++    result = check_projects(vault)
++
++    assert result["unreachable"][0]["reason"] == "unknown_commit"
++
++
++def test_missing_checkout_is_unavailable_not_stale(tmp_path: Path) -> None:
++    """The manifest is portable; a repo absent from this machine is not a finding."""
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(tmp_path / "nowhere", "abc1234")})
++
++    result = check_projects(vault)
++
++    assert result["behind"] == []
++    assert result["unavailable"] == [{
++        "project": "proj",
++        "reason": "checkout_not_found",
++        "path": str(tmp_path / "nowhere"),
++    }]
++
++
++def test_non_git_directory_is_unavailable(tmp_path: Path) -> None:
++    plain = make_project(tmp_path, {"a.py": "x = 1\n"}, git=False)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(plain, "abc1234")})
++
++    result = check_projects(vault)
++
++    assert result["unavailable"][0]["reason"] == "not_a_git_repo"
++
++
++def test_entry_without_commit_is_unsynced(tmp_path: Path) -> None:
++    project, _ = make_repo_two_commits(tmp_path)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, None)})
++
++    result = check_projects(vault)
++
++    assert result["unsynced"] == ["proj"]
++    assert result["behind"] == []
++
++
++def test_blank_commit_is_unsynced_not_crash(tmp_path: Path) -> None:
++    project, _ = make_repo_two_commits(tmp_path)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, "   ")})
++
++    assert check_projects(vault)["unsynced"] == ["proj"]
++
++
++def test_missing_hint_is_unavailable(tmp_path: Path) -> None:
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": {"source_repo": "repo:local", "last_commit_synced": "abc"}})
++
++    result = check_projects(vault)
++
++    assert result["unavailable"] == [{"project": "proj", "reason": "no_source_cwd_hint"}]
++
++
++def test_malformed_entry_does_not_sink_the_run(tmp_path: Path) -> None:
++    """One bad entry must not hide a real finding in a sibling entry."""
++    project, sha_first = make_repo_two_commits(tmp_path)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"bad": "not-a-dict", "proj": entry(project, sha_first)})
++
++    result = check_projects(vault)
++
++    assert [p["project"] for p in result["behind"]] == ["proj"]
++    assert {"project": "bad", "reason": "malformed_entry"} in result["unavailable"]
++
++
++def test_absent_and_malformed_manifest_are_empty(tmp_path: Path) -> None:
++    empty = {"behind": [], "current": [], "unreachable": [], "unsynced": [], "unavailable": []}
++    vault = tmp_path / "vault"
++    vault.mkdir()
++    assert check_projects(vault) == empty                      # no manifest at all
++
++    (vault / ".manifest.json").write_text("{not json", encoding="utf-8")
++    assert check_projects(vault) == empty                      # unreadable
++
++    (vault / ".manifest.json").write_text('{"projects": []}', encoding="utf-8")
++    assert check_projects(vault) == empty                      # wrong shape
++
++
++def test_tilde_hint_is_expanded(tmp_path: Path, monkeypatch) -> None:
++    project, sha_first = make_repo_two_commits(tmp_path)
++    monkeypatch.setenv("HOME", str(project.parent))
++    monkeypatch.setenv("USERPROFILE", str(project.parent))  # Windows
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, sha_first, source_cwd_hint="~/project")})
++
++    assert [p["commits"] for p in check_projects(vault)["behind"]] == [1]
++
++
++def test_hint_below_repo_root_still_resolves(tmp_path: Path) -> None:
++    """`rev-parse --git-dir` works from a subdirectory; a `.git` test would not."""
++    project, sha_first = make_repo_two_commits(tmp_path)
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, sha_first, source_cwd_hint=str(project / "src"))})
++
++    assert [p["commits"] for p in check_projects(vault)["behind"]] == [1]
++
++
++def test_linked_worktree_resolves(tmp_path: Path) -> None:
++    """A worktree's `.git` is a file, so an is_dir() test would call it non-git."""
++    project, sha_first = make_repo_two_commits(tmp_path)
++    wt = tmp_path / "wt"
++    subprocess.run(
++        ["git", "-C", str(project), "worktree", "add", "-q", str(wt)],
++        capture_output=True, text=True, check=True,
++    )
++    assert (wt / ".git").is_file()
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(project, sha_first, source_cwd_hint=str(wt))})
++
++    assert [p["commits"] for p in check_projects(vault)["behind"]] == [1]
++
++
++def test_cli_exits_2_on_a_finding_and_0_when_clean(tmp_path: Path) -> None:
++    project, sha_first = make_repo_two_commits(tmp_path)
++    head = _git(project, "rev-parse", "HEAD").stdout.strip()
++    vault = tmp_path / "vault"
++
++    write_manifest(vault, {"proj": entry(project, sha_first)})
++    stale = _run_cli(tmp_path, "projects-check", str(vault))
++    assert stale.returncode == 2, stale.stderr
++    assert json.loads(stale.stdout)["behind"][0]["commits"] == 1
++
++    write_manifest(vault, {"proj": entry(project, head)})
++    clean = _run_cli(tmp_path, "projects-check", str(vault))
++    assert clean.returncode == 0, clean.stderr
++    assert json.loads(clean.stdout)["current"] == ["proj"]
++
++
++def test_cli_does_not_exit_2_for_unavailable_only(tmp_path: Path) -> None:
++    """An absent checkout must not fail a scheduled run."""
++    vault = tmp_path / "vault"
++    write_manifest(vault, {"proj": entry(tmp_path / "nowhere", "abc1234")})
++
++    proc = _run_cli(tmp_path, "projects-check", str(vault))
++
++    assert proc.returncode == 0, proc.stderr

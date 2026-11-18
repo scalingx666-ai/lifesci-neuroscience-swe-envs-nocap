@@ -1,0 +1,16 @@
+# Issue
+
+**Title:** [pre-commit.ci] pre-commit autoupdate
+
+## Description
+
+<!--pre-commit.ci start-->
+updates:
+- [github.com/astral-sh/uv-pre-commit: 0.10.3 → 0.10.9](https://github.com/astral-sh/uv-pre-commit/compare/0.10.3...0.10.9)
+- [github.com/astral-sh/ruff-pre-commit: v0.15.1 → v0.15.5](https://github.com/astral-sh/ruff-pre-commit/compare/v0.15.1...v0.15.5)
+- [github.com/codespell-project/codespell: v2.4.1 → v2.4.2](https://github.com/codespell-project/codespell/compare/v2.4.1...v2.4.2)
+<!--pre-commit.ci end-->
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `439423d07630`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

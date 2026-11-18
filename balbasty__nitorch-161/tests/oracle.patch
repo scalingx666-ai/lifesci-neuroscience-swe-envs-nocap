@@ -1,0 +1,737 @@
+diff --git a/nitorch/cli/registration/register/cli.py b/nitorch/cli/registration/register/cli.py
+index c49e81c9..475850b5 100644
+--- a/nitorch/cli/registration/register/cli.py
++++ b/nitorch/cli/registration/register/cli.py
+@@ -123,6 +123,24 @@ def _main(options):
+                 affine_init = torch.eye(4)
+                 affine_init[:-1, -1] = shift
+ 
++        # affine prior precision: as for @nonlin, the precision of each
++        # group is FACTOR (global, 0 = no penalty) x its group factor
++        # (-t/-r/-z/-s, default 1)
++        factor = options.affine.factor
++        if isinstance(factor, (list, tuple)):
++            factor = factor[0] if factor else 0.
++        factor = float(factor)
++        groups = ('translation', 'rotation', 'zoom', 'shear')
++        per_group = {g: getattr(options.affine, g, 1.) for g in groups}
++        per_group = {g: 1. if v is None else float(v)
++                     for g, v in per_group.items()}
++        if not factor:
++            affine_penalty = None
++        elif all(v == 1. for v in per_group.values()):
++            affine_penalty = factor     # lambda * I, as without -t/-r/-z/-s
++        else:
++            affine_penalty = {g: factor * v for g, v in per_group.items()}
++
+         # build affine object
+         if options.affine.is2d is not False:
+             if isinstance(losses[0], objects.SumSimilarity):
+@@ -131,10 +149,10 @@ def _main(options):
+                 affine0 = losses[0].fixed.affine
+             affine = make_affine_2d(options.affine.is2d, affine0,
+                                     options.affine.name, options.affine.position,
+-                                    init=affine_init)
++                                    penalty=affine_penalty, init=affine_init)
+         else:
+             affine = make_affine(options.affine.name, options.affine.position,
+-                                 init=affine_init)
++                                 penalty=affine_penalty, init=affine_init)
+ 
+     # ------------------------------------------------------------------
+     #                           BUILD DENSE
+diff --git a/nitorch/cli/registration/register/parser.py b/nitorch/cli/registration/register/parser.py
+index 8522afca..f18a4b5b 100644
+--- a/nitorch/cli/registration/register/parser.py
++++ b/nitorch/cli/registration/register/parser.py
+@@ -163,8 +163,15 @@
+        [r, rigid]                       Translations + Rotations
+         s, similitude                   Translations + Rotations + Iso zoom
+         a, affine                       Full affine
+-    FACTOR must be a scalar value [1] and is a global penalty factor
+-    (no affine penalty is implemented yet, so FACTOR currently has no effect)
++    FACTOR must be a scalar value [0] and is the precision lambda of a
++    Gaussian prior N(0, (lambda I)^-1) on the (orthonormal) affine Lie
++    parameters q, i.e. a penalty 1/2 lambda ||q||^2. 0 means no penalty.
++    Per-group factors, multiplied by FACTOR (as for @nonlin), so that the
++    precision of a group is FACTOR x its factor:
++        -t, --translation-penalty F     Penalty factor of translations [1]
++        -r, --rotation-penalty F        Penalty factor of rotations [1]
++        -z, --zoom-penalty F            Penalty factor of zooms [1]
++        -s, --shear-penalty F           Penalty factor of shears [1]
+     Common options:
+         -p, --position                  Position of the affine: [sym], mov, fix
+         -g, --progressive               Progressive optimization (t -> r -> s -> a) [false]
+@@ -564,8 +571,15 @@ def _convert_discretize(x):
+                                 convert=lambda x: affine_aliases.get(x, x),
+                                 help='Name of the affine transform')
+ affine = cli.NamedGroup('affine', affine_choices, '@affine', n='?', make_default=False)
+-affine.add_positional('factor', nargs='*', default=[1.], convert=float,
+-                      help='Penalty factor')
++affine.add_positional('factor', nargs='*', default=[0.], convert=float,
++                      help='Prior precision (0 = no penalty)')
++for _grp, _flags in (('translation', ('-t', '--translation-penalty')),
++                     ('rotation', ('-r', '--rotation-penalty')),
++                     ('zoom', ('-z', '--zoom-penalty')),
++                     ('shear', ('-s', '--shear-penalty'))):
++    affine.add_option(_grp, _flags, nargs=1, convert=float, default=1.,
++                      help=f'Penalty factor of the {_grp} parameters '
++                           f'(times FACTOR)')
+ affine.add_option('position', ('-p', '--position'), default='sym', nargs=1,
+                   validation=cli.Validations.choice(['sym', 'mov', 'fix']),
+                   help='Position of the affine transform in the model')
+diff --git a/nitorch/tests/test_register_affine_prior.py b/nitorch/tests/test_register_affine_prior.py
+new file mode 100644
+index 00000000..b01438cd
+--- /dev/null
++++ b/nitorch/tests/test_register_affine_prior.py
+@@ -0,0 +1,360 @@
++"""Scaled-identity Gaussian prior on the affine Lie parameters (`@affine FACTOR`).
++
++penalty = 1/2 lambda ||q||^2, gradient lambda q, Hessian lambda I
++(mapped with the Gram matrix M into the `-g` sub-basis)."""
++import torch
++import pytest
++from nitorch import io, spatial
++from nitorch.cli.registration.register import cli as register_cli
++from nitorch.cli.registration.register.parser import parser
++from nitorch.tools.registration import objects
++from nitorch.tools.registration.pairwise_impl import PairwiseRegisterStep
++from nitorch.tests.test_register_symmetric import (
++    make_images, make_sim, make_svf, SHIFT)
++
++dt = torch.double
++IMAGES = ['@loss', 'mse', '@@fix', 'fix.nii', '@@mov', 'mov.nii']
++
++
++def prior_affine(lam, optim=None, basis='affine'):
++    affine = objects.AffineModel(basis, penalty=lam, optim=optim, position='m')
++    affine.set_dat(dim=3, dtype=dt)
++    g = torch.Generator().manual_seed(5)
++    affine.dat.dat.copy_(0.05 * torch.randn([len(affine.dat.dat)], dtype=dt,
++                                            generator=g))
++    return affine
++
++
++@pytest.mark.parametrize('args, expected', [
++    ([], 0.), (['rigid', '3.5'], 3.5), (['affine', '2'], 2.)])
++def test_factor_parsed(args, expected):
++    options = parser.parse(IMAGES + ['@affine'] + args)
++    assert options.affine.factor == [expected]
++
++
++@pytest.mark.parametrize('factor, expected', [(None, None), ('0', None),
++                                              ('7.5', 7.5)])
++def test_factor_reaches_model(tmp_path, monkeypatch, factor, expected):
++    shape = [8, 8, 8]
++    aff = spatial.affine_default(shape)
++    fix, mov = str(tmp_path / 'f.nii.gz'), str(tmp_path / 'm.nii.gz')
++    io.savef(torch.rand(shape), fix, affine=aff)
++    io.savef(torch.rand(shape), mov, affine=aff)
++    seen = {}
++
++    class Stop(Exception):
++        pass
++
++    def fake_run(losses, affine, *a, **k):
++        seen['affine'] = affine
++        raise Stop
++    monkeypatch.setattr(register_cli, 'run', fake_run)
++    args = ['-v', '0', '--cpu', '@loss', 'mse', '@@fix', fix, '@@mov', mov,
++            '@affine', 'rigid'] + ([factor] if factor else [])
++    with pytest.raises(Stop):
++        register_cli._cli(args)
++    assert isinstance(seen['affine'], objects.AffineModel)
++    assert seen['affine'].penalty == expected
++
++
++def test_group_options_parsed():
++    options = parser.parse(IMAGES + ['@affine', 'affine', '2',
++                                     '-t', '5', '-s', '7'])
++    assert options.affine.factor == [2.]
++    assert options.affine.translation == 5.
++    assert options.affine.shear == 7.
++    assert options.affine.rotation == 1.
++    assert options.affine.zoom == 1.
++    options = parser.parse(IMAGES + ['@affine', 'affine', '2'])
++    for g in ('translation', 'rotation', 'zoom', 'shear'):
++        assert getattr(options.affine, g) == 1.
++    options = parser.parse(IMAGES + ['@affine', '--rotation-penalty', '3',
++                                     '--zoom-penalty', '4',
++                                     '--translation-penalty', '1',
++                                     '--shear-penalty', '6'])
++    assert (options.affine.translation, options.affine.rotation,
++            options.affine.zoom, options.affine.shear) == (1., 3., 4., 6.)
++
++
++def _cli_affine(tmp_path, monkeypatch, affine_args):
++    shape = [8, 8, 8]
++    aff = spatial.affine_default(shape)
++    fix, mov = str(tmp_path / 'f.nii.gz'), str(tmp_path / 'm.nii.gz')
++    io.savef(torch.rand(shape), fix, affine=aff)
++    io.savef(torch.rand(shape), mov, affine=aff)
++    seen = {}
++
++    class Stop(Exception):
++        pass
++
++    def fake_run(losses, affine, *a, **k):
++        seen['affine'] = affine
++        raise Stop
++    monkeypatch.setattr(register_cli, 'run', fake_run)
++    args = ['-v', '0', '--cpu', '@loss', 'mse', '@@fix', fix, '@@mov', mov,
++            '@affine'] + affine_args
++    with pytest.raises(Stop):
++        register_cli._cli(args)
++    return seen['affine']
++
++
++@pytest.mark.parametrize('basis, args, values', [
++    # precision = FACTOR x group factor (default 1), as for @nonlin
++    ('affine', ['2', '-r', '3', '-s', '7'], dict(t=2., r=6., z=2., s=14.)),
++    ('affine', ['1', '--translation-penalty', '4', '--zoom-penalty', '6'],
++     dict(t=4., r=1., z=6., s=1.)),
++    ('affine', ['0.5', '-t', '0'], dict(t=0., r=.5, z=.5, s=.5)),
++    ('similitude', ['2', '-z', '9'], dict(t=2., r=2., z=18.)),
++    ('rigid', ['3', '-r', '8'], dict(t=3., r=24.)),
++])
++def test_group_options_reach_model(tmp_path, monkeypatch, basis, args,
++                                   values):
++    model = _cli_affine(tmp_path, monkeypatch, [basis] + args)
++    assert isinstance(model, objects.AffineModel)
++    # model.dat is only allocated by the fit: map the stored penalty to
++    # per-parameter indices on an allocated model of the same basis
++    expected = torch.as_tensor([values[c] for c in GROUPS[3, basis]],
++                               dtype=dt)
++    assert torch.equal(_model(basis, 3, model._penalty).penalty, expected)
++
++
++@pytest.mark.parametrize('args, expected', [
++    ([], None), (['2.5'], 2.5),
++    # FACTOR = 0 (default) means no penalty, whatever the group factors
++    (['-t', '5'], None), (['0', '-r', '3', '-s', '7'], None),
++    # all group factors 1: the scalar FACTOR (lambda I)
++    (['2.5', '-t', '1', '-z', '1'], 2.5),
++])
++def test_no_group_options_unchanged(tmp_path, monkeypatch, args, expected):
++    # without group options the penalty is the scalar FACTOR, as before
++    model = _cli_affine(tmp_path, monkeypatch, ['affine'] + args)
++    assert model.penalty == expected
++    assert isinstance(model.penalty, (float, type(None)))
++
++
++@pytest.mark.parametrize('factor', [0.5, 2., 3.])
++@pytest.mark.parametrize('comp', [0.25, 1., 4.])
++def test_effective_precision_is_factor_times_component(
++        tmp_path, monkeypatch, factor, comp):
++    model = _cli_affine(tmp_path, monkeypatch,
++                        ['affine', str(factor), '-t', str(comp),
++                         '-r', str(2 * comp), '-z', str(3 * comp),
++                         '-s', str(4 * comp)])
++    prec = _model('affine', 3, model._penalty).penalty
++    mult = dict(t=1., r=2., z=3., s=4.)
++    for c, p in zip(GROUPS[3, 'affine'], prec.tolist()):
++        assert p == pytest.approx(factor * comp * mult[c], rel=1e-12)
++
++
++def test_model_penalty_scalar():
++    assert objects.AffineModel('rigid').penalty is None
++    assert objects.AffineModel('rigid', penalty=0).penalty is None
++    a = objects.AffineModel('rigid', penalty=torch.tensor(2.))
++    assert a.penalty == 2. and isinstance(a.penalty, float)
++    assert a.switch_basis('affine').penalty == 2.
++    with pytest.raises(ValueError):
++        objects.AffineModel('rigid', penalty=-1)
++
++
++@pytest.mark.parametrize('optim', [None, 'rigid', 'similitude'])
++def test_penalty_value_grad_hess(optim):
++    fix, mov = make_images([6, 6, 6])
++    lam = 3.
++    affine = prior_affine(lam, optim)
++    step = PairwiseRegisterStep(make_sim(mov, fix, 'fwd'), affine, verbose=0)
++    par = affine.parameters()
++    q = affine.dat.dat.clone()
++    n = len(par)
++    g, h = torch.zeros(n, dtype=dt), torch.zeros(n, n, dtype=dt)
++    val = step._affine_penalty(q, g, h)
++    assert torch.allclose(val, 0.5 * lam * q.dot(q))
++    if optim is None:
++        assert torch.allclose(g, lam * q)
++        assert torch.allclose(h, lam * torch.eye(n, dtype=dt))
++    else:
++        M = par._gram(q)
++        assert torch.allclose(g, M.T @ (lam * q))
++        assert torch.allclose(h, lam * M.T @ M)
++        assert torch.allclose(h, lam * torch.eye(n, dtype=dt))  # orthonormal
++
++
++@pytest.mark.parametrize('optim', [None, 'rigid'])
++@pytest.mark.parametrize('step_name', ['do_affine_only', 'do_affine'])
++def test_objective_vs_fd(optim, step_name):
++    lam = 50.
++    fix, mov = make_images([8, 8, 8])
++    affine = prior_affine(lam, optim)
++    nonlin = make_svf(fix) if step_name == 'do_affine' else None
++    step = PairwiseRegisterStep(make_sim(mov, fix, 'fwd'), affine, nonlin,
++                                verbose=0)
++    fn = getattr(step, step_name)
++    par = affine.parameters()
++    x0 = affine.dat.dat.clone()
++    _, g, _ = fn(x0, grad=True, hess=True, in_line_search=True)
++    M = torch.eye(len(x0), dtype=dt) if optim is None else par._gram(x0)
++    fd = torch.zeros(len(par), dtype=dt)
++    eps = 1e-5
++    for i in range(len(par)):
++        fd[i] = (fn(x0 + eps * M[:, i], in_line_search=True) -
++                 fn(x0 - eps * M[:, i], in_line_search=True)) / (2 * eps)
++    assert (fd - g).norm() / fd.norm() < 1e-4
++    # the prior is counted exactly once in the objective
++    ll = fn(x0, in_line_search=True)
++    affine._penalty = None
++    ll0 = fn(x0, in_line_search=True)
++    assert torch.allclose(ll - ll0, 0.5 * lam * x0.dot(x0))
++
++
++@pytest.mark.parametrize('lam', [None, 0.])
++def test_off_is_bitwise_unchanged(lam):
++    fix, mov = make_images([8, 8, 8])
++    out = []
++    for pen in (lam, 'none'):
++        affine = prior_affine(None if pen == 'none' else pen)
++        assert affine.penalty is None
++        step = PairwiseRegisterStep(make_sim(mov, fix, 'fwd'), affine,
++                                    verbose=0)
++        out.append(step.do_affine_only(affine.dat.dat.clone(), grad=True,
++                                       hess=True, in_line_search=True))
++    for a, b in zip(*out):
++        assert torch.equal(a, b)
++
++
++def test_large_prior_shrinks_estimate(tmp_path):
++    shape = [24, 24, 24]
++    grid = spatial.identity_grid(shape, dtype=dt)
++    center = torch.as_tensor(shape, dtype=dt) / 2
++
++    def blob(shift):
++        x = grid - (center + torch.as_tensor(shift, dtype=dt))
++        x = x / torch.as_tensor([5., 3.5, 4.], dtype=dt)
++        return x.square().sum(-1).neg().exp().float()
++    aff = spatial.affine_default(shape, voxel_size=1.)
++    fix, mov = str(tmp_path / 'fix.nii.gz'), str(tmp_path / 'mov.nii.gz')
++    io.savef(blob([0, 0, 0]), fix, affine=aff)
++    io.savef(blob(SHIFT), mov, affine=aff)
++
++    def shift(factor):
++        lta = str(tmp_path / f'aff{factor}.lta')
++        register_cli._cli(
++            ['-v', '0', '--cpu', '@loss', 'mse',
++             '@@fix', fix, '-o', 'false', '-r', 'false',
++             '@@mov', mov, '-o', 'false', '-r', 'false',
++             '@affine', 'translation', factor, '-o', lta,
++             '@@optim', 'gn', '-n', '50', '@pyramid', '--levels', '1'])
++        t = io.transforms.loadf(lta).reshape([4, 4])[:3, -1]
++        return t.norm().item()
++    t0, t1 = shift('0'), shift('1e6')
++    assert t0 > 0.5 * torch.as_tensor(SHIFT).norm()
++    assert t1 < 0.1 * t0
++
++
++# ---------------------------------------------------------------------
++#   Per-component (diagonal) precision: vector and dict forms
++# ---------------------------------------------------------------------
++
++GROUPS = {
++    (3, 'translation'): 'ttt', (3, 'rotation'): 'rrr', (3, 'rigid'): 'tttrrr',
++    (3, 'similitude'): 'tttrrrz', (3, 'affine'): 'tttrrrzzzsss',
++    (2, 'translation'): 'tt', (2, 'rotation'): 'r', (2, 'rigid'): 'ttr',
++    (2, 'similitude'): 'ttrz', (2, 'affine'): 'ttrzzs',
++}
++PDICT = dict(translation=1., rotation=2., zoom=3., shear=4.)
++PVAL = dict(t=1., r=2., z=3., s=4.)
++
++
++def _model(basis, dim, penalty):
++    if dim == 3:
++        a = objects.AffineModel(basis, penalty=penalty)
++    else:
++        a = objects.Affine2dModel(basis, plane=2,
++                                  ref_affine=torch.eye(4, dtype=dt),
++                                  penalty=penalty)
++    a.set_dat(dim=3, dtype=dt)
++    return a
++
++
++@pytest.mark.parametrize('dim', [2, 3])
++@pytest.mark.parametrize('basis', ['translation', 'rotation', 'rigid',
++                                   'similitude', 'affine'])
++def test_dict_penalty_indices(dim, basis):
++    a = _model(basis, dim, PDICT)
++    expected = torch.as_tensor([PVAL[c] for c in GROUPS[dim, basis]], dtype=dt)
++    assert len(a.dat.dat) == len(expected)
++    assert torch.equal(a.penalty, expected)
++    # short keys and partial dicts (missing groups = 0)
++    a = _model(basis, dim, dict(t=5., sh=7.))
++    expected = torch.as_tensor([{'t': 5., 's': 7.}.get(c, 0.)
++                                for c in GROUPS[dim, basis]], dtype=dt)
++    assert torch.equal(a.penalty, expected)
++    # 's' is a short key for shear
++    a = _model(basis, dim, dict(t=5., s=7.))
++    assert torch.equal(a.penalty, expected)
++
++
++def test_dict_penalty_bad_key():
++    with pytest.raises(ValueError):
++        objects.AffineModel('affine', penalty=dict(foo=1.))
++
++
++def test_vector_penalty():
++    vec = torch.arange(1., 13., dtype=dt)
++    a = _model('affine', 3, vec.tolist())
++    assert torch.equal(a.penalty, vec)
++    # an affine-basis vector, mapped group-wise to similitude and rigid
++    s = a.switch_basis('similitude')
++    assert torch.equal(s.penalty,
++                       torch.as_tensor([1, 2, 3, 4, 5, 6, 8], dtype=dt))
++    r = a.switch_basis('rigid')
++    assert torch.equal(r.penalty, vec[:6])
++    # similitude-basis vector -> affine: iso zoom broadcast, no shear
++    b = _model('affine', 3, [1., 2, 3, 4, 5, 6, 9])
++    assert torch.equal(b.penalty, torch.as_tensor(
++        [1, 2, 3, 4, 5, 6, 9, 9, 9, 0, 0, 0], dtype=dt))
++    with pytest.raises(ValueError):
++        _model('affine', 3, [1., 2.]).penalty
++    with pytest.raises(ValueError):
++        objects.AffineModel('affine', penalty=[1., -1.])
++
++
++def test_penalty_cache_invalidation():
++    a = _model('affine', 3, PDICT)
++    p1 = a.penalty
++    assert a.penalty is p1                       # cached
++    a.penalty = dict(rotation=9.)
++    assert a.penalty is not p1 and a.penalty[3] == 9. and a.penalty[0] == 0.
++    s = a.switch_basis('rigid')
++    assert len(s.penalty) == 6 and len(a.penalty) == 12
++    a.set_dat(dim=3, dtype=torch.float)
++    assert a.penalty.dtype == torch.float
++    a.penalty = 2.
++    assert a.penalty == 2.
++
++
++@pytest.mark.parametrize('optim', [None, 'rigid', 'similitude'])
++@pytest.mark.parametrize('step_name', ['do_affine_only', 'do_affine'])
++def test_objective_vs_fd_nonuniform(optim, step_name):
++    fix, mov = make_images([8, 8, 8])
++    P = torch.linspace(5., 60., 12, dtype=dt)
++    affine = prior_affine(P.tolist(), optim)
++    nonlin = make_svf(fix) if step_name == 'do_affine' else None
++    step = PairwiseRegisterStep(make_sim(mov, fix, 'fwd'), affine, nonlin,
++                                verbose=0)
++    fn = getattr(step, step_name)
++    par = affine.parameters()
++    x0 = affine.dat.dat.clone()
++    _, g, _ = fn(x0, grad=True, hess=True, in_line_search=True)
++    M = torch.eye(len(x0), dtype=dt) if optim is None else par._gram(x0)
++    fd = torch.zeros(len(par), dtype=dt)
++    eps = 1e-5
++    for i in range(len(par)):
++        fd[i] = (fn(x0 + eps * M[:, i], in_line_search=True) -
++                 fn(x0 - eps * M[:, i], in_line_search=True)) / (2 * eps)
++    assert (fd - g).norm() / fd.norm() < 1e-4
++    # exact penalty terms
++    n = len(par)
++    gp, hp = torch.zeros(n, dtype=dt), torch.zeros(n, n, dtype=dt)
++    val = step._affine_penalty(x0, gp, hp)
++    assert torch.allclose(val, 0.5 * (P * x0 * x0).sum())
++    assert torch.allclose(gp, M.T @ (P * x0))
++    assert torch.allclose(hp, M.T @ torch.diag(P) @ M)
+diff --git a/nitorch/tests/test_register_parser.py b/nitorch/tests/test_register_parser.py
+index ecb43f57..9be227d9 100644
+--- a/nitorch/tests/test_register_parser.py
++++ b/nitorch/tests/test_register_parser.py
+@@ -30,3 +30,18 @@ def test_register_mi_rejects_patch_option():
+     # MI has no patch: -p is not offered (it used to be silently dropped)
+     with pytest.raises(Exception):
+         parser.parse(['@loss', 'mi', '-p', '5'] + IMAGES)
++
++
++@pytest.mark.parametrize('args, factor, groups', [
++    # group factors default to 1 (precision = FACTOR), FACTOR to 0 (off)
++    ([], [0.], (1., 1., 1., 1.)),
++    (['3'], [3.], (1., 1., 1., 1.)),
++    (['3', '-t', '2', '--shear-penalty', '0.5'], [3.], (2., 1., 1., .5)),
++    (['3', '--rotation-penalty', '4', '-z', '5'], [3.], (1., 4., 5., 1.)),
++])
++def test_register_affine_penalty_factors(args, factor, groups):
++    options = parser.parse(['@loss', 'mse'] + IMAGES +
++                           ['@affine', 'affine'] + args)
++    assert options.affine.factor == factor
++    assert (options.affine.translation, options.affine.rotation,
++            options.affine.zoom, options.affine.shear) == groups
+diff --git a/nitorch/tools/registration/objects.py b/nitorch/tools/registration/objects.py
+index 52a8a4af..a02436f8 100644
+--- a/nitorch/tools/registration/objects.py
++++ b/nitorch/tools/registration/objects.py
+@@ -2106,6 +2106,70 @@ def propagate_grad(self, g, h, moving, phi, left=None, right=None, inv=False,
+         return g, h, mugrad
+ 
+ 
++_AFFINE_PENALTY_GROUPS = ('translation', 'rotation', 'zoom', 'shear')
++
++
++def _affine_penalty_group(key):
++    """Canonical group name of a dict-penalty key"""
++    k = str(key).lower()
++    if k == 't' or k.startswith('tr'):
++        return 'translation'
++    if k == 'r' or k.startswith('ro'):
++        return 'rotation'
++    if k == 'z' or k.startswith('zo') or k.startswith('sc'):
++        return 'zoom'
++    if k == 's' or k.startswith('sh'):
++        return 'shear'
++    raise ValueError(f'Unknown affine penalty group: {key!r} (expected one '
++                     f'of {_AFFINE_PENALTY_GROUPS})')
++
++
++@functools.lru_cache(maxsize=None)
++def _affine_param_groups(basis, dim):
++    """Group of each parameter of an affine basis, classified from the
++    structure of its Lie generator."""
++    gens = spatial.affine_basis(_affine_group(basis), dim, dtype=torch.double)
++    groups = []
++    for g in gens:
++        lin = g[:-1, :-1]
++        if g[:-1, -1].abs().max() > 0:
++            groups.append('translation')
++        elif (lin + lin.T).abs().max() == 0:
++            groups.append('rotation')
++        elif (lin - lin.diag().diag_embed()).abs().max() == 0:
++            groups.append('zoom')
++        else:
++            groups.append('shear')
++    return tuple(groups)
++
++
++def _affine_penalty_vector(penalty, basis, dim, **backend):
++    """Per-parameter precision vector of an AffineModel penalty"""
++    groups = _affine_param_groups(basis, dim)
++    if isinstance(penalty, dict):
++        return torch.as_tensor([penalty.get(g, 0.) for g in groups], **backend)
++    penalty = torch.as_tensor(penalty, **backend)
++    if len(penalty) == len(groups):
++        return penalty.clone()
++    # given in another basis: identify it from its length
++    for other in ('affine', 'similitude', 'rigid', 'translation', 'rotation'):
++        src = _affine_param_groups(other, dim)
++        if len(src) == len(penalty):
++            break
++    else:
++        raise ValueError(f'Affine penalty of length {len(penalty)} does not '
++                         f'match any {dim}D affine basis')
++    out = torch.zeros(len(groups), **backend)
++    for group in _AFFINE_PENALTY_GROUPS:
++        dst = [i for i, g in enumerate(groups) if g == group]
++        sub = [i for i, g in enumerate(src) if g == group]
++        if not dst or not sub:
++            continue
++        val = penalty[sub]
++        out[dst] = val if len(val) == len(dst) else val.mean()
++    return out
++
++
+ class AffineModel(TransformationModel):
+     """Affine transformation model encoded in a Lie algebra"""
+ 
+@@ -2211,10 +2275,23 @@ def __init__(self, basis, factor=1, penalty=None, optim=None, position='symmetri
+             Affine basis name
+         factor : float, default=1
+             Regularization factor
+-        penalty : float or list[float] or dict(), optional
+-            L2 penalty
+-            If a list, one value per parameters.
+-            If a dict, keys "translation", "rotation", "zoom", "shear"
++        penalty : float or list[float] or dict, optional
++            Precision P of a Gaussian prior N(0, P^-1) on the
++            (orthonormal, model-basis) Lie parameters q, i.e. the
++            penalty 1/2 q' P q. None or 0 means no penalty.
++            - float lambda: P = lambda * I (what `@affine FACTOR` sets).
++            - list: one precision per parameter (diagonal P), in this
++              basis, or in another affine basis (identified by its
++              length) and then mapped group-wise (an isotropic zoom is
++              broadcast; anisotropic zooms are averaged).
++            - dict: one precision per group of parameters, with keys
++              "translation", "rotation", "zoom" and "shear"
++              (or "t", "r", "z", "sh"; "scale" for "zoom").
++              Missing groups have precision 0.
++            The `register` CLI follows the @nonlin convention: the
++            precision of each group is the global FACTOR times the
++            group factor (`-t/-r/-z/-s`, default 1), and is passed here
++            as a float (all group factors 1) or a dict.
+         optim : {'translation', 'rotation', 'rigid', 'similitude', 'affine'}
+             Parameters to optimize.
+         position : {'moving', 'fixed', 'symmetric'}, default='symmetric'
+@@ -2226,8 +2303,7 @@ def __init__(self, basis, factor=1, penalty=None, optim=None, position='symmetri
+             Pre-allocated log-parameters.
+         """
+         self.factor = factor
+-        self._penalty = penalty or None  # regutils.defaults_affine()
+-        self._penalty_list = None
++        self.penalty = penalty
+         self._basis = basis
+         self._optim = optim
+         self.position = position.lower()[0]
+@@ -2242,65 +2318,52 @@ def _truedim(self):
+ 
+     @property
+     def penalty(self):
+-        if not self.dat or self._penalty is None:
++        """Prior precision on the model-basis log-parameters, or None (off).
++
++        A float lambda (precision lambda * I), or a (F,) tensor with one
++        precision per model-basis parameter (diagonal precision), built
++        from a vector or a dict and cached.
++        """
++        if self._penalty is None or isinstance(self._penalty, float):
++            return self._penalty
++        if not self.dat:
+             return None
+-        if self._penalty_list is None:
+-            B = self._basis[0].lower()
+-            D = self._truedim
+-            nb_t = D
+-            nb_r = (D*(D-1))//2
+-            nb_z0 = 1
+-            nb_z1 = D
+-            nb_z = nb_z0 if B == 's' else nb_z1
+-            nb_s = (D*(D-1))//2
+-            nb_p = nb_t
+-            if B != 't':
+-                nb_p += nb_r
+-            if B not in 'tr':
+-                nb_p += nb_z
+-            if B not in 'trs':
+-                nb_p += nb_s
+-            backend = dict(dtype=self.dat.dtype, device=self.dat.device)
+-            penalty = torch.zeros([nb_p], **backend)
+-            if isinstance(self._penalty_list, dict):
+-                for key, val in self._penalty_list.items():
+-                    key = key.lower()[0]
+-                    if key == 't':
+-                        penalty[:nb_t] = val
+-                    elif key == 'r':
+-                        penalty[nb_t:nb_t+nb_r] = val
+-                    elif key == 's':
+-                        penalty[nb_t+nb_r:nb_t+nb_r+nb_z] = val
+-                    elif key == 'a':
+-                        penalty[nb_t+nb_r+nb_z:] = val
+-            else:
+-                penalty0 = torch.as_tensor(self._penalty, **backend)
+-                B0 = ('a' if len(penalty0) == nb_t+nb_r+nb_z1+nb_s else
+-                      's' if len(penalty0) == nb_t+nb_r+nb_z0 else
+-                      'r' if len(penalty0) == nb_t+nb_r else
+-                      't' if len(penalty0) == nb_t else
+-                      '')
+-                if not B0 or B == B0:
+-                    penalty[...] = penalty0
+-                elif B in 'tr':
+-                    N = min(len(penalty), len(penalty0))
+-                    penalty[:N] = penalty0[:N]
+-                else:
+-                    N = min(len(penalty), len(penalty0), nb_t+nb_r)
+-                    penalty[:N] = penalty0[:N]
+-                    if B == 's' and B0 == 'a':
+-                        penalty[nb_t+nb_r] = penalty[nb_t+nb_r:nb_t+nb_r+nb_z1].mean()
+-                    elif B == 'a' and B0 == 's':
+-                        penalty[nb_t+nb_r:nb_t+nb_r+nb_z1] = penalty0[nb_t+nb_r]
+-            self._penalty_list = penalty
+-        return self._penalty_list
++        backend = dict(dtype=self.dat.dtype, device=self.dat.device)
++        key = (self._basis, self._truedim, backend['dtype'], backend['device'])
++        if self._penalty_cache is None or self._penalty_cache[0] != key:
++            vec = _affine_penalty_vector(self._penalty, self._basis,
++                                         self._truedim, **backend)
++            self._penalty_cache = (key, vec)
++        return self._penalty_cache[1]
++
++    @penalty.setter
++    def penalty(self, value):
++        self._penalty_cache = None
++        if value is None:
++            self._penalty = None
++            return
++        if isinstance(value, dict):
++            value = {_affine_penalty_group(k): float(v)
++                     for k, v in value.items()}
++            if any(v < 0 for v in value.values()):
++                raise ValueError('Affine penalty must be non-negative')
++            self._penalty = value if any(value.values()) else None
++            return
++        value = torch.as_tensor(value, dtype=torch.double)
++        if (value < 0).any():
++            raise ValueError('Affine penalty must be non-negative')
++        if value.dim() == 0:
++            self._penalty = float(value) or None
++        else:
++            value = value.flatten()
++            self._penalty = value if value.any() else None
+ 
+     def switch_basis(self, basis):
+         obj = copy.deepcopy(self)
+         if obj.dat:
+             obj.dat = obj.dat.switch_basis(basis)
+         obj._basis = basis
+-        obj._penalty_list = None
++        obj._penalty_cache = None
+         return obj
+ 
+     def set_dat(self, dat=None, dim=None, **backend):
+@@ -2371,7 +2434,7 @@ def __repr__(self):
+         s += [f'factor={self.factor}']
+         s += [f'position={self.position}']
+         if self.penalty is not None:
+-            s += [f'penalty={self.penalty.tolist()}']
++            s += [f'penalty={self._penalty}']
+         s = ', '.join(s)
+         return f'{self.__class__.__name__}({s})'
+ 
+diff --git a/nitorch/tools/registration/pairwise_impl.py b/nitorch/tools/registration/pairwise_impl.py
+index 08a9fd9b..73420787 100644
+--- a/nitorch/tools/registration/pairwise_impl.py
++++ b/nitorch/tools/registration/pairwise_impl.py
+@@ -845,11 +845,13 @@ def _nonlin_penalty(self, vel, grad=None):
+         return 0.5 * vel.flatten().dot(vgrad.flatten())
+ 
+     def _affine_penalty(self, logaff, grad=None, hess=None):
+-        """L2 penalty on the (model-basis) affine log-parameters.
++        """Gaussian prior N(0, P^-1) on the model-basis log-parameters.
+ 
+-        Its gradient (P * q) and Hessian (diag(P)) live in the model
+-        basis; they are mapped to the optimised basis (`-g`) with the
+-        Gram matrix M of `_optim_grad`: M.T (P * q) and M.T diag(P) M.
++        P is diagonal: a scalar lambda (P = lambda I) or a vector of
++        per-parameter precisions. Value: 1/2 q' P q. Its gradient (P q)
++        and Hessian (P) live in the model basis; they are mapped to the
++        optimised basis (`-g`) with the Gram matrix M of `_optim_grad`:
++        M.T (P q) and M.T P M (lambda M.T q and lambda M.T M for a scalar).
+         `grad` and `hess` are updated in place. Returns the value.
+         """
+         if isinstance(logaff, AffineModel.Parameters):
+diff --git a/nitorch/tools/registration/pairwise_makeobj.py b/nitorch/tools/registration/pairwise_makeobj.py
+index 61eb207e..efea6af0 100644
+--- a/nitorch/tools/registration/pairwise_makeobj.py
++++ b/nitorch/tools/registration/pairwise_makeobj.py
+@@ -136,8 +136,10 @@ def make_affine(basis='rigid', position='symmetric', penalty=None, init=None):
+         If 'symmetric', both images are rotated by the transformation and
+         its inverse, towards a mean space; thereby making the model fully
+         symmetric.
+-    penalty : None
+-        Not implemented
++    penalty : float or list[float] or dict, optional
++        Precision of a Gaussian prior on the Lie parameters
++        (see `objects.AffineModel`). A float lambda gives the penalty
++        1/2 lambda ||q||^2. None or 0: no penalty.
+     init : str | MappedAffine | (4, 4) tensor
+         Initial affine
+ 

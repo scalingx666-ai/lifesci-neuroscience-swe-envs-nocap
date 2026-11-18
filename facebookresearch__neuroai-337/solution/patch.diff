@@ -1,0 +1,804 @@
+diff --git a/neuralset-repo/neuralset/dataloader.py b/neuralset-repo/neuralset/dataloader.py
+index edad7e0ab..b20189b59 100644
+--- a/neuralset-repo/neuralset/dataloader.py
++++ b/neuralset-repo/neuralset/dataloader.py
+@@ -30,6 +30,11 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _hashable(value: tp.Any) -> tp.Any:
++    return tuple(value) if isinstance(value, (list, np.ndarray)) else value
++
++
+ T = tp.TypeVar("T", bound="SegmentsMixin")
+ 
+ 
+@@ -103,7 +108,13 @@ def events(self) -> pd.DataFrame:
+         """All of the events spanned by all the segments"""
+         # TODO FIXME why are segments events with both an index AND and Index column
+         # TODO discuss should the trigger event be in events? Probably not
+-        return pd.concat([seg.events for seg in self.segments]).drop_duplicates()
++        events = pd.concat([seg.events for seg in self.segments])
++        # same as drop_duplicates, which fails on unhashable (e.g. list) cells;
++        # indices alone can collide across event stores
++        rows = events.apply(
++            lambda col: col.map(_hashable) if col.dtype == object else col
++        )
++        return events[~rows.duplicated().to_numpy()]
+ 
+     def __len__(self) -> int:
+         return len(self.segments)
+diff --git a/neuralset-repo/neuralset/events/etypes.py b/neuralset-repo/neuralset/events/etypes.py
+index 52d6956c2..abf4785e0 100644
+--- a/neuralset-repo/neuralset/events/etypes.py
++++ b/neuralset-repo/neuralset/events/etypes.py
+@@ -121,7 +121,8 @@ def from_dict(cls: tp.Type[E], row: tp.Any) -> E:
+         kwargs: dict[str, tp.Any] = {}
+         extra = {}
+         for k, v in row.items():
+-            if pd.isna(v):
++            # pd.isna is elementwise on sequences (e.g. ndarray cells from parquet)
++            if not isinstance(v, (list, tuple, np.ndarray)) and pd.isna(v):
+                 continue
+             if k in fs:
+                 kwargs[k] = v
+diff --git a/neuralset-repo/neuralset/events/test_etypes.py b/neuralset-repo/neuralset/events/test_etypes.py
+index 8226ff4e8..ab486efd6 100644
+--- a/neuralset-repo/neuralset/events/test_etypes.py
++++ b/neuralset-repo/neuralset/events/test_etypes.py
+@@ -52,6 +52,15 @@ def test_event_from_dict_with_nan() -> None:
+     assert out["category"] == "verb"
+ 
+ 
++def test_event_from_dict_with_sequences() -> None:
++    # parquet loads list columns back as ndarray cells
++    row: dict[str, tp.Any] = {"type": "Word", "start": 0, "timeline": "t"}
++    row.update(text="hello", a=[1, 2], b=np.array([0.5, 1.5]))
++    word = ns.events.Event.from_dict(row)
++    assert word.extra["a"] == [1, 2]
++    np.testing.assert_array_equal(word.extra["b"], [0.5, 1.5])
++
++
+ def test_sound(tmp_path: Path) -> None:
+     fp = tmp_path / "Sub1" / "Sub2" / "Sub3" / "noise.wav"
+     fp.parent.mkdir(parents=True)
+diff --git a/neuralset-repo/neuralset/extractors/audio.py b/neuralset-repo/neuralset/extractors/audio.py
+index 4f4f7b853..11f2fce76 100644
+--- a/neuralset-repo/neuralset/extractors/audio.py
++++ b/neuralset-repo/neuralset/extractors/audio.py
+@@ -100,9 +100,14 @@ def _get_data(self, events: list[etypes.Event]) -> tp.Iterator[nsbase.TimedArray
+                 wav = event.read()
+                 sfreq = event.frequency
+             elif isinstance(event, etypes.Video):
+-                audio = event.read().audio
+-                wav = torch.tensor(audio.to_soundarray(), dtype=torch.float32)
+-                sfreq = audio.fps
++                clip = event.read()
++                audio = clip.audio
++                if audio is None:  # silent video
++                    sfreq = self._input_frequency
++                    wav = torch.zeros(int(round(clip.duration * sfreq)), 1)
++                else:
++                    wav = torch.tensor(audio.to_soundarray(), dtype=torch.float32)
++                    sfreq = audio.fps
+             else:
+                 raise ValueError(
+                     f"Unsupported event type for Audio extractor: {type(event)}"
+diff --git a/neuralset-repo/neuralset/extractors/image.py b/neuralset-repo/neuralset/extractors/image.py
+index 36147b10c..6e001c040 100644
+--- a/neuralset-repo/neuralset/extractors/image.py
++++ b/neuralset-repo/neuralset/extractors/image.py
+@@ -150,9 +150,16 @@ def _exclude_from_cls_uid(cls) -> list[str]:
+         )
+ 
+     def _exclude_from_cache_uid(self) -> list[str]:
+-        return extractor_base.BaseStatic._exclude_from_cache_uid(
++        excluded = extractor_base.BaseStatic._exclude_from_cache_uid(
+             self
+         ) + hf.HuggingFaceMixin._exclude_from_cache_uid(self)
++        event_types = (
++            (self.event_types,) if isinstance(self.event_types, str) else self.event_types
++        )
++        if "Video" not in event_types:
++            # frequency only sets the frame sampling of videos
++            excluded.append("frequency")
++        return excluded
+ 
+     def _iter_image_latents(
+         self, events: tp.Sequence[etypes.Image], aggregate_layers: bool
+diff --git a/neuralset-repo/neuralset/extractors/neuro.py b/neuralset-repo/neuralset/extractors/neuro.py
+index 5403500f0..c2a1ea9b4 100644
+--- a/neuralset-repo/neuralset/extractors/neuro.py
++++ b/neuralset-repo/neuralset/extractors/neuro.py
+@@ -77,6 +77,17 @@ def _fir_n_samples(sfreq: float, l_freq: float | None, h_freq: float | None) ->
+     return len(mne.filter.create_filter(None, sfreq, l_freq, h_freq, verbose=False))
+ 
+ 
++def _scaler_header(scaler: tp.Any) -> dict[str, np.ndarray | None]:
++    """Fitted per-channel stats, such that ``x = x_scaled * scale + center``."""
++    if scaler is None:
++        return {"scaler_center": None, "scaler_scale": None}
++    center = scaler.center_ if hasattr(scaler, "center_") else scaler.mean_
++    return {
++        "scaler_center": np.asarray(center, dtype=np.float32),
++        "scaler_scale": np.asarray(scaler.scale_, dtype=np.float32),
++    }
++
++
+ @DumpContext.register
+ class MneTimedArray(TimedArray):
+     """TimedArray subclass for MNE data with convenience accessors for channel info.
+@@ -100,11 +111,14 @@ def from_native(cls, raw: mne.io.Raw, start: float | None = None) -> "MneTimedAr
+         if any("," in name for name in raw.ch_names):
+             raise ValueError("Channel names must not contain commas")
+         ch_locs = np.array([ch["loc"] for ch in raw.info["chs"]])
++        dev_head_t = raw.info["dev_head_t"]
+         header: dict[str, tp.Any] = {
+             # comma-sep: 0.18ms init vs 0.73ms for JSON list
+             "ch_names": ",".join(raw.ch_names),
+             "ch_types": ",".join(raw.get_channel_types()),
+             "ch_locs": ch_locs,
++            # stored even when None, to tell apart caches written before this key
++            "dev_head_t": None if dev_head_t is None else np.array(dev_head_t["trans"]),
+             "highpass": raw.info["highpass"],
+             "lowpass": raw.info["lowpass"],
+         }
+@@ -129,8 +143,9 @@ def ch_types(self) -> list[str]:
+     def to_info(self) -> mne.Info:
+         """Reconstruct an ``mne.Info`` from the stored header.
+ 
+-        Includes ch_names, ch_types, sfreq, channel locations, highpass/lowpass.
+-        Rich fields (bads, projs, filter history, …) are not preserved.
++        Includes ch_names, ch_types, sfreq, channel locations, ``dev_head_t``
++        and highpass/lowpass. Rich fields (bads, projs, filter history, …) are
++        not preserved.
+         """
+         info = mne.create_info(
+             self.ch_names, sfreq=float(self.frequency), ch_types=self.ch_types
+@@ -141,6 +156,11 @@ def to_info(self) -> mne.Info:
+         with info._unlock():
+             info["highpass"] = self.header["highpass"]
+             info["lowpass"] = self.header["lowpass"]
++        dev_head_t = self.header.get("dev_head_t")
++        if dev_head_t is not None:
++            info["dev_head_t"] = mne.transforms.Transform(
++                "meg", "head", np.array(dev_head_t, dtype=np.float64)
++            )
+         return info
+ 
+     def to_native(self) -> mne.io.RawArray:
+@@ -241,7 +261,9 @@ class MneRaw(BaseExtractor):
+         Number of CPUs to use for multiprocessing in MNE operations.
+     scaler : {"RobustScaler", "StandardScaler"}, optional
+         Optional scaling strategy to normalize channel data using scikit-learn
+-        scalers.
++        scalers. The fitted stats are cached in the header as ``scaler_center``
++        and ``scaler_scale`` (``x = x_cached * scale + center``; exact only
++        without ``apply_proj``, and before post-load steps like ``scale_factor``).
+     store_dtype : {"float32", "float16"}, default="float32"
+         Cache dtype. Reads always return float32.
+     scale_factor : float, optional
+@@ -365,8 +387,9 @@ def _preprocess_raw(self, raw: mne.io.Raw, event: etypes.MneRaw) -> MneTimedArra
+                 f"Data for {event!r} was recorded with Elekta MaxShield "
+                 "(Internal Active Shielding). These recordings contain "
+                 "compensation signals that corrupt brain data unless removed "
+-                "by SSS/tSSS (MaxFilter). Set allow_maxshield=True on the "
+-                "extractor to proceed anyway."
++                "by SSS/tSSS (MaxFilter). Set apply_sss='maxshield' on "
++                "MegExtractor to remove them, or allow_maxshield=True to proceed "
++                "anyway."
+             )
+         raw = self._pick_channels(raw, self.picks)
+ 
+@@ -395,6 +418,7 @@ def _preprocess_raw(self, raw: mne.io.Raw, event: etypes.MneRaw) -> MneTimedArra
+             raw.load_data()
+             raw = raw.resample(float(self.frequency), n_jobs=self.mne_cpus, verbose=False)
+ 
++        scaler = None
+         if self.scaler is not None:
+             raw.load_data()
+             scaler = getattr(sklearn.preprocessing, self.scaler)()
+@@ -418,7 +442,9 @@ def _preprocess_raw(self, raw: mne.io.Raw, event: etypes.MneRaw) -> MneTimedArra
+                 )
+                 raw._data = np.nan_to_num(raw._data, nan=val, posinf=val, neginf=val)
+ 
+-        return MneTimedArray.from_native(raw)
++        ta = MneTimedArray.from_native(raw)
++        ta.header.update(_scaler_header(scaler))
++        return ta
+ 
+     @infra.apply(
+         item_uid=lambda e: e._splittable_event_uid(),
+@@ -637,10 +663,89 @@ class MegExtractor(MneRaw):
+         resolves ``"meg"`` to the reference channels as well: 300 rather than
+         272 on a CTF-275. Those sit away from the head and measure the room,
+         so pass ``("mag", "grad")`` to get head sensors only on every system.
++    apply_sss : bool or "maxshield", default=False
++        Detect bad channels and apply Maxwell filtering (SSS) before any other
++        preprocessing, on Elekta/MEGIN recordings only: on all of them (True),
++        or only on those made with Internal Active Shielding (MaxShield), which
++        require it ("maxshield"). Recordings from other systems, or already
++        Maxwell-filtered, are left untouched.
++        Fine-calibration and cross-talk files are taken from the BIDS
++        ``acq-calibration`` / ``acq-crosstalk`` siblings of the raw file when
++        present.
++    compensation_grade : int, optional
++        Gradient compensation grade applied before channel selection, on
++        recordings carrying compensation information (CTF); ignored on other
++        systems. It needs the reference channels, which ``("mag", "grad")``
++        picks then drop.
+     """
+ 
+     event_types: tp.Literal["Meg"] = "Meg"
+     picks: str | tuple[str, ...] = pydantic.Field(("meg",), min_length=1)
++    apply_sss: bool | tp.Literal["maxshield"] = False
++    compensation_grade: int | None = None
++
++    def _preprocess_raw(self, raw: mne.io.Raw, event: etypes.MneRaw) -> MneTimedArray:
++        grade = self.compensation_grade
++        # Elekta/KIT report grade 0 without any compensation matrix
++        if grade is not None and raw.info["comps"] and raw.compensation_grade != grade:
++            # lazily, picking out the reference channels would drop the compensation
++            raw.load_data()
++            raw.apply_gradient_compensation(grade, verbose=False)
++        if self._needs_sss(raw):
++            raw = self._maxwell_filter(raw)
++        elif raw.info.get("maxshield", False) and self.allow_maxshield:
++            utils.warn_once(
++                "Processing MaxShield recordings without SSS: their active-shielding "
++                "compensation signals are left in the data. Set apply_sss='maxshield' "
++                "on MegExtractor to remove them."
++            )
++        return super()._preprocess_raw(raw, event)
++
++    def _needs_sss(self, raw: mne.io.Raw) -> bool:
++        info = raw.info
++        if not self.apply_sss:
++            return False
++        # MaxShield recordings are unfiltered by definition (MaxFilter clears the flag)
++        if self.apply_sss == "maxshield":
++            return bool(info.get("maxshield", False))
++        # Elekta/MEGIN Vectorview/TRIUX coils are the 30xx family
++        meg = [
++            ch for ch in info["chs"] if ch["kind"] == mne.io.constants.FIFF.FIFFV_MEG_CH
++        ]
++        if not any(ch["coil_type"] // 1000 == 3 for ch in meg):
++            return False
++        # Skip recordings already Maxwell-filtered (e.g. by MaxFilter at
++        # acquisition), which MNE records in the processing history.
++        if any(p.get("max_info", {}).get("sss_info") for p in info["proc_history"]):
++            return False
++        # Some exports drop the processing history (e.g. LibriBrain), so also
++        # check the data rank: SSS output spans ~80 dimensions out of 306
++        # sensors, while unfiltered data is full rank.
++        picks = mne.pick_types(info, meg=True, exclude="bads")
++        stop = min(raw.n_times, int(10 * info["sfreq"]))
++        if stop <= len(picks):
++            # too few samples to tell a reduced rank from a short chunk
++            return True
++        data = raw.get_data(picks=picks, stop=stop)
++        sv = np.linalg.svd(data - data.mean(1, keepdims=True), compute_uv=False)
++        return int((sv > sv[0] * 1e-6).sum()) > len(picks) // 2
++
++    @staticmethod
++    def _maxwell_filter(raw: mne.io.Raw) -> mne.io.Raw:
++        raw.load_data()
++        cal = ctc = None
++        # raw.filenames is the file actually read, also behind special loaders
++        if raw.filenames and raw.filenames[0] is not None:
++            folder = Path(raw.filenames[0]).parent
++            cal = next(folder.glob("*acq-calibration_meg.dat"), None)
++            ctc = next(folder.glob("*acq-crosstalk_meg.fif"), None)
++        frame = "head" if raw.info["dev_head_t"] is not None else "meg"
++        kwargs: dict[str, tp.Any] = dict(
++            calibration=cal, cross_talk=ctc, coord_frame=frame, verbose=False
++        )
++        noisy, flat = mne.preprocessing.find_bad_channels_maxwell(raw, **kwargs)[:2]
++        raw.info["bads"] = sorted(set(raw.info["bads"]) | set(noisy) | set(flat))
++        return mne.preprocessing.maxwell_filter(raw, **kwargs)
+ 
+ 
+ class EegExtractor(MneRaw):
+@@ -960,11 +1065,13 @@ def _preprocess_spikes(self, event: etypes.Spikes) -> TimedArray:
+         else:
+             raise ValueError(f"Unsupported spike data type: {type(h5py_or_raw)}")
+ 
++        scaler = None
+         if self.scaler is not None:
+-            scaler_cls = getattr(sklearn.preprocessing, self.scaler)()
+-            data = scaler_cls.fit_transform(data.T).T
++            scaler = getattr(sklearn.preprocessing, self.scaler)()
++            data = scaler.fit_transform(data.T).T
+ 
+         header: dict[str, tp.Any] = {"ch_names": ",".join(ch_names)}
++        header.update(_scaler_header(scaler))
+         return TimedArray(data=data, frequency=sfreq, start=event.start, header=header)
+ 
+     @infra.apply(
+@@ -1176,12 +1283,15 @@ def _preprocess_raw(self, raw: mne.io.Raw, event: etypes.MneRaw) -> MneTimedArra
+             raw.load_data()
+             raw = raw.resample(float(self.frequency), n_jobs=self.mne_cpus, verbose=False)
+ 
++        scaler = None
+         if self.scaler is not None:
+             raw.load_data()
+             scaler = getattr(sklearn.preprocessing, self.scaler)()
+             raw._data = scaler.fit_transform(raw._data.T).T
+ 
+-        return MneTimedArray.from_native(raw)
++        ta = MneTimedArray.from_native(raw)
++        ta.header.update(_scaler_header(scaler))
++        return ta
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2390,10 +2500,12 @@ def _get_timed_arrays(
+ class ChannelPositions(BaseStatic):
+     """Channel positions in 2D or 3D, extracted from a Raw object's mne.Info.
+ 
+-    3D positions (``n_spatial_dims=3``) are always returned in MNE's **head coordinate frame**,
+-    which is defined by the LPA, RPA, and nasion fiducial landmarks (origin at the midpoint of
+-    LPA–RPA, x-axis toward RPA, y-axis toward nasion, z-axis upward). This holds regardless of
+-    whether positions come from a named standard montage or from the raw data's channel locations.
++    3D positions (``n_spatial_dims=3``) are returned by default in MNE's **head coordinate
++    frame**, which is defined by the LPA, RPA, and nasion fiducial landmarks (origin at the
++    midpoint of LPA–RPA, x-axis toward RPA, y-axis toward nasion, z-axis upward). This holds
++    regardless of whether positions come from a named standard montage or from the raw data's
++    channel locations. MNE stores MEG sensor locations in the **device** (helmet) frame; they are
++    mapped to the head frame with the recording's ``dev_head_t`` unless ``coord_frame="device"``.
+     See https://mne.tools/stable/documentation/implementation.html#coordinate-systems for details.
+ 
+     Parameters
+@@ -2405,7 +2517,7 @@ class ChannelPositions(BaseStatic):
+         Number of spatial dimensions (i.e. coordinates) to extract for each channel. For
+         `n_spatial_dims=2`, the 2D projection of the channel positions as obtained through
+         `mne.Layout` will be used. For `n_spatial_dims=3`, the 3D positions are extracted from
+-        `mne.Montage` in head coordinate frame.
++        a standard `mne.Montage` or from the recording's channel locations.
+     layout_or_montage_name:
+         Name of the Layout or Montage to use. See `mne.channels.read_layout()` for a list of valid
+         layouts and `mne.channels.get_builtin_montages()` for standard montages. If not provided,
+@@ -2419,12 +2531,26 @@ class ChannelPositions(BaseStatic):
+         of shape (n_channels, n_spatial_dims * 2). If True, `event_types` must be one of
+         Eeg or Ieeg.
+     normalize:
+-        If True, min-max normalize channel positions between 0 and 1 across each dimension. If
+-        False, 2D positions are in arbitrary units given by the mne.Layout projection, while 3D
+-        positions will be in head coordinate frame (approximately in the range [-0.1, 0.1] meters).
++        Normalization of each recording's channel positions, computed over its valid channels.
++        ``"min_max"`` rescales each dimension separately to [0, 1], which distorts the geometry.
++        ``"center_and_scale"`` subtracts the mean position and divides by
++        ``sqrt(n_spatial_dims * mean squared norm)``, as in BrainOmni (arXiv:2505.18185), which
++        preserves the geometry. ``None`` keeps 2D positions in the arbitrary units of the
++        mne.Layout projection and 3D positions in meters (approximately in [-0.1, 0.1]). Booleans
++        are accepted for backward compatibility: ``True`` is ``"min_max"`` and ``False`` is
++        ``None``.
+     factor:
+-        Factor to scale the channel positions by. E.g. set it to 10.0 to get 3D coordinates in
+-        decimeters, which yields values approximately in the range [-1, 1].
++        Factor to scale the channel positions by, after ``normalize``. E.g. set it to 10.0 to get
++        3D coordinates in decimeters, which yields values approximately in the range [-1, 1].
++    coord_frame:
++        Frame of 3D MEG sensor positions (``mag``, ``grad`` and ``ref_meg`` channels read from the
++        recording's channel locations); other channels are always in the head frame. ``"head"``
++        maps MEG sensors to the head frame with each recording's ``dev_head_t`` (positions through
++        the full transform, coil orientations through its rotation), so that they follow the head
++        pose and share the frame of EEG electrodes. Recordings without ``dev_head_t`` stay in the
++        device frame, with a warning, and MEG neuro caches written before neuralset stored
++        ``dev_head_t`` raise an error. ``"device"`` keeps the frame of the MEG helmet, in which a
++        sensor has the same coordinates in every recording of a system, wherever the head sits.
+     """
+ 
+     event_types: tp.Literal["MneRaw", "Meg", "Eeg", "Ieeg"] = "MneRaw"
+@@ -2433,15 +2559,23 @@ class ChannelPositions(BaseStatic):
+     n_spatial_dims: tp.Literal[2, 3] = 2
+     layout_or_montage_name: str | None = None
+     include_ref_eeg: bool = False
+-    normalize: bool = True
++    normalize: tp.Literal["min_max", "center_and_scale"] | None = "min_max"
+     factor: float = 1.0
++    coord_frame: tp.Literal["head", "device"] = "head"
+ 
+     _neuro: MneRaw = pydantic.PrivateAttr()
+ 
+     # Value to use for channels that are not found in the layout
+     INVALID_VALUE: tp.ClassVar[float] = -0.1
+ 
+-    infra: MapInfra = MapInfra()
++    infra: MapInfra = MapInfra(version="1")
++
++    @pydantic.field_validator("normalize", mode="before")
++    @classmethod
++    def _normalize_from_bool(cls, value: tp.Any) -> tp.Any:
++        if isinstance(value, bool):
++            return "min_max" if value else None
++        return value
+ 
+     def model_post_init(self, log__: tp.Any) -> None:
+         super().model_post_init(log__)
+@@ -2499,12 +2633,48 @@ def _get_layout_positions(self, ta: MneTimedArray) -> dict[str, list[float]]:
+         mapping = {name: pos[:2].tolist() for name, pos in zip(layout.names, layout.pos)}
+         return mapping
+ 
+-    def _get_positions_from_ch_locs(self, ta: MneTimedArray) -> dict[str, list[float]]:
++    def _get_ch_locs(self, ta: MneTimedArray) -> np.ndarray:
++        """Channel ``loc`` arrays of a cached recording, of shape ``(n_channels, 12)``, with MEG
++        sensors in the frame set by ``coord_frame``."""
++        ch_locs = np.array(ta.header["ch_locs"], dtype=np.float64)
++        if self.coord_frame == "device":
++            return ch_locs
++        # MNE stores the loc of MEG sensors in the device frame, and that of other
++        # channels in the head frame; [0, 0, 0] positions are unknown
++        moved = np.isin(ta.ch_types, ("mag", "grad", "ref_meg"))
++        moved &= ~np.all(ch_locs[:, :3] == 0, axis=1)
++        if not moved.any():
++            return ch_locs
++        if "dev_head_t" not in ta.header:
++            raise ValueError(
++                "The cached header of this MEG recording has no dev_head_t, likely "
++                "because it was written before neuralset stored it, so its sensors "
++                "cannot be mapped to the head frame. Recompute the neuro extractor "
++                "cache (e.g. by changing its infra.version), or set "
++                'coord_frame="device".'
++            )
++        if ta.header["dev_head_t"] is None:
++            utils.warn_once(
++                "MEG recording without dev_head_t: its sensor locations stay in the "
++                "device frame."
++            )
++            return ch_locs
++        trans = np.array(ta.header["dev_head_t"], dtype=np.float64)
++        ch_locs[moved, :3] = mne.transforms.apply_trans(trans, ch_locs[moved, :3])
++        ch_locs[moved, 3:] = mne.transforms.apply_trans(
++            trans, ch_locs[moved, 3:].reshape(-1, 3), move=False
++        ).reshape(-1, 9)
++        return ch_locs
++
++    def _get_positions_from_ch_locs(
++        self, ta: MneTimedArray, ch_locs: np.ndarray | None = None
++    ) -> dict[str, list[float]]:
+         """Extract 3D channel positions from cached ch_locs, filtering out zero positions."""
+-        ch_locs: np.ndarray = ta.header["ch_locs"]
++        if ch_locs is None:
++            ch_locs = self._get_ch_locs(ta)
+         mapping: dict[str, list[float]] = {}
+         for i, name in enumerate(ta.ch_names):
+-            loc = np.asarray(ch_locs[i, :3])
++            loc = ch_locs[i, :3]
+             # [0, 0, 0] means the position is unknown. This shouldn't happen for
+             # MEG sensors or when ch_locs are properly set, but we filter
+             # defensively for robustness.
+@@ -2517,7 +2687,9 @@ def _get_positions_from_ch_locs(self, ta: MneTimedArray) -> dict[str, list[float
+             )
+         return mapping
+ 
+-    def _get_montage_positions(self, ta: MneTimedArray) -> dict[str, list[float]]:
++    def _get_montage_positions(
++        self, ta: MneTimedArray, ch_locs: np.ndarray | None = None
++    ) -> dict[str, list[float]]:
+         if self.layout_or_montage_name is not None:
+             montage = mne.channels.make_standard_montage(self.layout_or_montage_name)
+             native_head_t = mne.channels.compute_native_head_t(montage)
+@@ -2535,11 +2707,20 @@ def _get_montage_positions(self, ta: MneTimedArray) -> dict[str, list[float]]:
+                     "Please check the montage name."
+                 )
+             return mapping
+-        return self._get_positions_from_ch_locs(ta)
++        return self._get_positions_from_ch_locs(ta, ch_locs)
+ 
+-    def _compute_positions(self, ta: MneTimedArray) -> torch.Tensor:
++    def _compute_positions(
++        self, ta: MneTimedArray, ch_locs: np.ndarray | None = None
++    ) -> torch.Tensor:
+         """Get scaled channel positions from a cached MneTimedArray.
+ 
++        Parameters
++        ----------
++        ta :
++            Cached recording.
++        ch_locs :
++            Output of ``self._get_ch_locs(ta)``, computed if not provided.
++
+         Returns
+         -------
+         torch.Tensor :
+@@ -2554,9 +2735,9 @@ def _compute_positions(self, ta: MneTimedArray) -> torch.Tensor:
+             pos_mapping = self._get_layout_positions(ta)
+         elif self.n_spatial_dims == 3:
+             if is_meg:
+-                pos_mapping = self._get_positions_from_ch_locs(ta)
++                pos_mapping = self._get_positions_from_ch_locs(ta, ch_locs)
+             else:
+-                pos_mapping = self._get_montage_positions(ta)
++                pos_mapping = self._get_montage_positions(ta, ch_locs)
+ 
+         ta_ch_names = ta.ch_names
+         ch_names: list[str] = []
+@@ -2596,13 +2777,18 @@ def _compute_positions(self, ta: MneTimedArray) -> torch.Tensor:
+             ]
+         )
+ 
+-        if self.normalize:
++        if self.normalize == "min_max":
+             ptp = np.nanmax(positions, axis=0, keepdims=True) - np.nanmin(
+                 positions, axis=0, keepdims=True
+             )
+             if (ptp == 0.0).any():
+                 ptp[ptp == 0.0] = 1.0
+             positions = (positions - np.nanmin(positions, axis=0, keepdims=True)) / ptp
++        elif self.normalize == "center_and_scale":
++            valid = ~np.isnan(positions).any(axis=1)
++            positions -= positions[valid].mean(axis=0)
++            sq_norm = (positions[valid] ** 2).sum(axis=1).mean()
++            positions /= np.sqrt(self.n_spatial_dims * sq_norm)
+ 
+         positions *= self.factor
+         positions = np.nan_to_num(positions, nan=self.INVALID_VALUE)
+diff --git a/neuralset-repo/neuralset/extractors/test_image.py b/neuralset-repo/neuralset/extractors/test_image.py
+index 9c80a44e2..6ec03063b 100644
+--- a/neuralset-repo/neuralset/extractors/test_image.py
++++ b/neuralset-repo/neuralset/extractors/test_image.py
+@@ -89,7 +89,6 @@ def test_image(tmp_path: Path) -> None:
+         "token_aggregation",
+         "layers",
+         "layer_aggregation",
+-        "frequency",
+         "pretrained",
+         "dtype",
+         "cache_n_layers",
+diff --git a/neuralset-repo/neuralset/extractors/test_neuro.py b/neuralset-repo/neuralset/extractors/test_neuro.py
+index 0bd2ca3d6..291bbfa7d 100644
+--- a/neuralset-repo/neuralset/extractors/test_neuro.py
++++ b/neuralset-repo/neuralset/extractors/test_neuro.py
+@@ -855,6 +855,8 @@ def test_base_meg(tmp_path: Path) -> None:
+         "infra",  # for version
+         "fill_non_finite",
+         "store_dtype",
++        "apply_sss",
++        "compensation_grade",
+     }
+ 
+ 
+@@ -908,7 +910,7 @@ def test_epoch_correct(apply_proj: bool) -> None:
+ 
+ 
+ @pytest.mark.parametrize("n_spatial_dims", [3])
+-@pytest.mark.parametrize("normalize", [True, False])
++@pytest.mark.parametrize("normalize", ["min_max", "center_and_scale", None])
+ @pytest.mark.parametrize(
+     "factor",
+     [
+@@ -917,7 +919,7 @@ def test_epoch_correct(apply_proj: bool) -> None:
+     ],
+ )
+ def test_channel_positions_meg(
+-    test_data_path: Path, n_spatial_dims, normalize: bool, factor: float
++    test_data_path: Path, n_spatial_dims, normalize: tp.Any, factor: float
+ ) -> None:
+     # Create and prepare Meg extractors
+     meg = ns.extractors.MegExtractor(offset=1, picks="all")
+@@ -949,7 +951,7 @@ def test_channel_positions_meg(
+ 
+ 
+ @pytest.mark.parametrize("n_spatial_dims", [2, 3])
+-@pytest.mark.parametrize("normalize", [True, False])
++@pytest.mark.parametrize("normalize", ["min_max", "center_and_scale", None])
+ def test_channel_positions_eeg(test_data_path: Path, n_spatial_dims, normalize) -> None:
+     eeg = ns.extractors.EegExtractor()
+     events = ns.Study(
+@@ -1024,7 +1026,7 @@ def test_channel_positions_original_order_across_channel_sets() -> None:
+         neuro=eeg,
+         layout_or_montage_name=None,
+         n_spatial_dims=3,
+-        normalize=False,
++        normalize=None,
+     )
+ 
+     positions = positions_extractor._compute_positions(ta)
+@@ -1100,7 +1102,7 @@ def test_channel_positions_ieeg(test_data_path: Path) -> None:
+         event_types="Ieeg",
+         layout_or_montage_name=None,
+         n_spatial_dims=3,
+-        normalize=False,
++        normalize=None,
+     )
+     ch_pos.prepare(events)
+ 
+@@ -1198,6 +1200,7 @@ def test_mne_timed_array_cache_roundtrip(tmp_path: Path) -> None:
+                     shape: [2, 12]
+                     dtype: float64
+                     "#type": MemmapArray
++                dev_head_t: null
+     """
+     )
+     assert entry == expected, f"Structure mismatch:\n{json.dumps(entry, indent=2)}"
+@@ -1321,7 +1324,7 @@ def test_channel_positions_head_frame(montage_name: str) -> None:
+         neuro=eeg,
+         layout_or_montage_name=montage_name,
+         n_spatial_dims=3,
+-        normalize=False,
++        normalize=None,
+     )
+     pos_named = named._get_montage_positions(ta)
+ 
+@@ -1329,7 +1332,7 @@ def test_channel_positions_head_frame(montage_name: str) -> None:
+         neuro=eeg,
+         layout_or_montage_name=None,
+         n_spatial_dims=3,
+-        normalize=False,
++        normalize=None,
+     )
+     pos_fallback = fallback._get_montage_positions(ta)
+ 
+@@ -1344,6 +1347,77 @@ def test_channel_positions_head_frame(montage_name: str) -> None:
+         )
+ 
+ 
++def _meg_timed_array(dev_head_t: np.ndarray | None) -> tuple[MneTimedArray, np.ndarray]:
++    """Two MEG sensors with a full loc, and a misc channel of unknown position."""
++    ch_types = ["mag", "grad", "misc"]
++    info = mne.create_info(["MEG 0111", "MEG 0112", "MISC 001"], 100.0, ch_types)
++    locs = np.random.RandomState(0).randn(3, 12) * 0.05
++    locs[2] = 0.0
++    for ch, loc in zip(info["chs"], locs):
++        ch["loc"][:] = loc
++    if dev_head_t is not None:
++        info["dev_head_t"] = mne.transforms.Transform("meg", "head", dev_head_t)
++    raw = mne.io.RawArray(np.zeros((3, 10)), info, verbose=False)
++    return MneTimedArray.from_native(raw), locs
++
++
++def test_meg_channel_positions(tmp_path: Path) -> None:
++    """Sensor features follow dev_head_t in the head frame, and dev_head_t survives caching."""
++    from exca.cachedict import DumpContext
++
++    trans = mne.transforms.rotation(x=0.3, y=-0.2, z=0.4) @ mne.transforms.translation(
++        x=0.004, y=0.017, z=0.051
++    )
++    ta, locs = _meg_timed_array(trans)
++    ctx = DumpContext(tmp_path)
++    with ctx:
++        dumped = ctx.dump_entry("meg", ta)
++    ta = ctx.load(dumped["content"])
++    np.testing.assert_allclose(ta.to_info()["dev_head_t"]["trans"], trans)
++
++    from mne._fiff.tag import (  # type: ignore[import-untyped]
++        _coil_trans_to_loc,
++        _loc_to_coil_trans,
++    )
++
++    head_locs = locs.copy()
++    for i in range(2):
++        head_locs[i] = _coil_trans_to_loc(trans @ _loc_to_coil_trans(locs[i]))
++    frames: dict[tp.Literal["device", "head"], np.ndarray] = {
++        "device": locs,
++        "head": head_locs,
++    }
++    for coord_frame, expected in frames.items():
++        kwargs: dict[str, tp.Any] = dict(
++            neuro=ns.extractors.MegExtractor(), normalize=None, coord_frame=coord_frame
++        )
++        positions = ns.extractors.ChannelPositions(n_spatial_dims=3, **kwargs)
++        np.testing.assert_allclose(
++            positions._compute_positions(ta)[:2], expected[:2, :3], rtol=1e-6
++        )
++
++
++def test_channel_positions_without_dev_head_t(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Without dev_head_t, sensors stay in the device frame; caches predating it raise."""
++    monkeypatch.setattr("neuralset.utils.ISSUED_WARNINGS", set())
++    ta, _ = _meg_timed_array(None)
++    neuro = ns.extractors.MegExtractor()
++    device = ns.extractors.ChannelPositions(
++        neuro=neuro, n_spatial_dims=3, coord_frame="device"
++    )
++    head = ns.extractors.ChannelPositions(neuro=neuro, n_spatial_dims=3)
++    expected = device._compute_positions(ta)
++    with pytest.warns(UserWarning, match="without dev_head_t"):
++        torch.testing.assert_close(head._compute_positions(ta), expected)
++
++    del ta.header["dev_head_t"]
++    torch.testing.assert_close(device._compute_positions(ta), expected)
++    with pytest.raises(ValueError, match="no dev_head_t"):
++        head._compute_positions(ta)
++
++
+ def test_meg_borders(test_data_path: Path, tmp_path: Path) -> None:
+     cache_path = tmp_path / "cache"
+     # test from study
+@@ -1409,6 +1483,29 @@ def test_scaled_meg(
+     assert torch.allclose(scaled_X1, scaled_X2, atol=1e-12)
+ 
+ 
++def test_scaler_stats_in_header(test_data_path: Path, tmp_path: Path) -> None:
++    events = ns.Study(name="Test2023Meg", path=test_data_path, query="timeline_index<1")
++    event = etypes.Meg.from_dict(events.run().query('type=="Meg"').iloc[0])
++    tas = {}
++    for scaler in (None, "RobustScaler"):
++        infra: tp.Any = {"folder": tmp_path / str(scaler), "cluster": None}
++        extractor = ns.extractors.MegExtractor(
++            frequency=100.0, scaler=scaler, infra=infra
++        )
++        next(extractor._get_data([event]))  # writes the cache
++        tas[scaler] = next(extractor._get_data([event]))  # reads it back
++    assert tas[None].header["scaler_scale"] is None
++    assert tas[None].header["scaler_center"] is None
++    header = tas["RobustScaler"].header
++    scale = np.asarray(header["scaler_scale"])[:, None]
++    center = np.asarray(header["scaler_center"])[:, None]
++    unscaled = np.asarray(tas["RobustScaler"].data) * scale + center
++    expected = np.asarray(tas[None].data)
++    np.testing.assert_allclose(
++        unscaled, expected, rtol=1e-4, atol=np.abs(expected).max() * 1e-5
++    )
++
++
+ def test_first_samp() -> None:
+     events = ns.Study(name="Mne2013Sample", path=ns.CACHE_FOLDER).run()
+     meg_event = ns.events.Event.from_dict(events.loc[events.type == "Meg"].iloc[0])
+@@ -1419,6 +1516,62 @@ def test_first_samp() -> None:
+     assert extractor(meg_event, 43, 1).norm()
+ 
+ 
++def test_meg_apply_sss() -> None:
++    assert "apply_sss" not in ns.extractors.MegExtractor().infra.uid()
++    events = ns.Study(name="Mne2013Sample", path=ns.CACHE_FOLDER).run()
++    meg_event = etypes.Meg.from_dict(events.loc[events.type == "Meg"].iloc[0])
++    extractor = ns.extractors.MegExtractor(apply_sss=True, picks=("mag", "grad"))
++    raw = meg_event.read().crop(0, 20).load_data()
++    assert extractor._needs_sss(raw)
++    data = extractor._preprocess_raw(raw, meg_event).data
++    sv = np.linalg.svd(data - data.mean(1, keepdims=True), compute_uv=False)
++    assert (sv > sv[0] * 1e-6).sum() < 100 < data.shape[0]
++    filtered = mne.io.RawArray(data, raw.copy().pick(("mag", "grad")).info)
++    assert not extractor._needs_sss(filtered)
++
++
++def test_meg_compensation_grade(tmp_path: Path) -> None:
++    # CTF-like recording stored at grade 0, with a grade-3 compensation matrix
++    rng = np.random.default_rng(0)
++    n_meg, n_ref, sfreq = 4, 2, 100.0
++    names = [f"M{i}" for i in range(n_meg)] + [f"R{i}" for i in range(n_ref)]
++    info = mne.create_info(names, sfreq, ["mag"] * n_meg + ["ref_meg"] * n_ref)
++    weights = rng.normal(size=(n_meg, n_ref))
++    with info._unlock():
++        for ch in info["chs"]:
++            ch["coil_type"] = (
++                mne.io.constants.FIFF.FIFFV_COIL_CTF_GRAD
++                if ch["kind"] == mne.io.constants.FIFF.FIFFV_MEG_CH
++                else mne.io.constants.FIFF.FIFFV_COIL_CTF_REF_GRAD
++            )
++        comp_data = dict(nrow=n_meg, ncol=n_ref, data=weights)
++        comp_data.update(row_names=names[:n_meg], col_names=names[n_meg:])
++        info["comps"] = [
++            dict(
++                ctfkind=3,
++                kind=3,
++                save_calibrated=False,
++                rowcals=np.ones(n_meg),
++                colcals=np.ones(n_ref),
++                data=comp_data,
++            )
++        ]
++    data = rng.normal(size=(n_meg + n_ref, 1000))
++    fname = tmp_path / "ctf_raw.fif"
++    mne.io.RawArray(data, info).save(fname)
++    event = tp.cast(etypes.MneRaw, SimpleNamespace(frequency=sfreq))
++
++    def preprocess(**kwargs: tp.Any) -> np.ndarray:
++        extractor = ns.extractors.MegExtractor(picks=("mag", "grad"), **kwargs)
++        # not preloaded: picks would drop a lazily applied compensation
++        raw = mne.io.read_raw_fif(fname, verbose=False)
++        return extractor._preprocess_raw(raw, event).data
++
++    compensated = data[:n_meg] - weights @ data[n_meg:]
++    np.testing.assert_allclose(preprocess(compensation_grade=3), compensated, rtol=1e-4)
++    np.testing.assert_allclose(preprocess(), data[:n_meg], rtol=1e-4)
++
++
+ def test_fast_event() -> None:
+     events = ns.Study(name="Mne2013Sample", path=ns.CACHE_FOLDER).run()
+     meg_event = ns.events.Event.from_dict(events.loc[events.type == "Meg"].iloc[0])

@@ -1,0 +1,1323 @@
+diff --git a/nimare/meta/cbmr/contrasts.py b/nimare/meta/cbmr/contrasts.py
+index de6776c23..97a928cb6 100644
+--- a/nimare/meta/cbmr/contrasts.py
++++ b/nimare/meta/cbmr/contrasts.py
+@@ -73,6 +73,10 @@ def _level_index(bound_design):
+     """
+     names, term_of, seen = [], {}, {}
+     for block in bound_design.blocks:
++        if block.term.exposure:
++            # An exposure owns no coefficient, so it contributes no level to write a hypothesis
++            # over. Naming one is caught by build_contrast, which can say so specifically.
++            continue
+         for level in block.level_names:
+             if level in term_of:
+                 raise ContrastError(
+@@ -119,6 +123,30 @@ def _derive_label(statements):
+     return ";".join(s.replace(" ", "") for s in statements)
+ 
+ 
++def _reject_exposure_references(bound_design, statements):
++    """Say so plainly when a hypothesis names the exposure, rather than "unknown coefficient"."""
++    exposure_names = {
++        level
++        for block in bound_design.blocks
++        if block.term.exposure
++        for level in (block.level_names + (block.term.expr, str(block.term)))
++    }
++    if not exposure_names:
++        return
++    for statement in statements:
++        for token in _REFERENCE.findall(str(statement)):
++            if token in exposure_names:
++                term = next(b.term for b in bound_design.blocks if b.term.exposure)
++                raise ContrastError(
++                    f"{token!r} is the exposure {term}, which has no coefficient to test. Its "
++                    "value is fixed at 1 by construction rather than estimated, so there is no "
++                    "hypothesis to state about it. What the exposure changes is what every "
++                    "*other* term means: each spatial term is a distribution over voxels rather "
++                    "than a rate, so a contrast between them compares where foci fall rather "
++                    "than how many."
++                )
++
++
+ def build_contrast(bound_design, hypotheses):
+     """Translate hypotheses into a contrast over one term's coefficients.
+ 
+@@ -131,6 +159,7 @@ def build_contrast(bound_design, hypotheses):
+         raise ContrastError("No hypotheses given.")
+ 
+     names, term_of, aliases = _level_index(bound_design)
++    _reject_exposure_references(bound_design, statements)
+     canonical = [_canonicalize(str(s), names, aliases) for s in statements]
+ 
+     try:
+diff --git a/nimare/meta/cbmr/covariance.py b/nimare/meta/cbmr/covariance.py
+index c02707d62..283a10f25 100644
+--- a/nimare/meta/cbmr/covariance.py
++++ b/nimare/meta/cbmr/covariance.py
+@@ -66,16 +66,18 @@ def _validate(meat, correction):
+ 
+ 
+ def _fitted_pieces(model, foci):
+-    """Return residuals, fitted means, and the design's structural blocks."""
++    """Return residuals, fitted means, and the design's structural blocks.
++
++    The mean carries the exposure; the score contributions below do not gain a term for it,
++    because an exposure owns no coefficient and so contributes no score of its own. What it does
++    change is every *other* term's residual, which is why it belongs here rather than being
++    applied by each caller.
++    """
+     predictor = model.predictor
+     counts = _as_dense_array(foci)
+ 
+     spatial_coef, global_coef = model.unpack(model.coefficients.detach())
+-    log_intensity = predictor.log_intensity_by_pattern(spatial_coef).detach().cpu().numpy()
+-    moderator = predictor.moderator_effect(global_coef).detach().cpu().numpy()
+-
+-    eta = log_intensity[predictor.patterns.assignment] + moderator[:, None]
+-    mean = np.exp(eta)
++    mean = predictor.fitted_mean(spatial_coef, global_coef).detach().cpu().numpy()
+     return counts - mean, mean, predictor.spatial_block, predictor.global_block, predictor.bases
+ 
+ 
+@@ -209,6 +211,8 @@ def sandwich_covariance(model, foci, meat="cluster", correction="hc1", ridge=0.0
+             )
+         meat_matrix = meat_matrix * (n_observations / (n_observations - n_parameters))
+ 
++    _warn_if_meat_is_rank_deficient(model, meat_matrix, meat_kind)
++
+     bread = model.information_matrix(foci)
+     if ridge:
+         bread = bread + ridge * np.eye(n_parameters)
+@@ -216,6 +220,38 @@ def sandwich_covariance(model, foci, meat="cluster", correction="hc1", ridge=0.0
+     return bread_inverse @ meat_matrix @ bread_inverse
+ 
+ 
++def _warn_if_meat_is_rank_deficient(model, meat_matrix, meat_kind):
++    """Warn when the meat is singular, which an exposure makes it by construction.
++
++    Under ``exposure()`` each experiment's fitted total equals its observed total, so its
++    residuals sum to zero and its cluster score is orthogonal to the constant direction of its
++    spatial pattern -- one null direction per pattern. That is the conditional model behaving
++    correctly rather than a fault: the variance of a quantity that has been conditioned on really
++    is zero. It is still worth saying out loud, because the resulting standard errors are much
++    smaller than the unconditional ones and the difference is a change of estimand, not a gain in
++    precision.
++    """
++    eigenvalues = np.linalg.eigvalsh(meat_matrix)
++    largest = eigenvalues.max()
++    if largest <= 0:
++        return
++    deficient = int(np.sum(eigenvalues <= largest * 1e-10))
++    if not deficient:
++        return
++    detail = (
++        " This is expected under exposure(): conditioning on each experiment's total leaves its "
++        "residuals summing to zero, so each spatial pattern loses one direction. Standard errors "
++        "are for the conditional model -- where foci fall, given how many -- and are not "
++        "comparable with those from a fit without the exposure."
++        if model.predictor.has_exposure
++        else " Standard errors along those directions rest on the bread alone."
++    )
++    LGR.warning(
++        f"The {meat_kind} meat matrix is rank deficient in {deficient} of "
++        f"{meat_matrix.shape[0]} directions.{detail}"
++    )
++
++
+ # The information matrix's spatial block is ``sum_p L_pc L_pc' (B^T Sigma_p B)``, so the factor
+ # ``L_pc L_pc'`` decides which entries can be nonzero. That depends on the design, not on the
+ # distribution. The routines below exploit it; each is proved at
+diff --git a/nimare/meta/cbmr/distributions.py b/nimare/meta/cbmr/distributions.py
+index 38c14b431..171a9e9af 100644
+--- a/nimare/meta/cbmr/distributions.py
++++ b/nimare/meta/cbmr/distributions.py
+@@ -69,6 +69,16 @@ def check_design(self, predictor):
+         """Raise if this distribution cannot be used with ``predictor``'s design."""
+         if not self.requires_shared_patterns:
+             return
++        if any(block.term.is_derived_exposure for block in predictor.design.blocks):
++            raise DistributionError(
++                f"{self.name} estimates how much each experiment's total count varies beyond "
++                "Poisson, and exposure() fits every total exactly, so there is no such variation "
++                "left: the overdispersion is driven to zero and the fit does not converge. The "
++                "two say the same thing by different means -- conditioning on the totals already "
++                "removes what the overdispersion was there to absorb. Use Poisson with "
++                "exposure(), or drop exposure() and keep this distribution. An exposure of your "
++                "own, exposure(some_column), does not have this problem and is not refused."
++            )
+         counts = np.bincount(
+             predictor.patterns.assignment, minlength=predictor.patterns.n_patterns
+         )
+@@ -97,12 +107,19 @@ def _pattern_slices(predictor):
+ 
+ 
+ def _pattern_quantities(predictor, spatial_coef, global_coef, foci):
+-    """Return the per-pattern pieces the marginal likelihoods are written in terms of."""
++    """Return the per-pattern pieces the marginal likelihoods are written in terms of.
++
++    ``weight`` is ``E_i exp(m_i)``, which is what multiplies a pattern's spatial intensity to
++    give an experiment's mean. ``moderator`` is ``m_i`` alone, needed separately for the
++    ``sum_i y_i. m_i`` term: its exposure counterpart ``sum_i y_i. log E_i`` is parameter-free
++    and deliberately never formed.
++    """
+     log_intensity = predictor.log_intensity_by_pattern(spatial_coef)
+     moderator = predictor.moderator_effect(global_coef).to(spatial_coef.dtype)
++    weight = predictor.experiment_weights(global_coef, spatial_coef.dtype)
+     foci_per_voxel = _as_tensor(predictor.patterns.marginal_by_pattern(foci), spatial_coef.dtype)
+     foci_per_experiment = _as_tensor(experiment_totals(foci), spatial_coef.dtype)
+-    return log_intensity, moderator, foci_per_voxel, foci_per_experiment
++    return log_intensity, moderator, weight, foci_per_voxel, foci_per_experiment
+ 
+ 
+ class Poisson(Distribution):
+@@ -162,19 +179,21 @@ class NegativeBinomial(_OverdispersedDistribution):
+ 
+     def log_likelihood(self, predictor, spatial_coef, global_coef, nuisance, foci):
+         """Return the moment-matched negative-binomial log-likelihood."""
+-        log_intensity, moderator, foci_per_voxel, _ = _pattern_quantities(
++        log_intensity, _, weight, foci_per_voxel, _ = _pattern_quantities(
+             predictor, spatial_coef, global_coef, foci
+         )
+         total = torch.zeros((), dtype=spatial_coef.dtype)
+         for pattern, members in enumerate(_pattern_slices(predictor)):
+             overdispersion = nuisance[pattern]
+             intensity = torch.exp(log_intensity[pattern])
+-            moderator_effect = torch.exp(moderator[members])
++            member_weight = weight[members]
+             counts = foci_per_voxel[pattern]
+ 
+             # Parameters of the single NB variable matching the first two moments of the sum.
+-            moderator_sum = torch.sum(moderator_effect)
+-            moderator_square_sum = torch.sum(moderator_effect**2)
++            # Both moments carry the exposure, the second one squared, so this is not a single
++            # weighting of an unexposed quantity.
++            moderator_sum = torch.sum(member_weight)
++            moderator_square_sum = torch.sum(member_weight**2)
+             r = moderator_sum**2 / (overdispersion * moderator_square_sum)
+             p = 1 / (1 + moderator_sum / (overdispersion * intensity * moderator_square_sum))
+ 
+@@ -200,8 +219,8 @@ class ClusteredNegativeBinomial(_OverdispersedDistribution):
+ 
+     def log_likelihood(self, predictor, spatial_coef, global_coef, nuisance, foci):
+         """Return the clustered negative-binomial log-likelihood."""
+-        log_intensity, moderator, foci_per_voxel, foci_per_experiment = _pattern_quantities(
+-            predictor, spatial_coef, global_coef, foci
++        log_intensity, moderator, weight, foci_per_voxel, foci_per_experiment = (
++            _pattern_quantities(predictor, spatial_coef, global_coef, foci)
+         )
+         total = torch.zeros((), dtype=spatial_coef.dtype)
+         for pattern, members in enumerate(_pattern_slices(predictor)):
+@@ -209,7 +228,7 @@ def log_likelihood(self, predictor, spatial_coef, global_coef, nuisance, foci):
+             intensity_sum = torch.sum(torch.exp(log_intensity[pattern]))
+             member_moderator = moderator[members]
+             member_counts = foci_per_experiment[members]
+-            mean_per_experiment = intensity_sum * torch.exp(member_moderator)
++            mean_per_experiment = intensity_sum * weight[members]
+             n_experiments = member_counts.shape[0]
+ 
+             total = total + (
+diff --git a/nimare/meta/cbmr/estimator.py b/nimare/meta/cbmr/estimator.py
+index 9e4e46fe7..c9e78564d 100644
+--- a/nimare/meta/cbmr/estimator.py
++++ b/nimare/meta/cbmr/estimator.py
+@@ -60,7 +60,9 @@
+ )
+ from nimare.meta.cbmr._torch import torch
+ from nimare.meta.cbmr.basis import b_spline_bases
++from nimare.meta.cbmr.predictor import experiment_totals
+ from nimare.meta.cbmr.results import CBMRResult
++from nimare.meta.cbmr.terms import DERIVED_EXPOSURE_COLUMN, FormulaError
+ from nimare.utils import get_masker, get_masker_mask_image, get_template, seed_torch
+ 
+ LGR = logging.getLogger(__name__)
+@@ -263,6 +265,7 @@ class CBMR(_CBMRInputs):
+         CBMR("~ s(diagnosis:drug_status)")                 # a map per cell
+         CBMR("~ s(diagnosis) + sample_size")               # plus a scalar moderator
+         CBMR("~ s(diagnosis) + sample_size + s(avg_age)")  # one of each
++        CBMR("~ s(diagnosis) + exposure()")                # conditioned on each study's count
+ 
+     ``s()`` crosses a term with the spline basis, making its coefficient a map; without it the
+     term gets a single coefficient. That is the whole global-versus-voxelwise distinction, and
+@@ -271,6 +274,14 @@ class CBMR(_CBMRInputs):
+     moderator pooled across groups, ``s(diagnosis) + s(drug_status)`` for additive spatial main
+     effects, ``diagnosis:sample_size`` for a group-specific scalar slope.
+ 
++    ``exposure()`` is the one term that is not a moderator. It conditions the fit on each
++    experiment's own foci count, so every spatial term estimates a distribution over voxels
++    rather than a rate and a contrast between groups asks where foci fall rather than how many.
++    That is a different estimand, and it has consequences -- a non-spatial term has nothing left
++    to estimate beside it, and neither do the overdispersed distributions, so both are refused
++    rather than fitted to zero. ``exposure(column)`` carries a quantity of the user's own and
++    has none of those consequences. See :mod:`nimare.meta.cbmr.terms`.
++
+     Parameters
+     ----------
+     formula : :obj:`str` or :class:`~nimare.meta.cbmr.terms.Design`
+@@ -369,8 +380,29 @@ def _experiment_annotations(self):
+                 "to line up with the foci matrix. This is a bug in the studyset layer rather "
+                 "than in the formula."
+             )
++
++        # A copy, because the frame belongs to the studyset and the generated column below does
++        # not: it depends on this fit's mask and incidence_threshold, so leaving it behind would
++        # give a later fit with different settings a column whose meaning had silently changed.
++        annotations = annotations.copy()
++        annotations[DERIVED_EXPOSURE_COLUMN] = experiment_totals(self.inputs_["foci"])
+         return annotations
+ 
++    def _log_exposure(self, annotations):
++        """Report what the exposure does to the experiments that have none."""
++        exposure = self.predictor.exposure
++        if exposure is None:
++            return
++        empty = int(np.sum(np.asarray(exposure) == 0))
++        if not empty:
++            return
++        LGR.info(
++            f"{empty}/{len(exposure)} experiments have an exposure of zero. They are retained "
++            "and stay aligned with their annotations; under an exposure they contribute nothing, "
++            "because a study reporting no foci inside the mask says nothing about where foci "
++            "fall."
++        )
++
+     def _fit(self, dataset):
+         """Fit the formula-specified model and summarize it into maps and tables."""
+         from nimare.meta.cbmr.model import CBMRModel
+@@ -380,8 +412,11 @@ def _fit(self, dataset):
+         seed_torch(self.random_state, self.device)
+ 
+         annotations = self._experiment_annotations()
++        self.annotations_ = annotations
+         self.bound_design = bind(self.design, annotations)
++        _reject_moderators_under_a_derived_exposure(self.bound_design)
+         self.predictor = CBMRPredictor(self.bound_design, self.inputs_["coef_spline_bases"])
++        self._log_exposure(annotations)
+ 
+         n_bases = self.predictor.n_bases
+         LGR.info(
+@@ -414,6 +449,10 @@ def _summarize(self, foci):
+         errors = self.cbmr_model.standard_errors(foci)
+ 
+         for block in self.bound_design.blocks:
++            if block.term.exposure:
++                # No coefficient, so no estimate, no standard error and no table. Reporting a
++                # row for it would invite a hypothesis to be written over a fixed quantity.
++                continue
+             name = str(block.term)
+             values = np.atleast_2d(coefficients[name])
+             error_values = np.atleast_2d(errors[name])
+@@ -476,6 +515,20 @@ def _generate_description(self):
+             self.distribution.name, f"the {self.distribution.name} model"
+         )
+         n_bases = self.predictor.n_bases
++        exposure_text = ""
++        exposure_terms = self.bound_design.design.exposure_terms
++        if exposure_terms:
++            term = exposure_terms[0]
++            quantity = (
++                "each experiment's own foci count inside the analysis mask"
++                if term.is_derived_exposure
++                else f"the annotation {term.expr!r}"
++            )
++            exposure_text = (
++                f" The model was conditioned on {quantity}, which was carried as an exposure "
++                "with a fixed coefficient rather than fitted, so each spatial term estimates a "
++                "distribution over voxels rather than a rate."
++            )
+         return (
+             f"A coordinate-based meta-regression with the design {self.bound_design.design} was "
+             f"fitted with NiMARE {__version__}, using {distribution_text}. Spatial structure was "
+@@ -483,10 +536,48 @@ def _generate_description(self):
+             f"{n_bases} bases over {self.predictor.n_voxels} analysis-mask voxels, for "
+             f"{self.bound_design.n_parameters(n_bases)} coefficients across "
+             f"{self.predictor.patterns.n_experiments} experiments and "
+-            f"{self.predictor.patterns.n_patterns} distinct spatial map(s)."
++            f"{self.predictor.patterns.n_patterns} distinct spatial map(s)." + exposure_text
+         )
+ 
+ 
++def _reject_moderators_under_a_derived_exposure(bound_design):
++    """Refuse a non-spatial term alongside ``exposure()``, whose estimate is zero regardless.
++
++    Conditioning on each experiment's own total fits that total exactly. A non-spatial column
++    reaches the data only through those totals, so its score is identically zero and its maximum
++    likelihood estimate is exactly zero whatever the data -- reported, with an ordinary standard
++    error, as a confident null. Refusing beats reporting it.
++    """
++    derived = [block.term for block in bound_design.blocks if block.term.is_derived_exposure]
++    if not derived:
++        return
++    moderators = [
++        block.term
++        for block in bound_design.blocks
++        if not block.term.spatial and not block.term.exposure
++    ]
++    if not moderators:
++        return
++    names = ", ".join(str(term) for term in moderators)
++    spatial = " + ".join(f"s({term.expr})" for term in moderators)
++    raise FormulaError(
++        f"{names} has no coefficient to estimate alongside exposure(). Conditioning on each "
++        "experiment's foci count fits its total exactly, and a non-spatial term acts only on "
++        "that total, so its estimate is exactly zero whatever the data -- which would still be "
++        "reported with a standard error, and read as a confident null. Two ways to write what "
++        "you probably meant:\n"
++        f"  ~ ... + {spatial}\n"
++        "      ask whether the moderator changes *where* foci fall, which conditioning leaves "
++        "intact and which is the question an exposure model can answer;\n"
++        "  or model the totals separately\n"
++        "      they are an ordinary count regression on the per-experiment foci count with one "
++        "fixed effect per spatial map, and CBMR's coefficient for a non-spatial term is "
++        "numerically identical to it. Fit that alongside, and report both.\n"
++        "An exposure of your own, exposure(some_column), does not fit the totals exactly and so "
++        "is not refused."
++    )
++
++
+ def _table_safe(name):
+     """Make a rendered term usable as a result-table key."""
+     return name.replace(" ", "").replace("(", "-").replace(")", "").replace(":", "-")
+diff --git a/nimare/meta/cbmr/information.py b/nimare/meta/cbmr/information.py
+index 0ef16caa3..6dbc580f1 100644
+--- a/nimare/meta/cbmr/information.py
++++ b/nimare/meta/cbmr/information.py
+@@ -23,7 +23,14 @@
+ 
+ 
+ def _intensity_pieces(model):
+-    """Return the fitted intensity and moderator weights all closed forms share."""
++    """Return the fitted intensity and per-experiment weights all closed forms share.
++
++    ``weight`` is ``E_i exp(m_i)``, and it comes from
++    :meth:`~nimare.meta.cbmr.predictor.CBMRPredictor.experiment_weights` rather than being
++    rebuilt here. Rebuilding it was how this function could disagree with the likelihood: the
++    exposure would have been present in the fit and absent from every closed form, while the
++    autodiff fallback stayed correct and so agreed with neither.
++    """
+     predictor = model.predictor
+     flat = model.coefficients.detach().cpu().numpy()
+     n_spatial, n_global = model.n_spatial, model.n_global
+@@ -32,12 +39,9 @@ def _intensity_pieces(model):
+     loadings = predictor.patterns.loadings
+     intensity = np.exp((loadings @ spatial) @ predictor.bases.T)  # exp(S), (n_patterns, n_voxels)
+ 
+-    if n_global:
+-        global_block = predictor.global_block
+-        weight = np.exp(global_block @ flat[n_spatial:])  # exp(m_i)
+-    else:
+-        global_block = None
+-        weight = np.ones(predictor.patterns.assignment.size)
++    global_coef = model.unpack(model.coefficients.detach())[1]
++    weight = predictor.experiment_weights(global_coef).detach().cpu().numpy()
++    global_block = predictor.global_block if n_global else None
+     return predictor, loadings, intensity, global_block, weight
+ 
+ 
+diff --git a/nimare/meta/cbmr/predictor.py b/nimare/meta/cbmr/predictor.py
+index f5aef6483..9d4573626 100644
+--- a/nimare/meta/cbmr/predictor.py
++++ b/nimare/meta/cbmr/predictor.py
+@@ -20,9 +20,16 @@
+ 
+     log L = sum_p [ Y_p . s_p  +  sum_{i in p} y_i. m_i  -  (sum_v exp(s_p)) T_p ]
+ 
+-with ``Y_p`` the voxel marginal within pattern ``p`` and ``T_p = sum_{i in p} exp(m_i)``. Cost is
++with ``Y_p`` the voxel marginal within pattern ``p`` and ``T_p = sum_{i in p} E_i exp(m_i)``,
++where ``E_i`` is the experiment's exposure and is ``1`` unless the design says otherwise. Cost is
+ O(n_patterns x n_voxels).
+ 
++An exposure enters only through ``T_p``, on the natural scale. Written that way its own
++contribution to the likelihood, ``sum_i y_i. log E_i``, is free of every parameter and so is never
++formed -- which is what makes ``E_i = 0`` exactly representable rather than a logarithm of zero to
++be managed. The cost is that log-likelihoods are comparable only between models sharing an
++exposure; see the note in :mod:`nimare.meta.cbmr.terms`.
++
+ That single expression covers the whole range. Group-only spatial terms give one pattern per
+ group, recovering the fast path exactly. A spatial covariate gives every experiment its own
+ pattern, recovering the general path. Nothing in between needs special handling, and no
+@@ -157,7 +164,14 @@ def __init__(self, bound_design, bases):
+             raise ValueError("bases must be two-dimensional (n_voxels x n_bases).")
+ 
+         spatial_blocks = [block.block for block in bound_design.blocks if block.term.spatial]
+-        global_blocks = [block.block for block in bound_design.blocks if not block.term.spatial]
++        # An exposure term is non-spatial but owns no coefficient, so it must not reach
++        # ``global_block``: everything downstream reads that as the fitted moderator columns and
++        # would quietly hand the exposure a coefficient, which is the one thing it must not have.
++        global_blocks = [
++            block.block
++            for block in bound_design.blocks
++            if not block.term.spatial and not block.term.exposure
++        ]
+         if not spatial_blocks:
+             raise ValueError(
+                 "A CBMR design needs at least one spatial term; the spatial intensity is the "
+@@ -166,6 +180,7 @@ def __init__(self, bound_design, bases):
+ 
+         self.spatial_block = np.hstack(spatial_blocks)
+         self.global_block = np.hstack(global_blocks) if global_blocks else None
++        self.exposure = bound_design.exposure
+         self.patterns = SpatialPatterns(self.spatial_block)
+ 
+     @property
+@@ -193,6 +208,26 @@ def n_parameters(self):
+         """Total number of coefficients."""
+         return self.n_spatial_columns * self.n_bases + self.n_global_columns
+ 
++    @property
++    def has_exposure(self):
++        """Whether the design carries an exposure."""
++        return self.exposure is not None
++
++    def experiment_weights(self, global_coef, dtype=None):
++        """Return ``E_i exp(m_i)``, the multiplier on each experiment's spatial intensity.
++
++        The single place this product is formed. Every consumer -- the likelihood, the closed-form
++        information, the sandwich, the overdispersed marginals -- needs exactly it, and an earlier
++        arrangement in which two of them built it separately is how a change to one could be
++        silently missing from the other.
++        """
++        weights = torch.exp(self.moderator_effect(global_coef))
++        if dtype is not None:
++            weights = weights.to(dtype)
++        if self.exposure is None:
++            return weights
++        return _as_tensor(self.exposure, weights.dtype) * weights
++
+     def log_intensity_by_pattern(self, spatial_coef):
+         """Return the spatial log-intensity for each distinct pattern.
+ 
+@@ -233,18 +268,35 @@ def linear_predictor(self, spatial_coef, global_coef=None):
+ 
+         Materializes the array this module exists to avoid, so it is for diagnostics and tests
+         rather than for fitting. :func:`poisson_log_likelihood` never calls it.
++
++        Carries the coefficients only. The exposure multiplies the *mean* rather than adding to
++        the predictor, so it is applied by :meth:`fitted_mean` instead; adding ``log(E_i)`` here
++        would reintroduce the logarithm of zero the multiplicative form exists to avoid.
+         """
+         by_pattern = self.log_intensity_by_pattern(spatial_coef)
+         assignment = torch.as_tensor(self.patterns.assignment, dtype=torch.long)
+         eta = by_pattern[assignment]
+         return eta + self.moderator_effect(global_coef)[:, None]
+ 
++    def fitted_mean(self, spatial_coef, global_coef=None):
++        """Return the fitted (experiment x voxel) mean, exposure included.
++
++        ``mu_iv = E_i exp(m_i) exp(s_{p(i)}(v))``. Materializes the full array, so it is for the
++        sandwich and for diagnostics rather than for fitting.
++        """
++        by_pattern = torch.exp(self.log_intensity_by_pattern(spatial_coef))
++        assignment = torch.as_tensor(self.patterns.assignment, dtype=torch.long)
++        weights = self.experiment_weights(global_coef, by_pattern.dtype)
++        return by_pattern[assignment] * weights[:, None]
++
+ 
+ def poisson_log_likelihood(predictor, spatial_coef, global_coef, foci):
+     """Poisson log-likelihood of ``foci`` under ``predictor``, up to a constant.
+ 
+     Drops the ``-sum(log(y!))`` term, which does not depend on the parameters, matching what
+-    CBMR has always reported.
++    CBMR has always reported, and with an exposure also drops ``sum_i y_i. log E_i``, which does
++    not either. The second makes log-likelihoods incomparable across designs with different
++    exposures; see the module docstring.
+ 
+     Evaluated on marginals rather than on the (experiment x voxel) array; see the module
+     docstring. Exact, not an approximation -- verified against the elementwise form.
+@@ -278,11 +330,11 @@ def poisson_log_likelihood(predictor, spatial_coef, global_coef, foci):
+     # sum_i y_i. m_i
+     moderator_term = torch.dot(foci_per_experiment, moderator)
+ 
+-    # sum_p (sum_v exp(s_p)) T_p, with T_p the summed moderator effect within pattern p
++    # sum_p (sum_v exp(s_p)) T_p, with T_p the summed weight within pattern p
+     intensity_sum = torch.exp(log_intensity).sum(dim=1)
+     assignment = torch.as_tensor(predictor.patterns.assignment, dtype=torch.long)
+     moderator_sum = torch.zeros(
+         predictor.patterns.n_patterns, dtype=spatial_coef.dtype
+-    ).index_add_(0, assignment, torch.exp(moderator))
++    ).index_add_(0, assignment, predictor.experiment_weights(global_coef, spatial_coef.dtype))
+ 
+     return spatial_term + moderator_term - torch.dot(intensity_sum, moderator_sum)
+diff --git a/nimare/meta/cbmr/terms.py b/nimare/meta/cbmr/terms.py
+index 17b4c1ec9..4cb9d2d12 100644
+--- a/nimare/meta/cbmr/terms.py
++++ b/nimare/meta/cbmr/terms.py
+@@ -60,6 +60,47 @@
+ factor's coefficients *are* each level's log-intensity map, while an ``sz()`` factor's are
+ deviations from the baseline that ``1`` supplies, so a baseline term is always present alongside
+ one.
++
++Why an exposure is not a moderator
++----------------------------------
++``exposure(x)`` multiplies the expected count by ``x`` instead of giving it a coefficient::
++
++    ~ s(diagnosis) + exposure()              # condition on each study's own foci count
++    ~ s(diagnosis) + exposure(sample_size)   # any positive numeric annotation
++
++The name is ``exposure`` rather than ``offset`` because of the scale. R's ``offset()`` takes the
++linear predictor, which is why it is written ``offset(log(n))``; ``statsmodels`` distinguishes the
++two by name for the same reason, its ``exposure=`` being logged internally. CBMR takes the count
++itself, and carries it multiplicatively rather than as ``log(x)`` added to the predictor, which is
++the whole reason an experiment with no foci inside the mask is representable: it contributes
++``0`` to the pattern total and drops out, instead of producing ``log(0)``.
++
++What that changes is the estimand, and it is worth being explicit about it. Write an
++inhomogeneous Poisson likelihood in terms of each experiment's total ``y_i.`` and its spatial
++distribution ``p_i``, and it factorizes exactly::
++
++    L = prod_i Poisson(y_i. ; Lambda_i)  x  prod_i Multinomial(y_i ; y_i., p_i)
++
++A *spatial* term describes ``p_i`` -- where foci fall. A *non-spatial* term multiplies the whole
++map by ``exp(gamma z_i)``, so it describes ``Lambda_i`` -- how many foci there are -- and nothing
++else. ``exposure()`` fits the second factor and conditions the first away, which turns each
++spatial term from a rate into a distribution over voxels.
++
++Two consequences follow, and both are enforced rather than left to be discovered:
++
++* A non-spatial term alongside ``exposure()`` has no coefficient to estimate. Conditioning on each
++  experiment's total fits that total exactly, so the score of any non-spatial column is identically
++  zero and its estimate is exactly zero whatever the data -- reported with an ordinary standard
++  error, which reads as a confident null. The design is refused instead. Ask the question spatially
++  with ``s(z)``, or model the totals separately: for a design whose spatial terms are factors,
++  CBMR's coefficient for a non-spatial term is numerically the same as a count regression of
++  ``n_foci`` on that term with one fixed effect per spatial map.
++* The overdispersed distributions have nothing left to estimate either, since both exist to absorb
++  between-experiment variation in total count, and ``exposure()`` absorbs it first.
++
++The likelihood is returned up to a parameter-free constant that depends on the exposure, so a
++log-likelihood, an AIC or a likelihood ratio from an ``exposure()`` model cannot be compared with
++one from a model without it. Those are different likelihoods, of different quantities.
+ """
+ 
+ import re
+@@ -71,7 +112,16 @@
+ SPATIAL_MARKERS = ("s", "spatial")
+ SUM_TO_ZERO_MARKERS = ("sz",)
+ SUM_TO_ZERO = "sum_to_zero"
++EXPOSURE_MARKERS = ("exposure",)
++OFFSET_MARKERS = ("offset",)
+ INTERCEPT_TERM = "1"
++DERIVED_EXPOSURE_COLUMN = "_cbmr_n_foci"
++"""Name of the generated column holding each experiment's in-mask foci count.
++
++Namespaced like ``_cbmr_group`` so it cannot collide with a user annotation. ``exposure()``
++resolves to it, and nothing has to guess whether a bare ``n_foci`` meant this or a column
++of the user's own -- there is no bare name to guess about.
++"""
+ INTERCEPT_COLUMN = "Intercept"
+ """Name of the baseline coefficient.
+ 
+@@ -104,12 +154,16 @@ class Term:
+         ``"sum_to_zero"`` reparameterizes a factor term so its coefficients sum to zero across
+         levels, after mgcv's ``bs="sz"``. Required to combine two spatial factors additively;
+         see the module docstring. Default is None.
++    exposure : :obj:`bool`, optional
++        Whether the term is an exposure rather than a moderator: it multiplies the expected
++        count instead of carrying a coefficient. See the module docstring. Default is False.
+     """
+ 
+     expr: str
+     spatial: bool
+     spacing: int = None
+     constraint: str = None
++    exposure: bool = False
+ 
+     def __post_init__(self):
+         """Validate the term's fields."""
+@@ -134,12 +188,30 @@ def __post_init__(self):
+                     f"{self.expr!r}: it exists to stop a spatial factor from competing with the "
+                     "spatial baseline, and a non-spatial term never does."
+                 )
++        if self.exposure:
++            if self.spatial:
++                raise FormulaError(
++                    f"exposure({self.expr}) cannot also be spatial. An exposure is one number "
++                    "per experiment with no coefficient, so there is nothing for a spline basis "
++                    "to vary over. A per-voxel exposure -- a coverage mask -- is a different "
++                    "term that CBMR does not have yet."
++                )
++            if self.spacing is not None or self.constraint is not None:
++                raise FormulaError(
++                    f"exposure({self.expr}) takes no spacing= or bs=; both describe a spline "
++                    "basis, and an exposure has none."
++                )
+ 
+     @property
+     def is_intercept(self):
+         """Whether this term is the spatial baseline."""
+         return self.expr == INTERCEPT_TERM
+ 
++    @property
++    def is_derived_exposure(self):
++        """Whether this term is ``exposure()``, the response's own per-experiment totals."""
++        return self.exposure and self.expr == DERIVED_EXPOSURE_COLUMN
++
+     @property
+     def is_sum_to_zero(self):
+         """Whether this term is reparameterized to sum to zero across levels."""
+@@ -147,6 +219,8 @@ def is_sum_to_zero(self):
+ 
+     def __str__(self):
+         """Render the term back into formula syntax."""
++        if self.exposure:
++            return "exposure()" if self.is_derived_exposure else f"exposure({self.expr})"
+         if self.is_intercept:
+             return INTERCEPT_TERM
+         if not self.spatial:
+@@ -176,6 +250,38 @@ def _split_top_level(text, separator="+"):
+     return [part.strip() for part in parts]
+ 
+ 
++def _parse_exposure_marker(piece):
++    """Return the exposure expression if ``piece`` marks one, else None.
++
++    ``exposure()`` means the response's own per-experiment totals, which the estimator supplies
++    as :data:`DERIVED_EXPOSURE_COLUMN`. Spelling it with no argument is what makes the name
++    unshadowable: there is no bare word for a user annotation to collide with.
++    """
++    match = re.fullmatch(r"(\w+)\s*\((.*)\)", piece, flags=re.DOTALL)
++    if match is None:
++        return None
++    marker = match.group(1)
++    if marker in OFFSET_MARKERS:
++        raise FormulaError(
++            f"{piece!r}: CBMR spells this exposure(...), not offset(...). The difference is the "
++            "scale. R's offset() takes the linear predictor, so it is written offset(log(n)); "
++            "exposure() takes the count itself and multiplies the expected value by it, which "
++            "is what lets an experiment with no foci in the mask carry an exposure of zero "
++            "instead of a logarithm of zero. Write exposure() for the response's own totals, "
++            "or exposure(column) for a quantity of your own."
++        )
++    if marker not in EXPOSURE_MARKERS:
++        return None
++
++    arguments = [argument for argument in _split_top_level(match.group(2), separator=",")]
++    arguments = [argument for argument in arguments if argument]
++    if not arguments:
++        return DERIVED_EXPOSURE_COLUMN
++    if len(arguments) > 1:
++        raise FormulaError(f"{piece!r} takes at most one expression, got {arguments!r}.")
++    return arguments[0]
++
++
+ def _parse_spatial_marker(piece):
+     """Return ``(expression, spacing, constraint)`` if ``piece`` marks a spatial term, else None.
+ 
+@@ -240,12 +346,21 @@ def __post_init__(self):
+         object.__setattr__(self, "terms", tuple(self.terms))
+         seen = {}
+         for term in self.terms:
+-            key = (term.expr, term.spatial, term.constraint)
++            # ``exposure`` belongs in the key: ``~ s(g) + n + exposure(n)`` names the same
++            # column twice on purpose -- it is how a user asks whether the coefficient really is
++            # 1 -- and without it that reads as a duplicate.
++            key = (term.expr, term.spatial, term.constraint, term.exposure)
+             if key in seen:
+                 raise FormulaError(f"Term {term} appears more than once.")
+             seen[key] = True
+         if not self.terms:
+             raise FormulaError("A design needs at least one term.")
++        if len(self.exposure_terms) > 1:
++            names = ", ".join(str(term) for term in self.exposure_terms)
++            raise FormulaError(
++                f"A design takes at most one exposure, got {names}. Two exposures would "
++                "multiply, which is what a single exposure(a * b) says more clearly."
++            )
+ 
+     @classmethod
+     def from_formula(cls, formula):
+@@ -277,9 +392,20 @@ def from_formula(cls, formula):
+                 terms.append(Term(expr=INTERCEPT_TERM, spatial=True))
+                 continue
+ 
++            exposure = _parse_exposure_marker(piece)
++            if exposure is not None:
++                terms.append(Term(expr=exposure, spatial=False, exposure=True))
++                continue
++
+             marker = _parse_spatial_marker(piece)
+             if marker is not None:
+                 expression, spacing, constraint = marker
++                if _parse_exposure_marker(expression) is not None:
++                    raise FormulaError(
++                        f"{piece!r} makes an exposure spatial. An exposure is one number per "
++                        "experiment with no coefficient, so there is nothing for a spline basis "
++                        f"to vary over. Write the two as separate terms if you meant both."
++                    )
+                 if expression == INTERCEPT_TERM:
+                     explicit_intercept = True
+                 terms.append(
+@@ -307,7 +433,12 @@ def spatial_terms(self):
+     @property
+     def global_terms(self):
+         """Terms with a single coefficient per experiment-level column."""
+-        return tuple(term for term in self.terms if not term.spatial)
++        return tuple(term for term in self.terms if not term.spatial and not term.exposure)
++
++    @property
++    def exposure_terms(self):
++        """Terms that multiply the expected count instead of carrying a coefficient."""
++        return tuple(term for term in self.terms if term.exposure)
+ 
+     def with_term(self, term):
+         """Return a copy with one more term appended."""
+@@ -448,6 +579,8 @@ def n_columns(self):
+ 
+     def n_parameters(self, n_bases):
+         """Return the number of coefficients this term owns, given the basis width."""
++        if self.term.exposure:
++            return 0
+         return self.n_columns * (n_bases if self.term.spatial else 1)
+ 
+ 
+@@ -481,6 +614,26 @@ def spatial_blocks(self):
+         """Bound terms whose coefficients vary over voxels."""
+         return tuple(block for block in self.blocks if block.term.spatial)
+ 
++    @property
++    def exposure_blocks(self):
++        """Bound terms that multiply the expected count instead of carrying a coefficient."""
++        return tuple(block for block in self.blocks if block.term.exposure)
++
++    @property
++    def exposure(self):
++        """Return the per-experiment exposure, or None when the design has no exposure term.
++
++        ``None`` rather than a vector of ones so that the overwhelmingly common no-exposure
++        path allocates nothing and every consumer can branch on identity.
++        """
++        blocks = self.exposure_blocks
++        if not blocks:
++            return None
++        values = np.ones(blocks[0].block.shape[0], dtype=float)
++        for block in blocks:
++            values = values * block.block[:, 0]
++        return values
++
+     def n_parameters(self, n_bases):
+         """Return the total number of coefficients, given the spline basis width."""
+         return sum(block.n_parameters(n_bases) for block in self.blocks)
+@@ -489,6 +642,11 @@ def parameter_slices(self, n_bases):
+         """Map each term to the slice of the flat coefficient vector it owns."""
+         slices, offset = {}, 0
+         for block in self.blocks:
++            if block.term.exposure:
++                # Skipped rather than given a zero-width slice, so that every dict keyed by this
++                # mapping -- fitted coefficients, standard errors -- has no entry for a term that
++                # owns no parameter, instead of an empty one to be special-cased at each use.
++                continue
+             width = block.n_parameters(n_bases)
+             slices[str(block.term)] = slice(offset, offset + width)
+             offset += width
+@@ -504,6 +662,9 @@ def describe(self, n_bases):
+         """
+         lines = []
+         for block in self.blocks:
++            if block.term.exposure:
++                lines.append(f"  {str(block.term):32} {'':>4}                    fixed at 1")
++                continue
+             lines.append(
+                 f"  {str(block.term):32} {block.n_columns:>4} column(s) x "
+                 f"{n_bases if block.term.spatial else 1:>5} = "
+@@ -513,6 +674,32 @@ def describe(self, n_bases):
+         return "\n".join(lines)
+ 
+ 
++def _validate_exposure(term, block, names):
++    """Check that an exposure block is one non-negative column.
++
++    An exposure multiplies the expected count, so a factor expanding to indicators would say
++    something no user means, and a negative value has no reading at all. Zero is allowed and
++    deliberate: it is how an experiment with no foci inside the mask carries no information
++    about where foci fall, without a logarithm of zero appearing anywhere.
++    """
++    if block.shape[1] != 1:
++        raise FormulaError(
++            f"{term} expands to {block.shape[1]} columns ({', '.join(names)}), but an exposure "
++            "is a single number per experiment. This is what a factor does; an exposure has to "
++            "be numeric."
++        )
++    values = block[:, 0]
++    if not np.all(np.isfinite(values)):
++        raise FormulaError(f"{term} contains non-finite values; an exposure must be finite.")
++    if np.any(values < 0):
++        raise FormulaError(
++            f"{term} contains negative values. An exposure multiplies the expected count, so it "
++            "cannot be negative. If this is already on the log scale, pass the count itself."
++        )
++    if not np.any(values > 0):
++        raise FormulaError(f"{term} is zero for every experiment, which leaves no data to fit.")
++
++
+ def bind(design, annotations):
+     """Resolve a :class:`Design` against experiment annotations.
+ 
+@@ -526,6 +713,8 @@ def bind(design, annotations):
+         block, names, levels, level_map = _experiment_block(
+             term.expr, annotations, term.constraint
+         )
++        if term.exposure:
++            _validate_exposure(term, block, names)
+         blocks.append(
+             TermBlock(
+                 term=term,
+diff --git a/nimare/tests/test_meta_cbmr_exposure.py b/nimare/tests/test_meta_cbmr_exposure.py
+new file mode 100644
+index 000000000..67450d367
+--- /dev/null
++++ b/nimare/tests/test_meta_cbmr_exposure.py
+@@ -0,0 +1,380 @@
++"""Tests for ``exposure()``, which conditions CBMR on a per-experiment count.
++
++Two things are being checked, and they are different in kind. That the exposure reaches every
++consumer -- the likelihood, the closed-form information, the sandwich, the overdispersed
++marginals -- is arithmetic, and is checked by agreement with a form that already worked. That
++conditioning changes what the model can estimate is not arithmetic, and is checked by asserting
++the designs it makes meaningless are refused rather than fitted.
++"""
++
++import numpy as np
++import pandas as pd
++import pytest
++
++try:
++    import torch  # noqa: F401
++except ImportError:
++    TORCH_INSTALLED = False
++else:
++    TORCH_INSTALLED = True
++    from nimare.meta.cbmr.distributions import DistributionError
++    from nimare.meta.cbmr.information import closed_form_information
++    from nimare.meta.cbmr.model import CBMRModel
++    from nimare.meta.cbmr.predictor import CBMRPredictor
++    from nimare.meta.cbmr.terms import (
++        DERIVED_EXPOSURE_COLUMN,
++        Design,
++        FormulaError,
++        Term,
++        bind,
++    )
++
++pytestmark = pytest.mark.skipif(not TORCH_INSTALLED, reason="Torch not installed.")
++
++N_PER_GROUP = 40
++N_VOXELS = 30
++N_BASES = 4
++
++
++# --------------------------------------------------------------------------------------------
++# Parsing and validation, which need neither torch nor data.
++# --------------------------------------------------------------------------------------------
++
++
++def test_exposure_with_no_argument_means_the_derived_total():
++    """``exposure()`` names the estimator's generated column, so no bare word can shadow it."""
++    design = Design.from_formula("~ s(diagnosis) + exposure()")
++    (term,) = design.exposure_terms
++    assert term.expr == DERIVED_EXPOSURE_COLUMN
++    assert term.is_derived_exposure
++    assert str(design) == "~ s(diagnosis) + exposure()"
++
++
++def test_exposure_with_an_argument_is_an_ordinary_annotation():
++    """A user exposure resolves like any other term and is not the derived total."""
++    (term,) = Design.from_formula("~ s(diagnosis) + exposure(scan_volume)").exposure_terms
++    assert term.expr == "scan_volume"
++    assert not term.is_derived_exposure
++
++
++def test_offset_is_refused_and_points_at_exposure():
++    """The two differ by a scale, so the wrong one has to say which is meant."""
++    with pytest.raises(FormulaError, match="exposure"):
++        Design.from_formula("~ s(diagnosis) + offset(log(n))")
++
++
++@pytest.mark.parametrize(
++    "formula",
++    ["~ s(exposure(n))", "~ sz(exposure())", "~ s(diagnosis) + exposure(a, b)"],
++)
++def test_malformed_exposures_are_refused(formula):
++    """An exposure has no basis to vary over and takes at most one expression."""
++    with pytest.raises(FormulaError):
++        Design.from_formula(formula)
++
++
++def test_two_exposures_are_refused():
++    """Two exposures would multiply, which one ``exposure(a * b)`` says more clearly."""
++    with pytest.raises(FormulaError, match="at most one exposure"):
++        Design.from_formula("~ s(diagnosis) + exposure(a) + exposure(b)")
++
++
++def test_a_column_can_be_both_a_moderator_and_an_exposure():
++    """``~ s(g) + n + exposure(n)`` is how a user asks whether the coefficient really is 1.
++
++    It reads as a duplicate unless the deduplication key knows the two terms differ.
++    """
++    design = Design.from_formula("~ s(diagnosis) + n + exposure(n)")
++    assert [str(term) for term in design.terms] == ["s(diagnosis)", "n", "exposure(n)"]
++
++
++def test_a_spatial_exposure_is_refused_at_the_term_level():
++    """Constructed directly, not only through the formula parser."""
++    with pytest.raises(FormulaError, match="cannot also be spatial"):
++        Term(expr="n", spatial=True, exposure=True)
++
++
++# --------------------------------------------------------------------------------------------
++# Everything below needs data.
++# --------------------------------------------------------------------------------------------
++
++
++@pytest.fixture(scope="module")
++def data():
++    """Simulate counts from ``mu_iv = E_i p_g(v)``, so each group's shape is a distribution."""
++    rng = np.random.default_rng(23)
++    n_experiments = 2 * N_PER_GROUP
++    raw = rng.uniform(0.05, 1.0, (N_VOXELS, N_BASES))
++    bases = raw / raw.sum(axis=1, keepdims=True)
++
++    coefficients = rng.normal(0.0, 0.6, (2, N_BASES))
++    shape = np.exp(coefficients @ bases.T)
++    shape /= shape.sum(axis=1, keepdims=True)
++    group = np.repeat([0, 1], N_PER_GROUP)
++    # Reporting volume varies a lot between studies, which is the situation an exposure is for.
++    volume = np.exp(np.log(150.0) + 0.8 * rng.normal(size=n_experiments))
++    foci = rng.poisson(volume[:, None] * shape[group]).astype(float)
++
++    annotations = pd.DataFrame(
++        {
++            "diagnosis": ["schiz"] * N_PER_GROUP + ["dep"] * N_PER_GROUP,
++            "drug": ["yes", "no"] * N_PER_GROUP,
++            "n": rng.normal(size=n_experiments),
++            "scan_volume": rng.uniform(1.0, 3.0, size=n_experiments),
++            DERIVED_EXPOSURE_COLUMN: foci.sum(axis=1),
++        }
++    )
++    return annotations, bases, foci, shape, group
++
++
++def _model(formula, data, distribution="poisson", n_iter=400):
++    annotations, bases, foci, _, _ = data
++    predictor = CBMRPredictor(bind(Design.from_formula(formula), annotations), bases)
++    model = CBMRModel(predictor, distribution=distribution)
++    model.fit(foci, n_iter=n_iter, tol=1e-10)
++    return model
++
++
++def _log_maps(model):
++    """Return each spatial pattern's fitted log intensity."""
++    return model.log_intensity()
++
++
++def test_the_exposure_owns_no_parameters(data):
++    """The budget and the coefficient layout are identical with and without it."""
++    annotations, bases, _, _, _ = data
++    plain = bind(Design.from_formula("~ s(diagnosis)"), annotations)
++    exposed = bind(Design.from_formula("~ s(diagnosis) + exposure()"), annotations)
++
++    assert exposed.n_parameters(N_BASES) == plain.n_parameters(N_BASES)
++    assert exposed.parameter_slices(N_BASES) == plain.parameter_slices(N_BASES)
++    assert "exposure()" not in exposed.parameter_slices(N_BASES)
++    assert "fixed at 1" in exposed.describe(N_BASES)
++
++
++def test_the_exposure_is_not_a_moderator_column(data):
++    """It must not reach ``global_block``, which is read as the fitted moderator columns."""
++    annotations, bases, _, _, _ = data
++    predictor = CBMRPredictor(
++        bind(Design.from_formula("~ s(diagnosis) + exposure()"), annotations), bases
++    )
++    assert predictor.global_block is None
++    assert predictor.n_global_columns == 0
++    assert predictor.has_exposure
++
++
++@pytest.mark.parametrize(
++    "expression, match",
++    [
++        ("exposure(diagnosis)", "single number"),
++        ("exposure(negative)", "negative"),
++        ("exposure(all_zero)", "zero for every experiment"),
++    ],
++)
++def test_an_unusable_exposure_column_is_refused(data, expression, match):
++    """A factor, a negative value and an all-zero column each have no reading as an exposure."""
++    annotations, _, _, _, _ = data
++    annotations = annotations.assign(negative=-1.0, all_zero=0.0)
++    with pytest.raises(FormulaError, match=match):
++        bind(Design.from_formula(f"~ s(diagnosis) + {expression}"), annotations)
++
++
++def test_the_exposure_shifts_a_cell_means_map_by_a_constant_and_nothing_else(data):
++    """The sharp statement of what an exposure does to ``~ s(factor)``.
++
++    The exposure enters only through the pattern total ``T_p``, and a cell-means factor gives
++    each group its own coefficient block spanning the constant, so the fit can absorb the change
++    exactly. Every group's log map must move by ``log(T_p/T_p')`` and by nothing else -- which
++    catches a sign or scale slip anywhere along the exposure path, where a summary statistic such
++    as the spread of the fitted totals would not.
++    """
++    annotations, _, _, _, _ = data
++    plain_model = _model("~ s(diagnosis)", data)
++    plain = _log_maps(plain_model)
++    exposed = _log_maps(_model("~ s(diagnosis) + exposure()", data))
++
++    assignment = plain_model.predictor.patterns.assignment
++    totals = annotations[DERIVED_EXPOSURE_COLUMN].to_numpy()
++    for pattern in range(plain.shape[0]):
++        members = assignment == pattern
++        # Without an exposure T_p counts the experiments; with one it sums their totals.
++        expected = np.log(members.sum() / totals[members].sum())
++        difference = exposed[pattern] - plain[pattern]
++        assert np.allclose(difference, expected, atol=1e-4)
++
++
++def test_the_exposure_normalizes_each_pattern(data):
++    """Under an exact exposure the score equation makes each spatial term a distribution."""
++    model = _model("~ s(diagnosis) + exposure()", data)
++    assert np.allclose(np.exp(_log_maps(model)).sum(axis=1), 1.0, atol=1e-3)
++
++
++def test_the_exposure_recovers_a_shape_the_plain_fit_does_not(data):
++    """Counts drawn from ``mu_iv = E_i p_g(v)``: the exposure model recovers ``p_g``."""
++    _, _, _, shape, group = data
++    model = _model("~ s(diagnosis) + exposure()", data)
++    exposed = np.exp(_log_maps(model))
++    plain = np.exp(_log_maps(_model("~ s(diagnosis)", data)))
++
++    assignment = model.predictor.patterns.assignment
++    for pattern in range(exposed.shape[0]):
++        truth = shape[group[assignment == pattern][0]]
++        assert np.abs(exposed[pattern] - truth).max() < 0.1 * truth.max()
++        # The plain fit estimates a rate, whose scale is the group's mean count, so it is not
++        # close to a distribution at all.
++        assert np.abs(plain[pattern] - truth).max() > truth.max()
++
++
++def test_the_exposure_agrees_with_the_fitted_log_form(data):
++    """``exposure(w)`` is ``+ log(w)`` with the coefficient fixed, so the fitted one lands at 1."""
++    annotations, bases, foci, _, _ = data
++    annotations = annotations.assign(log_total=np.log(annotations[DERIVED_EXPOSURE_COLUMN]))
++    predictor = CBMRPredictor(
++        bind(Design.from_formula("~ s(diagnosis) + log_total"), annotations), bases
++    )
++    fitted = CBMRModel(predictor, distribution="poisson")
++    fitted.fit(foci, n_iter=600, tol=1e-10)
++    coefficient = fitted.fitted_coefficients()["log_total"]
++    assert np.abs(coefficient - 1.0).max() < 0.05
++
++
++def test_a_zero_exposure_experiment_contributes_nothing(data):
++    """Carried multiplicatively, ``E_i = 0`` drops out rather than giving ``log(0)``."""
++    annotations, bases, foci, _, _ = data
++    annotations = annotations.copy()
++    with_zero = annotations.copy()
++    with_zero.loc[with_zero.index[0], DERIVED_EXPOSURE_COLUMN] = 0.0
++    zeroed_foci = foci.copy()
++    zeroed_foci[0] = 0.0
++
++    kept = CBMRModel(
++        CBMRPredictor(bind(Design.from_formula("~ s(diagnosis) + exposure()"), with_zero), bases),
++        distribution="poisson",
++    )
++    kept.fit(zeroed_foci, n_iter=400, tol=1e-10)
++
++    dropped = CBMRModel(
++        CBMRPredictor(
++            bind(Design.from_formula("~ s(diagnosis) + exposure()"), with_zero.iloc[1:]), bases
++        ),
++        distribution="poisson",
++    )
++    dropped.fit(zeroed_foci[1:], n_iter=400, tol=1e-10)
++
++    kept_values = kept.coefficients.detach().cpu().numpy()
++    assert np.all(np.isfinite(kept_values))
++    assert np.abs(kept_values - dropped.coefficients.detach().cpu().numpy()).max() < 1e-6
++
++
++@pytest.mark.parametrize(
++    "formula", ["~ s(diagnosis) + exposure()", "~ s(diagnosis) + exposure(scan_volume)"]
++)
++def test_the_closed_form_information_sees_the_exposure(data, formula):
++    """The check that would have caught an exposure applied to the likelihood alone.
++
++    ``_intensity_pieces`` used to rebuild the per-experiment weight instead of asking the
++    predictor for it, so an exposure could be present in the fit and absent from every closed
++    form while the autodiff fallback stayed correct.
++    """
++    model = _model(formula, data)
++    foci = data[2]
++
++    def negative_log_likelihood(vector):
++        return -model.log_likelihood(foci, flat=vector, nuisance=None)
++
++    reference = (
++        torch.func.hessian(negative_log_likelihood)(model.coefficients.detach().clone())
++        .reshape(model.n_parameters, model.n_parameters)
++        .detach()
++        .cpu()
++        .numpy()
++    )
++    analytic = closed_form_information(model.distribution)(model, foci)
++    assert np.abs(analytic - reference).max() < 1e-8 * np.abs(reference).max()
++
++
++def test_a_moderator_alongside_the_derived_exposure_is_refused(data):
++    """Its estimate would be exactly zero whatever the data, reported as a confident null."""
++    from nimare.meta.cbmr.estimator import _reject_moderators_under_a_derived_exposure
++
++    annotations, _, _, _, _ = data
++    bound = bind(Design.from_formula("~ s(diagnosis) + n + exposure()"), annotations)
++    with pytest.raises(FormulaError, match="no coefficient to estimate"):
++        _reject_moderators_under_a_derived_exposure(bound)
++
++
++def test_a_moderator_alongside_a_user_exposure_is_allowed(data):
++    """The refusal is scoped to the derived total, not to the marker.
++
++    An exposure of the user's own does not fit the totals exactly, so a non-spatial term still
++    has variation to explain and a coefficient to estimate.
++    """
++    from nimare.meta.cbmr.estimator import _reject_moderators_under_a_derived_exposure
++
++    annotations, _, _, _, _ = data
++    bound = bind(Design.from_formula("~ s(diagnosis) + n + exposure(scan_volume)"), annotations)
++    _reject_moderators_under_a_derived_exposure(bound)
++
++    model = _model("~ s(diagnosis) + n + exposure(scan_volume)", data)
++    assert np.abs(model.fitted_coefficients()["n"]).max() > 1e-6
++
++
++@pytest.mark.parametrize("distribution", ["negativebinomial", "clusterednegativebinomial"])
++def test_an_overdispersed_family_with_the_derived_exposure_is_refused(data, distribution):
++    """Both exist to absorb variation in the totals, which the exposure absorbs first."""
++    annotations, bases, _, _, _ = data
++    predictor = CBMRPredictor(
++        bind(Design.from_formula("~ s(diagnosis) + exposure()"), annotations), bases
++    )
++    with pytest.raises(DistributionError, match="exposure"):
++        CBMRModel(predictor, distribution=distribution)
++
++
++@pytest.mark.parametrize("distribution", ["negativebinomial", "clusterednegativebinomial"])
++def test_an_overdispersed_family_with_a_user_exposure_is_allowed(data, distribution):
++    """Again scoped to the derived total: a user exposure leaves the totals free to vary.
++
++    Fitted to counts drawn overdispersed in the way each family models, for the reason the
++    information tests give: a negative binomial fitted to Poisson counts drives its
++    overdispersion to zero, and the test would be measuring that instead.
++    """
++    annotations, bases, foci, _, _ = data
++    rng = np.random.default_rng(5)
++    if distribution == "clusterednegativebinomial":
++        # One factor per experiment, shared across the brain.
++        dispersed = rng.poisson(foci * rng.gamma(6.0, 1 / 6.0, size=(foci.shape[0], 1)))
++    else:
++        # Independent gamma variation at each voxel.
++        dispersed = rng.poisson(rng.gamma(6.0, foci / 6.0))
++    predictor = CBMRPredictor(
++        bind(Design.from_formula("~ s(diagnosis) + exposure(scan_volume)"), annotations), bases
++    )
++    model = CBMRModel(predictor, distribution=distribution)
++    model.fit(dispersed.astype(float), n_iter=60, tol=1e-8)
++    assert np.all(np.isfinite(model.overdispersion()))
++    assert model.overdispersion().min() > 1e-3
++
++
++def test_a_hypothesis_naming_the_exposure_says_so(data):
++    """Rather than surfacing as a generic unknown coefficient."""
++    from nimare.meta.cbmr.contrasts import ContrastError, build_contrast
++
++    annotations, _, _, _, _ = data
++    bound = bind(Design.from_formula("~ s(diagnosis) + exposure(scan_volume)"), annotations)
++    with pytest.raises(ContrastError, match="no coefficient to test"):
++        build_contrast(bound, "scan_volume = 0")
++
++
++def test_the_exposure_contrast_equals_the_normalized_plain_contrast(data):
++    """The two routes to ``log p_A(v) - log p_B(v)`` agree.
++
++    Normalizing a plain fit afterwards gives the same answer as conditioning during it, which is
++    what makes the exposure a reparameterization rather than a different model.
++    """
++    exposed = _log_maps(_model("~ s(diagnosis) + exposure()", data))
++    plain = _log_maps(_model("~ s(diagnosis)", data))
++    normalizer = np.log(np.exp(plain).sum(axis=1))
++
++    from_exposure = exposed[0] - exposed[1]
++    from_normalizing = (plain[0] - plain[1]) - (normalizer[0] - normalizer[1])
++    assert np.abs(from_exposure - from_normalizing).max() < 1e-3
+diff --git a/nimare/tests/test_meta_cbmr_formula.py b/nimare/tests/test_meta_cbmr_formula.py
+index 5ecc7fcc2..ab8d67269 100644
+--- a/nimare/tests/test_meta_cbmr_formula.py
++++ b/nimare/tests/test_meta_cbmr_formula.py
+@@ -496,3 +496,68 @@ def test_the_public_fit_reports_the_design_derived_standard_errors(studyset):
+ 
+     actual = np.sqrt(np.diag(estimator.cbmr_model.covariance(foci)))
+     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-10)
++
++
++def test_exposure_conditions_the_fit_and_leaves_the_studyset_alone(studyset):
++    """End to end: the derived column is generated, used, and not left behind.
++
++    It depends on this fit's mask and incidence_threshold, so a later fit with different
++    settings must not find a stale one sitting in the studyset's annotations.
++    """
++    before = studyset.annotations_df.copy()
++    result = _fit("~ s(diagnosis) + exposure()", studyset)
++
++    assert "_cbmr_n_foci" not in studyset.annotations_df.columns
++    assert list(studyset.annotations_df.columns) == list(before.columns)
++    assert "_cbmr_n_foci" in result.estimator.annotations_.columns
++
++    # An exposure owns no coefficient, so it gets no table and no row anywhere.
++    assert not [key for key in result.tables if "exposure" in key]
++    assert result.estimator.bound_design.n_parameters(result.estimator.predictor.n_bases) == CBMR(
++        "~ s(diagnosis)", **FIT_KWARGS
++    ).fit(dataset=studyset).estimator.bound_design.n_parameters(result.estimator.predictor.n_bases)
++
++
++def test_exposure_makes_each_group_a_distribution(studyset):
++    """The score equation normalizes every spatial term without being asked.
++
++    Only approximately, and the approximation is the basis rather than the optimizer: the score
++    equation forces ``sum_v (B1)_v exp(s_g) = sum_v (B1)_v y``, and a B-spline basis with its
++    first column dropped and its unsupported ones removed is a partition of unity to within a
++    percent or so rather than exactly. Fitted to convergence, because the suite's fast settings
++    stop far short of it and the level is the last thing to settle.
++    """
++    converged = dict(tol=1e-4, n_iter=1500)
++    exposed = _fit("~ s(diagnosis) + exposure()", studyset, **converged)
++    plain = _fit("~ s(diagnosis)", studyset, **converged)
++
++    def group_totals(result):
++        return np.array(
++            [
++                result.maps[key].sum()
++                for key in result.maps
++                if key.startswith("spatialIntensity_group-")
++            ]
++        )
++
++    assert np.allclose(group_totals(exposed), 1.0, rtol=0.05)
++    # Without it each map is a rate, whose integral is the group's mean foci count.
++    assert group_totals(plain).min() > 2.0
++
++
++def test_a_moderator_alongside_exposure_is_refused_with_advice(studyset):
++    """Its estimate would be exactly zero whatever the data."""
++    with pytest.raises(FormulaError, match="no coefficient to estimate"):
++        _fit("~ s(diagnosis) + standardized_sample_sizes + exposure()", studyset)
++
++
++def test_a_spatial_moderator_alongside_exposure_is_allowed(studyset):
++    """Conditioning removes the volume question and leaves the shape question intact."""
++    result = _fit("~ s(diagnosis) + s(standardized_avg_age) + exposure()", studyset)
++    assert "voxelwiseModeratorEffect_standardized_avg_age" in result.maps
++
++
++def test_offset_in_a_public_formula_points_at_exposure(studyset):
++    """The name CBMR does not use says which one it does."""
++    with pytest.raises(FormulaError, match="exposure"):
++        CBMR("~ s(diagnosis) + offset(log(n))", **FIT_KWARGS)

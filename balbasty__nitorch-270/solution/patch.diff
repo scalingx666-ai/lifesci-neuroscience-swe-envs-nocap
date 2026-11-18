@@ -1,0 +1,680 @@
+diff --git a/nitorch/cli/registration/register/parser.py b/nitorch/cli/registration/register/parser.py
+index a084377d..5d88cc67 100644
+--- a/nitorch/cli/registration/register/parser.py
++++ b/nitorch/cli/registration/register/parser.py
+@@ -264,6 +264,8 @@
+         -s, --line-search               Number of backtracking line search [wolfe]
+         -t, --tolerance                 Tolerance for early stopping [1e-4]
+         -c, --crit                      Stopping criterion: [diff], gain
++        -d, --disp-tolerance            Tolerance for early stopping on the RMS displacement of
++                                        an update, in voxels [affine: 1e-3, nonlin: 1e-2]
+         -n, --max-iter                  Maximum number of iterations
+                                         [interleaved: affine=50,  nonlin=10,
+                                          sequential:  affine=100, nonlin=50]
+@@ -617,6 +619,11 @@ def _convert_discretize(x):
+                  help='Number of backtracking line search')
+ optim.add_option('tolerance', ('-t', '--tolerance'), nargs=1,
+                  convert=float, default=1e-4, help='Tolerance for early stopping')
++optim.add_option('disp_tolerance', ('-d', '--disp-tolerance'), nargs=1,
++                 convert=float, default=None,
++                 help='Tolerance for early stopping on the size of an '
++                      'update (RMS displacement, in image voxels at the '
++                      'current level; 0 = off)')
+ optim.add_option('crit', ('-c', '--crit'), nargs=1,
+                  default='diff', validation=cli.Validations.choice(['gain', 'diff']),
+                  help='Criterion for early stopping')
+diff --git a/nitorch/tests/test_register_disp_stopping.py b/nitorch/tests/test_register_disp_stopping.py
+new file mode 100644
+index 00000000..5413ee31
+--- /dev/null
++++ b/nitorch/tests/test_register_disp_stopping.py
+@@ -0,0 +1,267 @@
++"""Early stopping on the size of an update (#266).
++
++`OptimIterator(disp_tol=...)` stops when the accepted update is smaller
++than `disp_tol`, as measured by a `step_size` hook that `PairwiseRegister`
++sets: the RMS, over the fixed image, of the displacement the update
++causes, in voxels of the current level (exact, closed form, for affine;
++RMS of the displacement/velocity update for nonlinear models).
++"""
++import glob
++import os
++import numpy as np
++import torch
++import pytest
++
++from nitorch import spatial
++from nitorch.tools.registration import objects
++from nitorch.tools.registration.losses import MSE
++from nitorch.tools.registration.optim.base import OptimIterator
++from nitorch.tools.registration.optim.gd import GradientDescent
++from nitorch.tools.registration.pairwise_impl import (
++    PairwiseRegister, _affine_step_size, _nonlin_step_size)
++from nitorch.tools.registration.pairwise_makeobj import (
++    make_affine_optim, make_nonlin_optim,
++    AFFINE_DISP_TOLERANCE, NONLIN_DISP_TOLERANCE)
++
++dt = torch.double
++
++
++# ----------------------------------------------------------------------
++#   OptimIterator
++# ----------------------------------------------------------------------
++
++def _gd(disp_tol, tol=0, max_iter=50):
++    def closure(x, grad=False):
++        f = 0.5 * x.square().sum()
++        return (f, x.clone()) if grad else f
++    gd = GradientDescent(lr=0.5)
++    gd.iter = OptimIterator(max_iter=max_iter, tol=tol, disp_tol=disp_tol,
++                            step_size=lambda a, b: float((b - a).abs().max()))
++    sizes = []
++    orig = gd.step
++
++    def step(*a, **k):
++        out = orig(*a, **k)
++        sizes.append(out[0].clone())
++        return out
++    gd.step = step
++    gd.iter(torch.ones(1, dtype=dt), closure)
++    return sizes
++
++
++def test_stops_when_update_is_small():
++    # x_k = 0.5^k: the update is 0.5^k; stops at the first one < 1e-3
++    sizes = _gd(disp_tol=1e-3)
++    assert len(sizes) == 10, len(sizes)          # 0.5^10 < 1e-3 <= 0.5^9
++
++
++def test_zero_disables_displacement_criterion():
++    assert len(_gd(disp_tol=0, max_iter=30)) == 30
++
++
++def test_either_criterion_stops():
++    # the loss criterion fires first here (diff of 0.5 x^2 < 1e-2)
++    n_loss = len(_gd(disp_tol=0, tol=1e-2))
++    assert n_loss < len(_gd(disp_tol=1e-6, tol=0))
++    assert len(_gd(disp_tol=1e-6, tol=1e-2)) == n_loss
++
++
++def test_no_hook_falls_back_to_rms_of_parameters():
++    from nitorch.tools.registration.optim.base import rms_step
++    gd = GradientDescent(lr=0.5)
++    gd.iter = OptimIterator(max_iter=50, tol=0, disp_tol=1e-3)
++
++    def closure(x, grad=False):
++        f = 0.5 * x.square().sum()
++        return (f, x.clone()) if grad else f
++    x0 = torch.full([4], 2., dtype=dt)
++    gd.iter(x0.clone(), closure)
++    assert gd.iter.last_step_size < 1e-3
++    # rms over all parameters, of lists and of parameter wrappers
++    a, b = torch.zeros(3, dtype=dt), torch.full([3], 2., dtype=dt)
++    assert rms_step(a, b) == 2.
++    assert rms_step([a, a[:1]], [b, b[:1]]) == 2.
++    assert abs(rms_step([a, a[:1]], [b, b[:1] + 2]) - 7 ** 0.5) < 1e-12
++
++    class Wrapped:
++        def __init__(self, dat):
++            self.dat = dat
++    assert rms_step(Wrapped(a), Wrapped(b)) == 2.
++
++
++# ----------------------------------------------------------------------
++#   step-size measures
++# ----------------------------------------------------------------------
++
++def _image(shape=(9, 10, 11), masked=True, vx=(0.8, 1.0, 1.2), shift=0.):
++    aff = spatial.affine_default(shape, list(vx), dtype=dt)
++    aff[:3, -1] += shift
++    dat = torch.rand([1, *shape], dtype=dt)
++    mask = None
++    if masked:
++        mask = torch.zeros([1, *shape], dtype=dt)
++        mask[:, 2:7, 1:8, 3:10] = 1
++    return objects.Image(dat, affine=aff, mask=mask)
++
++
++def _affine_ref(affine, image, q0, q1, backward=False):
++    """Explicit sum of squared displacements (in the image's voxels) and
++    number of (masked) voxels."""
++    x = spatial.affine_grid(image.affine, image.shape)          # world
++    x = torch.cat([x, torch.ones_like(x[..., :1])], -1)[..., None]
++    exp = affine.dat.iexp if backward else affine.dat.exp
++    d = ((exp(q1) - exp(q0)).matmul(x))[..., :3, 0]
++    d = d.matmul(torch.linalg.inv(image.affine[:3, :3]).T)      # world -> vox
++    d = d.square().sum(-1)
++    w = image.mask[0] if image.masked else torch.ones_like(d)
++    return (d * w).sum(), w.sum()
++
++
++def _rand_q(affine, seed=0):
++    g = torch.Generator().manual_seed(seed)
++    q0 = 0.05 * torch.randn(affine.parameters().shape, dtype=dt, generator=g)
++    return q0, q0 + 0.01 * torch.randn(q0.shape, dtype=dt, generator=g)
++
++
++@pytest.mark.parametrize('masked', [True, False])
++@pytest.mark.parametrize('basis', ['rigid', 'affine'])
++@pytest.mark.parametrize('backward', [False, True])
++def test_affine_step_size_is_exact(masked, basis, backward):
++    # anisotropic voxels: RAS displacements are converted to voxels per axis
++    image = _image(masked=masked)
++    affine = objects.AffineModel(basis).set_dat(dim=3, dtype=dt)
++    q0, q1 = _rand_q(affine)
++    size = _affine_step_size(affine, [(image, backward)])(q0, q1)
++    ss, n = _affine_ref(affine, image, q0, q1, backward)
++    ref = (ss / n).sqrt().item()
++    assert abs(size - ref) <= 1e-10 * max(1, ref), (size, ref)
++    # the parameter wrapper is accepted too
++    p = affine.parameters()
++    assert _affine_step_size(affine, [(image, backward)])(p.clone(), p) == 0
++
++
++def test_affine_step_size_symmetric():
++    # both images (forward on fixed, inverse on moving): RMS over all
++    # their voxels, each in its own voxel coordinates
++    fix = _image(vx=(0.8, 1.0, 1.2))
++    mov = _image(shape=(8, 9, 10), vx=(1.5, 1.5, 1.5), masked=False, shift=3.)
++    affine = objects.AffineModel('affine').set_dat(dim=3, dtype=dt)
++    q0, q1 = _rand_q(affine, seed=1)
++    size = _affine_step_size(affine, [(fix, False), (mov, True)])(q0, q1)
++    ss1, n1 = _affine_ref(affine, fix, q0, q1, False)
++    ss2, n2 = _affine_ref(affine, mov, q0, q1, True)
++    ref = ((ss1 + ss2) / (n1 + n2)).sqrt().item()
++    assert abs(size - ref) <= 1e-10 * max(1, ref), (size, ref)
++
++
++@pytest.mark.parametrize('lattice', ['same', 'padded', 'coarser'])
++def test_nonlin_step_size_is_masked_rms(lattice):
++    image = _image()
++    nonlin = objects.SmallDefModel()
++    if lattice == 'same':
++        nonlin.set_dat(image.shape, affine=image.affine, dtype=dt)
++    elif lattice == 'padded':
++        shape = [s + 4 for s in image.shape]
++        aff = image.affine.matmul(spatial.affine_matrix_classic(
++            torch.tensor([-2., -2., -2.], dtype=dt)))   # padded by 2 voxels
++        nonlin.set_dat(shape, affine=aff, dtype=dt)
++    else:
++        # lattice voxels twice as large: a 1-voxel update moves the
++        # image's voxels by 2 voxels, and covers 8 of them
++        nonlin.set_dat(image.shape, affine=image.affine.matmul(
++            torch.diag(torch.tensor([2., 2., 2., 1.], dtype=dt))), dtype=dt)
++    g = torch.Generator().manual_seed(0)
++    v0 = torch.randn(nonlin.parameters().shape, dtype=dt, generator=g)
++    v1 = v0 + torch.randn(v0.shape, dtype=dt, generator=g)
++    size = _nonlin_step_size(nonlin, [(image, False)])(v0, v1)
++    d = (v1 - v0).square().sum(-1)
++    m = image.mask[0]
++    if lattice == 'padded':
++        d = d[2:-2, 2:-2, 2:-2]                    # back on the image grid
++        ref = ((d * m).sum() / m.sum()).sqrt()
++    elif lattice == 'same':
++        ref = ((d * m).sum() / m.sum()).sqrt()
++    else:
++        # lattice voxel i covers image voxels 2i-0.5 .. 2i+1.5: compare
++        # with the lattice voxels whose centre falls inside the mask
++        ref = None
++    if ref is not None:
++        assert abs(size - ref.item()) <= 1e-8 * ref.item(), (size, ref)
++    else:
++        same = _nonlin_step_size(nonlin, [(image, False)])
++        # a uniform update of 1 lattice voxel along x moves voxels by 2
++        u = torch.zeros_like(v0); u[..., 0] = 1
++        assert abs(same(torch.zeros_like(v0), u) - 2) < 1e-8
++
++
++def test_nonlin_step_size_symmetric_weights_by_voxel_count():
++    # two images with different resolutions: each lattice voxel counts as
++    # many target voxels as it covers (here, the coarse image's field of
++    # view contains the whole lattice, so that no voxel is on its border)
++    nonlin = objects.SmallDefModel()
++    fine = _image(shape=(8, 8, 8), vx=(1., 1., 1.), masked=False)
++    coarse = _image(shape=(6, 6, 6), vx=(2., 2., 2.), masked=False)
++    centre = lambda img: img.affine.matmul(torch.tensor(
++        [*[(n - 1) / 2 for n in img.shape], 1.], dtype=dt))
++    assert torch.allclose(centre(fine), centre(coarse))     # same centre
++    nonlin.set_dat(fine.shape, affine=fine.affine, dtype=dt)
++    u = torch.zeros(nonlin.parameters().shape, dtype=dt)
++    u[..., 0] = 1                              # 1 mm = 1 fine = 0.5 coarse
++    size = _nonlin_step_size(nonlin, [(fine, False), (coarse, True)])(
++        torch.zeros_like(u), u)
++    n_fine, n_coarse = 8 ** 3, 8 ** 3 / 8     # lattice voxels in coarse units
++    ref = ((n_fine * 1. + n_coarse * 0.25) / (n_fine + n_coarse)) ** 0.5
++    assert abs(size - ref) < 1e-8, (size, ref)
++
++
++# ----------------------------------------------------------------------
++#   PairwiseRegister / CLI
++# ----------------------------------------------------------------------
++
++def _pair(shape=(12, 12, 12)):
++    g = torch.Generator().manual_seed(0)
++    x = torch.rand([1, *shape], dtype=dt, generator=g)
++    for _ in range(2):
++        for d in range(1, 4):
++            x = (x + x.roll(1, d) + x.roll(-1, d)) / 3
++    aff = spatial.affine_default(shape, 1., dtype=dt)
++    return objects.Image(x, affine=aff), objects.Image(x.roll(1, 3), affine=aff)
++
++
++@pytest.mark.parametrize('kind', ['affine', 'nonlin'])
++def test_register_stops_on_displacement(kind):
++    def run(disp_tol):
++        fix, mov = _pair()
++        sim = objects.Similarity(MSE(lam=1, dim=3), mov, fix)
++        affine = nonlin = None
++        if kind == 'affine':
++            affine = objects.AffineModel('rigid', position='sym')
++            affine.frozen = False
++            optim = make_affine_optim('gn', 2, max_iter=30, tolerance=0,
++                                      disp_tolerance=disp_tol)
++        else:
++            nonlin = objects.SVFModel(steps=4)
++            nonlin.set_dat(fix.shape, affine=fix.affine, dtype=dt)
++            nonlin.frozen = False
++            optim = make_nonlin_optim('gn', 2, max_iter=30, tolerance=0,
++                                      disp_tolerance=disp_tol, nonlin=nonlin)
++        PairwiseRegister([sim], affine, nonlin, optim, verbose=0).fit()
++        return optim.iter.last_step_size
++    assert run(0) is None                          # not measured when off
++    last = run(1e-2)
++    assert last is not None and last < 1e-2
++
++
++def test_defaults():
++    assert make_affine_optim('gn', 2).iter.disp_tol == AFFINE_DISP_TOLERANCE
++    assert make_nonlin_optim('gn', 2).iter.disp_tol == NONLIN_DISP_TOLERANCE
++    assert make_nonlin_optim('gn', 2, disp_tolerance=0).iter.disp_tol == 0
++
++
++def test_cli_option():
++    from nitorch.cli.registration.register.parser import parser
++    base = ['@loss', 'mse', '@@fix', 'f.nii', '@@mov', 'm.nii']
++    opt = parser.parse(base + ['@nonlin', '@@optim', 'gn', '-d', '0.05'])
++    assert opt.nonlin.optim.disp_tolerance == 0.05
++    opt = parser.parse(base + ['@affine', '@@optim', 'gn'])
++    assert opt.affine.optim.disp_tolerance is None     # model default
+diff --git a/nitorch/tests/test_register_eval_count.py b/nitorch/tests/test_register_eval_count.py
+index 2cf7790f..922922e6 100644
+--- a/nitorch/tests/test_register_eval_count.py
++++ b/nitorch/tests/test_register_eval_count.py
+@@ -191,7 +191,7 @@ def _trace(kind, loss='mse', max_iter=3, outer=2):
+         orig[name] = getattr(PairwiseRegisterStep, name)
+     sim, affine, nonlin, optim = _setup(kind, loss, max_iter=max_iter)
+     for opt in (optim if kind == 'joint' else [optim]):
+-        opt.iter.tol = 0                # exactly `max_iter` steps
++        opt.iter.tol = opt.iter.disp_tol = 0    # exactly `max_iter` steps
+     if kind == 'joint':
+         optim.max_iter = outer
+     try:
+diff --git a/nitorch/tools/registration/optim/base.py b/nitorch/tools/registration/optim/base.py
+index 89cc2eda..a53e7a92 100644
+--- a/nitorch/tools/registration/optim/base.py
++++ b/nitorch/tools/registration/optim/base.py
+@@ -37,6 +37,19 @@ def _all_finite(x):
+     return math.isfinite(x)
+ 
+ 
++def rms_step(prev, new):
++    """Default size of an update: RMS of the change of the parameters
++    (in their own units), over all of them."""
++    prev = prev if isinstance(prev, (list, tuple)) else [prev]
++    new = new if isinstance(new, (list, tuple)) else [new]
++    ss, n = 0., 0
++    for x0, x1 in zip(prev, new):
++        x0, x1 = getattr(x0, 'dat', x0), getattr(x1, 'dat', x1)
++        ss += (x1 - x0).double().square().sum().item()
++        n += x1.numel()
++    return (ss / max(n, 1)) ** 0.5
++
++
+ def _clone(x):
+     if isinstance(x, (list, tuple)):
+         return [x1.clone() for x1 in x]
+@@ -279,7 +292,7 @@ class OptimIterator(OptimWrapper):
+     """
+ 
+     def __init__(self, optim=None, max_iter=20, tol=1e-9, stop='diff',
+-                 keep_state=True, **kwargs):
++                 keep_state=True, disp_tol=0, step_size=None, **kwargs):
+         """
+ 
+         Parameters
+@@ -289,15 +302,27 @@ def __init__(self, optim=None, max_iter=20, tol=1e-9, stop='diff',
+         max_iter : int, default=20
+             Maximum number of iterations
+         tol : float, default=1e-9
+-            Tolerance for early stopping
++            Tolerance for early stopping (on the loss)
+         stop : {'diff', 'gain', 'grad'}, default='diff'
+             Stopping criterion. Can be a combination.
+-
++        disp_tol : float, default=0
++            Tolerance for early stopping on the size of the accepted
++            update, as measured by `step_size`. 0 disables it.
++        step_size : callable(param_prev, param_new) -> float, optional
++            Size of an update (e.g., the RMS displacement it causes, in
++            voxels). Set by whoever knows what the parameters mean (e.g.,
++            `PairwiseRegister`). Default: RMS of the change of the
++            parameters (`rms_step`).
++
++        Iterations stop as soon as either criterion is met.
+         """
+         super().__init__(optim, **kwargs)
+         self.max_iter = max_iter
+         self.tol = tol
+         self.stop = stop
++        self.disp_tol = disp_tol
++        self.step_size = step_size
++        self.last_step_size = None
+         self.keep_state = keep_state
+         self.loss_max = -float('inf')
+         self.loss_prev = float('inf')
+@@ -341,15 +366,26 @@ def step(self, param=None, closure=None, **kwargs):
+         loss, *derivatives = self._get_loss(param, closure, **kwargs)
+ 
+         loss_prev = loss_max = loss
++        track_step = bool(self.disp_tol)
++        step_size = self.step_size if callable(self.step_size) else rms_step
++        self.last_step_size = None
+         for n_iter in range(1, self.max_iter+1):
+ 
+             # perform step
++            param_prev = _clone(param) if track_step else None
+             step = optim.step if optim.iter is self else optim.iter
+             param, loss, *derivatives = step(
+                 param, closure,
+                 **self.derivatives_to_dict(loss, *derivatives))
+ 
+-            # check convergence
++            # check convergence: size of the update
++            if track_step:
++                self.last_step_size = float(step_size(param_prev, param))
++                del param_prev
++                if self.last_step_size < self.disp_tol:
++                    break
++
++            # check convergence: loss
+             stop = abs(loss_prev-loss)
+             if self.stop == 'gain':
+                 denom = abs(loss_max-loss)
+@@ -378,7 +414,7 @@ def commit_line_search(self, param, closure, derivatives):
+             closure(param)
+ 
+     def repr_keys(self):
+-        return ['max_iter', 'tol', 'stop']
++        return ['max_iter', 'tol', 'stop', 'disp_tol']
+ 
+ 
+ class InterleavedOptimIterator(OptimIterator):
+diff --git a/nitorch/tools/registration/pairwise_impl.py b/nitorch/tools/registration/pairwise_impl.py
+index 6c06be18..379025b2 100644
+--- a/nitorch/tools/registration/pairwise_impl.py
++++ b/nitorch/tools/registration/pairwise_impl.py
+@@ -115,6 +115,29 @@ def __init__(self,
+     def __call__(self):
+         return self.fit()
+ 
++    def _set_step_sizes(self):
++        """Give each optimiser that stops on the size of its updates
++        (`disp_tol`) the function that measures them."""
++        targets = _step_targets(self.losses)
++        affine = self.affine if not getattr(self.affine, 'frozen', False) else None
++        nonlin = self.nonlin if not getattr(self.nonlin, 'frozen', False) else None
++        if affine and nonlin:
++            pairs = [(self.optim[0], 'affine'), (self.optim[1], 'nonlin')]
++        elif affine:
++            pairs = [(self.optim, 'affine')]
++        elif nonlin:
++            pairs = [(self.optim, 'nonlin')]
++        else:
++            pairs = []
++        for opt, kind in pairs:
++            it = getattr(opt, 'iter', None)
++            if not isinstance(it, optm.OptimIterator) or not it.disp_tol:
++                continue
++            if kind == 'affine':
++                it.step_size = _affine_step_size(self.affine, targets)
++            else:
++                it.step_size = _nonlin_step_size(self.nonlin, targets)
++
+     def fit(self):
+         # Transformation parameters must be floating point, even when
+         # the images are not (e.g., discretized images are integers).
+@@ -184,6 +207,7 @@ def fit(self):
+             step.init_penalties()
+ 
+         step.framerate = self.framerate
++        self._set_step_sizes()
+         if self.affine and self.nonlin:
+             if getattr(self.affine, 'frozen', False):
+                 nonlin_optim = self.optim
+@@ -259,6 +283,144 @@ def fit(self):
+         return step.ll
+ 
+ 
++# ----------------------------------------------------------------------
++#   Size of an accepted update, for displacement-based early stopping
++#   (#266): RMS of the displacement that the update causes, over the
++#   voxels of the images on which the losses are evaluated, each measured
++#   in the voxel coordinates of its own image (current pyramid level).
++#
++#   The "targets" are the (image, direction) pairs on whose grid a loss is
++#   computed: each loss's `fixed` image, warped by the forward transform,
++#   or by the inverse one if `loss.backward` (the reversed half of a
++#   symmetric loss, whose `fixed` is the original moving image).
++# ----------------------------------------------------------------------
++
++def _image_weights(image):
++    """Weights of an image's voxels: its mask if any, else ones."""
++    dat = image.dat
++    if image.masked:
++        w = image.mask.to(device=dat.device, dtype=torch.double)
++        while w.dim() > image.dim:      # channels: valid in any channel
++            w = w.amax(0)
++        return (w > 0).double()
++    return torch.ones(image.shape, dtype=torch.double, device=dat.device)
++
++
++def _step_targets(losses):
++    """Distinct (image, backward) pairs on whose grid the losses are
++    evaluated."""
++    targets, seen = [], set()
++    for loss in losses:
++        key = (id(loss.fixed), bool(loss.backward))
++        if key not in seen:
++            seen.add(key)
++            targets.append((loss.fixed, bool(loss.backward)))
++    return targets
++
++
++def _affine_step_size(affine, targets):
++    """Exact RMS displacement of an affine update, in closed form.
++
++    For a target image with voxel-to-world matrix `F` (linear part `F3`)
++    and homogeneous world coordinates `x~` of its (masked) voxels, the
++    displacement of a voxel, in that image's voxel coordinates, is
++    `F3^-1 (A1 - A0) x~` (A = forward transform, or its inverse for a
++    backward target), so that its mean square is `tr(R E[x~ x~'] R')`,
++    with `R = F3^-1 (A1 - A0)`. The second moments of each target grid
++    are computed once.
++    """
++    if not isinstance(targets, (list, tuple)):
++        targets = [(targets, False)]
++    stats = []
++    for image, backward in targets:
++        w = _image_weights(image)
++        dim = w.dim()
++        total = w.sum()
++        coords = [torch.arange(n, dtype=torch.double, device=w.device).reshape(
++                  [n if d == i else 1 for i in range(dim)])
++                  for d, n in enumerate(w.shape)]
++        mom = torch.zeros([dim + 1, dim + 1], dtype=torch.double,
++                          device=w.device)
++        mom[-1, -1] = 1
++        for d in range(dim):
++            wd = w * coords[d]
++            mom[d, -1] = mom[-1, d] = wd.sum() / total
++            for e in range(d, dim):
++                mom[d, e] = mom[e, d] = (wd * coords[e]).sum() / total
++            del wd
++        vox2world = image.affine.to(mom)
++        mom = vox2world.matmul(mom).matmul(vox2world.T)       # world moments
++        world2vox = torch.linalg.inv(vox2world[:dim, :dim])
++        stats.append((backward, total, mom, world2vox))
++    total = sum(t for _, t, _, _ in stats)
++
++    def step_size(prev, new):
++        q0 = getattr(prev, 'dat', prev)
++        q1 = getattr(new, 'dat', new)
++        rms2 = 0
++        for backward, count, mom, world2vox in stats:
++            exp = affine.dat.iexp if backward else affine.dat.exp
++            delta = exp(q1).to(mom) - exp(q0).to(mom)
++            delta = world2vox.matmul(delta[..., :dim, :])
++            ms = delta.matmul(mom).matmul(delta.transpose(-1, -2))
++            rms2 += count * ms.diagonal(0, -1, -2).sum(-1).mean()
++        return (rms2 / total).clamp_min(0).sqrt().item()
++    return step_size
++
++
++def _nonlin_step_size(nonlin, targets):
++    """RMS of the update of the nonlinear parameters, over the target
++    images, in each image's voxel coordinates.
++
++    The parameters live on the nonlinear lattice (voxel-to-world `L`), in
++    lattice voxels: an update `dv` is `L3 dv` in world units and
++    `F3^-1 L3 dv` in the voxels of a target image (voxel-to-world `F`).
++    Each lattice voxel is weighted by the number of (masked) target voxels
++    it covers.
++
++    smalldef: the parameter is the displacement: exact.
++    svf, shoot: the parameter is a velocity; the change of the displacement
++    is `exp(v + dv) - exp(v) ~= dv`, transported and stretched by the flow,
++    to first order (and `-dv` for the inverse, for backward targets). The
++    RMS of `dv` is used.
++    """
++    if not isinstance(targets, (list, tuple)):
++        targets = [(targets, False)]
++    lattice = list(nonlin.shape)
++    lat2world = nonlin.affine.double()
++    dim = len(lattice)
++    stats = []
++    for image, _ in targets:
++        w = _image_weights(image)
++        vox2world = image.affine.double().to(w.device)
++        lat2world = lat2world.to(w.device)
++        if list(w.shape) == lattice and torch.allclose(vox2world, lat2world):
++            weights = w
++        else:
++            # fraction of each lattice voxel that falls in the target image
++            lat2vox = torch.linalg.inv(vox2world).matmul(lat2world)
++            grid = spatial.affine_grid(lat2vox.to(w), lattice)
++            weights = spatial.grid_pull(w[None], grid, bound='zero',
++                                        extrapolate=False, interpolation=1)[0]
++        # number of target voxels per lattice voxel
++        weights = weights * (lat2world[:dim, :dim].det().abs()
++                             / vox2world[:dim, :dim].det().abs())
++        # lattice voxels -> target voxels
++        lat2tgt = torch.linalg.inv(vox2world[:dim, :dim]).matmul(
++            lat2world[:dim, :dim])
++        stats.append((weights, lat2tgt))
++    total = sum(w.sum() for w, _ in stats)
++
++    def step_size(prev, new):
++        delta = (new - prev).reshape([-1, *lattice, dim])
++        rms2 = 0
++        for weights, lat2tgt in stats:
++            d = delta.matmul(lat2tgt.T.to(delta)).square_().sum(-1)
++            rms2 += (d * weights.to(d)).sum() / len(d)
++        return (rms2 / total).clamp_min(0).sqrt().item()
++    return step_size
++
++
+ def _almost_identity(aff):
+     return torch.allclose(aff, torch.eye(*aff.shape, **utils.backend(aff)))
+ 
+diff --git a/nitorch/tools/registration/pairwise_makeobj.py b/nitorch/tools/registration/pairwise_makeobj.py
+index 2eb00117..c9331faa 100644
+--- a/nitorch/tools/registration/pairwise_makeobj.py
++++ b/nitorch/tools/registration/pairwise_makeobj.py
+@@ -349,8 +349,19 @@ def make_nonlin_2d(plane, affine_ref, *args, **kwargs):
+     return nonlin
+ 
+ 
++# Default tolerances on the size of an accepted update (#266): RMS, over the
++# (masked) voxels of the images the losses are evaluated on (the fixed
++# images, and both images of symmetric losses), of the displacement it
++# causes, each in the voxel coordinates of its own image at the current
++# pyramid level. Deliberately conservative: they only stop runs whose
++# updates have become negligible.
++AFFINE_DISP_TOLERANCE = 1e-3
++NONLIN_DISP_TOLERANCE = 1e-2
++
++
+ def make_affine_optim(optim=None, order=None, line_search='wolfe', lr=None,
+-                      max_iter=50, tolerance=1e-5, crit='diff', **kwargs):
++                      max_iter=50, tolerance=1e-5, crit='diff',
++                      disp_tolerance=None, **kwargs):
+     """Build an Optimizer for the affine model
+ 
+     Parameters
+@@ -375,6 +386,11 @@ def make_affine_optim(optim=None, order=None, line_search='wolfe', lr=None,
+         Tolerance for early stopping
+     crit : {'diff', 'gain'}, default='diff'
+         Stopping criterion
++    disp_tolerance : float, default=AFFINE_DISP_TOLERANCE
++        Tolerance for early stopping on the size of the accepted update:
++        RMS of the displacement it causes over the images the losses are
++        evaluated on, in their voxels (current pyramid level). 0 disables
++        it. Iterations stop as soon as either tolerance is met.
+ 
+     Keyword Parameters
+     ------------------
+@@ -431,13 +447,16 @@ def make_affine_optim(optim=None, order=None, line_search='wolfe', lr=None,
+     if line_search and not isinstance(affine_optim, (opt.Powell, opt.LBFGS)):
+         affine_optim.search = line_search
+ 
+-    affine_optim.iter = opt.OptimIterator(max_iter=max_iter, tol=tolerance, stop=crit)
++    if disp_tolerance is None:
++        disp_tolerance = AFFINE_DISP_TOLERANCE
++    affine_optim.iter = opt.OptimIterator(max_iter=max_iter, tol=tolerance,
++                                          stop=crit, disp_tol=disp_tolerance)
+     return affine_optim
+ 
+ 
+ def make_nonlin_optim(optim=None, order=None, line_search='wolfe', lr=None,
+                       max_iter=50, tolerance=1e-5, crit='diff',
+-                      nonlin=None, penalty=None, voxel_size=None,
++                      disp_tolerance=None, nonlin=None, penalty=None, voxel_size=None,
+                       preconditioner=None, **kwargs):
+     """Build an Optimizer for the affine model
+ 
+@@ -462,6 +481,13 @@ def make_nonlin_optim(optim=None, order=None, line_search='wolfe', lr=None,
+         Tolerance for early stopping
+     crit : {'diff', 'gain'}, default='diff'
+         Stopping criterion
++    disp_tolerance : float, default=NONLIN_DISP_TOLERANCE
++        Tolerance for early stopping on the size of the accepted update:
++        RMS of the update of the displacement (smalldef) or velocity
++        (svf, shoot: first-order estimate of the displacement change),
++        over the images the losses are evaluated on, in their voxels
++        (current pyramid level). 0 disables it. Iterations stop as soon
++        as either tolerance is met.
+     nonlin : NonlinModel, optional
+         Nonlinear model, from which the penalty, voxel size and
+         preconditioner can be guessed.
+@@ -540,7 +566,10 @@ def make_nonlin_optim(optim=None, order=None, line_search='wolfe', lr=None,
+     if line_search and not isinstance(nonlin_optim, (opt.Powell, opt.LBFGS)):
+         nonlin_optim.search = line_search
+ 
+-    nonlin_optim.iter = opt.OptimIterator(max_iter=max_iter, tol=tolerance, stop=crit)
++    if disp_tolerance is None:
++        disp_tolerance = NONLIN_DISP_TOLERANCE
++    nonlin_optim.iter = opt.OptimIterator(max_iter=max_iter, tol=tolerance,
++                                          stop=crit, disp_tol=disp_tolerance)
+     return nonlin_optim
+ 
+ 

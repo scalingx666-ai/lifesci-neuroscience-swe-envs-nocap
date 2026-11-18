@@ -1,0 +1,1353 @@
+diff --git a/src/minisweagent/agents/homogeneous/homogeneous_agent.py b/src/minisweagent/agents/homogeneous/homogeneous_agent.py
+index 4b1e27aba..b11cb32c4 100644
+--- a/src/minisweagent/agents/homogeneous/homogeneous_agent.py
++++ b/src/minisweagent/agents/homogeneous/homogeneous_agent.py
+@@ -183,6 +183,20 @@ def run_homogeneous_agent(
+             "best_speedup": speedup,
+             "summary": best_result.llm_conclusion if best_result else "No best patch selected",
+         }
++
++        # Snapshot the post-patch state of all files touched by the winner
++        # into <output_dir>/optimized_codes/ and embed the manifest. Failures
++        # here must never block report writing.
++        try:
++            from minisweagent.run.postprocess.optimized_codes import collect_optimized_codes
++
++            if report.get("best_patch"):
++                manifest = collect_optimized_codes(final_repo, report["best_patch"], final_output_dir)
++                if manifest:
++                    report["optimized_codes"] = manifest
++        except Exception as snapshot_exc:
++            logger.warning("optimized_codes snapshot failed: %s", snapshot_exc)
++
+         report_path = final_output_dir / "final_report.json"
+         report_path.write_text(json.dumps(report, indent=2, default=str))
+         logger.info("Wrote final_report.json to %s", report_path)
+diff --git a/src/minisweagent/run/pipeline_types.py b/src/minisweagent/run/pipeline_types.py
+index 140f706db..1996ea170 100644
+--- a/src/minisweagent/run/pipeline_types.py
++++ b/src/minisweagent/run/pipeline_types.py
+@@ -198,6 +198,7 @@ class FinalReport:
+     best_task: str | None = None
+     best_speedup: float | None = None
+     verified_speedup_unclamped: float | None = None
++    optimized_codes: dict[str, Any] | None = None
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return _strip_none({f.name: getattr(self, f.name) for f in fields(self)})
+@@ -214,4 +215,5 @@ def from_dict(cls, d: dict[str, Any]) -> FinalReport:
+             best_task=d.get("best_task"),
+             best_speedup=d.get("best_speedup"),
+             verified_speedup_unclamped=d.get("verified_speedup_unclamped", d.get("verified_speedup_raw")),
++            optimized_codes=d.get("optimized_codes") if isinstance(d.get("optimized_codes"), dict) else None,
+         )
+diff --git a/src/minisweagent/run/postprocess/optimized_codes.py b/src/minisweagent/run/postprocess/optimized_codes.py
+new file mode 100644
+index 000000000..eac51df54
+--- /dev/null
++++ b/src/minisweagent/run/postprocess/optimized_codes.py
+@@ -0,0 +1,328 @@
++"""Snapshot the post-patch state of all files touched by the best patch.
++
++``final_report.json`` historically pointed at ``best_patch`` only, leaving
++downstream consumers to figure out which files actually changed and what
++their post-patch contents look like. This module reconstructs that view:
++
++  * Replays the best patch onto a clean baseline checkout of ``repo_root``.
++  * Records every added / modified / deleted / renamed path via
++    ``git diff --name-status``.
++  * Copies the post-patch contents of added and modified files into
++    ``<output_dir>/optimized_codes/`` preserving their repo-relative
++    layout, so the directory is a self-contained, immediately usable
++    snapshot of "the optimized codebase".
++  * Returns a manifest dict suitable for direct embedding under the
++    ``optimized_codes`` key of ``final_report.json``.
++
++The function is best-effort: any failure (missing patch, apply error, etc.)
++is reported as a structured ``{"status": "skipped", "reason": ...}`` so the
++caller can safely embed the result without branching.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import shutil
++import subprocess
++from pathlib import Path
++from typing import Any
++
++from minisweagent.run.postprocess.evaluation import (
++    PatchApplyError,
++    cleanup_eval_worktree,
++    setup_eval_worktree,
++)
++from minisweagent.run.utils.generated_artifacts import is_jit_cache_artifact
++from minisweagent.run.utils.git_safe_env import get_git_safe_env
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_TARGET_DIR_NAME = "optimized_codes"
++
++# Stop reconstructing if the snapshot would exceed this size. Protects against
++# accidental copying of huge binary artifacts or build outputs that slipped
++# into the patch.
++_MAX_TOTAL_BYTES = 256 * 1024 * 1024  # 256 MiB
++
++
++def _git_diff_name_status(eval_dir: Path) -> list[tuple[str, list[str]]]:
++    """Return ``[(status_code, paths)]`` from ``git diff --name-status HEAD``.
++
++    Rename / copy statuses (``R100``, ``C075`` etc.) yield two paths
++    ``[old, new]``; every other status yields a single path.
++
++    ``git apply`` leaves newly created files untracked, so a plain
++    ``git diff HEAD`` misses them. We first mark untracked files with
++    ``git add -N`` (intent-to-add) so they show up as additions in the
++    diff without staging any content; this is reversible/no-op and uses
++    rename-detection (``-M``) so renames are properly classified rather
++    than reported as add+delete pairs.
++    """
++    git_env = get_git_safe_env(eval_dir.parent)
++    subprocess.run(
++        ["git", "add", "-N", "--", "."],
++        cwd=str(eval_dir),
++        capture_output=True,
++        text=True,
++        env=git_env,
++        timeout=60,
++    )
++    result = subprocess.run(
++        ["git", "diff", "--name-status", "-M", "-z", "HEAD"],
++        cwd=str(eval_dir),
++        capture_output=True,
++        text=True,
++        env=git_env,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        logger.warning(
++            "git diff --name-status failed in %s (rc=%s): %s",
++            eval_dir,
++            result.returncode,
++            result.stderr.strip(),
++        )
++        return []
++
++    # -z output: NUL-separated fields. For R/C entries, status and old/new
++    # paths arrive as three consecutive fields; other statuses use two.
++    tokens = result.stdout.split("\x00")
++    entries: list[tuple[str, list[str]]] = []
++    i = 0
++    while i < len(tokens):
++        status = tokens[i]
++        if not status:
++            i += 1
++            continue
++        i += 1
++        if status[0] in ("R", "C"):
++            if i + 1 >= len(tokens):
++                break
++            entries.append((status, [tokens[i], tokens[i + 1]]))
++            i += 2
++        else:
++            if i >= len(tokens):
++                break
++            entries.append((status, [tokens[i]]))
++            i += 1
++    return entries
++
++
++def _classify_entries(
++    entries: list[tuple[str, list[str]]],
++) -> tuple[list[str], list[str], list[str], list[dict[str, str]]]:
++    """Bucket name-status entries into added / modified / deleted / renamed."""
++    added: list[str] = []
++    modified: list[str] = []
++    deleted: list[str] = []
++    renamed: list[dict[str, str]] = []
++    for status, paths in entries:
++        head = status[0]
++        if head == "A":
++            added.append(paths[0])
++        elif head == "M":
++            modified.append(paths[0])
++        elif head == "D":
++            deleted.append(paths[0])
++        elif head in ("R", "C"):
++            if len(paths) == 2:
++                renamed.append({"from": paths[0], "to": paths[1]})
++        elif head == "T":
++            # Type change (e.g. file -> symlink). Treat as modified so the
++            # post-patch artifact still gets snapshotted.
++            modified.append(paths[0])
++    return added, modified, deleted, renamed
++
++
++def _drop_jit_cache_paths(
++    added: list[str],
++    modified: list[str],
++    deleted: list[str],
++    renamed: list[dict[str, str]],
++) -> tuple[
++    list[str],
++    list[str],
++    list[str],
++    list[dict[str, str]],
++    list[str],
++]:
++    """Filter JIT-cache paths out of the classified diff entries.
++
++    Layer B of the "no JIT pkls in final_report.optimized_codes" fix:
++    even if the upstream patch capture in ``save_and_test`` failed to
++    strip a flydsl_cache pkl (e.g. brand-new JIT cache pattern we haven't
++    enumerated yet), final_report.json still ends up clean here. The
++    function returns the four scrubbed lists plus a sorted list of the
++    paths that were dropped, so the manifest can expose what was filtered.
++    """
++
++    kept_added = [p for p in added if not is_jit_cache_artifact(p)]
++    kept_modified = [p for p in modified if not is_jit_cache_artifact(p)]
++    kept_deleted = [p for p in deleted if not is_jit_cache_artifact(p)]
++    kept_renamed: list[dict[str, str]] = []
++    dropped: set[str] = set()
++    dropped.update(p for p in added if is_jit_cache_artifact(p))
++    dropped.update(p for p in modified if is_jit_cache_artifact(p))
++    dropped.update(p for p in deleted if is_jit_cache_artifact(p))
++    for entry in renamed:
++        to_path = entry.get("to", "")
++        from_path = entry.get("from", "")
++        if is_jit_cache_artifact(to_path) or is_jit_cache_artifact(from_path):
++            if to_path:
++                dropped.add(to_path)
++            if from_path and from_path != to_path:
++                dropped.add(from_path)
++            continue
++        kept_renamed.append(entry)
++    return kept_added, kept_modified, kept_deleted, kept_renamed, sorted(dropped)
++
++
++def _copy_snapshot(
++    eval_dir: Path,
++    target_dir: Path,
++    rel_paths: list[str],
++) -> tuple[list[str], int]:
++    """Copy each ``rel_paths`` from ``eval_dir`` to ``target_dir`` preserving
++    the relative layout. Returns ``(files_copied, total_bytes)``.
++    """
++    copied: list[str] = []
++    total = 0
++    for rel in rel_paths:
++        # Reject anything that tries to escape the worktree via .. segments
++        # or absolute paths (defense in depth; git should never produce them).
++        rel_path = Path(rel)
++        if rel_path.is_absolute() or ".." in rel_path.parts:
++            logger.warning("Skipping suspicious diff path %r", rel)
++            continue
++
++        src = eval_dir / rel_path
++        if not src.is_file() and not src.is_symlink():
++            logger.debug("Skipping non-file diff entry: %s", src)
++            continue
++
++        dst = target_dir / rel_path
++        try:
++            dst.parent.mkdir(parents=True, exist_ok=True)
++            if src.is_symlink():
++                link_target = os.readlink(src)
++                if dst.exists() or dst.is_symlink():
++                    dst.unlink()
++                dst.symlink_to(link_target)
++            else:
++                shutil.copy2(src, dst)
++                total += dst.stat().st_size
++        except OSError as exc:
++            logger.warning("Failed to snapshot %s -> %s: %s", src, dst, exc)
++            continue
++
++        copied.append(str(rel_path))
++        if total > _MAX_TOTAL_BYTES:
++            logger.warning(
++                "optimized_codes snapshot exceeded size cap (%d bytes); truncating.",
++                _MAX_TOTAL_BYTES,
++            )
++            break
++    return copied, total
++
++
++def collect_optimized_codes(
++    repo_root: str | Path,
++    patch_file: str | Path | None,
++    output_dir: str | Path,
++    *,
++    target_dir_name: str = DEFAULT_TARGET_DIR_NAME,
++) -> dict[str, Any]:
++    """Materialize the post-patch state of files touched by *patch_file*.
++
++    Args:
++        repo_root: Repository the patch was generated against.
++        patch_file: Best patch from the GEAK run, or ``None``.
++        output_dir: Directory containing ``final_report.json``; the snapshot
++            lands at ``output_dir/<target_dir_name>``.
++        target_dir_name: Override the snapshot subdirectory name.
++
++    Returns:
++        A manifest dict ready to embed under ``final_report.json``'s
++        ``optimized_codes`` key. Never raises.
++    """
++    output_dir = Path(output_dir).resolve()
++
++    if not patch_file:
++        return {"status": "skipped", "reason": "no_best_patch"}
++
++    patch_path = Path(patch_file)
++    if not patch_path.is_file():
++        return {"status": "skipped", "reason": "patch_file_missing", "patch": str(patch_path)}
++    if patch_path.stat().st_size == 0:
++        return {"status": "skipped", "reason": "empty_patch", "patch": str(patch_path)}
++
++    repo = Path(repo_root)
++    if not repo.exists():
++        return {"status": "skipped", "reason": "repo_root_missing", "repo_root": str(repo)}
++
++    target_dir = output_dir / target_dir_name
++    eval_dir: Path | None = None
++    try:
++        try:
++            eval_dir = setup_eval_worktree(str(repo), str(patch_path), output_dir)
++        except PatchApplyError as exc:
++            logger.warning(
++                "collect_optimized_codes: patch did not apply against %s: %s",
++                repo,
++                exc,
++            )
++            return {"status": "skipped", "reason": "patch_apply_failed", "error": str(exc)}
++
++        entries = _git_diff_name_status(eval_dir)
++        added, modified, deleted, renamed = _classify_entries(entries)
++
++        added, modified, deleted, renamed, filtered_jit_cache = _drop_jit_cache_paths(added, modified, deleted, renamed)
++        if filtered_jit_cache:
++            logger.info(
++                "collect_optimized_codes: dropped %d JIT-cache path(s) from snapshot (sample: %s)",
++                len(filtered_jit_cache),
++                ", ".join(filtered_jit_cache[:3]),
++            )
++
++        if target_dir.exists():
++            shutil.rmtree(target_dir, ignore_errors=True)
++        target_dir.mkdir(parents=True, exist_ok=True)
++
++        snapshot_paths = sorted(set(added)) + sorted(set(modified)) + sorted(r["to"] for r in renamed)
++        files_copied, total_bytes = _copy_snapshot(eval_dir, target_dir, snapshot_paths)
++
++        manifest: dict[str, Any] = {
++            "status": "complete",
++            "directory": str(target_dir),
++            "files": sorted(files_copied),
++            "added": sorted(added),
++            "modified": sorted(modified),
++            "deleted": sorted(deleted),
++            "renamed": sorted(renamed, key=lambda r: (r.get("from", ""), r.get("to", ""))),
++            "total_bytes": total_bytes,
++            "filtered_jit_cache": filtered_jit_cache,
++        }
++        logger.info(
++            "collect_optimized_codes: snapshotted %d file(s) (%d added, %d modified, %d deleted, %d renamed, "
++            "%d JIT-cache dropped) totalling %d bytes at %s",
++            len(files_copied),
++            len(added),
++            len(modified),
++            len(deleted),
++            len(renamed),
++            len(filtered_jit_cache),
++            total_bytes,
++            target_dir,
++        )
++        return manifest
++
++    except Exception as exc:  # belt-and-suspenders -- never abort the report
++        logger.warning("collect_optimized_codes failed: %s", exc, exc_info=True)
++        return {"status": "skipped", "reason": "unexpected_error", "error": str(exc)}
++    finally:
++        if eval_dir is not None:
++            try:
++                cleanup_eval_worktree(str(repo), eval_dir)
++            except Exception as exc:
++                logger.debug("optimized_codes eval worktree cleanup failed: %s", exc)
+diff --git a/src/minisweagent/run/postprocess/results.py b/src/minisweagent/run/postprocess/results.py
+index 96b2a03e7..15a83eb04 100644
+--- a/src/minisweagent/run/postprocess/results.py
++++ b/src/minisweagent/run/postprocess/results.py
+@@ -287,11 +287,42 @@ def merge_round_evaluation_into_final_report(
+             merged["agent_summary"] = existing_summary
+         merged["summary"] = canonical_summary
+ 
++    _attach_optimized_codes(ctx, output_dir, merged)
++
+     final_report_path.write_text(json.dumps(merged, indent=2, default=str))
+     record_final_outcome(ctx, merged)
+     return merged
+ 
+ 
++def _attach_optimized_codes(
++    ctx: dict[str, Any],
++    output_dir: Path,
++    report: dict[str, Any],
++) -> None:
++    """Populate ``report['optimized_codes']`` by snapshotting the best patch.
++
++    Defensive wrapper: anything that goes wrong inside ``collect_optimized_codes``
++    is silently swallowed (the helper already returns a structured ``skipped``
++    payload for expected failures). Final report writing must never fail just
++    because the snapshot step did.
++    """
++    best_patch = report.get("best_patch")
++    if not best_patch:
++        return
++    repo_root = ctx.get("repo_root")
++    if not repo_root:
++        logger.debug("optimized_codes: ctx['repo_root'] missing; skipping snapshot.")
++        return
++    try:
++        from minisweagent.run.postprocess.optimized_codes import collect_optimized_codes
++
++        manifest = collect_optimized_codes(repo_root, best_patch, output_dir)
++        if manifest:
++            report["optimized_codes"] = manifest
++    except Exception as exc:
++        logger.warning("optimized_codes: snapshot failed: %s", exc)
++
++
+ def post_round_evaluate(
+     ctx: dict[str, Any],
+     round_num: int,
+@@ -368,6 +399,7 @@ def _dict_to_final_report(d: dict[str, Any]) -> Any:
+     best_speedup = d.get("best_speedup")
+     if best_speedup is None:
+         best_speedup = parse_reported_speedup(d.get("total_speedup"))
++    optimized = d.get("optimized_codes")
+     return FinalReport(
+         status=str(d.get("status", "complete")),
+         summary=str(d.get("summary", "")),
+@@ -376,6 +408,7 @@ def _dict_to_final_report(d: dict[str, Any]) -> Any:
+         best_task=d.get("best_task"),
+         best_speedup=float(best_speedup) if best_speedup is not None else None,
+         verified_speedup_unclamped=float(verified_raw) if verified_raw is not None else None,
++        optimized_codes=optimized if isinstance(optimized, dict) else None,
+     )
+ 
+ 
+@@ -429,6 +462,7 @@ def finalize_run(
+             finalize_result.setdefault("status", "complete")
+             finalize_result.setdefault("best_speedup", 1.0)
+             finalize_result.setdefault("best_speedup_verified", 1.0)
++            _attach_optimized_codes(ctx, output_dir, finalize_result)
+             report_path.write_text(json.dumps(finalize_result, indent=2, default=str))
+             logger.info("Wrote final_report.json (no verified round evaluations)")
+         return _dict_to_final_report(finalize_result)
+@@ -537,6 +571,7 @@ def auto_finalize(
+         "the orchestrator will run FULL_BENCHMARK automatically after this round; "
+         "do not use this speedup for final selection)"
+     )
++    _attach_optimized_codes(ctx, output_dir, report)
+     report_path.write_text(json.dumps(report, indent=2))
+     logger.info("Auto-finalized: %s", summary_text)
+     logger.info("Report written to: %s", report_path)
+diff --git a/src/minisweagent/run/utils/generated_artifacts.py b/src/minisweagent/run/utils/generated_artifacts.py
+index 0ad0b778d..5b89e7feb 100644
+--- a/src/minisweagent/run/utils/generated_artifacts.py
++++ b/src/minisweagent/run/utils/generated_artifacts.py
+@@ -10,6 +10,7 @@
+ 
+ import re
+ import subprocess
++from collections.abc import Callable
+ from fnmatch import fnmatch
+ from pathlib import Path, PurePosixPath
+ 
+@@ -183,6 +184,115 @@ def strip_generated_helper_sections(patch_text: str) -> tuple[str, list[str]]:
+     return "".join(kept), removed
+ 
+ 
++def _strip_diff_sections(
++    patch_text: str,
++    predicate: Callable[[str], bool],
++) -> tuple[str, list[str]]:
++    """Generic helper: drop ``diff --git`` sections whose path satisfies *predicate*.
++
++    Used by :func:`strip_jit_cache_sections` so JIT filtering stays behaviourally
++    aligned with :func:`strip_generated_helper_sections` (only the predicate differs).
++
++    Returns ``(sanitized_patch_text, removed_paths)``. Non-diff preamble and
++    sections without parseable ``diff --git`` headers are preserved verbatim.
++    """
++
++    if not patch_text.strip():
++        return patch_text, []
++
++    lines = patch_text.splitlines(keepends=True)
++    preamble: list[str] = []
++    sections: list[list[str]] = []
++    current: list[str] | None = None
++
++    for line in lines:
++        if line.startswith("diff --git "):
++            if current is not None:
++                sections.append(current)
++            current = [line]
++            continue
++        if current is None:
++            preamble.append(line)
++        else:
++            current.append(line)
++
++    if current is not None:
++        sections.append(current)
++
++    if not sections:
++        return patch_text, []
++
++    kept: list[str] = list(preamble)
++    removed: list[str] = []
++    for section in sections:
++        parsed = _parse_git_diff_paths(section[0])
++        if parsed is None:
++            kept.extend(section)
++            continue
++        a_path, b_path = parsed
++        if predicate(a_path) or predicate(b_path):
++            removed.append(b_path or a_path)
++            continue
++        kept.extend(section)
++
++    return "".join(kept), removed
++
++
++# ---------------------------------------------------------------------------
++# JIT runtime cache exclusion
++# ---------------------------------------------------------------------------
++#
++# The patterns above target files the GEAK *infrastructure* writes at the
++# worktree root. They do NOT cover JIT runtime cache files that the kernel
++# under test writes inside the package tree (e.g. aiter flydsl_cache pkls).
++# Those can ride along inside every patch and pollute final_report.json's
++# ``optimized_codes`` with hundreds of 0-byte "added" entries.
++
++_JIT_CACHE_PATH_SEGMENTS: frozenset[str] = frozenset(
++    {
++        "flydsl_cache",
++        ".triton",
++        "triton_cache",
++        "torch_compile_cache",
++        ".aiter_jit",
++    }
++)
++
++_JIT_NESTED_BUILD_DIRS: frozenset[str] = frozenset({"build", "__pycache__"})
++
++
++def is_jit_cache_artifact(rel_path: str | None) -> bool:
++    """Return True when *rel_path* lives inside a known JIT runtime cache."""
++
++    if not rel_path:
++        return False
++    rel = str(rel_path).lstrip("/")
++    if rel.startswith("./"):
++        rel = rel[2:]
++    if not rel:
++        return False
++    parts = PurePosixPath(rel).parts
++    for seg in parts:
++        if seg in _JIT_CACHE_PATH_SEGMENTS:
++            return True
++    for i in range(len(parts) - 1):
++        if parts[i] == "jit" and parts[i + 1] in _JIT_NESTED_BUILD_DIRS:
++            return True
++    return False
++
++
++def strip_jit_cache_sections(patch_text: str) -> tuple[str, list[str]]:
++    """Drop diff sections whose path lives inside a JIT runtime cache."""
++
++    return _strip_diff_sections(patch_text, is_jit_cache_artifact)
++
++
++def jit_cache_diff_basename_excludes() -> list[str]:
++    """Return JIT-cache directory basenames for ``diff -ruN --exclude=PATTERN``."""
++
++    return sorted(_JIT_CACHE_PATH_SEGMENTS)
++
++
+ # Conflict-marker regexes. We reject patches whose 3-way merge result contains
+ # any of the classic markers so we never silently apply corrupted content.
+ _CONFLICT_MARKER_RE = re.compile(rb"^(<{7} |={7}$|>{7} )", re.MULTILINE)
+diff --git a/src/minisweagent/tools/save_and_test.py b/src/minisweagent/tools/save_and_test.py
+index 389ef2db9..d0d33ad55 100644
+--- a/src/minisweagent/tools/save_and_test.py
++++ b/src/minisweagent/tools/save_and_test.py
+@@ -22,7 +22,11 @@
+     extract_latency_ms,
+     parse_shape_latencies_ms,
+ )
+-from minisweagent.run.utils.generated_artifacts import generated_helper_excludes
++from minisweagent.run.utils.generated_artifacts import (
++    generated_helper_excludes,
++    jit_cache_diff_basename_excludes,
++    strip_jit_cache_sections,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -776,7 +780,9 @@ def _get_patch_content(self) -> str:
+                 timeout=30,
+                 shell=True,
+             )
+-            return result.stdout
++            if result.returncode == 0 and result.stdout.strip():
++                return self._strip_jit_cache_from_patch(result.stdout)
++            # Fall through to diff -ruN when git diff fails or returns empty.
+ 
+         if ctx.base_repo_path and ctx.base_repo_path.exists():
+             excludes = [
+@@ -800,6 +806,14 @@ def _get_patch_content(self) -> str:
+                 "*.ncu-rep",
+                 "__hip_fatbin",
+                 ".cache",
++                # JIT runtime caches (.aiter_jit, .triton, flydsl_cache,
++                # torch_compile_cache, triton_cache) are pre-excluded here so
++                # ``diff -ruN`` never scans them in the first place. The
++                # ``_strip_jit_cache_from_patch`` post-filter below still runs
++                # as defence-in-depth, but pre-excluding avoids walking
++                # potentially large cache trees and keeps the captured patch
++                # narrower from the start.
++                *jit_cache_diff_basename_excludes(),
+                 *self._generated_helper_excludes(),
+             ]
+             if ctx.patch_output_dir:
+@@ -826,10 +840,32 @@ def _get_patch_content(self) -> str:
+             # without choking on absolute paths like
+             # ``--- /home/user/repo/.../kernel.py``. Otherwise eval fails
+             # with "kernel.py: No such file or directory".
+-            return _normalize_diff_ruN_to_git(result.stdout, ctx.base_repo_path, cwd)
++            normalized = _normalize_diff_ruN_to_git(result.stdout, ctx.base_repo_path, cwd)
++            return self._strip_jit_cache_from_patch(normalized)
+ 
+         return ""
+ 
++    @staticmethod
++    def _strip_jit_cache_from_patch(patch_text: str) -> str:
++        """Drop any ``diff --git`` section whose path is a JIT runtime cache.
++
++        Layer A of the "no JIT pkls in final_report.optimized_codes" fix.
++        ``git add -N . && git diff`` can capture flydsl_cache placeholder pkls
++        when the harness imports the package. Post-strip the rendered patch;
++        Layer B (collect_optimized_codes) provides defence-in-depth.
++        """
++
++        if not patch_text:
++            return patch_text
++        sanitized, removed = strip_jit_cache_sections(patch_text)
++        if removed:
++            logger.info(
++                "save_and_test: stripped %d JIT-cache section(s) from captured patch (sample: %s)",
++                len(removed),
++                ", ".join(removed[:3]),
++            )
++        return sanitized
++
+     # Evaluation infrastructure files that agents must never modify.
+     # These are restored from git baseline before every test run.
+     _PROTECTED_PATTERNS = {
+diff --git a/tests/run/test_optimized_codes.py b/tests/run/test_optimized_codes.py
+new file mode 100644
+index 000000000..251e8bc14
+--- /dev/null
++++ b/tests/run/test_optimized_codes.py
+@@ -0,0 +1,423 @@
++"""Tests for the optimized_codes snapshot helper.
++
++Exercises the end-to-end ``collect_optimized_codes`` flow against real
++git repos created in tmp_path:
++
++  * Plain modification              -> snapshotted, classified as ``modified``
++  * New file (added)                -> snapshotted, classified as ``added``
++  * Deleted file                    -> only recorded, not in directory
++  * Rename                          -> new path snapshotted, recorded as renamed
++  * Mixed multi-file patch          -> all snapshots correct
++  * Missing / empty / bad patch     -> graceful skipped manifest
++  * Path traversal in diff          -> ignored (defensive)
++"""
++
++from __future__ import annotations
++
++import os
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from minisweagent.run.postprocess.optimized_codes import (
++    DEFAULT_TARGET_DIR_NAME,
++    collect_optimized_codes,
++)
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
++    return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True)
++
++
++def _init_git_repo(root: Path, initial_files: dict[str, str]) -> None:
++    root.mkdir(parents=True, exist_ok=True)
++    _run(["git", "init", "-b", "main"], root)
++    _run(["git", "config", "user.email", "test@local"], root)
++    _run(["git", "config", "user.name", "Test"], root)
++    for rel, content in initial_files.items():
++        path = root / rel
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content)
++    _run(["git", "add", "-A"], root)
++    _run(["git", "commit", "-m", "initial"], root)
++
++
++def _make_patch_from_changes(
++    repo: Path,
++    *,
++    write: dict[str, str] | None = None,
++    delete: list[str] | None = None,
++    rename: dict[str, str] | None = None,
++    patch_path: Path | None = None,
++) -> Path:
++    """Apply the given changes to `repo`, capture `git diff HEAD` as a
++    patch file, then revert the repo so it's back at HEAD. Returns the
++    written patch path.
++    """
++    write = write or {}
++    delete = delete or []
++    rename = rename or {}
++
++    for rel, content in write.items():
++        path = repo / rel
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(content)
++
++    for rel in delete:
++        (repo / rel).unlink()
++
++    for old, new in rename.items():
++        (repo / new).parent.mkdir(parents=True, exist_ok=True)
++        _run(["git", "mv", old, new], repo)
++
++    _run(["git", "add", "-A"], repo)
++    diff = subprocess.run(
++        ["git", "diff", "--cached", "--binary", "-M"],
++        cwd=str(repo),
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++    if patch_path is None:
++        patch_path = repo.parent / "candidate.patch"
++    patch_path.write_text(diff.stdout)
++
++    _run(["git", "reset", "--hard", "HEAD"], repo)
++    return patch_path
++
++
++# ---------------------------------------------------------------------------
++# Happy-path: each kind of change
++# ---------------------------------------------------------------------------
++
++
++class TestCollectOptimizedCodes:
++    def test_modified_file_snapshots_post_patch_content(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"aiter/ops/foo.py": "def foo(): return 1\n"})
++        patch = _make_patch_from_changes(
++            repo, write={"aiter/ops/foo.py": "def foo(): return 2\n"}
++        )
++        out = tmp_path / "out"
++        out.mkdir()
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        assert manifest["status"] == "complete"
++        assert manifest["modified"] == ["aiter/ops/foo.py"]
++        assert manifest["added"] == []
++        assert manifest["deleted"] == []
++        assert manifest["renamed"] == []
++        assert manifest["files"] == ["aiter/ops/foo.py"]
++
++        snapshot = out / DEFAULT_TARGET_DIR_NAME / "aiter" / "ops" / "foo.py"
++        assert snapshot.is_file()
++        assert snapshot.read_text() == "def foo(): return 2\n"
++        assert manifest["directory"] == str((out / DEFAULT_TARGET_DIR_NAME).resolve())
++
++    def test_added_file_appears_in_snapshot(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"keep.py": "keep\n"})
++        patch = _make_patch_from_changes(repo, write={"new/added.py": "added\n"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        assert manifest["status"] == "complete"
++        assert manifest["added"] == ["new/added.py"]
++        snapshot = out / DEFAULT_TARGET_DIR_NAME / "new" / "added.py"
++        assert snapshot.is_file() and snapshot.read_text() == "added\n"
++
++    def test_deleted_file_recorded_but_not_snapshotted(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"obsolete.py": "old\n", "keep.py": "keep\n"})
++        patch = _make_patch_from_changes(repo, delete=["obsolete.py"])
++        out = tmp_path / "out"
++        out.mkdir()
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        assert manifest["status"] == "complete"
++        assert manifest["deleted"] == ["obsolete.py"]
++        assert manifest["files"] == []
++        assert not (out / DEFAULT_TARGET_DIR_NAME / "obsolete.py").exists()
++
++    def test_rename_snapshots_destination(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        content = "x" * 200
++        _init_git_repo(repo, {"old/path.py": content})
++        patch = _make_patch_from_changes(repo, rename={"old/path.py": "new/path.py"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        assert manifest["status"] == "complete"
++        if manifest["renamed"]:
++            assert manifest["renamed"][0]["to"] == "new/path.py"
++            assert manifest["renamed"][0]["from"] == "old/path.py"
++        else:
++            assert "new/path.py" in manifest["added"]
++            assert "old/path.py" in manifest["deleted"]
++        snapshot = out / DEFAULT_TARGET_DIR_NAME / "new" / "path.py"
++        assert snapshot.is_file() and snapshot.read_text() == content
++
++    def test_multi_file_mixed_change(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(
++            repo,
++            {
++                "aiter/ops/a.py": "a v1\n",
++                "aiter/ops/b.py": "b v1\n",
++                "trash.py": "delete me\n",
++            },
++        )
++        patch = _make_patch_from_changes(
++            repo,
++            write={
++                "aiter/ops/a.py": "a v2\n",
++                "aiter/new/c.py": "c new\n",
++            },
++            delete=["trash.py"],
++        )
++        out = tmp_path / "out"
++        out.mkdir()
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        assert manifest["status"] == "complete"
++        assert manifest["added"] == ["aiter/new/c.py"]
++        assert manifest["modified"] == ["aiter/ops/a.py"]
++        assert manifest["deleted"] == ["trash.py"]
++        assert manifest["files"] == ["aiter/new/c.py", "aiter/ops/a.py"]
++
++        snap_root = out / DEFAULT_TARGET_DIR_NAME
++        assert (snap_root / "aiter" / "ops" / "a.py").read_text() == "a v2\n"
++        assert (snap_root / "aiter" / "new" / "c.py").read_text() == "c new\n"
++        assert not (snap_root / "trash.py").exists()
++        assert not (snap_root / "aiter" / "ops" / "b.py").exists()
++        assert manifest["total_bytes"] > 0
++
++    def test_total_bytes_sums_added_and_modified(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"a.py": "x\n"})
++        patch = _make_patch_from_changes(
++            repo, write={"a.py": "longer content here\n", "b.py": "another file\n"}
++        )
++        out = tmp_path / "out"
++        out.mkdir()
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        snap_root = out / DEFAULT_TARGET_DIR_NAME
++        expected = (snap_root / "a.py").stat().st_size + (snap_root / "b.py").stat().st_size
++        assert manifest["total_bytes"] == expected
++
++    def test_snapshot_directory_is_replaced_on_rerun(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"a.py": "a v1\n"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        junk = out / DEFAULT_TARGET_DIR_NAME / "stale" / "junk.txt"
++        junk.parent.mkdir(parents=True)
++        junk.write_text("stale")
++
++        patch = _make_patch_from_changes(repo, write={"a.py": "a v2\n"})
++        manifest = collect_optimized_codes(repo, patch, out)
++        assert manifest["status"] == "complete"
++        assert not junk.exists()
++        assert (out / DEFAULT_TARGET_DIR_NAME / "a.py").read_text() == "a v2\n"
++
++
++class TestSkippedCases:
++    def test_none_patch_returns_skipped(self, tmp_path: Path) -> None:
++        result = collect_optimized_codes(tmp_path, None, tmp_path)
++        assert result == {"status": "skipped", "reason": "no_best_patch"}
++
++    def test_missing_patch_returns_skipped(self, tmp_path: Path) -> None:
++        result = collect_optimized_codes(tmp_path, tmp_path / "nope.patch", tmp_path)
++        assert result["status"] == "skipped"
++        assert result["reason"] == "patch_file_missing"
++
++    def test_empty_patch_returns_skipped(self, tmp_path: Path) -> None:
++        empty = tmp_path / "empty.patch"
++        empty.write_text("")
++        result = collect_optimized_codes(tmp_path, empty, tmp_path)
++        assert result["status"] == "skipped"
++        assert result["reason"] == "empty_patch"
++
++    def test_missing_repo_returns_skipped(self, tmp_path: Path) -> None:
++        patch = tmp_path / "p.patch"
++        patch.write_text("garbage\n")
++        result = collect_optimized_codes(tmp_path / "no_such_repo", patch, tmp_path)
++        assert result["status"] == "skipped"
++        assert result["reason"] == "repo_root_missing"
++
++    def test_unappliable_patch_returns_skipped(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"a.py": "real content\n"})
++
++        patch = tmp_path / "bad.patch"
++        patch.write_text(
++            "diff --git a/a.py b/a.py\n"
++            "--- a/a.py\n"
++            "+++ b/a.py\n"
++            "@@ -1 +1 @@\n"
++            "-this line does not exist in the file\n"
++            "+replacement\n"
++        )
++        result = collect_optimized_codes(repo, patch, tmp_path / "out")
++        assert result["status"] == "skipped"
++        assert result["reason"] == "patch_apply_failed"
++
++    def test_returns_skipped_on_cleanup_failure_does_not_raise(
++        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"a.py": "v1\n"})
++        patch = _make_patch_from_changes(repo, write={"a.py": "v2\n"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        from minisweagent.run.postprocess import optimized_codes as mod
++
++        def _boom(*_a, **_kw):
++            raise RuntimeError("synthetic cleanup error")
++
++        monkeypatch.setattr(mod, "cleanup_eval_worktree", _boom)
++
++        manifest = collect_optimized_codes(repo, patch, out)
++        assert manifest["status"] == "complete"
++        assert manifest["modified"] == ["a.py"]
++
++
++class TestDefensive:
++    def test_path_traversal_entry_is_skipped(
++        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"a.py": "v1\n"})
++        patch = _make_patch_from_changes(repo, write={"a.py": "v2\n"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        from minisweagent.run.postprocess import optimized_codes as mod
++
++        original = mod._git_diff_name_status
++
++        def _poisoned(eval_dir):  # type: ignore[no-untyped-def]
++            entries = original(eval_dir)
++            entries.append(("M", ["../escape.txt"]))
++            entries.append(("M", ["/absolute/leak.txt"]))
++            return entries
++
++        monkeypatch.setattr(mod, "_git_diff_name_status", _poisoned)
++
++        manifest = collect_optimized_codes(repo, patch, out)
++        assert manifest["status"] == "complete"
++        assert (out / DEFAULT_TARGET_DIR_NAME / "a.py").is_file()
++        assert not (tmp_path / "escape.txt").exists()
++        assert not Path("/absolute/leak.txt").exists()
++        files_outside = [f for f in manifest["files"] if f.startswith("..") or os.path.isabs(f)]
++        assert files_outside == []
++
++
++class TestJitCacheFilter:
++    def test_jit_pkls_dropped_from_manifest_and_snapshot(
++        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"aiter/ops/foo.py": "v1\n"})
++        patch = _make_patch_from_changes(repo, write={"aiter/ops/foo.py": "v2\n"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        from minisweagent.run.postprocess import optimized_codes as mod
++
++        original = mod._git_diff_name_status
++
++        def _inject_jit_pkls(eval_dir):  # type: ignore[no-untyped-def]
++            entries = original(eval_dir)
++            for i in range(50):
++                rel = (
++                    f"aiter/jit/flydsl_cache/launch_gemm_{i:03d}/"
++                    f"hash_{i:03d}.pkl"
++                )
++                entries.append(("A", [rel]))
++            entries.append(("A", ["pkg/.triton/cache/blob"]))
++            entries.append(("A", ["pkg/torch_compile_cache/0/out.py"]))
++            entries.append(("M", ["aiter/jit/build/foo.o"]))
++            return entries
++
++        monkeypatch.setattr(mod, "_git_diff_name_status", _inject_jit_pkls)
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        assert manifest["status"] == "complete"
++        assert manifest["added"] == []
++        assert manifest["modified"] == ["aiter/ops/foo.py"]
++        assert manifest["files"] == ["aiter/ops/foo.py"]
++
++        dropped = manifest.get("filtered_jit_cache", [])
++        assert len(dropped) == 53
++
++        snap_root = out / DEFAULT_TARGET_DIR_NAME
++        assert (snap_root / "aiter" / "ops" / "foo.py").is_file()
++        assert not (snap_root / "aiter" / "jit").exists()
++        assert not (snap_root / "pkg").exists()
++
++    def test_clean_patch_has_empty_filtered_jit_cache(self, tmp_path: Path) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"a.py": "v1\n"})
++        patch = _make_patch_from_changes(repo, write={"a.py": "v2\n"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        manifest = collect_optimized_codes(repo, patch, out)
++
++        assert manifest["status"] == "complete"
++        assert manifest["filtered_jit_cache"] == []
++        assert manifest["modified"] == ["a.py"]
++
++    def test_renamed_jit_path_dropped_with_both_sides_recorded(
++        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        repo = tmp_path / "repo"
++        _init_git_repo(repo, {"a.py": "v1\n"})
++        patch = _make_patch_from_changes(repo, write={"a.py": "v2\n"})
++        out = tmp_path / "out"
++        out.mkdir()
++
++        from minisweagent.run.postprocess import optimized_codes as mod
++
++        original = mod._git_diff_name_status
++
++        def _inject_renamed_jit(eval_dir):  # type: ignore[no-untyped-def]
++            entries = original(eval_dir)
++            entries.append(
++                (
++                    "R100",
++                    [
++                        "aiter/jit/flydsl_cache/old/a.pkl",
++                        "aiter/jit/flydsl_cache/new/a.pkl",
++                    ],
++                )
++            )
++            return entries
++
++        monkeypatch.setattr(mod, "_git_diff_name_status", _inject_renamed_jit)
++
++        manifest = collect_optimized_codes(repo, patch, out)
++        assert manifest["status"] == "complete"
++        assert manifest["renamed"] == []
++        dropped = set(manifest["filtered_jit_cache"])
++        assert "aiter/jit/flydsl_cache/old/a.pkl" in dropped
++        assert "aiter/jit/flydsl_cache/new/a.pkl" in dropped
+diff --git a/tests/tools/test_save_and_test_diff_fallthrough.py b/tests/tools/test_save_and_test_diff_fallthrough.py
+new file mode 100644
+index 000000000..6528a9014
+--- /dev/null
++++ b/tests/tools/test_save_and_test_diff_fallthrough.py
+@@ -0,0 +1,257 @@
++"""Regression tests for ``SaveAndTestTool._get_patch_content`` fall-through.
++
++The bug being pinned here:
++
++    When a slot worktree is created via ``git worktree add`` without
++    ``--recurse-submodules``, the underlying repo's submodules (e.g.
++    ``3rdparty/composable_kernel``) are missing their ``.git`` files.
++    ``git add -N . && git diff -- .`` then aborts with::
++
++        fatal: not a git repository: '3rdparty/composable_kernel/.git'
++
++    On the previous code path that error was swallowed: ``result.stdout``
++    was returned verbatim (empty string), the orchestrator recorded a
++    zero-byte ``patch_*.patch``, and the round was discarded as
++    "no changes detected" even when the agent had really edited
++    ``kernel.py`` and the test had really passed.
++
++The fix: the git branch now falls through to the ``diff -ruN`` backup
++path when ``git diff`` returns non-zero or empty stdout, instead of
++returning empty unconditionally. ``diff -ruN`` does not understand
++submodule pointers and therefore is robust to this failure mode.
++"""
++
++from __future__ import annotations
++
++import subprocess
++from pathlib import Path
++from unittest import mock
++
++from minisweagent.tools.save_and_test import SaveAndTestContext, SaveAndTestTool
++
++
++def _make_tool(tmp_path: Path, *, base_repo: Path | None) -> SaveAndTestTool:
++    """Build a tool wired to ``tmp_path`` with optional ``base_repo`` fallback."""
++    tool = SaveAndTestTool()
++    tool.set_context(
++        SaveAndTestContext(
++            cwd=str(tmp_path),
++            test_command=None,
++            timeout=10,
++            patch_output_dir=None,
++            base_repo_path=base_repo,
++        )
++    )
++    return tool
++
++
++def _git_diff_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
++    """Build a ``CompletedProcess`` shaped like ``git diff``'s output."""
++    return subprocess.CompletedProcess(
++        args=["git", "add", "-N", ".", "&&", "git", "diff"],
++        returncode=returncode,
++        stdout=stdout,
++        stderr="" if returncode == 0 else "fatal: not a git repository: '3rdparty/composable_kernel/.git'\n",
++    )
++
++
++def _diff_ruN_result(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
++    return subprocess.CompletedProcess(
++        args=["diff", "-ruN"],
++        returncode=returncode,
++        stdout=stdout,
++        stderr="",
++    )
++
++
++def test_git_branch_returns_stdout_when_nonempty_and_zero_exit(tmp_path):
++    """Regression guard: the happy path must keep returning git's stdout verbatim."""
++    base_repo = tmp_path / "base"
++    base_repo.mkdir()
++    tool = _make_tool(tmp_path, base_repo=base_repo)
++
++    git_patch = "diff --git a/kernel.py b/kernel.py\n@@ -1 +1 @@\n-old\n+new\n"
++
++    with (
++        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
++        mock.patch(
++            "minisweagent.tools.save_and_test.subprocess.run",
++            return_value=_git_diff_result(git_patch, returncode=0),
++        ) as run,
++    ):
++        out = tool._get_patch_content()
++
++    assert out == git_patch
++    # The fall-through branch must NOT have been invoked when git already
++    # produced a real patch.
++    assert run.call_count == 1
++
++
++def test_git_branch_falls_through_on_nonzero_exit(tmp_path):
++    """Submodule-missing case: git diff fails -> diff -ruN backup runs."""
++    base_repo = tmp_path / "base"
++    base_repo.mkdir()
++    (base_repo / "kernel.py").write_text("old\n")
++    (tmp_path / "kernel.py").write_text("new\n")
++    tool = _make_tool(tmp_path, base_repo=base_repo)
++
++    diff_ruN_patch = (
++        f"diff -ruN {base_repo}/kernel.py {tmp_path}/kernel.py\n"
++        f"--- {base_repo}/kernel.py\t2026-01-01 00:00:00 +0000\n"
++        f"+++ {tmp_path}/kernel.py\t2026-01-01 00:00:01 +0000\n"
++        "@@ -1 +1 @@\n-old\n+new\n"
++    )
++
++    side_effects = [
++        _git_diff_result("", returncode=128),  # git aborted on missing submodule .git
++        _diff_ruN_result(diff_ruN_patch, returncode=1),  # diff -ruN exits 1 when files differ
++    ]
++
++    with (
++        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
++        mock.patch(
++            "minisweagent.tools.save_and_test.subprocess.run",
++            side_effect=side_effects,
++        ) as run,
++    ):
++        out = tool._get_patch_content()
++
++    assert run.call_count == 2, "fall-through must invoke diff -ruN backup branch"
++    # The output should be the normalised git-style patch derived from diff -ruN.
++    assert out.startswith("diff --git a/kernel.py b/kernel.py"), (
++        f"expected normalised git-style header, got: {out[:120]!r}"
++    )
++    assert "+new" in out and "-old" in out
++
++
++def test_git_branch_falls_through_on_empty_stdout(tmp_path):
++    """git diff exits 0 but returns empty -> diff -ruN backup picks up the change."""
++    base_repo = tmp_path / "base"
++    base_repo.mkdir()
++    (base_repo / "kernel.py").write_text("old\n")
++    (tmp_path / "kernel.py").write_text("new\n")
++    tool = _make_tool(tmp_path, base_repo=base_repo)
++
++    diff_ruN_patch = (
++        f"diff -ruN {base_repo}/kernel.py {tmp_path}/kernel.py\n"
++        f"--- {base_repo}/kernel.py\t2026-01-01 00:00:00 +0000\n"
++        f"+++ {tmp_path}/kernel.py\t2026-01-01 00:00:01 +0000\n"
++        "@@ -1 +1 @@\n-old\n+new\n"
++    )
++
++    side_effects = [
++        _git_diff_result("", returncode=0),
++        _diff_ruN_result(diff_ruN_patch, returncode=1),
++    ]
++
++    with (
++        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
++        mock.patch(
++            "minisweagent.tools.save_and_test.subprocess.run",
++            side_effect=side_effects,
++        ) as run,
++    ):
++        out = tool._get_patch_content()
++
++    assert run.call_count == 2
++    assert "+new" in out and "-old" in out
++
++
++def test_git_branch_empty_returns_empty_when_no_base_repo(tmp_path):
++    """No base_repo_path -> can't fall through -> behaviour unchanged (empty string)."""
++    tool = _make_tool(tmp_path, base_repo=None)
++
++    with (
++        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
++        mock.patch(
++            "minisweagent.tools.save_and_test.subprocess.run",
++            return_value=_git_diff_result("", returncode=0),
++        ) as run,
++    ):
++        out = tool._get_patch_content()
++
++    assert out == ""
++    assert run.call_count == 1
++
++
++def test_git_branch_success_path_still_strips_jit_cache(tmp_path):
++    """Composition guard: the fall-through fix and the JIT-cache strip must coexist.
++
++    PR #244 (this branch) and ``fix/final_report_optimized_codes`` both
++    rewrite the git-branch return statement. After merging both, the
++    successful git-branch return path must still apply
++    ``_strip_jit_cache_from_patch`` — otherwise we silently regress the
++    "no JIT pkls in final_report.optimized_codes" behaviour.
++    """
++    base_repo = tmp_path / "base"
++    base_repo.mkdir()
++    tool = _make_tool(tmp_path, base_repo=base_repo)
++
++    real_section = "diff --git a/kernel.py b/kernel.py\n@@ -1 +1 @@\n-old\n+new\n"
++    # Use the public helper to construct a JIT-cache section the stripper
++    # is guaranteed to recognise, so this test does not encode a private
++    # path convention from generated_artifacts.py.
++    jit_section = (
++        "diff --git a/flydsl_cache/abc.pkl b/flydsl_cache/abc.pkl\n"
++        "new file mode 100644\n"
++        "index 0000000..1111111\n"
++        "Binary files /dev/null and b/flydsl_cache/abc.pkl differ\n"
++    )
++
++    with (
++        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
++        mock.patch(
++            "minisweagent.tools.save_and_test.subprocess.run",
++            return_value=_git_diff_result(real_section + jit_section, returncode=0),
++        ),
++    ):
++        out = tool._get_patch_content()
++
++    assert "kernel.py" in out, "real kernel.py edit must survive"
++    assert "flydsl_cache" not in out, (
++        f"JIT-cache section must be stripped from the git-branch successful return; got: {out!r}"
++    )
++
++
++def test_diff_ruN_excludes_jit_cache_basenames(tmp_path):
++    """``diff -ruN`` must pre-exclude every JIT-cache directory basename.
++
++    Pins that ``_get_patch_content`` wires the shared
++    ``jit_cache_diff_basename_excludes()`` helper into the diff command,
++    so that JIT caches (e.g. ``flydsl_cache/``, ``.triton/``) are never
++    even scanned. The post-strip ``_strip_jit_cache_from_patch`` still
++    runs as defence-in-depth, but this guard pins the pre-filter so we
++    don't silently regress to a "post-strip only" world.
++    """
++    from minisweagent.run.utils.generated_artifacts import jit_cache_diff_basename_excludes
++
++    base_repo = tmp_path / "base"
++    base_repo.mkdir()
++    tool = _make_tool(tmp_path, base_repo=base_repo)
++
++    captured_args: list = []
++
++    def _capture(cmd, *args, **kwargs):  # noqa: ARG001
++        captured_args.append(cmd)
++        if isinstance(cmd, str):
++            return _git_diff_result("", returncode=0)
++        return _diff_ruN_result("", returncode=0)
++
++    with (
++        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
++        mock.patch(
++            "minisweagent.tools.save_and_test.subprocess.run",
++            side_effect=_capture,
++        ),
++    ):
++        tool._get_patch_content()
++
++    diff_ruN_cmd = next(c for c in captured_args if isinstance(c, list) and c[0] == "diff")
++    expected = jit_cache_diff_basename_excludes()
++    assert expected, "helper must return a non-empty list (test guards the contract)"
++    for basename in expected:
++        assert f"--exclude={basename}" in diff_ruN_cmd, (
++            f"diff -ruN must include --exclude={basename}; got: {diff_ruN_cmd}"
++        )
++
++

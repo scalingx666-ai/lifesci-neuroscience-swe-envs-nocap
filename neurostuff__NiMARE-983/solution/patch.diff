@@ -1,0 +1,800 @@
+diff --git a/nimare/decode/continuous.py b/nimare/decode/continuous.py
+index 66dc24bea..c5a22d534 100755
+--- a/nimare/decode/continuous.py
++++ b/nimare/decode/continuous.py
+@@ -12,11 +12,12 @@
+ from nilearn.image import load_img
+ from nilearn.maskers import NiftiMasker
+ from nilearn.masking import apply_mask
++from scipy import sparse as sp_sparse
+ from tqdm.auto import tqdm
+ 
+ from nimare.decode.base import Decoder
+ from nimare.decode.utils import weight_priors
+-from nimare.meta.cbma.base import CBMAEstimator
++from nimare.meta.cbma.base import CBMAEstimator, PairwiseCBMAEstimator
+ from nimare.meta.cbma.mkda import MKDAChi2
+ from nimare.results import MetaResult
+ from nimare.stats import pearson
+@@ -168,7 +169,6 @@ class CorrelationDecoder(Decoder):
+         Number of cores to use for parallelization.
+         If <=0, defaults to using all available cores.
+         Default is 1.
+-
+     Warnings
+     --------
+     Coefficients from correlating two maps have very large degrees of freedom,
+@@ -250,6 +250,12 @@ def _fit(self, dataset):
+             Support for :class:`~nimare.dataset.Dataset` inputs is deprecated and will be removed
+             in a future release. Prefer :class:`~nimare.nimads.Studyset`.
+         """
++        self._precomputed_ma_maps_ = None
++        self._precomputed_ma_map_id_to_idx_ = None
++        self._precomputed_mask_flat_to_masked_ = None
++        if isinstance(self.meta_estimator, PairwiseCBMAEstimator):
++            self._precompute_meta_estimator_maps(dataset)
++
+         n_features = len(self.features_)
+         maps = _collect_feature_maps(
+             Parallel(return_as="generator", n_jobs=self.n_cores)(
+@@ -260,6 +266,58 @@ def _fit(self, dataset):
+ 
+         self.results_ = MetaResult(self, mask=dataset.masker, maps=maps)
+ 
++    def _precompute_meta_estimator_maps(self, dataset):
++        """Precompute study-wise MA maps for reuse across decoder features."""
++        valid_ids = set(self.inputs_["id"])
++        precomp_ids = np.unique(
++            dataset.coordinates.loc[dataset.coordinates["id"].isin(valid_ids), "id"]
++        )
++        if precomp_ids.size == 0:
++            return
++
++        precomp_dataset = dataset.slice(precomp_ids.tolist())
++        ma_maps = self.meta_estimator.kernel_transformer.transform(
++            precomp_dataset, return_type="sparse"
++        )
++        self._precomputed_ma_maps_ = self._ma_maps_to_masked_matrix(
++            ma_maps, precomp_dataset.masker
++        )
++        self._precomputed_ma_map_id_to_idx_ = {
++            id_: idx for idx, id_ in enumerate(precomp_ids.tolist())
++        }
++
++    def _subset_precomputed_ma_maps(self, selected_ids):
++        """Return a study-sliced sparse MA map tensor for the requested ids."""
++        if self._precomputed_ma_maps_ is None:
++            return None
++
++        study_indices = [self._precomputed_ma_map_id_to_idx_[id_] for id_ in selected_ids]
++        return self._precomputed_ma_maps_[study_indices]
++
++    def _ma_maps_to_masked_matrix(self, ma_maps, masker):
++        """Convert 4D sparse MA maps to a study-by-voxel CSR matrix within the mask."""
++        if sp_sparse.issparse(ma_maps):
++            return ma_maps.tocsr()
++
++        if self._precomputed_mask_flat_to_masked_ is None:
++            mask_data = _mask_img_to_bool(masker.mask_img).reshape(-1)
++            flat_to_masked = np.full(mask_data.shape[0], -1, dtype=np.int32)
++            flat_to_masked[mask_data] = np.arange(mask_data.sum(), dtype=np.int32)
++            self._precomputed_mask_flat_to_masked_ = flat_to_masked
++
++        flat_voxels = np.ravel_multi_index(ma_maps.coords[1:], dims=masker.mask_img.shape)
++        rows = ma_maps.coords[0].astype(np.int32, copy=False)
++        cols = self._precomputed_mask_flat_to_masked_[flat_voxels]
++        valid_mask = cols >= 0
++        rows = rows[valid_mask]
++        cols = cols[valid_mask]
++        data = ma_maps.data[valid_mask]
++        return sp_sparse.csr_matrix(
++            (data, (rows, cols)),
++            shape=(ma_maps.shape[0], int(self._precomputed_mask_flat_to_masked_.max()) + 1),
++            dtype=ma_maps.dtype,
++        )
++
+     def _run_fit(self, feature, dataset):
+         feature_ids = dataset.get_studies_by_label(
+             labels=[feature],
+@@ -283,9 +341,23 @@ def _run_fit(self, feature, dataset):
+                 return None
+ 
+             nonfeature_dset = dataset.slice(nonfeature_ids)
+-            meta_results = self.meta_estimator.fit(feature_dset, nonfeature_dset)
++            if self._precomputed_ma_maps_ is not None:
++                meta_results = self.meta_estimator.fit(
++                    feature_dset,
++                    nonfeature_dset,
++                    ma_maps1=self._subset_precomputed_ma_maps(feature_ids),
++                    ma_maps2=self._subset_precomputed_ma_maps(nonfeature_ids),
++                )
++            else:
++                meta_results = self.meta_estimator.fit(feature_dset, nonfeature_dset)
+         else:
+-            meta_results = self.meta_estimator.fit(feature_dset)
++            if self._precomputed_ma_maps_ is not None:
++                meta_results = self.meta_estimator.fit(
++                    feature_dset,
++                    ma_maps=self._subset_precomputed_ma_maps(feature_ids),
++                )
++            else:
++                meta_results = self.meta_estimator.fit(feature_dset)
+ 
+         feature_data = meta_results.get_map(
+             self.target_image,
+diff --git a/nimare/estimator.py b/nimare/estimator.py
+index 949d95085..9436f26c1 100644
+--- a/nimare/estimator.py
++++ b/nimare/estimator.py
+@@ -28,9 +28,15 @@ class Estimator(NiMAREBase):
+     # attributes to set; values are strings indicating location in Dataset.
+     _required_inputs = {}
+ 
+-    def __init__(self, memory=Memory(location=None, verbose=0), memory_level=0):
++    def __init__(
++        self,
++        memory=Memory(location=None, verbose=0),
++        memory_level=0,
++        generate_description=True,
++    ):
+         self.memory = memory
+         self.memory_level = memory_level
++        self.generate_description = generate_description
+ 
+     def _collect_inputs(self, dataset, drop_invalid=True):
+         """Search for, and validate, required inputs as necessary.
+@@ -91,6 +97,12 @@ def _generate_description(self):
+         """Generate a text description of the Estimator."""
+         pass
+ 
++    def _description_text(self):
++        """Return the estimator description, or an empty string when disabled."""
++        if not self.generate_description:
++            return ""
++        return self._generate_description()
++
+     @abstractmethod
+     def _preprocess_input(self, dataset):
+         """Perform any additional preprocessing steps on data in self.inputs_.
+@@ -150,6 +162,8 @@ def fit(self, dataset, drop_invalid=True):
+         self._collect_inputs(dataset, drop_invalid=drop_invalid)
+         self._preprocess_input(dataset)
+         maps, tables, description = self._cache(self._fit, func_memory_level=1)(dataset)
++        if not self.generate_description:
++            description = ""
+ 
+         if hasattr(self, "masker") and self.masker is not None:
+             masker = self.masker
+diff --git a/nimare/meta/cbma/ale.py b/nimare/meta/cbma/ale.py
+index 8369823b2..1d7696b71 100755
+--- a/nimare/meta/cbma/ale.py
++++ b/nimare/meta/cbma/ale.py
+@@ -653,7 +653,7 @@ def _fit(self, dataset1, dataset2):
+             "z_desc-group1MinusGroup2": z_arr,
+             "logp_desc-group1MinusGroup2": logp_arr,
+         }
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -1248,7 +1248,7 @@ def _fit(self, dataset):
+ 
+         # Write out unthresholded value images
+         maps = {"stat": stat_values, "logp": logp_values, "z": z_values}
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+diff --git a/nimare/meta/cbma/base.py b/nimare/meta/cbma/base.py
+index 03cdfbf3b..515122eaa 100644
+--- a/nimare/meta/cbma/base.py
++++ b/nimare/meta/cbma/base.py
+@@ -10,6 +10,7 @@
+ from joblib import Memory, Parallel, delayed
+ from nilearn.maskers import NiftiMasker
+ from scipy import ndimage
++from scipy import sparse as sp_sparse
+ from tqdm.auto import tqdm
+ 
+ from nimare.estimator import Estimator
+@@ -82,6 +83,7 @@ def __init__(
+         kernel_transformer,
+         memory=Memory(location=None, verbose=0),
+         memory_level=0,
++        generate_description=True,
+         *,
+         mask=None,
+         **kwargs,
+@@ -105,7 +107,11 @@ def __init__(
+         kernel_transformer = _check_type(kernel_transformer, KernelTransformer, **kernel_args)
+         self.kernel_transformer = kernel_transformer
+ 
+-        super().__init__(memory=memory, memory_level=memory_level)
++        super().__init__(
++            memory=memory,
++            memory_level=memory_level,
++            generate_description=generate_description,
++        )
+ 
+     def _preprocess_input(self, dataset):
+         """Mask required input images using either the Dataset's mask or the Estimator's.
+@@ -265,9 +271,56 @@ def _fit(self, dataset):
+         p_values, z_values = self._summarystat_to_p(stat_values, null_method=self.null_method)
+ 
+         maps = {"stat": stat_values, "p": p_values, "z": z_values}
+-        description = self._generate_description()
++        description = self._description_text()
+         return maps, {}, description
+ 
++    def _clear_precomputed_ma_inputs(self):
++        """Remove MA-map inputs retained from prior fit calls."""
++        if not hasattr(self, "inputs_"):
++            return
++
++        for key in ("ma_maps", "ma_maps1", "ma_maps2"):
++            self.inputs_.pop(key, None)
++
++    def fit(self, dataset, drop_invalid=True, ma_maps=None):
++        """Fit Estimator to a Studyset-backed collection.
++
++        Parameters
++        ----------
++        dataset : :obj:`~nimare.nimads.Studyset`, :obj:`~nimare.studyset.StudysetView`, \
++                or :obj:`~nimare.dataset.Dataset`
++            Collection object to analyze.
++        drop_invalid : :obj:`bool`, optional
++            Whether to automatically ignore any studies without the required data or not.
++            Default is False.
++        ma_maps : :obj:`sparse._coo.core.COO`, optional
++            Precomputed study-wise MA maps aligned to the study ids in ``dataset``.
++            When provided, the estimator will reuse these maps instead of recomputing them from
++            coordinates.
++
++        Returns
++        -------
++        :obj:`~nimare.results.MetaResult`
++            Results of Estimator fitting.
++        """
++        dataset = ensure_studyset_view(dataset)
++        self._clear_precomputed_ma_inputs()
++        self._collect_inputs(dataset, drop_invalid=drop_invalid)
++        self._preprocess_input(dataset)
++        if ma_maps is not None:
++            self.inputs_["ma_maps"] = ma_maps
++
++        maps, tables, description = self._cache(self._fit, func_memory_level=1)(dataset)
++        if not self.generate_description:
++            description = ""
++
++        if hasattr(self, "masker") and self.masker is not None:
++            masker = self.masker
++        else:
++            masker = dataset.masker
++
++        return MetaResult(self, mask=masker, maps=maps, tables=tables, description=description)
++
+     def _compute_weights(self, ma_values):
+         """Perform optional weight computation routine.
+ 
+@@ -298,6 +351,28 @@ def _collect_ma_maps(self, coords_key="coordinates", maps_key="ma_maps", return_
+             Return a 4D sparse array of shape
+             (n_studies, mask.shape) with MA maps.
+         """
++        if maps_key in self.inputs_:
++            LGR.debug("Using precomputed MA maps from inputs (%s).", maps_key)
++            ma_maps = self.inputs_[maps_key]
++            if return_type == "sparse":
++                return ma_maps
++            if return_type == "summary_array":
++                if sp_sparse.issparse(ma_maps):
++                    return np.asarray(ma_maps.sum(axis=0)).ravel()
++
++                mask_img = self.masker.mask_img or self.masker.labels_img
++                mask_data = _mask_img_to_bool(mask_img)
++                summary_map = ma_maps.sum(axis=0)
++                if isinstance(summary_map, sparse._coo.core.COO):
++                    summary_map = summary_map.todense()
++                summary_map = np.asarray(summary_map).reshape(-1)
++                return summary_map[mask_data.reshape(-1)]
++
++            raise ValueError(
++                f"Precomputed MA maps do not support return_type '{return_type}'. "
++                "Use 'sparse' or 'summary_array'."
++            )
++
+         LGR.debug(f"Generating MA maps from coordinates ({coords_key}).")
+ 
+         ma_maps = self.kernel_transformer.transform(
+@@ -989,7 +1064,7 @@ def _compute_summarystat_est(self, ma_values):
+         """
+         raise NotImplementedError
+ 
+-    def fit(self, dataset1, dataset2, drop_invalid=True):
++    def fit(self, dataset1, dataset2, drop_invalid=True, ma_maps1=None, ma_maps2=None):
+         """Fit Estimator to two Studyset-backed collections.
+ 
+         Parameters
+@@ -997,6 +1072,10 @@ def fit(self, dataset1, dataset2, drop_invalid=True):
+         dataset1/dataset2 : :obj:`~nimare.nimads.Studyset`, \
+                 :obj:`~nimare.studyset.StudysetView`, or :obj:`~nimare.dataset.Dataset`
+             Collection objects to analyze.
++        ma_maps1/ma_maps2 : :obj:`sparse._coo.core.COO`, optional
++            Precomputed study-wise MA maps aligned to ``dataset1`` and ``dataset2``,
++            respectively. When provided, the estimator will reuse these maps instead of
++            recomputing them from coordinates.
+ 
+         Returns
+         -------
+@@ -1014,10 +1093,13 @@ def fit(self, dataset1, dataset2, drop_invalid=True):
+         """
+         dataset1 = ensure_studyset_view(dataset1)
+         dataset2 = ensure_studyset_view(dataset2)
++        self._clear_precomputed_ma_inputs()
+ 
+         # Reproduce fit() for dataset1 to collect and process inputs.
+         self._collect_inputs(dataset1, drop_invalid=drop_invalid)
+         self._preprocess_input(dataset1)
++        if ma_maps1 is not None:
++            self.inputs_["ma_maps"] = ma_maps1
+         if "ma_maps" in self.inputs_.keys():
+             # Grab pre-generated MA maps
+             self.inputs_["ma_maps1"] = self.inputs_.pop("ma_maps")
+@@ -1028,6 +1110,8 @@ def fit(self, dataset1, dataset2, drop_invalid=True):
+         # Reproduce fit() for dataset2 to collect and process inputs.
+         self._collect_inputs(dataset2, drop_invalid=drop_invalid)
+         self._preprocess_input(dataset2)
++        if ma_maps2 is not None:
++            self.inputs_["ma_maps"] = ma_maps2
+         if "ma_maps" in self.inputs_.keys():
+             # Grab pre-generated MA maps
+             self.inputs_["ma_maps2"] = self.inputs_.pop("ma_maps")
+@@ -1037,6 +1121,8 @@ def fit(self, dataset1, dataset2, drop_invalid=True):
+ 
+         # Now run the Estimator-specific _fit() method.
+         maps, tables, description = self._cache(self._fit, func_memory_level=1)(dataset1, dataset2)
++        if not self.generate_description:
++            description = ""
+ 
+         if hasattr(self, "masker") and self.masker is not None:
+             masker = self.masker
+diff --git a/nimare/meta/cbma/mkda.py b/nimare/meta/cbma/mkda.py
+index cf9d78adc..8ebd0e2f8 100644
+--- a/nimare/meta/cbma/mkda.py
++++ b/nimare/meta/cbma/mkda.py
+@@ -7,7 +7,7 @@
+ import sparse
+ from joblib import Memory, Parallel, delayed
+ from pymare.stats import fdr
+-from scipy import ndimage
++from scipy import ndimage, special
+ from scipy.stats import chi2
+ from tqdm.auto import tqdm
+ 
+@@ -23,6 +23,11 @@
+ __version__ = _version.get_versions()["version"]
+ 
+ 
++def _chi2_sf_1dof(stat_values):
++    """Survival function for chi-square statistics with one degree of freedom."""
++    return special.erfc(np.sqrt(stat_values / 2.0))
++
++
+ class MKDADensity(CBMAEstimator):
+     r"""Multilevel kernel density analysis- Density analysis.
+ 
+@@ -488,9 +493,9 @@ def _fit(self, dataset1, dataset2):
+ 
+         # One-way chi-square test for uniformity of activation
+         pAgF_chi2_vals = one_way(np.squeeze(n_selected_active_voxels), n_selected)
+-        pAgF_p_vals = chi2.sf(pAgF_chi2_vals, 1)
++        pAgF_p_vals = _chi2_sf_1dof(pAgF_chi2_vals)
+         pAgF_sign = np.sign(n_selected_active_voxels - np.mean(n_selected_active_voxels))
+-        pAgF_z = p_to_z(pAgF_p_vals, tail="two") * pAgF_sign
++        pAgF_z = np.sqrt(pAgF_chi2_vals) * pAgF_sign
+ 
+         del pAgF_sign
+ 
+@@ -514,10 +519,10 @@ def _fit(self, dataset1, dataset2):
+         del n_selected_active_voxels, n_unselected_active_voxels
+ 
+         eps = np.spacing(1)
+-        pFgA_p_vals = chi2.sf(pFgA_chi2_vals, 1)
++        pFgA_p_vals = _chi2_sf_1dof(pFgA_chi2_vals)
+         pFgA_p_vals[pFgA_p_vals < eps] = eps
+         pFgA_sign = np.sign(pAgF - pAgU).ravel()
+-        pFgA_z = p_to_z(pFgA_p_vals, tail="two") * pFgA_sign
++        pFgA_z = np.sqrt(pFgA_chi2_vals) * pFgA_sign
+ 
+         del pFgA_sign, pAgU
+ 
+@@ -537,7 +542,7 @@ def _fit(self, dataset1, dataset2):
+             maps["prob_desc-AgF_prior"] = pAgF_prior
+             maps["prob_desc-FgA_prior"] = pFgA_prior
+ 
+-        description = self._generate_description()
++        description = self._description_text()
+         return maps, {}, description
+ 
+     def _run_fwe_permutation(self, iter_xyz1, iter_xyz2, iter_df1, iter_df2, conn, voxel_thresh):
+diff --git a/nimare/meta/cbmr.py b/nimare/meta/cbmr.py
+index 491e41bb6..8b140f35b 100644
+--- a/nimare/meta/cbmr.py
++++ b/nimare/meta/cbmr.py
+@@ -421,7 +421,7 @@ def _fit(self, dataset):
+ 
+         maps, tables = self.model.summary()
+ 
+-        return maps, tables, self._generate_description()
++        return maps, tables, self._description_text()
+ 
+ 
+ class CBMRInference(object):
+diff --git a/nimare/meta/ibma.py b/nimare/meta/ibma.py
+index ac45f6e2e..624df757e 100755
+--- a/nimare/meta/ibma.py
++++ b/nimare/meta/ibma.py
+@@ -315,7 +315,7 @@ def _fit(self, dataset):
+                 ) = self._fit_model(bag["values"])
+ 
+         maps = {"z": z_map, "p": p_map, "dof": dof_map}
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -542,7 +542,7 @@ def _fit(self, dataset):
+                 )
+ 
+         maps = {"z": z_map, "p": p_map, "dof": dof_map}
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -692,7 +692,7 @@ def _fit(self, dataset):
+         # tau2 is a float, not a map, so it can't go into the results dictionary
+         tables = {"level-estimator": pd.DataFrame(columns=["tau2"], data=[self.tau2])}
+         maps = {"z": z_map, "p": p_map, "est": est_map, "se": se_map, "dof": dof_map}
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, tables, description
+ 
+@@ -843,7 +843,7 @@ def _fit(self, dataset):
+             "tau2": tau2_map,
+             "dof": dof_map,
+         }
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -993,7 +993,7 @@ def _fit(self, dataset):
+             "tau2": tau2_map,
+             "dof": dof_map,
+         }
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -1161,7 +1161,7 @@ def _fit(self, dataset):
+             "sigma2": sigma2_map,
+             "dof": dof_map,
+         }
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -1332,7 +1332,7 @@ def _fit(self, dataset):
+             "tau2": tau2_map,
+             "dof": dof_map,
+         }
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -1482,7 +1482,7 @@ def _fit(self, dataset):
+                 ) = self._fit_model(bag["values"])
+ 
+         maps = {"t": t_map, "z": z_map, "dof": dof_map}
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, {}, description
+ 
+@@ -1724,6 +1724,6 @@ def _fit(self, dataset):
+         # tau2 is a float, not a map, so it can't go into the results dictionary
+         tables = {"level-estimator": pd.DataFrame(columns=["tau2"], data=[self.tau2])}
+         maps = {"z": z_map, "p": p_map, "est": est_map, "se": se_map, "dof": dof_map}
+-        description = self._generate_description()
++        description = self._description_text()
+ 
+         return maps, tables, description
+diff --git a/nimare/meta/utils.py b/nimare/meta/utils.py
+index b7b3ee6fc..f98f4ef7c 100755
+--- a/nimare/meta/utils.py
++++ b/nimare/meta/utils.py
+@@ -79,6 +79,42 @@ def _convolve_sphere_to_mask(kernel, ijks, index, max_shape):
+     return occ
+ 
+ 
++@jit(nopython=True, cache=True)
++def _sum_across_studies_last_seen(kernel, ijks, exp_idx, n_studies, max_shape, value):
++    """Accumulate study counts directly while deduplicating voxels within each study.
++
++    This matches the previous Python implementation for ``sum_across_studies=True``:
++    each voxel contributes at most once per study before being added into the across-study
++    summary map, even if multiple peaks from the same study overlap there.
++    """
++    all_values = np.zeros((max_shape[0], max_shape[1], max_shape[2]), dtype=np.int32)
++    last_seen = np.full((max_shape[0], max_shape[1], max_shape[2]), -1, dtype=np.int32)
++
++    for study_idx in range(n_studies):
++        for peak_idx in range(ijks.shape[0]):
++            if exp_idx[peak_idx] != study_idx:
++                continue
++
++            peak = ijks[peak_idx]
++            for kernel_idx in range(kernel.shape[1]):
++                x = kernel[0, kernel_idx] + peak[0]
++                y = kernel[1, kernel_idx] + peak[1]
++                z = kernel[2, kernel_idx] + peak[2]
++                if (
++                    (x >= 0)
++                    and (y >= 0)
++                    and (z >= 0)
++                    and (x < max_shape[0])
++                    and (y < max_shape[1])
++                    and (z < max_shape[2])
++                    and (last_seen[x, y, z] != study_idx)
++                ):
++                    last_seen[x, y, z] = study_idx
++                    all_values[x, y, z] += value
++
++    return all_values
++
++
+ def compute_kda_ma(
+     mask,
+     ijks,
+@@ -147,11 +183,6 @@ def compute_kda_ma(
+ 
+     exp_idx_uniq, exp_idx = np.unique(exp_idx, return_inverse=True)
+     n_studies = len(exp_idx_uniq)
+-    # Determine which experiments to use occupancy vs. unique-rows
+-    # occupancy is more efficient when there are many foci per experiment
+-    # unique-rows is more efficient when there are few foci per experiment
+-    exp_counts = np.bincount(exp_idx, minlength=n_studies)
+-    use_occ_by_exp = exp_counts >= KDA_OCCUPANCY_MIN_FOCI
+ 
+     kernel_shape = (n_studies,) + shape
+ 
+@@ -161,31 +192,28 @@ def compute_kda_ma(
+     kernel = cube[:, np.sum(np.dot(np.diag(vox_dims), cube) ** 2, 0) ** 0.5 <= r]
+ 
+     if sum_across_studies:
+-        all_values = np.zeros(shape, dtype=np.int32)
+-
+-        # Loop over experiments
+-        for i_exp, _ in enumerate(exp_idx_uniq):
+-            # Index peaks by experiment
+-            curr_exp_idx = exp_idx == i_exp
+-            use_occ = use_occ_by_exp[i_exp]
+-
+-            # preallocate array for current study
+-            study_values = np.zeros(shape, dtype=np.int32)
+-            if use_occ:
+-                occ = _convolve_sphere_to_mask(kernel, ijks, curr_exp_idx, max_shape)
+-                study_values[occ] = value
+-            else:
+-                sphere_coords = _convolve_sphere(kernel, ijks, curr_exp_idx, max_shape)
+-                study_values[sphere_coords[:, 0], sphere_coords[:, 1], sphere_coords[:, 2]] = value
+-
+-            # Sum across studies
+-            all_values += study_values
++        # The JIT helper preserves the previous semantics while avoiding per-study temporary
++        # arrays: deduplicate voxels within each study, then accumulate once across studies.
++        all_values = _sum_across_studies_last_seen(
++            kernel,
++            ijks,
++            exp_idx.astype(np.int32),
++            n_studies,
++            max_shape,
++            np.int32(value),
++        )
+ 
+         # Only return values within the mask
+         all_values = all_values.reshape(-1)
+         kernel_data = all_values[mask_data.reshape(-1)]
+ 
+     else:
++        # Determine which experiments to use occupancy vs. unique-rows.
++        # Occupancy is more efficient when there are many foci per experiment;
++        # unique-rows is more efficient when there are few foci per experiment.
++        exp_counts = np.bincount(exp_idx, minlength=n_studies)
++        use_occ_by_exp = exp_counts >= KDA_OCCUPANCY_MIN_FOCI
++
+         all_coords = []
+         # Loop over experiments
+         for i_exp, _ in enumerate(exp_idx_uniq):
+diff --git a/nimare/results.py b/nimare/results.py
+index b24abcde0..0e66c5178 100644
+--- a/nimare/results.py
++++ b/nimare/results.py
+@@ -117,8 +117,9 @@ def description_(self):
+     @description_.setter
+     def description_(self, desc):
+         """Automatically extract references when the description is set."""
++        desc = desc or ""
+         self.__description = desc
+-        self.bibtex_ = get_description_references(desc)
++        self.bibtex_ = "" if not desc else get_description_references(desc)
+ 
+     def get_map(self, name, return_type="image"):
+         """Get stored map as image or array.
+diff --git a/nimare/tests/test_decode_continuous.py b/nimare/tests/test_decode_continuous.py
+index ab1a95d30..f3e7b8efd 100644
+--- a/nimare/tests/test_decode_continuous.py
++++ b/nimare/tests/test_decode_continuous.py
+@@ -10,7 +10,7 @@
+ import pytest
+ 
+ from nimare.decode import continuous
+-from nimare.meta import kernel, mkda
++from nimare.meta import ale, kernel, mkda
+ 
+ 
+ def test_CorrelationDecoder_smoke(testdata_laird, tmp_path_factory):
+@@ -114,6 +114,71 @@ def test_CorrelationDecoder_pairwise_skips_features_without_comparison_set(testd
+     )
+ 
+ 
++def test_CorrelationDecoder_pairwise_uses_precomputed_ma_maps_without_changing_maps(
++    testdata_laird,
++):
++    """Automatic decoder MA-map precomputation should preserve feature maps."""
++    testdata_laird = testdata_laird.copy()
++    features = testdata_laird.get_labels(ids=testdata_laird.ids[0])[:3]
++
++    decoder = continuous.CorrelationDecoder(
++        features=features,
++        meta_estimator=mkda.MKDAChi2(generate_description=False),
++        n_cores=1,
++    )
++    decoder.fit(testdata_laird)
++
++    assert decoder.results_.maps.keys() == set(features)
++    assert decoder._precomputed_ma_maps_ is not None
++
++    for feature in features:
++        feature_ids = testdata_laird.get_studies_by_label(labels=[feature], label_threshold=0.001)
++        feature_ids = sorted(list(set(feature_ids).intersection(decoder.inputs_["id"])))
++        nonfeature_ids = sorted(list(set(decoder.inputs_["id"]) - set(feature_ids)))
++        feature_dset = testdata_laird.slice(feature_ids)
++        nonfeature_dset = testdata_laird.slice(nonfeature_ids)
++        expected = (
++            mkda.MKDAChi2(generate_description=False)
++            .fit(feature_dset, nonfeature_dset)
++            .get_map("z_desc-association", return_type="array")
++        )
++        assert np.array_equal(decoder.results_.maps[feature], expected)
++
++
++def test_CorrelationDecoder_single_group_cbma_skips_pairwise_fastpath(testdata_laird):
++    """Single-dataset CBMA estimators should not use the pairwise MA-map fast path."""
++    testdata_laird = testdata_laird.copy()
++    features = testdata_laird.get_labels(ids=testdata_laird.ids[0])[:3]
++
++    decoder = continuous.CorrelationDecoder(
++        features=features,
++        meta_estimator=ale.ALE(
++            null_method="approximate",
++            generate_description=False,
++            kernel__sample_size=20,
++        ),
++        target_image="stat",
++        n_cores=1,
++    )
++    decoder.fit(testdata_laird)
++
++    assert decoder._precomputed_ma_maps_ is None
++
++    for feature in features:
++        feature_ids = testdata_laird.get_studies_by_label(labels=[feature], label_threshold=0.001)
++        feature_ids = sorted(list(set(feature_ids).intersection(decoder.inputs_["id"])))
++        expected = (
++            ale.ALE(
++                null_method="approximate",
++                generate_description=False,
++                kernel__sample_size=20,
++            )
++            .fit(testdata_laird.slice(feature_ids))
++            .get_map("stat", return_type="array")
++        )
++        assert np.allclose(decoder.results_.maps[feature], expected)
++
++
+ def test_CorrelationDistributionDecoder_smoke(testdata_laird, tmp_path_factory):
+     """Smoke test for continuous.CorrelationDistributionDecoder."""
+     tmpdir = tmp_path_factory.mktemp("test_CorrelationDistributionDecoder")
+diff --git a/nimare/tests/test_meta_ale.py b/nimare/tests/test_meta_ale.py
+index b7b78d2c3..161686afd 100644
+--- a/nimare/tests/test_meta_ale.py
++++ b/nimare/tests/test_meta_ale.py
+@@ -118,6 +118,7 @@ def test_ALE_approximate_null_unit(testdata_cbma, tmp_path_factory):
+     assert "logp_desc-size_level-cluster_corr-FWE_method-montecarlo" in corr_results.maps.keys()
+     assert "logp_desc-mass_level-cluster_corr-FWE_method-montecarlo" in corr_results.maps.keys()
+     assert "logp_level-voxel_corr-FWE_method-montecarlo" in corr_results.maps.keys()
++
+     assert isinstance(
+         corr_results.get_map(
+             "z_desc-size_level-cluster_corr-FWE_method-montecarlo", return_type="image"
+@@ -168,6 +169,27 @@ def test_ALE_approximate_null_unit(testdata_cbma, tmp_path_factory):
+     )
+ 
+ 
++def test_ALE_precomputed_ma_maps_do_not_leak_between_fit_calls(testdata_cbma):
++    """Precomputed MA maps from one fit should not affect a later fit."""
++    testdata_cbma = testdata_cbma.copy()
++    ids = sorted(testdata_cbma.ids)
++    first_dset = testdata_cbma.slice(ids[:8])
++    second_dset = testdata_cbma.slice(ids[8:16])
++
++    meta = ale.ALE(null_method="approximate", generate_description=False)
++    precomputed = meta.kernel_transformer.transform(first_dset, return_type="sparse")
++
++    meta.fit(first_dset, ma_maps=precomputed)
++    second_result = meta.fit(second_dset)
++    expected = ale.ALE(null_method="approximate", generate_description=False).fit(second_dset)
++
++    assert "ma_maps" not in meta.inputs_
++    assert np.array_equal(
++        second_result.get_map("stat", return_type="array"),
++        expected.get_map("stat", return_type="array"),
++    )
++
++
+ def test_ALE_montecarlo_null_unit(testdata_cbma, tmp_path_factory):
+     """Unit test for ALE with an montecarlo null_method.
+ 
+diff --git a/nimare/tests/test_meta_mkda.py b/nimare/tests/test_meta_mkda.py
+index 7b21756bd..16a9dff67 100644
+--- a/nimare/tests/test_meta_mkda.py
++++ b/nimare/tests/test_meta_mkda.py
+@@ -128,6 +128,31 @@ def test_MKDAChi2_fwe_1core(testdata_cbma):
+     )
+ 
+ 
++def test_MKDAChi2_precomputed_ma_maps_do_not_leak_between_fit_calls(testdata_cbma):
++    """Precomputed pairwise MA maps should not affect a later fit."""
++    testdata_cbma = testdata_cbma.copy()
++    ids = sorted(testdata_cbma.ids)
++    first_dset1 = testdata_cbma.slice(ids[:4])
++    first_dset2 = testdata_cbma.slice(ids[4:8])
++    second_dset1 = testdata_cbma.slice(ids[8:12])
++    second_dset2 = testdata_cbma.slice(ids[12:16])
++
++    meta = MKDAChi2(generate_description=False)
++    precomputed1 = meta.kernel_transformer.transform(first_dset1, return_type="sparse")
++    precomputed2 = meta.kernel_transformer.transform(first_dset2, return_type="sparse")
++
++    meta.fit(first_dset1, first_dset2, ma_maps1=precomputed1, ma_maps2=precomputed2)
++    second_result = meta.fit(second_dset1, second_dset2)
++    expected = MKDAChi2(generate_description=False).fit(second_dset1, second_dset2)
++
++    assert "ma_maps1" not in meta.inputs_
++    assert "ma_maps2" not in meta.inputs_
++    assert np.array_equal(
++        second_result.get_map("chi2_desc-association", return_type="array"),
++        expected.get_map("chi2_desc-association", return_type="array"),
++    )
++
++
+ def test_MKDAChi2_fwe_2core(testdata_cbma):
+     """Smoke test for MKDAChi2."""
+     meta = MKDAChi2()

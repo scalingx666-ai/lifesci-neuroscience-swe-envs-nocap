@@ -1,0 +1,205 @@
+diff --git a/docs/guide/configuration.md b/docs/guide/configuration.md
+index 6895e1c0..5356dac9 100644
+--- a/docs/guide/configuration.md
++++ b/docs/guide/configuration.md
+@@ -195,6 +195,8 @@ All times are in seconds unless stated otherwise. These settings are
+ | `SendSocketBufferSize` | `0` | TCP send buffer size of outlet connections, in bytes. `0` keeps the OS default. |
+ | `ReceiveSocketBufferSize` | `0` | TCP receive buffer size of outlet connections, in bytes. `0` keeps the OS default. |
+ | `SmoothingHalftime` | `90.0` | Default half-time of the time-stamp smoothing post-processing option. |
++| `SmoothingBreakThresholdSeconds` | `0` | Restart the time-stamp smoothing when a time stamp is off the fitted line by more than this many seconds and by more than `SmoothingBreakThresholdSamples`, so a break in the stream shows in the time stamps. `0` for both: never restart. |
++| `SmoothingBreakThresholdSamples` | `0` | The same threshold in sample periods. pyxdf uses `1` s and `500` samples. |
+ | `ForceDefaultTimestamps` | `0` | If `1`, outlets ignore time stamps passed by the program and use the current local clock instead. |
+ 
+ ### [log]
+diff --git a/docs/internals/time_sync.md b/docs/internals/time_sync.md
+index 2354e12c..f4718e08 100644
+--- a/docs/internals/time_sync.md
++++ b/docs/internals/time_sync.md
+@@ -232,6 +232,14 @@ In plain words:
+ - The filter starts on the first sample. It subtracts the whole seconds of that
+   first timestamp to keep the arithmetic precise.
+ - Samples dropped by `flush()` are counted, so the sample index stays correct.
++- A break (the sender pauses, then carries on) is smoothed over unless a break
++  threshold is configured: the sample after the break gets the time of the
++  next point on the old line, and the error decays over several half-times.
++  With `SmoothingBreakThresholdSeconds` and/or `SmoothingBreakThresholdSamples`
++  set, a sample whose timestamp is off the line by more than the greater of the
++  two thresholds (in either direction) restarts the filter at that sample, as at
++  stream start, so the jump shows in the timestamps. `proc_monotonize` still
++  holds timestamps after a backward jump until time catches up.
+ - Streams with an irregular rate (`srate` = 0) pass through unchanged.
+ 
+ Why smooth at all: timestamps are usually taken on a slightly irregular
+@@ -280,6 +288,8 @@ from. Defaults come from `src/api_config.cpp`.
+ | `TimeUpdateInterval` | 2.0 s | Time between the starts of two waves. |
+ | `TimeUpdateMinProbes` | 6 | Replies needed for a wave to produce an estimate. |
+ | `SmoothingHalftime` | 90 s | Default half-life of the dejitter filter's sample weights. |
++| `SmoothingBreakThresholdSeconds` | 0 (off) | Error, in seconds, beyond which the dejitter filter restarts. |
++| `SmoothingBreakThresholdSamples` | 0 (off) | The same, in sample periods; the greater of the two applies. |
+ 
+ The outlet's unicast UDP port (and thus the time service port) comes from
+ `BasePort` (16572) and `PortRange` (32) in the `[ports]` section.
+diff --git a/src/api_config.cpp b/src/api_config.cpp
+index c1e8bb19..bfd13acf 100644
+--- a/src/api_config.cpp
++++ b/src/api_config.cpp
+@@ -336,6 +336,8 @@ void api_config::load(INI &pt) {
+ 	inlet_buffer_reserve_samples_ = pt.get("tuning.InletBufferReserveSamples", 128);
+ 	socket_receive_buffer_size_ = pt.get("tuning.ReceiveSocketBufferSize", 0);
+ 	smoothing_halftime_ = pt.get("tuning.SmoothingHalftime", 90.0F);
++	smoothing_break_threshold_seconds_ = pt.get("tuning.SmoothingBreakThresholdSeconds", 0.0);
++	smoothing_break_threshold_samples_ = pt.get("tuning.SmoothingBreakThresholdSamples", 0.0);
+ 	force_default_timestamps_ = pt.get("tuning.ForceDefaultTimestamps", false);
+ }
+ 
+diff --git a/src/api_config.h b/src/api_config.h
+index 7e339cc5..edd32c52 100644
+--- a/src/api_config.h
++++ b/src/api_config.h
+@@ -255,6 +255,11 @@ class api_config {
+ 	int socket_receive_buffer_size() const { return socket_receive_buffer_size_; }
+ 	/// Default halftime of the time-stamp smoothing window (if enabled), in seconds.
+ 	float smoothing_halftime() const { return smoothing_halftime_; }
++	/// A smoothing prediction error larger than this many seconds (and than the samples threshold)
++	/// restarts the smoothing; <= 0 for both: never.
++	double smoothing_break_threshold_seconds() const { return smoothing_break_threshold_seconds_; }
++	/// The same threshold, in sample periods.
++	double smoothing_break_threshold_samples() const { return smoothing_break_threshold_samples_; }
+ 	/// Override timestamps with lsl clock if True
+ 	bool force_default_timestamps() const { return force_default_timestamps_; }
+ 
+@@ -334,6 +339,8 @@ class api_config {
+ 	int inlet_buffer_reserve_samples_;
+ 	int socket_receive_buffer_size_;
+ 	float smoothing_halftime_;
++	double smoothing_break_threshold_seconds_;
++	double smoothing_break_threshold_samples_;
+ 	bool force_default_timestamps_;
+ };
+ 
+diff --git a/src/time_postprocessor.cpp b/src/time_postprocessor.cpp
+index cebd1167..0130197c 100644
+--- a/src/time_postprocessor.cpp
++++ b/src/time_postprocessor.cpp
+@@ -1,5 +1,6 @@
+ #include "time_postprocessor.h"
+ #include "api_config.h"
++#include <algorithm>
+ #include <cmath>
+ #include <limits>
+ #include <utility>
+@@ -22,6 +23,8 @@ time_postprocessor::time_postprocessor(postproc_callback_t query_correction,
+ 	: samples_since_last_clocksync(samples_between_clocksyncs),
+ 	  query_srate_(std::move(query_srate)), options_(proc_none),
+ 	  halftime_(api_config::get_instance()->smoothing_halftime()),
++	  break_seconds_(api_config::get_instance()->smoothing_break_threshold_seconds()),
++	  break_samples_(api_config::get_instance()->smoothing_break_threshold_samples()),
+ 	  query_correction_(std::move(query_correction)), query_reset_(std::move(query_reset)),
+ 	  next_query_time_(0.0), last_offset_(0.0), last_value_(std::numeric_limits<double>::lowest()) {
+ }
+@@ -83,10 +86,10 @@ double time_postprocessor::process_internal(double value) {
+ 
+ 	// --- jitter removal ---
+ 	if (options_ & proc_dejitter) {
+-		// initialize the smoothing state if not yet done so
+-		if (!dejitter.is_initialized()) {
++		// initialize the smoothing state if not yet done so, or restart it after a break
++		if (!dejitter.is_initialized() || dejitter.is_break(value)) {
+ 			double srate = query_srate_();
+-			dejitter = postproc_dejitterer(value, srate, halftime_);
++			dejitter = postproc_dejitterer(value, srate, halftime_, break_seconds_, break_samples_);
+ 		}
+ 		value = dejitter.dejitter(value);
+ 	}
+@@ -101,14 +104,22 @@ double time_postprocessor::process_internal(double value) {
+ 	return value;
+ }
+ 
+-postproc_dejitterer::postproc_dejitterer(double t0, double srate, double halftime)
++postproc_dejitterer::postproc_dejitterer(
++	double t0, double srate, double halftime, double break_seconds, double break_samples)
+ 	: t0_(static_cast<uint_fast32_t>(t0)) {
+ 	if (srate > 0) {
+ 		w1_ = 1. / srate;
+ 		lam_ = pow(2, -1 / (srate * halftime));
++		break_threshold_ = std::max(break_seconds, break_samples / srate);
+ 	}
+ }
+ 
++bool postproc_dejitterer::is_break(double t) const noexcept {
++	// same prediction error as `al` in dejitter(); judged per sample so a burst is no break
++	return break_threshold_ > 0 &&
++		   std::fabs(t - t0_ - (w0_ + samples_since_t0_ * w1_)) > break_threshold_;
++}
++
+ double postproc_dejitterer::dejitter(double t) noexcept {
+ 	if (!smoothing_applicable()) return t;
+ 
+diff --git a/src/time_postprocessor.h b/src/time_postprocessor.h
+index 8f68fe4b..a19083dd 100644
+--- a/src/time_postprocessor.h
++++ b/src/time_postprocessor.h
+@@ -24,13 +24,19 @@ struct postproc_dejitterer {
+ 	double P00_{1e10}, P11_{1e10}, P01_{0};
+ 	/// forget factor lambda in RLS calculation
+ 	double lam_{0};
++	/// a prediction error larger than this (in seconds) is a break in the stream; 0: never
++	double break_threshold_{0};
+ 
+-	/// constructor
+-	postproc_dejitterer(double t0 = 0, double srate = 0, double halftime = 0);
++	/// constructor; the break threshold is the greater of break_seconds and break_samples periods
++	postproc_dejitterer(double t0 = 0, double srate = 0, double halftime = 0,
++		double break_seconds = 0, double break_samples = 0);
+ 
+ 	/// dejitter a timestamp and update RLS parameters
+ 	double dejitter(double t) noexcept;
+ 
++	/// true if t is so far from the fitted line that the fit should restart at t
++	bool is_break(double t) const noexcept;
++
+ 	/// adjust RLS parameters to account for samples not seen
+ 	void skip_samples(uint_fast32_t skipped_samples) noexcept;
+ 	bool is_initialized() const noexcept { return t0_ != 0; }
+@@ -79,6 +85,8 @@ class time_postprocessor {
+ 	uint32_t options_;
+ 	/// smoothing half-time
+ 	float halftime_;
++	/// break thresholds of the smoothing, in seconds and in sample periods
++	double break_seconds_, break_samples_;
+ 
+ 	// handling of time corrections
+ 	/// a callback function that returns the current time-correction offset
+diff --git a/testing/int/postproc.cpp b/testing/int/postproc.cpp
+index 69d27318..35b638f5 100644
+--- a/testing/int/postproc.cpp
++++ b/testing/int/postproc.cpp
+@@ -79,3 +79,28 @@ TEST_CASE("rls_smoothing", "[basic]") {
+ 	CHECK(fabs(pp.w0_ - latency) < .1);
+ 	CHECK(fabs(pp.w1_ - 1 / srate) < 1e-6);
+ }
++
++TEST_CASE("rls_smoothing_break", "[basic]") {
++	const double t0 = 5000, srate = 100., halftime = 90, pause = 2;
++	for (double break_seconds : {0., 1.}) {
++		INFO("break threshold " << break_seconds);
++		const double break_samples = break_seconds > 0 ? 50 : 0;
++		lsl::postproc_dejitterer pp(t0, srate, halftime, break_seconds, break_samples);
++		std::default_random_engine rng;
++		std::normal_distribution<double> jitter(0, .002);
++		double max_err_after = 0;
++		for (int i = 0; i < 400 * srate; ++i) {
++			// 300 s of data, then the sender pauses for 2 s
++			const double t = t0 + i / srate + (i >= 300 * srate ? pause : 0), tj = t + jitter(rng);
++			// as in time_postprocessor::process_internal
++			if (pp.is_break(tj))
++				pp = lsl::postproc_dejitterer(tj, srate, halftime, break_seconds, break_samples);
++			const double err = pp.dejitter(tj) - t;
++			if (i >= 300 * srate) max_err_after = std::max(max_err_after, fabs(err));
++		}
++		if (break_seconds > 0)
++			CHECK(max_err_after < .02);
++		else
++			CHECK(max_err_after > 1.5); // today's behaviour: the break is smoothed over
++	}
++}

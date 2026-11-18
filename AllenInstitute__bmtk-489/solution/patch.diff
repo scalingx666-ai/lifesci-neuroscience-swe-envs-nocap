@@ -1,0 +1,1227 @@
+diff --git a/.gitignore b/.gitignore
+index 3f02d4bf..594a99bc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -53,4 +53,6 @@ examples/dpointnet_v1/GLIF_network/cached_networks/
+ examples/dpointnet_v1/lgn_cache/
+ examples/dpointnet_v1/Neuropixels_data/
+ examples/dpointnet_v1/Synchronization_data/
+-examples/dpointnet_*/*callbacks*
+\ No newline at end of file
++examples/dpointnet_*/*callbacks*
++**/_lgn_grating_ops.so
++**/_lgn_grating_ops.archs
+diff --git a/bmtk/simulator/dpointnet/custom_ops/build.sh b/bmtk/simulator/dpointnet/custom_ops/build.sh
+index 5691d340..d9b48339 100755
+--- a/bmtk/simulator/dpointnet/custom_ops/build.sh
++++ b/bmtk/simulator/dpointnet/custom_ops/build.sh
+@@ -8,6 +8,7 @@ cxx="${CXX:-$prefix/bin/x86_64-conda-linux-gnu-g++}"
+ build_dir="${DPOINTNET_CUSTOM_OP_BUILD_DIR:-$custom_ops_dir/build}"
+ output="${DPOINTNET_CUSTOM_OP_OUTPUT:-$custom_ops_dir/_csr_spike_ops.so}"
+ glif_output="${DPOINTNET_GLIF_OP_OUTPUT:-$custom_ops_dir/_glif_state_ops.so}"
++lgn_output="${DPOINTNET_LGN_OP_OUTPUT:-$custom_ops_dir/_lgn_grating_ops.so}"
+ 
+ if [[ -n "${NVCC:-}" ]]; then
+   nvcc="$NVCC"
+@@ -96,6 +97,29 @@ mkdir -p "$build_dir"
+   -Wl,-rpath,"$prefix/lib" \
+   -o "$glif_output"
+ 
++"$cxx" -std=c++17 -fPIC -O3 -DNDEBUG \
++  -I"$prefix/include" \
++  "${tf_compile_flags[@]}" \
++  -c "$custom_ops_dir/lgn_grating_ops.cc" \
++  -o "$build_dir/lgn_grating_ops.o"
++
++"$nvcc" -ccbin "$cxx" -std=c++17 -x cu -Xcompiler=-fPIC -O3 -DNDEBUG \
++  --expt-relaxed-constexpr \
++  -DGOOGLE_CUDA=1 \
++  -I"$prefix/include" \
++  "${tf_compile_flags[@]}" \
++  "${gencode_flags[@]}" \
++  -c "$custom_ops_dir/lgn_grating_ops.cu.cc" \
++  -o "$build_dir/lgn_grating_ops.cu.o"
++
++"$cxx" -shared \
++  "$build_dir/lgn_grating_ops.o" \
++  "$build_dir/lgn_grating_ops.cu.o" \
++  "${tf_link_flags[@]}" \
++  -L"$prefix/lib" -lcudart \
++  -Wl,-rpath,"$prefix/lib" \
++  -o "$lgn_output"
++
+ arch_file="${output%.so}.archs"
+ {
+   printf 'sm=%s\n' "${cuda_archs[*]}"
+@@ -103,6 +127,8 @@ arch_file="${output%.so}.archs"
+ } > "$arch_file"
+ 
+ cp "$arch_file" "${glif_output%.so}.archs"
++cp "$arch_file" "${lgn_output%.so}.archs"
+ 
+ echo "$output"
+ echo "$glif_output"
++echo "$lgn_output"
+diff --git a/bmtk/simulator/dpointnet/custom_ops/lgn_common.cuh b/bmtk/simulator/dpointnet/custom_ops/lgn_common.cuh
+new file mode 100644
+index 00000000..bdc8f75e
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/custom_ops/lgn_common.cuh
+@@ -0,0 +1,101 @@
++// Adapted from Javier Galvan's v1_model_utils/cuda_lgn/lgn_common.cuh (commit d8fb466b; credit: Javier).
++// DPointNet renames the operators with the Dpointnet prefix and keeps the math unchanged.
++// Shared by the LGN ops: output modes, the spike probability, and the chunked
++// Bernoulli uniforms that the spike ops write into a batch in place.
++#pragma once
++
++#include <limits>
++
++#include "tensorflow/core/framework/op_kernel.h"
++#include "tensorflow/core/util/gpu_kernel_helper.h"
++
++namespace lgn {
++
++constexpr int kMaxEntries = 16;
++
++enum class Output { kSpikes, kProbabilities, kRates };
++
++// The chunk's uniforms: tensors of `per_entry` samples each.
++template <typename U> struct Uniforms {
++  const U* entry[kMaxEntries];
++  int per_entry;
++  // Constant indices only: a dynamically indexed parameter array would be
++  // copied to local memory.
++  __device__ const U* Sample(int sample, int64_t stride) const {
++    const int index = sample / per_entry;
++    const U* pointer = entry[0];
++#pragma unroll
++    for (int e = 1; e < kMaxEntries; ++e)
++      if (e == index) pointer = entry[e];
++    return pointer + static_cast<int64_t>(sample % per_entry) * stride;
++  }
++};
++
++// p = 1 - exp(-rate dt), dt = 1 ms, to about half an ulp, without a division
++// or the general expm1f. x = -rate / 1000 is kept as x_hi + x_lo (x_lo the
++// rounding error of x_hi plus the split constant's low part), and for
++// |x| <= 0.5 (rates <= 500 Hz) p = -x - x^2 (1/2 + x/6 + ...) =
++// -(x_hi + (x_hi^2 s + x_lo)), s the degree-8 Taylor series (truncation
++// < 2e-9 relative), so the only rounding of size ulp(p) is the final one;
++// otherwise 1 - expf(x).
++__device__ inline float SpikeProbability(float rate) {
++  constexpr float kHigh = -1e-3f;
++  constexpr float kLow = static_cast<float>(-1e-3 - static_cast<double>(kHigh));
++  const float high = rate * kHigh;
++  const float low = fmaf(rate, kHigh, -high) + rate * kLow;
++  if (high < -0.5f) return 1.f - expf(high + low);
++  float series = 1.f / 362880.f;
++  series = fmaf(series, high, 1.f / 40320.f);
++  series = fmaf(series, high, 1.f / 5040.f);
++  series = fmaf(series, high, 1.f / 720.f);
++  series = fmaf(series, high, 1.f / 120.f);
++  series = fmaf(series, high, 1.f / 24.f);
++  series = fmaf(series, high, 1.f / 6.f);
++  series = fmaf(series, high, 0.5f);
++  return -(high + fmaf(high * high, series, low));
++}
++
++// Reads the spike op's `uniforms` list (at most 16 equal [time, units] or
++// [samples, time, units] tensors, the samples [offset, offset + *count) of a
++// [batch, time, units] batch) and returns in *spikes input `spikes_input`
++// forwarded in place, or a new output when that input is empty, so a batch is
++// sampled chunk by chunk without ever holding every sample's uniforms.
++template <typename U>
++tensorflow::Status PrepareSpikes(tensorflow::OpKernelContext* c, int spikes_input,
++                                 const tensorflow::TensorShape& shape, int offset,
++                                 Uniforms<U>* uniforms, int* count,
++                                 tensorflow::Tensor** spikes) {
++  using tensorflow::errors::InvalidArgument;
++  const tensorflow::Tensor& previous = c->input(spikes_input);
++  tensorflow::OpInputList entries;
++  TF_RETURN_IF_ERROR(c->input_list("uniforms", &entries));
++  const tensorflow::TensorShape& entry_shape = entries[0].shape();
++  const int dims = entry_shape.dims();
++  const int64_t per_entry = dims == 3 ? entry_shape.dim_size(0) : 1;
++  if (entries.size() > kMaxEntries || dims < 2 || dims > 3 || per_entry <= 0 ||
++      entry_shape.dim_size(dims - 2) != shape.dim_size(1) ||
++      entry_shape.dim_size(dims - 1) != shape.dim_size(2) ||
++      offset + entries.size() * per_entry > shape.dim_size(0))
++    return InvalidArgument("uniforms must be at most 16 [time, units] or "
++                           "[samples, time, units] tensors within the batch");
++  *uniforms = Uniforms<U>{{}, static_cast<int>(per_entry)};
++  for (int e = 0; e < entries.size(); ++e) {
++    if (entries[e].shape() != entry_shape)
++      return InvalidArgument("uniform tensors must have one shape");
++    uniforms->entry[e] = entries[e].flat<U>().data();
++  }
++  *count = static_cast<int>(entries.size() * per_entry);
++  if (previous.NumElements() == 0) return c->allocate_output(0, shape, spikes);
++  if (previous.shape() != shape)
++    return InvalidArgument("spikes_in must be empty or [batch, time, units]");
++  TF_RETURN_IF_ERROR(c->forward_input_or_allocate_output({spikes_input}, 0, shape, spikes));
++  if ((*spikes)->flat<bool>().data() != previous.flat<bool>().data() &&
++      cudaMemcpyAsync((*spikes)->flat<bool>().data(), previous.flat<bool>().data(),
++                      previous.TotalBytes(), cudaMemcpyDeviceToDevice,
++                      c->eigen_device<Eigen::GpuDevice>().stream()) != cudaSuccess)
++    // Not forwardable: keep the samples earlier chunks wrote.
++    return tensorflow::errors::Internal("spikes_in copy failed");
++  return tensorflow::OkStatus();
++}
++
++}  // namespace lgn
+diff --git a/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.cc b/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.cc
+new file mode 100644
+index 00000000..aaa50013
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.cc
+@@ -0,0 +1,77 @@
++// Adapted from Javier Galvan's v1_model_utils/cuda_lgn/lgn_grating_ops.cc (commit d8fb466b; credit: Javier).
++// DPointNet renames the operators with the Dpointnet prefix and keeps the math unchanged.
++#include "tensorflow/core/framework/op.h"
++#include "tensorflow/core/framework/shape_inference.h"
++
++using namespace tensorflow;
++
++// The LGN response to a drifting sinusoidal grating, factored exactly.
++//
++// A grating frame is Im(e^{i(k.r + w f + phi)}), and every stage up to the
++// rectification is linear, so each unit's filtered response is
++//   out_n(t) = Im(A_n R_n(t)),
++// where the complex spatial coefficient A_n depends only on the sample's
++// orientation and phase, and the complex temporal response R_n(t) - the unit's
++// temporal kernel applied to e^{iwf} inside the stimulus window, zero-padded
++// gray screen outside it - depends only on the unit and the stimulus timing.
++// R is precomputed once in float64 (see wrapper.py).
++//
++// LgnGratingCoefficients computes A (and A' of the non-dominant subunit of
++// composite units) in float64: the separable Gaussian filter of the complex
++// grating, zero-padded to the frame (TF 'SAME'), sampled at each unit's four
++// bilinear corners with the corner weights, edge normalization, amplitude and
++// contrast folded into `weights`. It returns float32 [batch, 2, units, 2]:
++// A in plane 0 and A' in plane 1 (zero for simple units), as [Re, Im].
++REGISTER_OP("DpointnetLgnGratingCoefficients")
++    .Attr("T: {half, float}")
++    .Attr("theta_sign: float = 1.0").Attr("theta_offset: float = 0.0")
++    .Attr("rows: int").Attr("cols: int")
++    .Input("theta: T").Input("phase: T").Input("wavenumber: double")
++    .Input("vertical_taps: double").Input("horizontal_taps: double")
++    .Input("bins: int64").Input("corners: int64").Input("weights: double")
++    .Output("coefficients: float")
++    .SetShapeFn([](shape_inference::InferenceContext* c) {
++      c->set_output(0, c->MakeShape({c->Dim(c->input(0), 0), 2,
++                                     c->Dim(c->input(5), 0), 2}));
++      return absl::OkStatus();
++    });
++
++// The spike probabilities p = 1 - exp(-rate dt), dt = 1 ms, or with
++// `rates` the rates in Hz, [batch, time, units], of
++//   rate = max(Im(A R) + spont, 0) + [composite] max(Im(A' R') + spont, 0).
++// R' is compact over the composite units; composite_slot maps a unit to its
++// column of R', or -1.
++REGISTER_OP("DpointnetLgnGratingProbabilities")
++    .Attr("rates: bool = false")
++    .Input("coefficients: float").Input("response: float")
++    .Input("composite_response: float").Input("composite_slot: int64")
++    .Input("spontaneous: float")
++    .Output("probabilities: float")
++    .SetShapeFn([](shape_inference::InferenceContext* c) {
++      c->set_output(0, c->MakeShape({c->Dim(c->input(0), 0),
++                                     c->Dim(c->input(1), 0),
++                                     c->Dim(c->input(1), 1)}));
++      return absl::OkStatus();
++    });
++
++// Spikes uniforms < p for the samples [offset, offset + chunk) of the batch,
++// the uniforms given as at most 16 equal tensors, [time, units] (one sample
++// each, so none is ever copied into a stack) or [samples, time, units]. They are
++// written into `spikes_in` in place (or into a new [batch, time, units]
++// tensor when `spikes_in` is empty), so a batch is sampled in chunks without
++// ever holding every sample's uniforms. The probability never leaves
++// registers; the uniforms are TensorFlow's, in their own dtype.
++REGISTER_OP("DpointnetLgnGratingSpikes")
++    .Attr("U: {half, float}").Attr("offset: int >= 0")
++    .Attr("entries: int >= 1")
++    .Input("spikes_in: bool")
++    .Input("coefficients: float").Input("response: float")
++    .Input("composite_response: float").Input("composite_slot: int64")
++    .Input("spontaneous: float").Input("uniforms: entries * U")
++    .Output("spikes: bool")
++    .SetShapeFn([](shape_inference::InferenceContext* c) {
++      c->set_output(0, c->MakeShape({c->Dim(c->input(1), 0),
++                                     c->Dim(c->input(2), 0),
++                                     c->Dim(c->input(2), 1)}));
++      return absl::OkStatus();
++    });
+diff --git a/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.cu.cc b/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.cu.cc
+new file mode 100644
+index 00000000..ff24ab3f
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.cu.cc
+@@ -0,0 +1,356 @@
++// Adapted from Javier Galvan's v1_model_utils/cuda_lgn/lgn_grating_ops.cu.cc (commit d8fb466b; credit: Javier).
++// DPointNet renames the operators with the Dpointnet prefix and keeps the math unchanged.
++#if GOOGLE_CUDA
++#define EIGEN_USE_GPU
++#include <cuda_fp16.h>
++
++#include "tensorflow/core/framework/op_kernel.h"
++#include "tensorflow/core/util/gpu_kernel_helper.h"
++#include "lgn_common.cuh"
++
++using namespace tensorflow;
++using GPUDevice = Eigen::GpuDevice;
++
++namespace {
++
++using lgn::Output;
++using lgn::SpikeProbability;
++using lgn::Uniforms;
++
++constexpr double kPi = 3.141592653589793238462643383279502884;
++constexpr int kUnits = 4;    // consecutive units per response thread
++constexpr int kSteps = 4;    // timesteps per response thread
++constexpr int kResponseThreads = 128;
++constexpr int kResponseBlocks = 4;  // per SM: >= 16 warps to hide the streaming latency
++constexpr int kSampleGroup = 16;     // samples per thread (blockIdx.z splits the chunk)
++constexpr int kTableThreads = 256;
++
++__device__ double2 Mul(double2 a, double2 b) {
++  return make_double2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
++}
++
++__device__ double2 Exp(double angle) {
++  double s, c;
++  sincos(angle, &s, &c);
++  return make_double2(c, s);
++}
++
++template <typename T> __device__ double Degrees(T value) {
++  return static_cast<double>(static_cast<float>(value));
++}
++
++// One (bin, sample) block: the complex grating e^{i k.r} filtered along each
++// axis by the bin's separable Gaussian, zero-padded to the frame. Entry x < cols
++// is the horizontal factor at column x (times the phase e^{i phi}), entry
++// cols + y the vertical factor at row y; their product is the filtered complex
++// grating at (y, x).
++template <typename T>
++__global__ void TablesKernel(const T* __restrict__ theta, const T* __restrict__ phase,
++                             const double* __restrict__ wavenumber, float sign,
++                             float offset, int bins, int taps,
++                             const double* __restrict__ vertical,
++                             const double* __restrict__ horizontal, int rows, int cols,
++                             double2* __restrict__ tables) {
++  extern __shared__ double2 shifts[];  // [2 * taps]: e^{i f (j - c)}, x then y
++  const int bin = blockIdx.x, sample = blockIdx.y, center = taps / 2;
++  const double orientation = kPi * (180.0 - (sign * Degrees(theta[sample]) + offset)) / 180.0;
++  const double phi = kPi * (180.0 - Degrees(phase[sample])) / 180.0;
++  const double fx = *wavenumber * cos(orientation);
++  const double fy = *wavenumber * sin(orientation);
++  for (int j = threadIdx.x; j < taps; j += blockDim.x) {
++    shifts[j] = Exp(fx * (j - center));
++    shifts[taps + j] = Exp(fy * (j - center));
++  }
++  __syncthreads();
++  for (int e = threadIdx.x; e < cols + rows; e += blockDim.x) {
++    const bool along_x = e < cols;
++    const int position = along_x ? e : e - cols, size = along_x ? cols : rows;
++    const double* tap = (along_x ? horizontal : vertical) + bin * taps;
++    const double2* shift = shifts + (along_x ? 0 : taps);
++    double2 sum = make_double2(0.0, 0.0);
++    const int first = max(0, center - position);
++    const int last = min(taps, size + center - position);
++    for (int j = first; j < last; ++j) {
++      sum.x += tap[j] * shift[j].x;
++      sum.y += tap[j] * shift[j].y;
++    }
++    tables[(sample * bins + bin) * (cols + rows) + e] =
++        Mul(sum, Exp(along_x ? fx * position + phi : fy * position));
++  }
++}
++
++// corner = [x0, x1, y0, y1]; weights of (y0,x0), (y1,x0), (y0,x1), (y1,x1).
++__device__ float2 Sample(const double2* table, int cols, const int64_t* corner,
++                         const double* weight) {
++  const double2 y0 = table[cols + corner[2]], y1 = table[cols + corner[3]];
++  const double2 left = make_double2(weight[0] * y0.x + weight[1] * y1.x,
++                                    weight[0] * y0.y + weight[1] * y1.y);
++  const double2 right = make_double2(weight[2] * y0.x + weight[3] * y1.x,
++                                     weight[2] * y0.y + weight[3] * y1.y);
++  const double2 a = Mul(table[corner[0]], left), b = Mul(table[corner[1]], right);
++  return make_float2(a.x + b.x, a.y + b.y);
++}
++
++// coefficients [batch, 2, units] complex: plane 0 the dominant subunit, plane 1
++// the non-dominant one (zero weights unless composite).
++__global__ void CoefficientsKernel(int64_t count, int units, int bins, int rows, int cols,
++                                   const int64_t* __restrict__ bin,
++                                   const int64_t* __restrict__ corners,
++                                   const double* __restrict__ weights,
++                                   const double2* __restrict__ tables,
++                                   float2* __restrict__ coefficients) {
++  GPU_1D_KERNEL_LOOP(i, count) {
++    const int64_t sample = i / units;
++    const int unit = i - sample * units;
++    const double2* table = tables + (sample * bins + bin[unit]) * (cols + rows);
++    float2* out = coefficients + 2 * sample * units + unit;
++    out[0] = Sample(table, cols, corners + 8 * unit, weights + 8 * unit);
++    out[units] = Sample(table, cols, corners + 8 * unit + 4, weights + 8 * unit + 4);
++  }
++}
++
++__device__ float4 Load4(const Eigen::half* u) {
++  const ::uint2 raw = __ldcs(reinterpret_cast<const ::uint2*>(u));
++  const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
++  const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
++  return make_float4(a.x, a.y, b.x, b.y);
++}
++__device__ float4 Load4(const float* u) { return __ldcs(reinterpret_cast<const float4*>(u)); }
++
++__device__ float Im(float2 a, float2 r) { return fmaf(a.x, r.y, a.y * r.x); }
++
++// Each thread holds the temporal responses of kUnits consecutive units over
++// kSteps timesteps in registers and sweeps the samples [begin, end), so R is
++// read once per launch while the uniforms and outputs stream through. kVector:
++// units % kUnits == 0, so every thread's units are whole and 4-aligned.
++template <typename U, Output kOutput, bool kVector>
++__global__ void __launch_bounds__(kResponseThreads, kResponseBlocks)
++ResponseKernel(int units, int steps, int begin, int end,
++               const float2* __restrict__ coefficients,
++               const float2* __restrict__ response,
++               const float2* __restrict__ composite_response, int composites,
++               const int64_t* __restrict__ composite_slot,
++               const float* __restrict__ spontaneous, Uniforms<U> uniforms,
++               void* __restrict__ output) {
++  const int first = (blockIdx.x * blockDim.x + threadIdx.x) * kUnits;
++  if (first >= units) return;
++  const int t0 = blockIdx.y * kSteps;
++  const int width = kVector ? kUnits : min(kUnits, units - first);
++  float2 r[kSteps][kUnits];
++  int slot[kUnits];
++  float spont[kUnits];
++  bool composite = false;
++#pragma unroll
++  for (int j = 0; j < kUnits; ++j) {
++    const bool live = j < width;
++    slot[j] = live ? static_cast<int>(composite_slot[first + j]) : -1;
++    spont[j] = live ? spontaneous[first + j] : 0.f;
++    composite |= slot[j] >= 0;
++#pragma unroll
++    for (int s = 0; s < kSteps; ++s)
++      r[s][j] = live && t0 + s < steps
++          ? response[static_cast<int64_t>(t0 + s) * units + first + j] : make_float2(0.f, 0.f);
++  }
++  const int group_begin = begin + blockIdx.z * kSampleGroup;
++  const int group_end = min(end, group_begin + kSampleGroup);
++  for (int b = group_begin; b < group_end; ++b) {
++    const float2* plane = coefficients + 2 * static_cast<int64_t>(b) * units + first;
++    float2 a[kUnits], ac[kUnits];
++#pragma unroll
++    for (int j = 0; j < kUnits; ++j) {
++      a[j] = j < width ? plane[j] : make_float2(0.f, 0.f);
++      ac[j] = composite && slot[j] >= 0 ? plane[units + j] : make_float2(0.f, 0.f);
++    }
++    // Issue every timestep's uniform load before any arithmetic.
++    float4 u[kSteps];
++    const int sample = b - begin;
++    const U* base = kOutput == Output::kSpikes
++        ? uniforms.Sample(sample, static_cast<int64_t>(steps) * units) + first : nullptr;
++    if constexpr (kOutput == Output::kSpikes && kVector) {
++#pragma unroll
++      for (int s = 0; s < kSteps; ++s)
++        if (t0 + s < steps) u[s] = Load4(base + static_cast<int64_t>(t0 + s) * units);
++    }
++#pragma unroll
++    for (int s = 0; s < kSteps; ++s) {
++      const int t = t0 + s;
++      if (t >= steps) continue;
++      float value[kUnits];
++#pragma unroll
++      for (int j = 0; j < kUnits; ++j) {
++        // Im(A R) + spont, rectified, per subunit.
++        float rate = fmaxf(Im(a[j], r[s][j]) + spont[j], 0.f);
++        if (composite && slot[j] >= 0)
++          rate += fmaxf(Im(ac[j], composite_response[static_cast<int64_t>(t) * composites + slot[j]])
++                        + spont[j], 0.f);
++        value[j] = kOutput == Output::kRates ? rate : SpikeProbability(rate);
++      }
++      const int64_t out = (static_cast<int64_t>(b) * steps + t) * units + first;
++      if constexpr (kOutput == Output::kSpikes) {
++        bool* spikes = static_cast<bool*>(output) + out;
++        if constexpr (kVector) {
++          __stcs(reinterpret_cast<unsigned int*>(spikes),
++                 (u[s].x < value[0]) | (u[s].y < value[1]) << 8 |
++                 (u[s].z < value[2]) << 16 | (u[s].w < value[3]) << 24);
++        } else {
++          const U* uniform = base + static_cast<int64_t>(t) * units;
++          for (int j = 0; j < width; ++j) spikes[j] = static_cast<float>(uniform[j]) < value[j];
++        }
++      } else {
++        float* probabilities = static_cast<float*>(output) + out;
++        if constexpr (kVector) {
++          __stcs(reinterpret_cast<float4*>(probabilities),
++                 make_float4(value[0], value[1], value[2], value[3]));
++        } else {
++          for (int j = 0; j < width; ++j) probabilities[j] = value[j];
++        }
++      }
++    }
++  }
++}
++
++Status ValidateResponse(OpKernelContext* c, int first) {
++  const Tensor& coefficients = c->input(first);
++  const Tensor& response = c->input(first + 1);
++  const Tensor& composite = c->input(first + 2);
++  if (coefficients.dims() != 4 || coefficients.dim_size(1) != 2 || coefficients.dim_size(3) != 2)
++    return errors::InvalidArgument("coefficients must be [batch, 2, units, 2]");
++  const int64_t units = coefficients.dim_size(2);
++  if (response.dims() != 3 || response.dim_size(1) != units || response.dim_size(2) != 2)
++    return errors::InvalidArgument("response must be [time, units, 2]");
++  if (composite.dims() != 3 || composite.dim_size(0) != response.dim_size(0) ||
++      composite.dim_size(2) != 2)
++    return errors::InvalidArgument("composite_response must be [time, composites, 2]");
++  for (int index : {first + 3, first + 4})
++    if (c->input(index).dims() != 1 || c->input(index).dim_size(0) != units)
++      return errors::InvalidArgument("per-unit constants must be [units]");
++  if (response.NumElements() / 2 > std::numeric_limits<int>::max() ||
++      coefficients.dim_size(0) > std::numeric_limits<int>::max())
++    return errors::InvalidArgument("LGN response too large");
++  return OkStatus();
++}
++
++template <typename U, Output kOutput>
++Status LaunchResponse(OpKernelContext* c, int first, int begin, int end,
++                      Uniforms<U> uniforms, void* output) {
++  const Tensor& response = c->input(first + 1);
++  const int steps = response.dim_size(0), units = response.dim_size(1);
++  if (steps == 0 || units == 0 || end <= begin) return OkStatus();
++  const dim3 blocks((units + kUnits * kResponseThreads - 1) / (kUnits * kResponseThreads),
++                    (steps + kSteps - 1) / kSteps, (end - begin + kSampleGroup - 1) / kSampleGroup);
++  auto kernel = units % kUnits == 0 ? ResponseKernel<U, kOutput, true>
++                                    : ResponseKernel<U, kOutput, false>;
++  return GpuLaunchKernel(
++      kernel, blocks, kResponseThreads, 0,
++      c->eigen_device<GPUDevice>().stream(), units, steps, begin, end,
++      reinterpret_cast<const float2*>(c->input(first).flat<float>().data()),
++      reinterpret_cast<const float2*>(response.flat<float>().data()),
++      reinterpret_cast<const float2*>(c->input(first + 2).flat<float>().data()),
++      static_cast<int>(c->input(first + 2).dim_size(1)),
++      c->input(first + 3).flat<int64_t>().data(),
++      c->input(first + 4).flat<float>().data(), uniforms, output);
++}
++
++
++template <typename T>
++class CoefficientsOp : public OpKernel {
++ public:
++  explicit CoefficientsOp(OpKernelConstruction* c) : OpKernel(c) {
++    OP_REQUIRES_OK(c, c->GetAttr("theta_sign", &sign_));
++    OP_REQUIRES_OK(c, c->GetAttr("theta_offset", &offset_));
++    OP_REQUIRES_OK(c, c->GetAttr("rows", &rows_));
++    OP_REQUIRES_OK(c, c->GetAttr("cols", &cols_));
++  }
++  void Compute(OpKernelContext* c) override {
++    const Tensor& theta = c->input(0);
++    const Tensor& vertical = c->input(3);
++    const Tensor& bin = c->input(5);
++    const int64_t batch = theta.NumElements(), units = bin.NumElements();
++    OP_REQUIRES(c, c->input(1).NumElements() == batch && c->input(2).NumElements() == 1,
++                errors::InvalidArgument("theta, phase must be [batch]; wavenumber a scalar"));
++    OP_REQUIRES(c, vertical.dims() == 2 && vertical.shape() == c->input(4).shape(),
++                errors::InvalidArgument("taps must be [bins, taps], alike"));
++    OP_REQUIRES(c, c->input(6).NumElements() == 8 * units &&
++                c->input(7).NumElements() == 8 * units,
++                errors::InvalidArgument("corners and weights must be [units, 8]"));
++    const int bins = vertical.dim_size(0), taps = vertical.dim_size(1);
++    Tensor* coefficients;
++    OP_REQUIRES_OK(c, c->allocate_output(0, TensorShape({batch, 2, units, 2}), &coefficients));
++    if (batch == 0 || units == 0) return;
++    Tensor tables;
++    OP_REQUIRES_OK(c, c->allocate_temp(
++        DT_DOUBLE, TensorShape({batch, bins, rows_ + cols_, 2}), &tables));
++    auto& d = c->eigen_device<GPUDevice>();
++    auto* table = reinterpret_cast<double2*>(tables.flat<double>().data());
++    OP_REQUIRES_OK(c, GpuLaunchKernel(
++        TablesKernel<T>, dim3(bins, batch), kTableThreads,
++        2 * taps * sizeof(double2), d.stream(), theta.flat<T>().data(),
++        c->input(1).flat<T>().data(),
++        c->input(2).flat<double>().data(), sign_, offset_, bins, taps,
++        vertical.flat<double>().data(), c->input(4).flat<double>().data(),
++        rows_, cols_, table));
++    auto config = GetGpuLaunchConfig(batch * units, d);
++    OP_REQUIRES_OK(c, GpuLaunchKernel(
++        CoefficientsKernel, config.block_count, config.thread_per_block, 0,
++        d.stream(), batch * units, static_cast<int>(units), bins, rows_, cols_,
++        bin.flat<int64_t>().data(),
++        c->input(6).flat<int64_t>().data(), c->input(7).flat<double>().data(),
++        table, reinterpret_cast<float2*>(coefficients->flat<float>().data())));
++  }
++ private:
++  float sign_, offset_;
++  int rows_, cols_;
++};
++
++class ProbabilitiesOp : public OpKernel {
++ public:
++  explicit ProbabilitiesOp(OpKernelConstruction* c) : OpKernel(c) {
++    OP_REQUIRES_OK(c, c->GetAttr("rates", &rates_));
++  }
++  void Compute(OpKernelContext* c) override {
++    OP_REQUIRES_OK(c, ValidateResponse(c, 0));
++    const int batch = c->input(0).dim_size(0);
++    Tensor* output;
++    OP_REQUIRES_OK(c, c->allocate_output(0, TensorShape(
++        {batch, c->input(1).dim_size(0), c->input(1).dim_size(1)}), &output));
++    void* data = output->flat<float>().data();
++    OP_REQUIRES_OK(c, rates_
++        ? LaunchResponse<float, Output::kRates>(c, 0, 0, batch, Uniforms<float>{}, data)
++        : LaunchResponse<float, Output::kProbabilities>(c, 0, 0, batch, Uniforms<float>{}, data));
++  }
++ private:
++  bool rates_;
++};
++
++template <typename U>
++class SpikesOp : public OpKernel {
++ public:
++  explicit SpikesOp(OpKernelConstruction* c) : OpKernel(c) {
++    OP_REQUIRES_OK(c, c->GetAttr("offset", &offset_));
++  }
++  void Compute(OpKernelContext* c) override {
++    OP_REQUIRES_OK(c, ValidateResponse(c, 1));
++    const int64_t batch = c->input(1).dim_size(0);
++    const TensorShape shape({batch, c->input(2).dim_size(0), c->input(2).dim_size(1)});
++    Uniforms<U> uniforms;
++    int count;
++    Tensor* spikes;
++    OP_REQUIRES_OK(c, lgn::PrepareSpikes(c, 0, shape, offset_, &uniforms, &count, &spikes));
++    OP_REQUIRES_OK(c, LaunchResponse<U, Output::kSpikes>(
++        c, 1, offset_, offset_ + count, uniforms,
++        spikes->flat<bool>().data()));
++  }
++ private:
++  int offset_;
++};
++
++}  // namespace
++
++#define REG(T) REGISTER_KERNEL_BUILDER(Name("DpointnetLgnGratingCoefficients").Device(DEVICE_GPU).TypeConstraint<T>("T"), CoefficientsOp<T>);
++REG(float); REG(Eigen::half);
++#undef REG
++REGISTER_KERNEL_BUILDER(Name("DpointnetLgnGratingProbabilities").Device(DEVICE_GPU), ProbabilitiesOp);
++#define REG(U) REGISTER_KERNEL_BUILDER(Name("DpointnetLgnGratingSpikes").Device(DEVICE_GPU).TypeConstraint<U>("U"), SpikesOp<U>);
++REG(float); REG(Eigen::half);
++#undef REG
++#endif
+diff --git a/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.py b/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.py
+new file mode 100644
+index 00000000..bfa2ed7c
+--- /dev/null
++++ b/bmtk/simulator/dpointnet/custom_ops/lgn_grating_ops.py
+@@ -0,0 +1,266 @@
++"""Native drifting-grating LGN: exact factorization of the movie -> filters -> rate pipeline.
++
++Adapted from Javier Galvan's ``v1_model_utils/cuda_lgn/wrapper.py`` (commit
++d8fb466b; credit: Javier). See ``lgn_grating_ops.cc`` for the math: a grating
++frame is ``Im(e^{i(k.r + w f + phi)})`` and every stage up to the rectification
++is linear, so each unit's filtered response is ``Im(A_n R_n(t))`` with a
++per-sample complex spatial coefficient ``A`` (computed by the op in float64)
++and a per-unit complex temporal response ``R`` precomputed here once in
++float64 from the float32 LGN constants. Rates and spike probabilities equal
++the TensorFlow path's to float32 rounding; spikes use the same stateless
++float32 uniforms. The operators contain no architecture-specific intrinsics
++and are built for every target of the fat binary.
++"""
++
++from pathlib import Path
++import warnings
++
++import numpy as np
++import tensorflow as tf
++
++from .csr_spike_ops import _gpu_compatibility_error, _read_built_architectures
++
++_LIBRARY_PATH = Path(__file__).with_name("_lgn_grating_ops.so")
++_ARCHITECTURE_PATH = Path(__file__).with_name("_lgn_grating_ops.archs")
++_SM_ARCHITECTURES, _PTX_ARCHITECTURE = _read_built_architectures(_ARCHITECTURE_PATH)
++_OPS = None
++_LOAD_ERROR = None
++MAX_CHUNK = 16
++
++
++def _load():
++    global _OPS, _LOAD_ERROR
++    if _OPS is None and _LOAD_ERROR is None:
++        if not _LIBRARY_PATH.exists():
++            _LOAD_ERROR = f"Native LGN grating library does not exist at {_LIBRARY_PATH}."
++            return None
++        try:
++            _OPS = tf.load_op_library(str(_LIBRARY_PATH))
++        except (tf.errors.NotFoundError, OSError) as exc:
++            _LOAD_ERROR = f"Native LGN grating library failed to load: {exc}"
++    return _OPS
++
++
++def lgn_grating_op_status():
++    """Human-readable load status of the native grating library."""
++    _load()
++    if _OPS is not None:
++        return f"loaded from {_LIBRARY_PATH}"
++    return _LOAD_ERROR or "not loaded"
++
++
++def native_grating_lgn_available():
++    """Whether the native grating operators can run: a GPU is visible, the fat
++    binary targets it and the library loads."""
++    if not tf.config.list_physical_devices("GPU"):
++        return False
++    if _load() is None:
++        return False
++    error = _gpu_compatibility_error(_SM_ARCHITECTURES, _PTX_ARCHITECTURE, _ARCHITECTURE_PATH)
++    if error:
++        warnings.warn(str(error))
++        return False
++    return True
++
++
++REQUIRED_CONSTANTS = (
++    "is_composite", "gaussian_filters", "spatial_range_indices", "amplitude", "non_dom_amplitude",
++    "x", "y", "non_dominant_x", "non_dominant_y", "dom_temporal_kernels", "non_dom_temporal_kernels",
++    "spontaneous_firing_rates",
++)
++
++
++def supports_lgn(lgn):
++    """Whether ``lgn`` exposes the ``lgn_tf.lgn.LGN`` constants the factorization needs."""
++    return all(hasattr(lgn, name) for name in REQUIRED_CONSTANTS)
++
++
++def _numpy(value):
++    return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
++
++
++def _separable_taps(filters):
++    """Rank-one float64 factors of each 2-D Gaussian, centered in a common odd width."""
++    taps = max(max(f.shape) for f in filters)
++    vertical, horizontal = np.zeros((len(filters), taps)), np.zeros((len(filters), taps))
++    for k, kernel in enumerate(filters):
++        u, singular, vh = np.linalg.svd(kernel, full_matrices=False)
++        if singular[1:].sum() > singular[0] * 1e-5 or kernel.shape[0] % 2 == 0 or kernel.shape[1] % 2 == 0:
++            raise ValueError("Expected odd, rank-one Gaussian spatial kernels")
++        column, row = u[:, 0] * np.sqrt(singular[0]), vh[0] * np.sqrt(singular[0])
++        if column.sum() < 0:
++            column, row = -column, -row
++        before_v, before_h = (taps - column.size) // 2, (taps - row.size) // 2
++        vertical[k, before_v:before_v + column.size] = column
++        horizontal[k, before_h:before_h + row.size] = row
++    return vertical, horizontal
++
++
++def _bilinear(x, y, reciprocal, scale):
++    """Corner coordinates [x0, x1, y0, y1] and weights of (y0,x0), (y1,x0), (y0,x1), (y1,x1)."""
++    x0, x1, y0, y1 = np.floor(x), np.ceil(x), np.floor(y), np.ceil(y)
++    fx, fy = x - x0, y - y0
++    corners = np.stack((x0, x1, y0, y1), axis=1).astype(np.int64)
++    weights = np.stack(((1 - fx) * (1 - fy), (1 - fx) * fy, fx * (1 - fy), fx * fy), axis=1)
++    rows = corners[:, [2, 3, 2, 3]]
++    cols = corners[:, [0, 0, 1, 1]]
++    return corners, weights * reciprocal[rows, cols] * scale[:, None]
++
++
++def _same_correlation_normalizer(rows, cols, kernel):
++    """The 'SAME' zero-padded correlation of an all-ones frame with ``kernel``
++    (what the TensorFlow path divides by under ``bmtk_compat``), computed on the
++    host in float64: the frame is all ones, so each entry is the sum of the taps
++    that fall inside the frame."""
++    height, width = kernel.shape
++    rows_sum = np.zeros((rows, height)); cols_sum = np.zeros((cols, width))
++    # TensorFlow 'SAME' pads (k - 1) // 2 before and the remainder after.
++    pad_top, pad_left = (height - 1) // 2, (width - 1) // 2
++    for r in range(rows):
++        for i in range(height):
++            rows_sum[r, i] = 0 <= r + i - pad_top < rows
++    for c in range(cols):
++        for j in range(width):
++            cols_sum[c, j] = 0 <= c + j - pad_left < cols
++    return rows_sum @ kernel @ cols_sum.T
++
++
++def _temporal_response(kernels, omega, seq_len, pre_delay, duration, chunk=4096):
++    """R[t, n] = sum over lags m with the frame t - m - pre_delay in the stimulus of
++    K[L - 1 - m, n] e^{i omega (t - m - pre_delay)}: the causal depthwise
++    convolution of e^{i omega f}, zero-padded before the kernel and outside the window."""
++    length, units = kernels.shape
++    frame = np.arange(seq_len) - pre_delay
++    high = np.clip(frame + 1, 0, length)
++    low = np.clip(frame - duration + 1, 0, length)
++    rotation = np.exp(1j * omega * frame)[:, None]
++    shift = np.exp(-1j * omega * np.arange(length))[:, None]
++    response = np.empty((seq_len, units, 2), np.float32)
++    for start in range(0, units, chunk):
++        lagged = kernels[::-1, start:start + chunk].astype(np.float64) * shift
++        prefix = np.concatenate((np.zeros((1, lagged.shape[1])), np.cumsum(lagged, axis=0)))
++        value = rotation * (prefix[high] - prefix[low])
++        response[:, start:start + chunk, 0] = value.real
++        response[:, start:start + chunk, 1] = value.imag
++    return response
++
++
++class GratingLGNKernel:
++    """The native grating operators and their constants for one ``DriftingGratingLGN``.
++
++    ``lgn`` is a built ``lgn_tf.lgn.LGN``. ``chunk`` samples are drawn per spike
++    op call (at most 16): a chunk reuses the temporal responses across its
++    samples; at 17,400 units and 500 steps a chunk of 16 float32 uniform
++    tensors occupies about 531 MiB while one sample's occupies 33 MiB.
++    Constants are ``tf.constant`` on the current device; under a distribution
++    strategy construct one kernel per replica.
++    """
++
++    def __init__(self, lgn, *, seq_len, pre_delay, post_delay, temporal_f, cpd, contrast,
++                 rows, cols, theta_sign, theta_offset, bmtk_compat=True, chunk=16):
++        if not 1 <= chunk <= MAX_CHUNK:
++            raise ValueError(f"chunk must be in [1, {MAX_CHUNK}], got {chunk}")
++        ops = _load()
++        if ops is None:
++            raise RuntimeError(lgn_grating_op_status())
++        if not tf.config.list_physical_devices("GPU"):
++            raise RuntimeError("Native LGN grating operators require a visible GPU.")
++        error = _gpu_compatibility_error(_SM_ARCHITECTURES, _PTX_ARCHITECTURE, _ARCHITECTURE_PATH)
++        if error:
++            raise RuntimeError(str(error))
++        duration = seq_len - pre_delay - post_delay
++        if duration < 0:
++            raise ValueError("Grating delays must not exceed seq_len.")
++        composite = _numpy(lgn.is_composite).astype(np.float32) > 0.5
++        units = composite.size
++        f64 = lambda value: _numpy(value).astype(np.float32).astype(np.float64)  # noqa: E731
++        # Our LGN keeps conv2d kernels [h, w, 1, 1]; the factorization wants 2-D Gaussians.
++        filters = [f64(kernel).reshape(f64(kernel).shape[:2]) for kernel in lgn.gaussian_filters]
++        vertical, horizontal = _separable_taps(filters)
++        bins = np.full(units, -1, np.int64)
++        for k, indices in enumerate(lgn.spatial_range_indices):
++            bins[np.asarray(indices)] = k
++        if (bins < 0).any():
++            raise ValueError("Every LGN unit needs a spatial filter bin")
++        corners = np.zeros((units, 8), np.int64)
++        weights = np.zeros((units, 8))
++        amplitude = f64(lgn.amplitude) * contrast
++        non_dom_amplitude = f64(lgn.non_dom_amplitude) * contrast
++        x, y = f64(lgn.x), f64(lgn.y)
++        non_dom_x, non_dom_y = f64(lgn.non_dominant_x), f64(lgn.non_dominant_y)
++        for k, kernel in enumerate(filters):
++            reciprocal = (
++                1.0 / _same_correlation_normalizer(rows, cols, kernel) if bmtk_compat
++                else np.ones((rows, cols))
++            )
++            units_k = np.flatnonzero(bins == k)
++            corners[units_k, :4], weights[units_k, :4] = _bilinear(
++                x[units_k], y[units_k], reciprocal, amplitude[units_k])
++            units_k = units_k[composite[units_k]]
++            corners[units_k, 4:], weights[units_k, 4:] = _bilinear(
++                non_dom_x[units_k], non_dom_y[units_k], reciprocal, non_dom_amplitude[units_k])
++        omega = 2 * np.pi * temporal_f / 1000.0
++        composite_ids = np.flatnonzero(composite)
++        slot = np.full(units, -1, np.int64)
++        slot[composite_ids] = np.arange(composite_ids.size)
++        response = _temporal_response(_numpy(lgn.dom_temporal_kernels), omega, seq_len, pre_delay, duration)
++        composite_response = _temporal_response(
++            _numpy(lgn.non_dom_temporal_kernels)[:, composite_ids], omega, seq_len, pre_delay, duration)
++        self.seq_len, self.units, self.chunk = seq_len, units, chunk
++        self._ops = ops
++        self._attrs = dict(theta_sign=float(theta_sign), theta_offset=float(theta_offset), rows=rows, cols=cols)
++        self._spatial = [tf.constant(value, dtype) for value, dtype in (
++            (2 * np.pi * cpd, tf.float64), (vertical, tf.float64), (horizontal, tf.float64),
++            (bins, tf.int64), (corners, tf.int64), (weights, tf.float64))]
++        self._temporal = [tf.constant(value, dtype) for value, dtype in (
++            (response, tf.float32), (composite_response, tf.float32), (slot, tf.int64),
++            (_numpy(lgn.spontaneous_firing_rates).astype(np.float32), tf.float32))]
++
++    def coefficients(self, theta, phase):
++        """Complex spatial coefficients [batch, 2, units, 2] of the batch's gratings."""
++        return self._ops.dpointnet_lgn_grating_coefficients(theta, phase, *self._spatial, **self._attrs)
++
++    def probabilities(self, theta, phase, rates=False):
++        """Float32 spike probabilities (or rates in Hz with ``rates``), [batch, seq_len, units]."""
++        return self._ops.dpointnet_lgn_grating_probabilities(
++            self.coefficients(theta, phase), *self._temporal, rates=rates)
++
++    def spikes(self, theta, phase, spike_seeds, dtype=tf.float32):
++        """Spikes [batch, seq_len, units]: stateless uniforms in ``dtype`` (use float32;
++        float16 uniforms have 1024 levels and bias the rate upwards) below the
++        probabilities, drawn ``chunk`` samples at a time into one buffer."""
++        shape = (self.seq_len, self.units)
++
++        def uniform(seed):
++            return tf.random.stateless_uniform(shape, seed=seed, dtype=dtype)
++
++        def sample(spikes, uniforms, offset):
++            return self._ops.dpointnet_lgn_grating_spikes(
++                spikes, coefficients, *self._temporal, uniforms, offset=offset)
++
++        batch = theta.shape[0]
++        if batch is None:
++            # Symbolic batch: one sample at a time (its own coefficients, uniforms
++            # and spikes op), so memory stays bounded by one sample's uniforms.
++            def one(sample):
++                sample_theta, sample_phase, seed = sample
++                return self._ops.dpointnet_lgn_grating_spikes(
++                    tf.zeros((0,), tf.bool), self.coefficients(sample_theta[None], sample_phase[None]),
++                    *self._temporal, [uniform(seed)], offset=0)[0]
++
++            return tf.map_fn(
++                one, (theta, phase, spike_seeds), fn_output_signature=tf.TensorSpec(shape, tf.bool),
++                parallel_iterations=1,
++            )
++        if batch == 0:
++            return tf.zeros((0,) + shape, tf.bool)
++        coefficients = self.coefficients(theta, phase)
++        spikes = tf.zeros((0,), tf.bool)
++        for begin in range(0, batch, self.chunk):
++            with tf.control_dependencies([spikes] if begin else []):
++                uniforms = [uniform(spike_seeds[b]) for b in range(begin, min(begin + self.chunk, batch))]
++            spikes = sample(spikes, uniforms, begin)
++            # Release this chunk's uniforms before the next chunk is drawn so only
++            # one chunk is ever alive in eager execution.
++            del uniforms
++        return spikes
+diff --git a/bmtk/simulator/dpointnet/input_modules/lgn_generator.py b/bmtk/simulator/dpointnet/input_modules/lgn_generator.py
+index 7a0726f3..e3f54cef 100644
+--- a/bmtk/simulator/dpointnet/input_modules/lgn_generator.py
++++ b/bmtk/simulator/dpointnet/input_modules/lgn_generator.py
+@@ -356,7 +356,17 @@ def make_drifting_grating_stimulus(
+ 
+ 
+ class DriftingGratingLGN:
+-    """Graph-callable grating filtering, adapted from Javier's stim_dataset.py."""
++    """Graph-callable grating filtering, adapted from Javier's stim_dataset.py.
++
++    ``lgn_backend`` selects the implementation: ``"auto"`` (default) uses the
++    native exact-factorization grating operators
++    (``custom_ops.lgn_grating_ops``) when a GPU and the built library are
++    available and otherwise the TensorFlow movie -> spatial -> temporal path;
++    ``"native"`` requires the operators and ``"tensorflow"`` forces the
++    TensorFlow path. Both produce the same rates to float32 rounding and draw
++    the same stateless float32 uniforms, so spikes agree up to probabilities
++    within one ulp of a uniform. ``backend`` reports the resolved choice.
++    """
+ 
+     def __init__(
+         self,
+@@ -374,7 +384,13 @@ def __init__(
+         bmtk_compat=True,
+         dtype=tf.float32,
+         current_input=False,
++        lgn_backend="auto",
++        native_chunk=16,
+     ):
++        if lgn_backend not in ("auto", "native", "tensorflow"):
++            raise ValueError(
++                f'lgn_backend must be "auto", "native" or "tensorflow", got {lgn_backend!r}'
++            )
+         self.lgn = lgn_network
+         self.seq_len = seq_len
+         self.pre_delay = pre_delay
+@@ -392,8 +408,41 @@ def __init__(
+         self.bmtk_compat = bmtk_compat
+         self.dtype = tf.as_dtype(dtype)
+         self.current_input = current_input
++        self.kernel = None
++        if lgn_backend != "tensorflow":
++            from ..custom_ops import lgn_grating_ops
++
++            # The native coefficient operator accepts float16/float32 angles only.
++            native_dtype = self.dtype in (tf.float16, tf.float32)
++            if lgn_backend == "native" and not native_dtype:
++                raise ValueError(
++                    f'lgn_backend="native" requires dtype float16 or float32, got {self.dtype.name}.'
++                )
++            # Auto needs a usable GPU library, a supported dtype and a full LGN
++            # (duck-typed stand-ins keep the TensorFlow path); an explicit request
++            # fails loudly instead.
++            if lgn_backend == "native" or (
++                native_dtype and lgn_grating_ops.supports_lgn(lgn_network)
++                and lgn_grating_ops.native_grating_lgn_available()
++            ):
++                self.kernel = lgn_grating_ops.GratingLGNKernel(
++                    lgn_network, seq_len=seq_len, pre_delay=pre_delay, post_delay=post_delay,
++                    temporal_f=temporal_f, cpd=cpd, contrast=contrast, rows=row_size,
++                    cols=col_size, theta_sign=1.0 if rotation == "cw" else -1.0,
++                    theta_offset=180.0 if billeh_phase else 0.0, bmtk_compat=bmtk_compat,
++                    chunk=native_chunk,
++                )
++        self.backend = "native" if self.kernel is not None else "tensorflow"
++
++    def _as_batch(self, orientation, phase):
++        return tuple(
++            tf.reshape(tf.cast(value, self.dtype), (1,)) for value in (orientation, phase)
++        )
+ 
+     def firing_rates(self, orientation, phase):
++        if self.kernel is not None:
++            rates = self.kernel.probabilities(*self._as_batch(orientation, phase), rates=True)
++            return tf.cast(rates[0], self.dtype)
+         theta = orientation if self.rotation == "cw" else -orientation
+         if self.billeh_phase:
+             theta += 180
+@@ -416,6 +465,14 @@ def firing_rates(self, orientation, phase):
+         )
+ 
+     def spikes(self, orientation, phase, spike_seed):
++        if self.kernel is not None:
++            if self.current_input:
++                return tf.cast(
++                    self.kernel.probabilities(*self._as_batch(orientation, phase))[0], self.dtype
++                ) * 1.3
++            return self.kernel.spikes(
++                *self._as_batch(orientation, phase), tf.reshape(spike_seed, (1, 2)), tf.float32
++            )[0]
+         probabilities = 1 - tf.exp(-self.firing_rates(orientation, phase) / 1000.0)
+         if self.current_input:
+             return probabilities * 1.3
+@@ -425,6 +482,13 @@ def spikes(self, orientation, phase, spike_seed):
+         return uniform < probabilities
+ 
+     def batch_spikes(self, orientation, phase, spike_seeds):
++        if self.kernel is not None:
++            theta = tf.cast(orientation[:, 0], self.dtype)
++            if self.current_input:
++                return tf.cast(self.kernel.probabilities(theta, tf.cast(phase, self.dtype)), self.dtype) * 1.3
++            # The native op compares float32 uniforms; float16 uniforms have 1024
++            # levels and would bias the spike rate upwards.
++            return self.kernel.spikes(theta, tf.cast(phase, self.dtype), spike_seeds, tf.float32)
+         return tf.map_fn(
+             lambda sample: self.spikes(*sample),
+             (orientation[:, 0], phase, spike_seeds),
+@@ -598,7 +662,14 @@ def create_drifting_gratings_generator(
+     seed=None,
+     phase=None,
+     _error_handler=None,
++    lgn_backend=None,
++    native_chunk=None,
+ ):
++    # ``lgn_backend``/``native_chunk`` select the device route's implementation;
++    # this host reference generator accepts and ignores them so one stimulus
++    # option dictionary serves both routes (host warmup uses this generator even
++    # when device generation is enabled).
++    del lgn_backend, native_chunk
+ 
+     # lgn = LGN(
+     #     network=network,
+diff --git a/docs/autodocs/source/dpointnet_lgn_pipeline.rst b/docs/autodocs/source/dpointnet_lgn_pipeline.rst
+index 196934b6..5e8dbb2e 100644
+--- a/docs/autodocs/source/dpointnet_lgn_pipeline.rst
++++ b/docs/autodocs/source/dpointnet_lgn_pipeline.rst
+@@ -61,6 +61,31 @@ unsupported strategies or host firing-rate output. Unsupported device requests
+ raise instead of changing your input protocol. Gray-screen stimuli use the
+ host route by default.
+ 
++Native grating operators
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++Device generation of drifting gratings uses the native exact-factorization
++operators (``custom_ops/_lgn_grating_ops.so``, built by ``custom_ops/build.sh``
++beside the state and projection libraries) whenever a GPU and the built
++library are available. A grating frame is ``Im(e^{i(k.r + w f + phi)})`` and
++every stage before rectification is linear, so each unit's filtered response is
++``Im(A R(t))`` with a per-sample complex spatial coefficient ``A`` (computed in
++float64 on the device) and a per-unit complex temporal response ``R``
++precomputed once in float64. The resulting rates equal the movie -> spatial ->
++temporal TensorFlow path to float32 rounding, and spikes use the same stateless
++float32 uniforms, so the stimulus protocol, seeds and trial assignment are
++unchanged. On the 17,400-unit LGN at batch 32 and 500 steps an RTX 3090
++generates a batch in about 0.11 s instead of 0.88 s.
++
++The stimulus option ``lgn_backend`` selects the implementation: ``"auto"``
++(default), ``"native"`` (raises when the operators or a compatible GPU are
++missing) or ``"tensorflow"``. ``native_chunk`` (1-16, default 16) sets how many
++samples' uniforms are alive at once (about 33 MiB per sample at 17,400 units
++and 500 steps). ``DriftingGratingLGN.backend`` reports the resolved choice.
++The operators contain no architecture-specific instructions and are part of
++the fat binary (SM 6.1 upward). Structure adapted from Javier Galvan's
++``v1_model_utils/cuda_lgn`` (credit: Javier).
++
+ .. _dpointnet_lgn_pipeline--seeded-sampling:
+ 
+ Seeds and batches
+diff --git a/tests/simulator/dpointnet/test_lgn_grating_native.py b/tests/simulator/dpointnet/test_lgn_grating_native.py
+new file mode 100644
+index 00000000..ae0d4654
+--- /dev/null
++++ b/tests/simulator/dpointnet/test_lgn_grating_native.py
+@@ -0,0 +1,174 @@
++import os
++from types import SimpleNamespace
++
++import numpy as np
++import pandas as pd
++import pytest
++
++tf = pytest.importorskip("tensorflow")
++
++from bmtk.simulator.dpointnet.custom_ops import lgn_grating_ops
++from bmtk.simulator.dpointnet.input_modules.lgn_generator import DriftingGratingLGN
++from bmtk.simulator.dpointnet.lgn_tf.lgn import LGN
++
++LGN_CSV = os.environ.get(
++    "DPOINTNET_LGN_CSV",
++    "/local2/results/dpointnet_rule_search/javier_runtime_20260929/data/tf_data/lgn_full_col_cells_120x80.csv",
++)
++
++
++def _native_available():
++    return lgn_grating_ops.native_grating_lgn_available()
++
++
++@pytest.fixture(scope="module")
++def small_lgn(tmp_path_factory):
++    """A 300-unit LGN drawn from every unit type of the full 120x80 population."""
++    if not os.path.exists(LGN_CSV):
++        pytest.skip("Full LGN population CSV is unavailable.")
++    frame = pd.read_csv(LGN_CSV, sep=" ")
++    rng = np.random.default_rng(5)
++    rows = np.concatenate([
++        rng.choice(np.flatnonzero(frame["model_id"] == name), size=min(20, count), replace=False)
++        for name, count in frame["model_id"].value_counts().items()
++    ])
++    subset = frame.iloc[np.sort(rows)].reset_index(drop=True)
++    cache = tmp_path_factory.mktemp("lgn")
++    network = SimpleNamespace(get_nodes_df=lambda: subset, n_nodes=len(subset), name="lgn")
++    return LGN(
++        network=network, row_size=80, col_size=120,
++        spon_frs_path=str(cache / "spon.pkl"), temp_krns_path=str(cache / "temp.pkl"),
++        spatial_krns_path=str(cache / "spatial.pkl"),
++    )
++
++
++def _generators(lgn, **options):
++    native = DriftingGratingLGN(lgn, 120, pre_delay=20, post_delay=10, lgn_backend="native", **options)
++    reference = DriftingGratingLGN(lgn, 120, pre_delay=20, post_delay=10, lgn_backend="tensorflow", **options)
++    assert native.backend == "native" and reference.backend == "tensorflow"
++    return native, reference
++
++
++def test_backend_selection_and_errors(small_lgn):
++    with pytest.raises(ValueError, match="lgn_backend"):
++        DriftingGratingLGN(small_lgn, 120, lgn_backend="cuda")
++    reference = DriftingGratingLGN(small_lgn, 120, lgn_backend="tensorflow")
++    assert reference.backend == "tensorflow" and reference.kernel is None
++    automatic = DriftingGratingLGN(small_lgn, 120)
++    assert automatic.backend == ("native" if _native_available() else "tensorflow")
++    if not _native_available():
++        with pytest.raises(RuntimeError):
++            DriftingGratingLGN(small_lgn, 120, lgn_backend="native")
++        return
++    with pytest.raises(ValueError, match="chunk"):
++        lgn_grating_ops.GratingLGNKernel(
++            small_lgn, seq_len=120, pre_delay=0, post_delay=0, temporal_f=2, cpd=0.04, contrast=0.8,
++            rows=80, cols=120, theta_sign=1.0, theta_offset=0.0, chunk=0,
++        )
++    with pytest.raises(ValueError, match="delays"):
++        DriftingGratingLGN(small_lgn, 120, pre_delay=100, post_delay=100, lgn_backend="native")
++
++
++@pytest.mark.parametrize("rotation,billeh_phase", [("ccw", False), ("cw", True)])
++def test_native_rates_match_tensorflow_path(small_lgn, rotation, billeh_phase):
++    """The exact factorization reproduces the movie -> spatial -> temporal rates
++    to float32 rounding for every unit type, both rotations and the phase offset."""
++    if not _native_available():
++        pytest.skip("Native LGN grating operators and a compatible GPU are required.")
++    native, reference = _generators(small_lgn, rotation=rotation, billeh_phase=billeh_phase)
++    for theta, phase in ((0.0, 0.0), (37.5, 123.0), (271.0, 359.0)):
++        expected = reference.firing_rates(tf.constant(theta), tf.constant(phase)).numpy()
++        actual = native.firing_rates(tf.constant(theta), tf.constant(phase)).numpy()
++        assert actual.shape == expected.shape == (120, small_lgn.n_nodes)
++        assert np.all(actual >= 0) and actual.mean() > 0.1
++        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=5e-3)
++        # Gray screen before and after the grating: both paths agree there too.
++        np.testing.assert_allclose(actual[:20], expected[:20], rtol=1e-5, atol=1e-4)
++
++
++def test_native_batch_spikes_match_tensorflow_path_and_are_seeded(small_lgn):
++    if not _native_available():
++        pytest.skip("Native LGN grating operators and a compatible GPU are required.")
++    native, reference = _generators(small_lgn)
++    rng = np.random.default_rng(11)
++    batch = 5
++    theta = tf.constant(rng.uniform(0, 360, (batch, 1)).astype(np.float32))
++    phase = tf.constant(rng.uniform(0, 360, batch).astype(np.float32))
++    seeds = tf.constant(rng.integers(0, 2**31 - 1, (batch, 2)).astype(np.int32))
++    actual = native.batch_spikes(theta, phase, seeds).numpy()
++    expected = reference.batch_spikes(theta, phase, seeds).numpy()
++    assert actual.shape == expected.shape == (batch, 120, small_lgn.n_nodes) and actual.dtype == np.bool_
++    # Same stateless uniforms; probabilities differ only by float32 rounding.
++    mismatch = np.mean(actual != expected)
++    assert mismatch < 1e-4, mismatch
++    assert abs(actual.mean() - expected.mean()) / expected.mean() < 1e-2
++    np.testing.assert_array_equal(native.batch_spikes(theta, phase, seeds).numpy(), actual)
++    # Chunking over the batch does not change the samples.
++    chunked = DriftingGratingLGN(small_lgn, 120, pre_delay=20, post_delay=10, lgn_backend="native", native_chunk=2)
++    np.testing.assert_array_equal(chunked.batch_spikes(theta, phase, seeds).numpy(), actual)
++    single = native.spikes(theta[1, 0], phase[1], seeds[1]).numpy()
++    np.testing.assert_array_equal(single, actual[1])
++
++
++def test_native_current_input_matches_tensorflow_path(small_lgn):
++    if not _native_available():
++        pytest.skip("Native LGN grating operators and a compatible GPU are required.")
++    native, reference = _generators(small_lgn, current_input=True)
++    theta = tf.constant([[12.0], [200.0]]); phase = tf.constant([5.0, 90.0])
++    seeds = tf.zeros((2, 2), tf.int32)
++    np.testing.assert_allclose(
++        native.batch_spikes(theta, phase, seeds).numpy(), reference.batch_spikes(theta, phase, seeds).numpy(),
++        rtol=1e-4, atol=1e-5,
++    )
++
++
++def test_native_ops_run_inside_tf_function(small_lgn):
++    if not _native_available():
++        pytest.skip("Native LGN grating operators and a compatible GPU are required.")
++    native, _ = _generators(small_lgn)
++    theta = tf.constant([[45.0], [90.0], [135.0]]); phase = tf.constant([0.0, 10.0, 20.0])
++    seeds = tf.constant([[1, 2], [3, 4], [5, 6]], tf.int32)
++    eager = native.batch_spikes(theta, phase, seeds).numpy()
++    compiled = tf.function(native.batch_spikes)(theta, phase, seeds).numpy()
++    np.testing.assert_array_equal(compiled, eager)
++
++
++def test_native_symbolic_batch_matches_static_batch(small_lgn):
++    """A tf.function with an unknown batch dimension samples one trial at a time
++    and reproduces the statically batched spikes."""
++    if not _native_available():
++        pytest.skip("Native LGN grating operators and a compatible GPU are required.")
++    native, _ = _generators(small_lgn)
++    rng = np.random.default_rng(3)
++    theta = rng.uniform(0, 360, (3, 1)).astype(np.float32)
++    phase = rng.uniform(0, 360, 3).astype(np.float32)
++    seeds = rng.integers(0, 2**31 - 1, (3, 2)).astype(np.int32)
++    static = native.batch_spikes(tf.constant(theta), tf.constant(phase), tf.constant(seeds)).numpy()
++    symbolic = tf.function(native.batch_spikes, input_signature=(
++        tf.TensorSpec((None, 1), tf.float32), tf.TensorSpec((None,), tf.float32), tf.TensorSpec((None, 2), tf.int32),
++    ))
++    np.testing.assert_array_equal(symbolic(theta, phase, seeds).numpy(), static)
++    np.testing.assert_array_equal(symbolic(theta[:2], phase[:2], seeds[:2]).numpy(), static[:2])
++
++
++def test_unsupported_dtype_keeps_tensorflow_under_auto(small_lgn):
++    automatic = DriftingGratingLGN(small_lgn, 120, dtype=tf.float64)
++    assert automatic.backend == "tensorflow"
++    rates = automatic.firing_rates(tf.constant(30.0, tf.float64), tf.constant(0.0, tf.float64))
++    assert rates.shape == (120, small_lgn.n_nodes) and np.all(np.isfinite(rates.numpy()))
++    with pytest.raises(ValueError, match="float16 or float32"):
++        DriftingGratingLGN(small_lgn, 120, dtype=tf.float64, lgn_backend="native")
++
++
++def test_host_generator_accepts_device_backend_options(small_lgn):
++    """The host reference generator (initial-state warmup) tolerates the device
++    route's stimulus options so one option dictionary serves both routes."""
++    from bmtk.simulator.dpointnet.input_modules.lgn_generator import create_drifting_gratings_generator
++
++    dataset = create_drifting_gratings_generator(
++        small_lgn, 40, orientation=[90.0], phase=10.0, pre_delay=5, post_delay=5, seed=3,
++        lgn_backend="tensorflow", native_chunk=4,
++    )
++    spikes, meta = next(iter(dataset))
++    assert spikes.shape == (40, small_lgn.n_nodes) and spikes.dtype == tf.bool
++    assert float(meta["orientation"][0]) == 90.0

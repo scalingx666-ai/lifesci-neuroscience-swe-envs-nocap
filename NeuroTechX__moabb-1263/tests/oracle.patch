@@ -1,0 +1,510 @@
+diff --git a/docs/source/whats_new.rst b/docs/source/whats_new.rst
+index 094e293afa..9303507957 100644
+--- a/docs/source/whats_new.rst
++++ b/docs/source/whats_new.rst
+@@ -28,6 +28,7 @@ Enhancements
+ - Test MOABB on free-threaded CPython 3.14 (``3.14t``) with an allowed-to-fail CI job that also checks importing MOABB keeps the GIL disabled, and require ``h5py>=3.16.0`` on Python 3.14+, the first h5py release with free-threaded (``cp314t``) wheels (:gh:`829` by `Bruno Aristimunha`_).
+ - ``nemar_subject_template`` on :class:`moabb.datasets.base.BaseDataset` now also accepts an explicit ``{moabb_subject: bids_label}`` mapping, so NEMAR deposits whose BIDS subject labels no format template can produce (``sub-zdvm``, ``sub-A01``, non-contiguous ids) are declared as data instead of by overriding ``_nemar_subject``; string templates keep working unchanged. :class:`moabb.datasets.Lioi2020_XP2` drops its ``_nemar_subject`` override for the mapping, with the same labels (:gh:`1098` by `Bruno Aristimunha`_).
+ - Evaluations now log datasets they drop from the paradigm's default list (``datasets=None``) at INFO instead of WARNING, so a default benchmark run no longer floods the console with expected incompatibilities; datasets passed explicitly still warn when removed (:gh:`862` by `Bruno Aristimunha`_).
++- Evaluations now save results as soon as they are computed instead of once per dataset: in :meth:`~moabb.evaluations.base.BaseEvaluation.process`, each ``(pipeline, subject)`` is written to the HDF5 file as soon as all of its folds have finished, so a crash later in a dataset no longer loses the subjects already evaluated. The file layout, the saved values and the ``overwrite`` / resume behaviour are unchanged: a rerun skips the saved subjects and computes only the missing ones. Writes still happen only in the main process, also with ``n_jobs > 1`` (:gh:`419` by `Bruno Aristimunha`_).
+ - Add :class:`moabb.datasets.Wang2026Handwriting`, a Chinese handwriting-imagery dataset from Wang et al. (2026, Scientific Data, CC-BY 4.0; figshare, BIDS): 21 healthy adults in two handwriting-imagery tasks -- CCS-HI (five Chinese character strokes) and SV-HI (six Pinyin vowels) -- each recorded in two sessions, 40 trials of 4 s per class, 32-channel 10-10 EEG at 1 kHz. The two BIDS tasks share a session and carry no run entity, so the loader keys them by task; the release's ``trial_type`` labels are normalized to the class names and the two sessions with fewer valid trials (sub-06 ses-02 SV-HI, sub-13 ses-02 CCS-HI) are kept as released (:gh:`1244` by `LiQing`_).
+ - Add standalone :class:`moabb.paradigms.CognitiveTask` for non-motor endogenous tasks (handwriting/stroke imagery, mental arithmetic, mental rotation, word generation, music imagery). It subclasses :class:`~moabb.paradigms.base.BaseParadigm` directly — not motor imagery — with MotorImagery-matching 8-32 Hz defaults, N-class event logic, and validity on both ``paradigm="cognitive"`` and the existing ``paradigm="imagery"`` tag (follows the Cued Cognitive Tasks branch of :gh:`1056`). :class:`moabb.datasets.Shin2017B` (mental arithmetic vs rest), :class:`moabb.datasets.BNCI2024_001` (10-letter handwritten character task) and :class:`moabb.datasets.Wang2026Handwriting` (Chinese stroke/vowel handwriting imagery) flip to ``paradigm="cognitive"`` with a new ``summary_cognitive.csv`` table, updated docstrings/METADATA, and runtime/docs/test allowlists (neural-signature handler, bubble-plot colormap, metadata catalog checks).
+ - :class:`moabb.datasets.Dreyer2023` (and its ``A``/``B``/``C`` subclasses) now load their EEG from NEMAR's ``nm000250`` ``sourcedata/`` store when the download provider allows it, falling back to the OSF host exactly like other NEMAR-mirrored datasets; this stops MOABB's docs/example builds from failing on OSF's ``files.de-1.osf.io`` 429 rate limiting. ``get_subject_info()`` reads the demographic ``performance.csv`` from the store once it is published there, else falls back to OSF (:gh:`1237` by `Bruno Aristimunha`_).
+diff --git a/moabb/evaluations/base.py b/moabb/evaluations/base.py
+index 7ab1cdf524..876133ec4b 100644
+--- a/moabb/evaluations/base.py
++++ b/moabb/evaluations/base.py
+@@ -955,6 +955,155 @@ def _evaluate_parallel_dataset(
+         list of dict
+             Result dictionaries matching :meth:`evaluate`.
+         """
++        prepared = self._prepare_parallel_dataset(
++            dataset,
++            pipelines,
++            param_grid,
++            process_pipeline,
++            postprocess_pipeline=postprocess_pipeline,
++            work_plan=work_plan,
++        )
++        if prepared is None:
++            return []
++        X, y, metadata, tasks, aggregate = prepared
++
++        # X, y, metadata passed as positional args for joblib auto-mmap.
++        fold_results = Parallel(n_jobs=self.n_jobs)(
++            delayed(_evaluate_fold)(X, y, metadata, **task) for task in tasks
++        )
++        return self._finalize_results(list(chain.from_iterable(fold_results)), aggregate)
++
++    def _iter_parallel_dataset_batches(
++        self,
++        dataset,
++        pipelines,
++        param_grid,
++        process_pipeline,
++        postprocess_pipeline=None,
++        work_plan=None,
++    ):
++        """Yield the results of one dataset as soon as they are complete.
++
++        Same computation as :meth:`_evaluate_parallel_dataset`, but the fold
++        results are consumed while the folds still run, and a batch is yielded
++        once every fold of a ``(pipeline, subject)`` pair has finished. That
++        pair is the unit the results cache uses to skip work on a rerun
++        (:meth:`~moabb.analysis.results.Results.batch_not_yet_computed`), so
++        a batch is never written for a subject whose folds are not all done:
++        a crash leaves no partial subject behind, and a rerun recomputes
++        exactly the missing pairs (:gh:`419`).
++
++        Batches come out in the order in which the pairs first appear in the
++        task list. The built-in splitters keep a subject's folds together, so
++        the rows of each pipeline reach the HDF5 file in the same order as when
++        the whole dataset was saved at once.
++
++        Parameters
++        ----------
++        dataset, pipelines, param_grid, process_pipeline, postprocess_pipeline, work_plan
++            See :meth:`_evaluate_parallel_dataset`.
++
++        Yields
++        ------
++        list of dict
++            Finished (and, if needed, fold-aggregated) result dictionaries.
++        """
++        prepared = self._prepare_parallel_dataset(
++            dataset,
++            pipelines,
++            param_grid,
++            process_pipeline,
++            postprocess_pipeline=postprocess_pipeline,
++            work_plan=work_plan,
++        )
++        if prepared is None:
++            return
++        X, y, metadata, tasks, aggregate = prepared
++
++        # Which (pipeline, subject) pairs each task produces rows for, and how
++        # many tasks every pair still waits on.
++        key_order, pending, task_keys = [], {}, []
++        for task in tasks:
++            subjects = task["score_subjects"]
++            if subjects is None:
++                subjects = [task["subject"]]
++            keys = list(dict.fromkeys((task["pipeline_name"], str(s)) for s in subjects))
++            for key in keys:
++                if key not in pending:
++                    pending[key] = 0
++                    key_order.append(key)
++                pending[key] += 1
++            task_keys.append(keys)
++
++        buffers = defaultdict(list)
++        unexpected = []
++        score_cols = {}
++        next_key = 0
++        fold_iter = self._iter_fold_results(X, y, metadata, tasks)
++        for keys, fold_results in zip(task_keys, fold_iter):
++            for res in fold_results:
++                score_cols.update(dict.fromkeys(c for c in res if c.startswith("score_")))
++                key = (res["pipeline"], str(res["subject"]))
++                (buffers[key] if key in pending else unexpected).append(res)
++            for key in keys:
++                pending[key] -= 1
++
++            batch = []
++            while next_key < len(key_order) and pending[key_order[next_key]] == 0:
++                batch.extend(buffers.pop(key_order[next_key], []))
++                next_key += 1
++            if batch:
++                yield self._finalize_results(batch, aggregate, list(score_cols))
++
++        # Rows for a subject the task list did not announce (custom splitters):
++        # keep them, as before, and save them once all folds are done.
++        leftover = [res for key in key_order[next_key:] for res in buffers.pop(key, [])]
++        leftover += unexpected
++        if leftover:
++            yield self._finalize_results(leftover, aggregate, list(score_cols))
++
++    def _iter_fold_results(self, X, y, metadata, tasks):
++        """Run the fold tasks, returning their results in task order.
++
++        With joblib >= 1.3 the results are streamed: each one is available as
++        soon as its fold (and the folds before it) finished. Older joblib
++        versions return the full list at the end.
++        """
++        # X, y, metadata passed as positional args for joblib auto-mmap.
++        jobs = (delayed(_evaluate_fold)(X, y, metadata, **task) for task in tasks)
++        try:
++            parallel = Parallel(n_jobs=self.n_jobs, return_as="generator")
++        except TypeError:  # joblib < 1.3 has no return_as
++            parallel = Parallel(n_jobs=self.n_jobs)
++        return parallel(jobs)
++
++    def _finalize_results(self, results, aggregate, score_cols=None):
++        """Aggregate folds if requested and drop the internal bookkeeping keys."""
++        if aggregate:
++            results = self._aggregate_fold_results(results, score_cols=score_cols)
++        for res in results:
++            res.pop("n_samples_total", None)
++            res.pop("is_error", None)
++        return results
++
++    def _prepare_parallel_dataset(
++        self,
++        dataset,
++        pipelines,
++        param_grid,
++        process_pipeline,
++        postprocess_pipeline=None,
++        work_plan=None,
++    ):
++        """Load one dataset and build its fold tasks.
++
++        Returns
++        -------
++        tuple | None
++            ``(X, y, metadata, tasks, aggregate)``, or ``None`` when there is
++            nothing left to compute. ``aggregate`` tells whether fold results
++            must be averaged per subject/session/pipeline.
++        """
+         dataset_splitter = self._create_splitter()
+         if dataset_splitter is None:
+             raise RuntimeError(
+@@ -973,7 +1122,7 @@ def _evaluate_parallel_dataset(
+                     work_plan[subject] = run_pipes
+ 
+         if not work_plan:
+-            return []
++            return None
+ 
+         subjects_to_load = (
+             dataset.subject_list if self._needs_all_subjects else list(work_plan.keys())
+@@ -995,26 +1144,15 @@ def _evaluate_parallel_dataset(
+             dataset, X, y, metadata, dataset_splitter, work_plan, pipelines, param_grid
+         )
+         if not tasks:
+-            return []
++            return None
+ 
+-        # X, y, metadata passed as positional args for joblib auto-mmap.
+-        fold_results = Parallel(n_jobs=self.n_jobs)(
+-            delayed(_evaluate_fold)(X, y, metadata, **task) for task in tasks
+-        )
+-        all_results = list(chain.from_iterable(fold_results))
+-
+-        if self._aggregate_folds and not hasattr(
++        aggregate = self._aggregate_folds and not hasattr(
+             getattr(dataset_splitter, "cv_class", None), "get_metadata"
+-        ):
+-            all_results = self._aggregate_fold_results(all_results)
+-
+-        for res in all_results:
+-            res.pop("n_samples_total", None)
+-            res.pop("is_error", None)
+-        return all_results
++        )
++        return X, y, metadata, tasks, aggregate
+ 
+     @staticmethod
+-    def _aggregate_fold_results(fold_results):
++    def _aggregate_fold_results(fold_results, score_cols=None):
+         """Aggregate per-fold results into averaged results.
+ 
+         Groups by (subject, session, pipeline) and averages scores/durations.
+@@ -1023,6 +1161,10 @@ def _aggregate_fold_results(fold_results):
+         ----------
+         fold_results : list of dict
+             Per-fold result dicts.
++        score_cols : list of str | None
++            Extra ``score_*`` columns seen in other batches of the same
++            dataset. A batch made only of error folds lacks them; they are then
++            filled from ``score`` like any other error fold.
+ 
+         Returns
+         -------
+@@ -1033,6 +1175,9 @@ def _aggregate_fold_results(fold_results):
+             return []
+ 
+         df = pd.DataFrame(fold_results)
++        for col in score_cols or ():
++            if col not in df.columns:
++                df[col] = np.nan
+         group_keys = ["subject", "session", "pipeline"]
+         score_cols = [c for c in df.columns if c == "score" or c.startswith("score_")]
+         agg_ops = dict.fromkeys(score_cols + ["time"], "mean")
+@@ -1107,6 +1252,13 @@ def process(
+         -------
+         results: :class:`pandas.DataFrame`
+             A dataframe containing the results.
++
++        Notes
++        -----
++        Results are written to the results file as soon as every fold of a
++        ``(pipeline, subject)`` pair has finished, so a run that crashes keeps
++        the subjects already evaluated; rerunning with ``overwrite=False``
++        computes only the missing ones.
+         """
+ 
+         # check pipelines
+@@ -1210,25 +1362,19 @@ def _process_parallel(self, pipelines, param_grid, postprocess_pipeline):
+                 )
+                 work_plan = {subj: dict(pipelines) for subj in dataset.subject_list}
+ 
+-            all_results = self._evaluate_parallel_dataset(
++            # Save each (pipeline, subject) as soon as all its folds are done,
++            # so a crash later in the dataset does not lose finished work.
++            for batch in self._iter_parallel_dataset_batches(
+                 dataset=dataset,
+                 pipelines=pipelines,
+                 param_grid=param_grid,
+                 process_pipeline=process_pipeline,
+                 postprocess_pipeline=postprocess_pipeline,
+                 work_plan=work_plan,
+-            )
+-            if not all_results:
+-                res_per_db.append(
+-                    self.results.to_dataframe(
+-                        pipelines=pipelines, process_pipeline=process_pipeline
+-                    )
+-                )
+-                continue
+-
+-            for res in all_results:
+-                self._log_result(res)
+-            self._push_results_batch(all_results, pipelines, process_pipeline)
++            ):
++                for res in batch:
++                    self._log_result(res)
++                self._push_results_batch(batch, pipelines, process_pipeline)
+ 
+             res_per_db.append(
+                 self.results.to_dataframe(
+diff --git a/moabb/tests/test_evaluations.py b/moabb/tests/test_evaluations.py
+index 6cb4b544f6..eec2d52db6 100644
+--- a/moabb/tests/test_evaluations.py
++++ b/moabb/tests/test_evaluations.py
+@@ -2353,6 +2353,28 @@ def test_error_folds_multi_metric_use_fallback(self):
+         # score_f1: avg(0.7, 0.0) = 0.35
+         np.testing.assert_almost_equal(res["score_f1"], 0.35)
+ 
++    def test_error_only_batch_gets_score_columns_seen_elsewhere(self):
++        """A batch of error folds still fills the score_* columns of the dataset.
++
++        Results are saved per (pipeline, subject) batch (gh-419), so an
++        error-only subject is aggregated alone; ``score_cols`` brings in the
++        columns the other subjects produced, as one big aggregation would.
++        """
++        from moabb.evaluations.base import BaseEvaluation
++
++        folds = [
++            self._make_fold(2, "0", "csp", 0.0, is_error=True),
++            self._make_fold(2, "0", "csp", 0.0, is_error=True),
++        ]
++        agg = BaseEvaluation._aggregate_fold_results(
++            folds, score_cols=["score_accuracy", "score_f1"]
++        )
++        assert len(agg) == 1
++        np.testing.assert_almost_equal(agg[0]["score_accuracy"], 0.0)
++        np.testing.assert_almost_equal(agg[0]["score_f1"], 0.0)
++        # Without score_cols the behaviour is unchanged.
++        assert "score_f1" not in BaseEvaluation._aggregate_fold_results(folds)[0]
++
+     def test_non_numeric_score_fold_does_not_abort(self):
+         """A fold with a non-numeric score becomes NaN, not a fatal TypeError."""
+         from moabb.evaluations.base import BaseEvaluation
+@@ -2674,3 +2696,195 @@ def test_within_session_passes_epochs(clf, tmp_path):
+     )
+     results = evaluation.process({"clf": clf})
+     assert len(results) == 1
++
++
++# Fit counter shared by every clone of ``_CrashOnFitLDA``. The crash switch is
++# kept outside the estimator parameters so a crashing run and a clean rerun
++# share the same pipeline digest and therefore the same HDF5 entries.
++_CRASH_STATE = {"n_fits": 0, "crash_at": None}
++
++
++class _CrashOnFitLDA(sklearn.base.ClassifierMixin, sklearn.base.BaseEstimator):
++    """LDA on log-variance features that can be told to crash on a given fit."""
++
++    def fit(self, X, y):
++        _CRASH_STATE["n_fits"] += 1
++        if _CRASH_STATE["n_fits"] == _CRASH_STATE["crash_at"]:
++            raise RuntimeError("simulated pipeline crash")
++        self.lda_ = LDA().fit(self._features(X), y)
++        self.classes_ = self.lda_.classes_
++        return self
++
++    @staticmethod
++    def _features(X):
++        return np.log(np.var(np.asarray(X), axis=-1))
++
++    def predict(self, X):
++        return self.lda_.predict(self._features(X))
++
++    def predict_proba(self, X):
++        return self.lda_.predict_proba(self._features(X))
++
++    def decision_function(self, X):
++        return self.lda_.decision_function(self._features(X))
++
++
++def _run_crash_evaluation(evaluation_class, ds, hdf5_path, overwrite, crash_at=None):
++    _CRASH_STATE.update(n_fits=0, crash_at=crash_at)
++    evaluation = evaluation_class(
++        paradigm=FakeImageryParadigm(),
++        datasets=[ds],
++        overwrite=overwrite,
++        n_jobs=1,
++        random_state=42,
++        hdf5_path=str(hdf5_path),
++    )
++    pipes = {"crashy": make_pipeline(_CrashOnFitLDA())}
++    return evaluation, pipes
++
++
++@pytest.mark.parametrize(
++    "evaluation_class",
++    [
++        ev.WithinSessionEvaluation,
++        ev.WithinSubjectEvaluation,
++        ev.CrossSessionEvaluation,
++        ev.CrossSubjectEvaluation,
++    ],
++)
++def test_results_persisted_before_crash_and_resumed(evaluation_class, tmp_path):
++    """Finished subjects are saved before a later subject crashes (gh-419/775).
++
++    The pipeline crashes on the very last fit, which belongs to the last
++    subject evaluated. Every other subject must already be in the HDF5 file,
++    with the same rows, in the same order, as an uninterrupted run; the
++    crashing subject must not be there at all (no partial rows), and a rerun
++    with ``overwrite=False`` must only fit the missing subject.
++    """
++    ds = FakeDataset(["left_hand", "right_hand"], n_subjects=3, n_sessions=2, seed=7)
++    subjects = [str(s) for s in ds.subject_list]
++
++    # Reference: uninterrupted run, also tells how many fits a full run needs.
++    ref_eval, pipes = _run_crash_evaluation(
++        evaluation_class, ds, tmp_path / "ref", overwrite=True
++    )
++    reference = ref_eval.process(pipes)
++    n_fits_total = _CRASH_STATE["n_fits"]
++    assert n_fits_total % len(subjects) == 0
++    n_fits_per_subject = n_fits_total // len(subjects)
++
++    # Crashing run: dies on the last fit, i.e. inside the last subject.
++    crash_eval, pipes = _run_crash_evaluation(
++        evaluation_class, ds, tmp_path / "run", overwrite=True, crash_at=n_fits_total
++    )
++    with pytest.raises(RuntimeError, match="simulated pipeline crash"):
++        crash_eval.process(pipes)
++
++    saved = crash_eval.results.to_dataframe()
++    assert not saved.empty, "finished subjects were lost when the run crashed"
++    finished = list(saved["subject"].unique())
++    assert len(finished) == len(subjects) - 1
++    (crashed,) = set(subjects) - set(finished)
++
++    cols = ["subject", "session", "score", "samples", "samples_test", "n_classes"]
++    pd.testing.assert_frame_equal(
++        saved[cols].reset_index(drop=True),
++        reference.loc[reference["subject"] != crashed, cols].reset_index(drop=True),
++    )
++
++    # Rerun without overwrite: only the missing subject is computed.
++    resume_eval, pipes = _run_crash_evaluation(
++        evaluation_class, ds, tmp_path / "run", overwrite=False
++    )
++    resumed = resume_eval.process(pipes)
++    assert _CRASH_STATE["n_fits"] == n_fits_per_subject
++
++    # WithinSubjectSplitter shares one RNG across the subjects it is given, so
++    # a subject evaluated alone gets other folds than in a full run (this
++    # predates gh-419). Its scores are only compared for the finished subjects.
++    if evaluation_class is ev.WithinSubjectEvaluation:
++        cols.remove("score")
++    pd.testing.assert_frame_equal(
++        resumed[cols].sort_values(["subject", "session"]).reset_index(drop=True),
++        reference[cols].sort_values(["subject", "session"]).reset_index(drop=True),
++    )
++    assert not resumed.duplicated(["subject", "session"]).any()
++
++
++def test_results_pushed_per_subject_batch(tmp_path, monkeypatch):
++    """process() writes one (pipeline, subject) batch at a time (gh-419)."""
++    ds = FakeDataset(["left_hand", "right_hand"], n_subjects=3, n_sessions=2, seed=7)
++    evaluation, _ = _run_crash_evaluation(
++        ev.WithinSessionEvaluation, ds, tmp_path, overwrite=True
++    )
++    pipes = {
++        "a": make_pipeline(_CrashOnFitLDA()),
++        "b": make_pipeline(FunctionTransformer(_identity), _CrashOnFitLDA()),
++    }
++    pushed = []
++    original_add = evaluation.results.add
++
++    def spy_add(results, pipelines, process_pipeline):
++        pushed.append(
++            sorted(
++                {
++                    (name, str(r["subject"]))
++                    for name, rows in results.items()
++                    for r in rows
++                }
++            )
++        )
++        return original_add(results, pipelines, process_pipeline)
++
++    monkeypatch.setattr(evaluation.results, "add", spy_add)
++    results = evaluation.process(pipes)
++
++    # 3 subjects x 2 pipelines, each saved on its own, each exactly once.
++    assert all(len(batch) == 1 for batch in pushed)
++    assert sorted(b[0] for b in pushed) == sorted(
++        (name, str(s)) for name in pipes for s in ds.subject_list
++    )
++    assert len(results) == 3 * 2 * 2  # subjects x sessions x pipelines
++
++
++def test_streamed_results_match_without_return_as(tmp_path, monkeypatch):
++    """joblib < 1.3 (no ``return_as``) falls back to a list, same results."""
++    import moabb.evaluations.base as base_module
++
++    ds = FakeDataset(["left_hand", "right_hand"], n_subjects=2, n_sessions=2, seed=7)
++    ref_eval, pipes = _run_crash_evaluation(
++        ev.WithinSessionEvaluation, ds, tmp_path / "ref", overwrite=True
++    )
++    reference = ref_eval.process(pipes)
++
++    class OldParallel(base_module.Parallel):
++        def __init__(self, *args, **kwargs):
++            if "return_as" in kwargs:
++                raise TypeError("unexpected keyword argument 'return_as'")
++            super().__init__(*args, **kwargs)
++
++    monkeypatch.setattr(base_module, "Parallel", OldParallel)
++    old_eval, pipes = _run_crash_evaluation(
++        ev.WithinSessionEvaluation, ds, tmp_path / "old", overwrite=True
++    )
++    fallback = old_eval.process(pipes)
++
++    cols = ["subject", "session", "score", "samples", "samples_test", "n_classes"]
++    pd.testing.assert_frame_equal(fallback[cols], reference[cols])
++
++
++def test_streamed_results_same_with_two_jobs(tmp_path):
++    """Streaming from worker processes gives the same rows as n_jobs=1."""
++    ds = FakeDataset(["left_hand", "right_hand"], n_subjects=2, n_sessions=2, seed=7)
++    ref_eval, pipes = _run_crash_evaluation(
++        ev.WithinSessionEvaluation, ds, tmp_path / "one", overwrite=True
++    )
++    reference = ref_eval.process(pipes)
++    par_eval, pipes = _run_crash_evaluation(
++        ev.WithinSessionEvaluation, ds, tmp_path / "two", overwrite=True
++    )
++    par_eval.n_jobs = 2
++    parallel = par_eval.process(pipes)
++
++    cols = ["subject", "session", "score", "samples", "samples_test", "n_classes"]
++    pd.testing.assert_frame_equal(parallel[cols], reference[cols])

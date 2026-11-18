@@ -1,0 +1,516 @@
+diff --git a/src/train_combined.py b/src/train_combined.py
+index 3d4a5ae..f9f05d1 100644
+--- a/src/train_combined.py
++++ b/src/train_combined.py
+@@ -26,6 +26,8 @@
+ from tqdm import tqdm
+ from collections import OrderedDict
+ from dalle2_pytorch import DiffusionPriorNetwork
++import kornia
++from kornia.augmentation.container import AugmentationSequential
+ 
+ import utils
+ from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
+@@ -52,7 +54,8 @@
+ )
+ voxel2clip_path = '' # ckpt path for voxel2clip model
+ voxel_dims = 1 # (1, 3)
+-use_mixco = False # use mixco on the voxels
++use_mixco = False # use mixup-contrastive on the voxels
++mixup_pct = 0.5 # mixup pct for voxels
+ n_samples_save = 8 # how many SD samples from train and val to save
+ sample_interval = 1 # after how many epochs to save samples
+ save_at_end = False # sample images and save at end of training only
+@@ -65,6 +68,7 @@
+ clip_aug_mode = 'none' # ('none', 'x', 'y')
+ clip_aug_prob = 0.03 # prob of applying augmentation to a batch
+ sd_scheduler = 'pndms' # scheduler for SD image variation pipeline ('pndms', 'unipcm')
++use_image_aug = False # use image augmentation prior to getting CLIP embeddings
+ # -----------------------------------------------------------------------------
+ # params for all models
+ seed = 0
+@@ -81,7 +85,7 @@
+ first_batch = False # use only the first batch of training and validation data
+ ckpt_saving = True # enables checkpoint saving
+ ckpt_interval = 0 # after how many epochs to save a checkpoint (0 = never, will only save best one)
+-outdir = f'../train_logs/{model_name}/test'
++outdir = f'../train_logs/models/{model_name}/test'
+ 
+ # -----------------------------------------------------------------------------
+ # read in any command line args or config file values and override the above params
+@@ -117,9 +121,25 @@
+         json.dump(config, f, indent=2)
+ 
+ if is_master: print('Creating Clipper...')
++
++if use_image_aug:
++    train_augs = AugmentationSequential(
++        kornia.augmentation.RandomCrop((140, 140), p=0.3),
++        kornia.augmentation.Resize((224, 224)),
++        kornia.augmentation.RandomHorizontalFlip(p=0.5),
++        kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
++        kornia.augmentation.RandomGrayscale(p=0.3),
++        data_keys=["input"],
++        # random_apply = (1,4)
++    )
++else:
++    train_augs = None
++
+ # Don't L2 norm the extracted CLIP embeddings since we want the prior 
+ # to learn un-normed embeddings for usage with the SD image variation pipeline.
+-clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device)
++clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device,
++                        train_transforms=train_augs,
++)
+ 
+ if is_master: print('Creating voxel2clip...')
+ voxel2clip_arch = voxel2clip_kwargs.pop('arch')
+@@ -275,7 +295,7 @@ def get_sd_pipe(path_or_name):
+ num_workers = num_devices
+ 
+ train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
+-    batch_size, "images",
++    batch_size,
+     num_workers=num_workers,
+     train_url=train_url,
+     val_url=val_url,
+@@ -345,7 +365,7 @@ def save_ckpt(tag):
+     raise ValueError(f'unknown alpha_schedule: {alpha_schedule}')
+ 
+ # for Atom's loss
+-epoch_temps = np.linspace(0.004, 0.0075, num_epochs-int(0.5*num_epochs), endpoint=True)
++soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
+ 
+ if wandb_log and is_master:
+     import wandb
+@@ -371,6 +391,10 @@ def save_ckpt(tag):
+     train_dl = [(voxel0, image0, trial0, key0)]
+     val_dl = [(val_voxel0, val_image0, val_trial0, val_key0)]
+ 
++# save_ckpt('best')
++# import sys
++# sys.exit(0)
++
+ # feed text and images into diffusion prior network
+ progress_bar = tqdm(range(epoch, num_epochs), desc='train loop', disable=(distributed and local_rank != 0))
+ 
+@@ -395,7 +419,6 @@ def save_ckpt(tag):
+     image_aug = None
+ 
+     alpha = alphas[epoch]
+-    epoch_temp = epoch_temps[epoch - int(0.5*num_epochs)]
+ 
+     keys = set()
+ 
+@@ -417,9 +440,10 @@ def save_ckpt(tag):
+             else:
+                 clip_target = clip_extractor.embed_image(image).float()
+             
+-            if use_mixco and epoch < int(0.5*num_epochs):
++            if use_mixco and epoch < int(mixup_pct * num_epochs):
+                 # mixup augment the voxels
+                 voxel, perm, betas, select = utils.mixco(voxel)
++                clip_target = utils.mixco_clip_target(clip_target, perm, select, betas)
+             
+             if combine_models:
+                 # loss here is MSE for the prior, clip_voxels are voxel2clip outputs
+@@ -429,17 +453,20 @@ def save_ckpt(tag):
+                 if combine_losses:
+                     # combine losses for contrastive learned voxel2clip mapper and the prior
+                     if use_mixco:
+-                        if epoch < int(0.5*num_epochs):
++                        if epoch < int(mixup_pct * num_epochs):
+                             loss_nce = contrast_loss(
+                                 nn.functional.normalize(clip_voxels, dim=-1), 
+                                 nn.functional.normalize(clip_target, dim=-1),
+-                                temp=0.006, perm=perm, betas=betas, select=select,
++                                temp=0.006, perm=perm, betas=betas,
++                                select=select, distributed=distributed, local_rank=local_rank,
+                             )
++                         
+                         else:
++                            epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
+                             loss_nce = utils.soft_clip_loss(
+                                 nn.functional.normalize(clip_voxels, dim=-1), 
+                                 nn.functional.normalize(clip_target, dim=-1),
+-                                temp=epoch_temp,
++                                temp=epoch_temp, distributed=distributed,
+                             )
+                     else:
+                         loss_nce = contrast_loss(
+@@ -571,18 +598,23 @@ def save_ckpt(tag):
+ 
+                         if combine_losses:
+                             if use_mixco:
+-                                if epoch < int(0.5*num_epochs):
++                                if epoch < int(mixup_pct * num_epochs):
++                                    print('Computing contrastive loss', flush=True)
+                                     loss_nce = contrast_loss(
+                                         nn.functional.normalize(clip_voxels, dim=-1), 
+                                         nn.functional.normalize(clip_target, dim=-1),
+-                                        temp=0.006,
++                                        temp=0.006, distributed=False,
+                                     )
++                                    print('loss_contrast', loss_nce, flush=True)
+                                 else:
++                                    print('Computing soft clip loss', flush=True)
++                                    epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
+                                     loss_nce = utils.soft_clip_loss(
+                                         nn.functional.normalize(clip_voxels, dim=-1), 
+                                         nn.functional.normalize(clip_target, dim=-1),
+-                                        temp=epoch_temp,
++                                        temp=epoch_temp, distributed=False,
+                                     )
++                                    print('loss_soft_clip', loss_nce, flush=True)
+                             else:
+                                 loss_nce = contrast_loss(
+                                     nn.functional.normalize(clip_voxels, dim=-1), 
+@@ -682,14 +714,16 @@ def save_ckpt(tag):
+                 else:
+                     voxel2clip_ = voxel2clip
+ 
++                n_samples_save_train = n_samples_save // 2
++
+                 grids, train_fid = utils.sample_images(
+                     clip_extractor, 
+                     voxel2clip_, 
+                     sd_pipe, 
+                     diffusion_prior if not distributed else diffusion_prior.module,
+-                    voxel0[:n_samples_save], 
+-                    image0[:n_samples_save], 
+-                    annotations=subj01_annots[trial0[:n_samples_save]] if is_text else None,
++                    voxel0[:n_samples_save_train], 
++                    image0[:n_samples_save_train], 
++                    annotations=subj01_annots[trial0[:n_samples_save_train]] if is_text else None,
+                     seed=42,
+                 )
+                 for i, grid in enumerate(grids):
+diff --git a/src/train_combined.slurm b/src/train_combined.slurm
+new file mode 100644
+index 0000000..cdd4c62
+--- /dev/null
++++ b/src/train_combined.slurm
+@@ -0,0 +1,130 @@
++#!/bin/bash
++#SBATCH --account=medarc
++#SBATCH --partition=g40
++#SBATCH --nodes=1             # node count
++#SBATCH --ntasks-per-node=8   # with DDP, must equal num of gpus
++#SBATCH --cpus-per-task=4     # rule-of-thumb is 4 times number of gpus
++#SBATCH --gres=gpu:8
++#SBATCH --mem-per-gpu=40G
++#SBATCH --time=10:00:00       # total run time limit (HH:MM:SS)
++#SBATCH --comment=medarc
++
++# for DDP
++export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
++export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
++echo "WORLD_SIZE="$WORLD_SIZE
++master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
++export MASTER_ADDR=$master_addr
++echo "MASTER_ADDR="$MASTER_ADDR
++
++# activate conda environment
++export CONDA_HOME=/fsx/$(whoami)/miniconda3
++eval "$(conda shell.bash hook)"
++conda activate medical-v1
++
++# srun python train_combined.py \
++# config/1D_combo.py \
++# --batch_size=64 \
++# --val_batch_size=300 \
++# --wandb_log=True \
++# --wandb_notes='1D e2e (8 GPUs) with pretrained prior AND voxel2clip, MSE loss only' \
++# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-MSE-only \
++# --remote_data=True \
++# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
++# --n_samples_save=16 \
++# --sample_interval=10 \
++# --use_mixco=False \
++# --voxel2clip_path='checkpoints/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth' \
++# --combine_losses=False \
++# &> ../train_logs/logs/log.txt
++
++## text modality
++# srun python train_combined.py \
++# config/1D_combo.py \
++# --batch_size=64 \
++# --val_batch_size=300 \
++# --wandb_log=True \
++# --wandb_notes='1D e2e (8 GPUs) with pretrained prior, text modality' \
++# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-text \
++# --remote_data=True \
++# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
++# --n_samples_save=16 \
++# --sample_interval=10 \
++# --modality='text' \
++# &> ../train_logs/logs/log-text.txt
++
++## same as text above but image modality
++# srun python train_combined.py \
++# config/1D_combo.py \
++# --batch_size=64 \
++# --val_batch_size=300 \
++# --wandb_log=True \
++# --wandb_notes='1D e2e (8 GPUs) with pretrained prior, image modality' \
++# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-image \
++# --remote_data=True \
++# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
++# --n_samples_save=16 \
++# --sample_interval=10 \
++# --modality='image' \
++# &> ../train_logs/logs/log-image.txt
++
++## adding mixco
++srun python train_combined.py \
++config/1D_combo.py \
++--batch_size=64 \
++--val_batch_size=300 \
++--wandb_log=True \
++--wandb_notes='1D e2e image with mixco' \
++--wandb_run_name='e2e-image-mixco' \
++--outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-image-w-mixco \
++--remote_data=True \
++--cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
++--n_samples_save=16 \
++--sample_interval=30 \
++--modality='image' \
++--num_epochs=60 \
++--use_mixco=True \
++--use_image_aug=False \
++--first_batch=False \
++&> ../train_logs/logs/log-image-w-mixco.txt
++
++# no mixco, only image aug
++srun python train_combined.py \
++config/1D_combo.py \
++--batch_size=64 \
++--val_batch_size=300 \
++--wandb_log=True \
++--wandb_notes='1D e2e image with image aug' \
++--wandb_run_name='e2e-image-image-aug' \
++--outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-w-aug \
++--remote_data=True \
++--cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
++--n_samples_save=16 \
++--sample_interval=30 \
++--modality='image' \
++--num_epochs=60 \
++--use_mixco=False \
++--use_image_aug=True \
++--first_batch=False \
++&> ../train_logs/logs/log-image-w-aug.txt
++
++## adding mixco and image augs
++srun python train_combined.py \
++config/1D_combo.py \
++--batch_size=64 \
++--val_batch_size=300 \
++--wandb_log=True \
++--wandb_notes='1D e2e image with mixco and image aug' \
++--wandb_run_name='e2e-image-mixco-and-aug' \
++--outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-image-w-mixco-and-aug \
++--remote_data=True \
++--cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
++--n_samples_save=16 \
++--sample_interval=30 \
++--modality='image' \
++--num_epochs=60 \
++--use_mixco=True \
++--use_image_aug=True \
++--first_batch=False \
++&> ../train_logs/logs/log-image-w-mixco-and-aug.txt
++
+diff --git a/src/train_voxel2clip.py b/src/train_voxel2clip.py
+index f2cb77e..a8a4b07 100755
+--- a/src/train_voxel2clip.py
++++ b/src/train_voxel2clip.py
+@@ -48,7 +48,7 @@
+     initial_lr = 1e-3 #3e-5
+     max_lr = 3e-4
+     wandb_log = False
+-    wandb_project = 'laion-fmri'
++    wandb_project = 'fMRI-reconstruction-NSD'
+     wandb_run_name = ''
+     wandb_notes = ''
+     first_batch = False
+@@ -61,6 +61,8 @@
+     cache_dir = 'cache'
+     n_cache_recs = 0
+     mixup_pct = 0.5
++    outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
++    test_is_val = False
+ 
+     torch.backends.cuda.matmul.allow_tf32 = True
+ 
+@@ -69,7 +71,6 @@
+     exec(open('configurator.py').read()) # overrides from command line or config file
+     config = {k: globals()[k] for k in config_keys} # will be useful for logging
+ 
+-    outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
+     os.makedirs(outdir, exist_ok=True)
+     num_devices = torch.cuda.device_count()
+     if num_devices==0: num_devices = 1
+@@ -117,14 +118,25 @@
+     if remote_data:
+         # pull data directly from huggingface
+         train_url, val_url = utils.get_huggingface_urls(data_commit)
++        meta_url = None
+     else:
+         # local paths
+         if data_commit is None:
+             train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/train/train_subj01_{0..49}.tar"
+             val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
++            meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/metadata_subj01.json"
+         else:
+             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
+             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
++            meta_url = None
++        
++        if test_is_val:
++            # use test data as val data and combine train+val for training
++            train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj01_{0..49}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj01_0.tar}"
++            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/test/test_subj01_{0..5}.tar"
++            meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/metadata_subj01.json"
++            # num_train = 24680 + 300
++            # num_val = 2770
+ 
+     if voxel_dims == 1:
+         voxels_key = 'nsdgeneral.npy'
+@@ -140,11 +152,13 @@
+         num_workers=num_workers,
+         train_url=train_url,
+         val_url=val_url,
++        meta_url=meta_url,
+         cache_dir=cache_dir,
+         n_cache_recs=n_cache_recs,
+         voxels_key=voxels_key,
+         val_batch_size=300,
+         to_tuple=["voxels", "images", "trial", "__key__"],
++        test_is_val=test_is_val,
+     )
+ 
+     assert modality in ("image", "text"), f"Unknown modality: {modality}"
+@@ -191,6 +205,9 @@
+     best_val_loss = 1e9
+     soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
+ 
++    keys = set()
++    val_keys = set()
++
+     for epoch in progress_bar:
+         voxel2clip.train()
+ 
+@@ -202,6 +219,7 @@
+         val_bwd_percent_correct = 0.
+ 
+         for train_i, (voxel, image, trial, key) in enumerate(train_dl):
++            keys.update(key)
+             optimizer.zero_grad()
+ 
+             image = image.to(device).float()
+@@ -271,6 +289,7 @@
+         if local_rank==0: 
+             voxel2clip.eval()
+             for val_i, (voxel, image, trial, key) in enumerate(val_dl):
++                val_keys.update(key)
+                 with torch.no_grad():
+                     image = image.to(device).float()
+                     voxel = voxel.to(device).float()
+@@ -297,14 +316,15 @@
+                                 nn.functional.normalize(clip_voxels, dim=-1), 
+                                 nn.functional.normalize(clip_target, dim=-1),
+                                 temp=0.006,
+-                                distributed=distributed,
++                                distributed=False, # always false otherwise DDP hangs here
+                             )
+                         else:
+                             epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
+                             loss = utils.soft_clip_loss(
+                                 nn.functional.normalize(clip_voxels, dim=-1), 
+                                 nn.functional.normalize(clip_target, dim=-1),
+-                                temp=epoch_temp, distributed=distributed
++                                temp=epoch_temp,
++                                distributed=False, # always false otherwise DDP hangs here
+                             )
+                         utils.check_loss(loss)
+ 
+@@ -344,12 +364,14 @@
+                 "val/loss": np.mean(val_losses[-(val_i+1):]),
+                 "train/lr": lrs[-1],
+                 "train/num_steps": len(losses),
+-                "train/cosine_sim_base": sims_base / (train_i + 1),
+-                "val/cosine_sim_base": val_sims_base / (val_i + 1),
++                "train/cos_sim_base": sims_base / (train_i + 1),
++                "val/cos_sim_base": val_sims_base / (val_i + 1),
+                 "train/fwd_pct_correct": fwd_percent_correct / (train_i + 1),
+                 "train/bwd_pct_correct": bwd_percent_correct / (train_i + 1),
+                 "val/val_fwd_pct_correct": val_fwd_percent_correct / (val_i + 1),
+                 "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1),
++                "train/unique_samples": len(keys), # only accurate without DDP
++                "val/unique_samples": len(val_keys),
+             }
+             if local_rank==0: print(logs)
+ 
+diff --git a/src/utils.py b/src/utils.py
+index 75ec3eb..98cb8bf 100755
+--- a/src/utils.py
++++ b/src/utils.py
+@@ -136,6 +136,12 @@ def mixco(voxels, beta=0.15, s_thresh=0.5):
+     betas[~select] = 1
+     return voxels, perm, betas, select
+ 
++def mixco_clip_target(clip_target, perm, select, betas):
++    clip_target_shuffle = clip_target[perm]
++    clip_target[select] = clip_target[select] * betas[select].reshape(-1, 1) + \
++        clip_target_shuffle[select] * (1 - betas[select]).reshape(-1, 1)
++    return clip_target
++
+ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, local_rank=None):
+     if distributed:
+         all_targs = gather_features(targs, None)
+@@ -152,7 +158,7 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
+             probs = probs_all
+ 
+         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
+-        print('mixco loss: ', loss.item())
++        # print('mixco loss: ', loss.item())
+         return loss
+     else:
+         return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
+@@ -275,7 +281,7 @@ def check_loss(loss):
+ 
+ def get_dataloaders(
+     batch_size,
+-    image_var,
++    image_var='images',
+     num_devices=None,
+     num_workers=None,
+     train_url=None,
+@@ -288,6 +294,7 @@ def get_dataloaders(
+     voxels_key="nsdgeneral.npy",
+     val_batch_size=None,
+     to_tuple=["voxels", "images", "__key__"], # include trial with ["voxels", "images", "trial", "__key__"]
++    test_is_val=False,
+ ):
+     print("Getting dataloaders...")
+     assert image_var == 'images'
+@@ -309,10 +316,16 @@ def get_dataloaders(
+         # for commits up to 9947586218b6b7c8cab804009ddca5045249a38d
+         num_train = 24983
+         num_val = 492
++        assert test_is_val == False, "test_is_val == True not supported without a meta_url"
+     else:
+         metadata = json.load(open(meta_url))
+-        num_train = metadata['totals']['train']
+-        num_val = metadata['totals']['val']
++        if test_is_val:
++            # `train_url` contains train + val and `val_url` contains test
++            num_train = metadata['totals']['train'] + metadata['totals']['val']
++            num_val = metadata['totals']['test']
++        else:
++            num_train = metadata['totals']['train']
++            num_val = metadata['totals']['val']
+         
+     if num_samples is not None:
+         num_train = num_samples

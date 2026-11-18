@@ -1,0 +1,328 @@
+diff --git a/README.md b/README.md
+index b6b789c3..a768d8bd 100755
+--- a/README.md
++++ b/README.md
+@@ -250,7 +250,7 @@ igneous execute $QUEUE # process the queue
+ 
+ #### Scripting Downsample
+ 
+-```python3
++```python
+ tasks = create_downsampling_tasks(
+     layer_path, # e.g. 'gs://bucket/dataset/layer'
+     mip=0, # Start downsampling from this mip level (writes to next level up)
+@@ -336,7 +336,7 @@ igneous design ds-memory gs://bucket/dataset 3.5e9 --verbose
+ 
+ #### Scripting Transfer
+ 
+-```python3
++```python
+ tasks = create_transfer_tasks(
+   src_layer_path, dest_layer_path, 
+   chunk_size=None, shape=None, 
+@@ -380,7 +380,7 @@ igneous execute $QUEUE
+ #### Scripting
+ 
+ 
+-```python3
++```python
+ tasks = create_deletion_tasks(
+   layer_path, # data layer to target
+   mip=0, # Which layer to start deleting from
+@@ -436,7 +436,7 @@ igneous execute $QUEUE
+ 
+ #### Scripting Meshing
+ 
+-```python3
++```python
+ tasks = create_meshing_tasks(             # First Pass
+   layer_path, # Which data layer 
+   mip, # Which resolution level to mesh at (we often choose near isotropic resolutions)
+@@ -489,7 +489,7 @@ igneous execute $QUEUE
+ 
+ #### Scripting Skeletonization
+ 
+-```python3
++```python
+ import igneous.task_creation as tc 
+ 
+ # First Pass: Generate Skeletons
+@@ -626,6 +626,45 @@ For smaller images that could reasonably be processed on a single machine there
+ igneous -p PARALLEL image ccl auto SRC DEST --shape 512,512,512 --encoding compresso --queue queue
+ ````
+ 
++### Computing Per-Object Voxel Counts
++
++This will create a [`MapBuffer`](https://github.com/seung-lab/mapbuffer) dictionary containing the global number of voxels per a label at the location `$CLOUDPATH/$KEY/stats/voxel_counts.mb`. You can then use this file to lookup the global voxel count for each label.
++
++#### Scripting Voxel Counts
++
++```python
++import igneous.task_creation as tc
++
++cloudpath = ... 
++mip = 0
++tasks = tc.create_voxel_counting_tasks(
++  cloudpath, mip=mip
++)
++tq = LocalTaskQueue(parallel=1)
++tq.insert_all(tasks)
++
++tc.accumulate_voxel_counts(cloudpath, mip)
++
++from cloudfiles import CloudFile
++from mapbuffer import MapBuffer
++cf = CloudFile("/".join(cloudpath, "stats", "voxel_counts.mb"))
++
++fn = lambda x: int.from_bytes(x, byteorder='little')
++# for (slow) remote access w/o having to download the file
++mb = MapBuffer(cf, frombytesfn=fn)
++# for fast local access, but downloads the whole file
++mb = MapBuffer(cf.get(), frombytesfn=fn)
++mb[label] # fetches voxel count for label
++```
++
++#### CLI Voxel Counts
++
++```bash
++igneous image voxels count SRC --mip 0 --queue queue
++igneous execute -x queue
++igneous image voxels sum SRC --mip 0 # no execution needed
++```
++
+ ## Conclusion
+ 
+ It's possible something has changed or is not covered in this documentation. Please read `igneous/task_creation/` and `igneous/tasks/` for the most current information.  
+diff --git a/igneous/task_creation/image.py b/igneous/task_creation/image.py
+index 680771cf..cbc01d8f 100644
+--- a/igneous/task_creation/image.py
++++ b/igneous/task_creation/image.py
+@@ -1,3 +1,4 @@
++from collections import defaultdict
+ from functools import reduce, partial
+ import operator
+ from typing import Any, Dict, Union, Tuple, cast, Optional, Iterator
+@@ -11,6 +12,8 @@
+ import numpy as np
+ from tqdm import tqdm
+ 
++from mapbuffer import MapBuffer
++
+ from cloudfiles import CloudFiles
+ 
+ import cloudvolume
+@@ -25,7 +28,8 @@
+   TransferTask, TouchTask, LuminanceLevelsTask,
+   HyperSquareConsensusTask, # HyperSquareTask,
+   ImageShardTransferTask, ImageShardDownsampleTask,
+-  CCLFacesTask, CCLEquivalancesTask, RelabelCCLTask
++  CCLFacesTask, CCLEquivalancesTask, RelabelCCLTask,
++  CountVoxelsTask
+ )
+ 
+ from igneous.shards import image_shard_shape_from_spec
+@@ -53,6 +57,8 @@
+   "create_ccl_face_tasks",
+   "create_ccl_equivalence_tasks",
+   "create_ccl_relabel_tasks",
++  "create_voxel_counting_tasks",
++  "accumulate_voxel_counts",
+ ]
+ 
+ # A reasonable size for processing large
+@@ -1444,3 +1450,80 @@ def on_finish(self):
+ 
+   return RelabelCCLTaskIterator(bounds, shape)
+ 
++def create_voxel_counting_tasks(
++  cloudpath, mip
++):
++  """
++  Counts voxels in 512^3 tasks and uploads the JSON files
++  to $KEY/stats/voxel_counts/$BBOX.json
++  """
++  vol = CloudVolume(cloudpath, max_redirects=0, mip=mip)
++  shape = Vec(512,512,512)
++  bounds = vol.bounds.clone()
++
++  class CountVoxelsTaskIterator(FinelyDividedTaskIterator):
++    def task(self, shape, offset):
++      bounded_shape = min2(shape, bounds.maxpt - offset)
++      return partial(CountVoxelsTask,
++        cloudpath=cloudpath,
++        shape=bounded_shape.clone(),
++        offset=offset.clone(),
++        mip=mip,
++      )
++
++    def on_finish(self):
++      vol = CloudVolume(cloudpath, max_redirects=0)
++      vol.provenance.processing.append({
++        'method': {
++          'task': 'CountVoxelsTask',
++          'cloudpath': cloudpath,
++          'mip': mip,
++          'shape': shape.tolist(),
++        },
++        'by': operator_contact(),
++        'date': strftime('%Y-%m-%d %H:%M %Z'),
++      })
++      vol.commit_provenance()
++
++  return CountVoxelsTaskIterator(bounds, shape)
++
++def accumulate_voxel_counts(cloudpath, mip):
++  """
++  Accumulate counts from each task.
++
++  Results are saved in a mapbuffer file:
++  $cloudpath/$KEY/stats/voxel_counts.mb
++  """
++  vol = CloudVolume(cloudpath, max_redirects=0, mip=mip)
++  shape = Vec(512,512,512)
++  bounds = vol.bounds.clone()
++
++  class CountVoxelsTaskIterator(FinelyDividedTaskIterator):
++    def task(self, shape, offset):
++      bounded_shape = min2(shape, bounds.maxpt - offset)
++      return Bbox(offset, offset + bounded_shape)
++  
++  itr = CountVoxelsTaskIterator(bounds, shape)
++  filenames = ( f'{bbx.to_filename()}.json' for bbx in itr )
++
++  cf = CloudFiles(cloudpath)
++  stats_path = cf.join(cloudpath, f'{vol.key}', 'stats', 'voxel_counts')
++  cf = CloudFiles(stats_path)
++
++  count_files = cf.get_json(filenames)
++  final_counts = defaultdict(int)
++
++  for counts in count_files:
++    for segid, ct in counts.items():
++      final_counts[int(segid)] += ct
++
++
++  final_path = cf.join(cloudpath, f'{vol.key}', 'stats')
++  cf = CloudFiles(final_path)
++
++  mb = MapBuffer(
++    final_counts, 
++    tobytesfn=lambda x: x.to_bytes(8, byteorder='little')
++  )
++  cf.put('voxel_counts.mb', mb.tobytes())
++
+diff --git a/igneous/tasks/__init__.py b/igneous/tasks/__init__.py
+index 6f7e8c68..643da80a 100644
+--- a/igneous/tasks/__init__.py
++++ b/igneous/tasks/__init__.py
+@@ -19,6 +19,7 @@
+   LuminanceLevelsTask, ContrastNormalizationTask,
+   MaskAffinitymapTask, InferenceTask, BlackoutTask,
+   TouchTask, ImageShardTransferTask, ImageShardDownsampleTask,
+-  CCLFacesTask, CCLEquivalancesTask, RelabelCCLTask
++  CCLFacesTask, CCLEquivalancesTask, RelabelCCLTask,
++  CountVoxelsTask
+ )
+ from .spatial_index import SpatialIndexTask
+\ No newline at end of file
+diff --git a/igneous/tasks/image/image.py b/igneous/tasks/image/image.py
+index b959e2ec..6aba8c32 100755
+--- a/igneous/tasks/image/image.py
++++ b/igneous/tasks/image/image.py
+@@ -9,6 +9,9 @@
+ import numpy as np
+ from tqdm import tqdm
+ 
++import fastremap
++from mapbuffer import MapBuffer
++
+ from cloudfiles import CloudFiles
+ from taskqueue.registered_task import RegisteredTask
+ 
+@@ -609,3 +612,41 @@ def ImageShardDownsampleTask(
+     src_vol.cloudpath, src_vol.meta.key(mip + 1)
+   )
+   CloudFiles(basepath).put(filename, shard)
++
++@queueable
++def CountVoxelsTask(
++  cloudpath:str,
++  shape:ShapeType,
++  offset:ShapeType,
++  mip:int = 0,
++  fill_missing:bool = False,
++  agglomerate:bool = False,
++  timestamp:Optional[int] = None
++):
++  shape = Vec(*shape)
++  offset = Vec(*offset)
++  mip = int(mip)
++  fill_missing = bool(fill_missing)
++
++  cv = CloudVolume(
++    cloudpath, fill_missing=fill_missing, 
++    mip=mip, bounded=False, progress=False
++  )
++  bbox = Bbox(offset, offset + shape)
++  bbox = Bbox.clamp(bbox, cv.meta.bounds(mip))
++  
++  labels = cv.download(
++    bbox, 
++    agglomerate=agglomerate, 
++    timestamp=timestamp
++  )
++  uniq, cts = fastremap.unique(labels, return_counts=True)
++  voxel_counts = { str(segid): ct for segid, ct in zip(uniq, cts) }
++
++  cf = CloudFiles(cloudpath)
++
++  cf.put_json(
++    cf.join(f'{cv.key}', 'stats', 'voxel_counts', f'{bbox.to_filename()}.json'),
++    voxel_counts
++  )
++
+diff --git a/igneous_cli/cli.py b/igneous_cli/cli.py
+index 54968eec..1d638a07 100644
+--- a/igneous_cli/cli.py
++++ b/igneous_cli/cli.py
+@@ -289,6 +289,40 @@ def xfer(
+   tq = TaskQueue(normalize_path(queue))
+   tq.insert(tasks, parallel=parallel)
+ 
++@imagegroup.group("voxels")
++def voxelgroup():
++  """Compute voxel counts per label."""
++  pass
++
++@voxelgroup.command("count")
++@click.argument("path", type=CloudPath())
++@click.option('--mip', default=0, help="Count this mip level of the image pyramid.", show_default=True)
++@click.option('--queue', default=None, required=True, help="AWS SQS queue or directory to be used for a task queue. e.g. sqs://my-queue or ./my-queue. See https://github.com/seung-lab/python-task-queue")
++@click.pass_context
++def count_voxels(ctx, path, mip, queue):
++  """Create voxel counting tasks.
++
++  These tasks are 512x512x512 voxels and result
++  in a JSON file that lives at:
++  $cloudpath/$KEY/stats/voxel_counts/$BBOX.json
++  """
++  tasks = tc.create_voxel_counting_tasks(path, mip=mip)
++  parallel = int(ctx.obj.get("parallel", 1))
++  tq = TaskQueue(normalize_path(queue))
++  tq.insert(tasks, parallel=parallel)
++
++@voxelgroup.command("sum")
++@click.argument("path", type=CloudPath())
++@click.option('--mip', default=0, help="Count this mip level of the image pyramid.", show_default=True)
++@click.pass_context
++def sum_voxel_counts(ctx, path, mip):
++  """Accumulate counts from each task.
++
++  Results are saved in a mapbuffer file:
++  $cloudpath/$KEY/stats/voxel_counts.mb
++  """
++  tc.accumulate_voxel_counts(path, mip=mip)
++
+ @imagegroup.group("contrast")
+ def contrastgroup():
+   """Perform contrast correction on the image."""

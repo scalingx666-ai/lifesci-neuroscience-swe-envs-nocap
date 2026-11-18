@@ -1,0 +1,683 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 867a62b1..b86fdc4b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -613,6 +613,49 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+   the vault (switching vaults starts a fresh strip).
+ 
+ ### Fixed
++- **A note could double one block of its own text, geometrically, until it was
++  megabytes of one paragraph.** `vaultDocStore.coldApply` opens a TRANSIENT
++  bridge for a background note — a fresh `Y.Doc`, so a fresh clientID every
++  time — hydrates it from the local CRDT store, folds in the `.md` on disk,
++  applies the server's update and egests the result. Folding the file in first
++  is a three-way merge and has to stay one (an AI that edited the file while no
++  bridge was alive would otherwise be overwritten by the egest), but ingest
++  turns file bytes into ops attributed to THIS client. So when the file already
++  held the text of the update about to be applied — which is exactly what a
++  local store that has fallen behind its own file looks like — that text was
++  inserted TWICE, once as this client's fresh ops and once as the server's, and
++  Yjs keeps both. The egest wrote the doubled text back to the file, so the next
++  update through the same path doubled twice as much.
++  A customer's `Map of Content.md` ran that eighteen times in an hour: eighteen
++  updates, each from a different clientID, each re-inserting the whole current
++  delta, 276 bytes → 8 MB, ending at 2^16 copies of one added block — 16 MB of
++  Yjs state for a 686-byte note, 1,179,679 lines of 35 distinct ones. It is NOT
++  the 2026-09-04 seed-vs-pull race (that duplicates the whole note, from two
++  versions interleaved); this one duplicates only the delta and leaves the rest
++  intact, which is what the line-frequency profile shows.
++  `isExternalEdit` is the fix and it is exact rather than heuristic: ask what
++  the update ALONE would make the text, and if the file already says that, the
++  file is this loop's own echo, not an edit worth ingesting. Three more doors of
++  the same family closed alongside it — `NoteBridge.drainIngest` now serialises
++  its passes (two that overlap each diffed against the same text and each
++  applied their own copy), re-diffs after the recovery snapshot's `await` (the
++  one window between reading the doc and applying a diff computed from it), and
++  refuses a whole-file insert into a doc still waiting for its first pull (a
++  seed by another name, outside the pull-then-seed order). `destroy()` no longer
++  drops updates the store never got: persistence was fire-and-forget and the
++  teardown synchronous, which is how the local store ends up behind its own file
++  in the first place — `whenPersisted()` closes that gap, and both cold apply
++  and LRU retire await it. Pinned by `sync/__tests__/coldApplyDoubling.test.ts`
++  and `bridge/__tests__/doubling-ingest.test.ts`.
++- **The note size ceiling capped each message, not the note.** A note that
++  doubles doubles from small, so every single update in the cascade above was
++  comfortably under `MAX_NOTE_MB` and the cap never fired — which is how a 10 MB
++  limit produced a 16 MB note. `beforeHandleMessage` now also refuses any write
++  to a doc whose `Y.Text` is already over the cap (its own length counter, so
++  O(1)), making the limit a wall rather than a step size: a doc under it always
++  accepts one more message so it can be edited down, a doc over it accepts none
++  and is a repair job (`POST /api/notes/:id/reset-crdt`). Extracted as
++  `noteSizeRefusal` and pinned in `tests/repair-oversized-doc.test.ts`.
+ - **Read-only was enforced on the surfaces people type into, not on the ones
+   they create with.** Three write paths asked only whether the caller was a
+   MEMBER of the vault, so someone who could not change a single note in a folder
+diff --git a/app/apps/desktop/src/lib/bridge/__tests__/doubling-ingest.test.ts b/app/apps/desktop/src/lib/bridge/__tests__/doubling-ingest.test.ts
+new file mode 100644
+index 00000000..0818aed9
+--- /dev/null
++++ b/app/apps/desktop/src/lib/bridge/__tests__/doubling-ingest.test.ts
+@@ -0,0 +1,129 @@
++// The ingest-side twin of the seed-vs-pull race (doubling.test.ts).
++//
++// `seedFromFileIfEmpty` and `hydrate` both re-assert emptiness INSIDE the
++// transaction, so neither can seed on top of a pull any more. `drainIngest` had
++// the same shape and none of that protection:
++//
++//   • against an EMPTY doc its diff is the whole file inserted — a seed by
++//     another name, and one that runs outside the pull-then-seed order;
++//   • the recovery snapshot a whole-file diff always takes is an `await`
++//     between reading the doc and applying the diff computed from it;
++//   • nothing serialized two passes, so the debounced watcher drain and the
++//     sync layer's `ingestNow` could each apply their own copy.
++//
++// All three are live callers, not theory: `docSession.handleLocalFileChanged`
++// ingests any resident bridge the watcher names, including one whose first pull
++// has not landed yet, and it does so while the uploader is working the same doc.
++
++import { describe, expect, it } from "vitest";
++import * as Y from "yjs";
++import { NoteBridge } from "../noteBridge";
++import { makeHarness } from "./helpers";
++import { ORIGIN_REMOTE, type BridgeIO, type CrdtPersistence } from "../types";
++
++const PATH = "Map of Content.md";
++const FILE_TEXT = "---\ntype: moc\n---\n\n## Map of Content\n\n- [[One]]\n- [[Two]]\n";
++const SERVER_TEXT = "---\ntype: moc\n---\n\n## Map of Content\n\n- [[One]]\n- [[Two]]\n";
++
++function applyRemote(bridge: NoteBridge, text: string): void {
++  const remote = new Y.Doc();
++  remote.getText("content").insert(0, text);
++  Y.applyUpdate(bridge.doc, Y.encodeStateAsUpdate(remote), ORIGIN_REMOTE);
++}
++
++describe("note-doubling: ingest vs. pull", () => {
++  it("refuses to seed an unpulled doc from disk, and leaves the seed to the ordered path", async () => {
++    const { io, fs } = makeHarness({ [PATH]: "# placeholder\n" });
++    const bridge = await NoteBridge.open(io, {
++      docId: "doc-1",
++      path: PATH,
++      seedFromFile: false, // signed in: this doc waits for the pull
++    });
++    expect(bridge.serialize()).toBe("");
++
++    // The file gains its real content while the doc is still empty and unpulled
++    // — an external writer, or the folder arriving from another device.
++    fs.externalWrite(PATH, FILE_TEXT);
++    expect(await bridge.ingestNow()).toBe(false);
++    expect(bridge.serialize()).toBe("");
++
++    // The pull lands; the ordered seed hook then finds the doc populated and
++    // does nothing. One copy of the note, not two.
++    applyRemote(bridge, SERVER_TEXT);
++    expect(await bridge.seedFromFileIfEmpty()).toBe(false);
++    expect(bridge.serialize()).toBe(SERVER_TEXT);
++  });
++
++  it("does not apply a diff computed before the recovery snapshot let a remote in", async () => {
++    const { io, fs, persistence } = makeHarness({ [PATH]: "# one\n" });
++    const bridge = await NoteBridge.open(io, {
++      docId: "doc-2",
++      path: PATH,
++      seedFromFile: true, // local vault: seeded on open, so the doc holds text
++    });
++    expect(bridge.serialize()).toBe("# one\n");
++
++    // A whole-file rewrite (an AI editing the vault folder): ratio > 0.6, so a
++    // recovery snapshot is taken first — and the server's update lands in that
++    // await, moving the doc out from under the diff already computed.
++    fs.externalWrite(PATH, FILE_TEXT);
++    let landed = false;
++    const racing: CrdtPersistence = {
++      loadState: (id) => persistence.loadState(id),
++      appendUpdate: (id, u) => persistence.appendUpdate(id, u),
++      saveSnapshot: async (id, s, v) => {
++        await persistence.saveSnapshot(id, s, v);
++        if (!landed) {
++          landed = true;
++          applyRemote(bridge, SERVER_TEXT);
++        }
++      },
++    };
++    // eslint-disable-next-line @typescript-eslint/no-explicit-any
++    (bridge as any).io = { ...io, persistence: racing } as BridgeIO;
++
++    await bridge.ingestNow();
++
++    // The file is what ingest is merging in, so the file's text is the answer —
++    // once, re-diffed against the doc as the remote left it.
++    expect(bridge.serialize()).toBe(FILE_TEXT);
++  });
++
++  it("does not double when two ingests of a whole-file rewrite overlap", async () => {
++    const { io, fs } = makeHarness({ [PATH]: "# one\n" });
++    const bridge = await NoteBridge.open(io, {
++      docId: "doc-3",
++      path: PATH,
++      seedFromFile: true,
++    });
++    fs.externalWrite(PATH, FILE_TEXT);
++
++    // The debounced watcher drain and the sync layer's `ingestNow` ask for the
++    // same merge at once.
++    let release: (() => void) | null = null;
++    const held = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    let first = true;
++    const slow: BridgeIO = {
++      ...io,
++      readFile: async (p) => {
++        const text = await fs.readFile(p);
++        if (first) {
++          first = false;
++          await held; // hold pass #1 inside its read
++        }
++        return text;
++      },
++    };
++    // eslint-disable-next-line @typescript-eslint/no-explicit-any
++    (bridge as any).io = slow;
++
++    const a = bridge.ingestNow();
++    const b = bridge.ingestNow();
++    release!();
++    await Promise.all([a, b]);
++
++    expect(bridge.serialize()).toBe(FILE_TEXT);
++  });
++});
+diff --git a/app/apps/desktop/src/lib/bridge/noteBridge.ts b/app/apps/desktop/src/lib/bridge/noteBridge.ts
+index f7552c76..047d6685 100644
+--- a/app/apps/desktop/src/lib/bridge/noteBridge.ts
++++ b/app/apps/desktop/src/lib/bridge/noteBridge.ts
+@@ -63,6 +63,22 @@ export class NoteBridge {
+   private ingestTimer: number | null = null;
+   private egestTimer: number | null = null;
+   private ingestDirty = false;
++  /** The ingest pass in flight, if any. Two passes that overlap each diff
++   *  against the SAME `this.text` and each apply their own result: against an
++   *  empty doc that is the whole file inserted twice — the doubling bug through
++   *  a second door (`__tests__/doubling-ingest.test.ts`). The debounced watcher
++   *  drain and the sync layer's `ingestNow` target the same doc routinely, so
++   *  passes are chained here rather than left to interleave. */
++  private ingestInFlight: Promise<boolean> | null = null;
++  /** Appends still in flight. Updates are persisted fire-and-forget and
++   *  `destroy()` is synchronous, so a bridge torn down right after it applied
++   *  ops used to drop them — while `flushEgest` had already put the same text in
++   *  the `.md`. That leaves the local CRDT BEHIND its own file, which is the
++   *  state a diff-and-push cycle turns into duplicated text: the next bridge
++   *  reads the file, does not recognise the content as its own, and re-inserts
++   *  it under a fresh clientID. `whenPersisted()` is the way to close a bridge
++   *  without opening that gap. */
++  private persistQueue: Promise<void> = Promise.resolve();
+   private destroyed = false;
+   /** Consecutive failed egest writes (0 once one lands). Drives the retry
+    *  backoff and the `onWriteFailed`/`onWriteRecovered` UI cues. */
+@@ -111,7 +127,16 @@ export class NoteBridge {
+       this.observedUpdates++;
+       this.logLength++;
+       this.logBytes += update.byteLength;
+-      void Promise.resolve(this.io.persistence.appendUpdate(this.docId, update))
++      // Started eagerly (not chained behind the queue): the store's ordering is
++      // its own business, and deferring the call by a microtask changes when a
++      // log row exists. The queue only TRACKS completion, for `whenPersisted`.
++      const appended = Promise.resolve(
++        this.io.persistence.appendUpdate(this.docId, update),
++      );
++      this.persistQueue = this.persistQueue
++        .catch(() => {})
++        .then(() => appended);
++      appended
+         .then(() => {
+           // Compact LIVE, not only on the next load: one paste or AI rewrite can
+           // put megabytes into the log, and until now nothing shrank it until
+@@ -121,6 +146,7 @@ export class NoteBridge {
+           if (this.shouldCompact()) void this.compact();
+         })
+         .catch((e) => this.reportError(e, "appendUpdate"));
++      void this.persistQueue;
+     };
+ 
+     this.onTextChange = (_evt, tr) => {
+@@ -310,7 +336,33 @@ export class NoteBridge {
+     return this.drainIngest();
+   }
+ 
++  /**
++   * Run one ingest pass, never overlapping another. A queued pass re-reads the
++   * dirty flag when its turn comes, so a file change that arrived mid-pass is
++   * still merged (against the doc as the earlier pass left it) and one that was
++   * already covered costs nothing.
++   */
+   private async drainIngest(): Promise<boolean> {
++    const prior = this.ingestInFlight;
++    const run = (async () => {
++      if (prior) {
++        try {
++          await prior;
++        } catch {
++          // A failed pass must not strand the queue behind it.
++        }
++      }
++      return this.runIngest();
++    })();
++    this.ingestInFlight = run;
++    try {
++      return await run;
++    } finally {
++      if (this.ingestInFlight === run) this.ingestInFlight = null;
++    }
++  }
++
++  private async runIngest(): Promise<boolean> {
+     if (this.destroyed || !this.ingestDirty) return false;
+     this.ingestDirty = false;
+ 
+@@ -373,10 +425,28 @@ export class NoteBridge {
+     }
+     this.truncateReported = false;
+ 
++    // A diff against an EMPTY doc is not a merge, it is a seed: every byte of
++    // the file is inserted as this device's own history. Seeding is ordered —
++    // pull the server's canonical state FIRST, then `seedFromFileIfEmpty` only
++    // if the doc is still empty (spec 03 §5) — and this path is not in that
++    // order. `docSession.handleLocalFileChanged` ingests any resident bridge
++    // the watcher names, including one whose first pull has not landed, so
++    // without this the file's text and the server's text both end up in the
++    // doc: the note-doubling bug through the ingest door. A doc that has held
++    // content this session (`everHadContent`) is past its seed and a genuine
++    // clear-all still ingests; a local-only vault seeds on open and never gets
++    // here empty.
++    if (current.length === 0 && !this.everHadContent && !this.seedOnOpen) {
++      return false;
++    }
++
+     const diffs = computeDiff(current, fileText);
+     const ratio = changeRatio(diffs, current.length, fileText.length);
+ 
+     if (ratio > this.cfg.largeDiffRatio) {
++      // What the doc had seen when `current` and `diffs` were taken — the check
++      // after the snapshot below compares against it.
++      const generation = this.observedUpdates;
+       // A coarse whole-file rewrite (e.g. an AI edit) can merge badly against a
+       // concurrent edit. Snapshot the pre-diff state first so it's recoverable
+       // (spec 02 §6, spec 03 §5). The snapshot row IS the recovery point; the
+@@ -391,6 +461,16 @@ export class NoteBridge {
+       } catch (e) {
+         this.reportError(e, "ingest:recoverySnapshot");
+       }
++      // That snapshot is the one await between reading `current` and applying
++      // the diff against it, and a remote update landing inside it leaves the
++      // diff describing a document that no longer exists — positions shifted,
++      // and on the empty-doc case every byte of the file inserted on top of the
++      // server's copy of the same note. Re-diff against what the doc says NOW;
++      // the seed refusal above is re-evaluated with it.
++      if (this.observedUpdates !== generation) {
++        this.ingestDirty = true;
++        return this.runIngest();
++      }
+     }
+ 
+     this.doc.transact(() => {
+@@ -527,6 +607,22 @@ export class NoteBridge {
+     await this.drainEgest();
+   }
+ 
++  /**
++   * Resolve once every update this doc has produced is in the local CRDT store.
++   *
++   * Call it before `destroy()` on any bridge that applied ops — a cold apply, an
++   * LRU retire — or the doc goes away holding updates the store never got. See
++   * {@link persistQueue}.
++   */
++  async whenPersisted(): Promise<void> {
++    try {
++      await this.persistQueue;
++    } catch {
++      // Already reported by the append's own catch; a failed persist must not
++      // stop a teardown.
++    }
++  }
++
+   /**
+    * Write the doc's text to disk NOW, whether or not an egest is pending.
+    *
+diff --git a/app/apps/desktop/src/lib/sync/__tests__/coldApplyDoubling.test.ts b/app/apps/desktop/src/lib/sync/__tests__/coldApplyDoubling.test.ts
+new file mode 100644
+index 00000000..f1ade6be
+--- /dev/null
++++ b/app/apps/desktop/src/lib/sync/__tests__/coldApplyDoubling.test.ts
+@@ -0,0 +1,101 @@
++// The cold-apply doubling loop (2026-09-04, a customer's `Map of Content.md`).
++//
++// `coldApply` opens a TRANSIENT bridge — a brand-new `Y.Doc`, so a brand-new
++// clientID every time — hydrates it from the LOCAL CRDT store, folds in the file
++// on disk, applies the server's update and egests the result.
++//
++// Folding the file in is a three-way merge and has to stay one: an AI that
++// edited the `.md` while no bridge was alive would otherwise be overwritten by
++// the egest. But ingest turns file bytes into ops attributed to THIS client, so
++// when the file ALREADY holds the text of the update about to be applied — which
++// is what a local CRDT store that has fallen behind its own file looks like —
++// that text was inserted twice: once as this client's fresh ops, once as the
++// server's, and Yjs keeps both. The egest then wrote the doubled text back to
++// the file, so the next update through here doubled twice as much.
++//
++// Production ran that eighteen times in one hour: eighteen updates, each from a
++// different clientID, each re-inserting the whole current delta, ending at 2^16
++// copies of one added block — 16 MB of Yjs state for a 686-byte note,
++// 1,179,679 lines of 35 distinct ones.
++
++import { describe, expect, it } from "vitest";
++import * as Y from "yjs";
++import { VaultDocStore } from "../vaultDocStore";
++import { makeHarness } from "../../bridge/__tests__/helpers";
++
++const DOC = "doc-moc";
++const PATH = "Map of Content.md";
++const BASE = "# Map of Content\n\n- [[One]]\n";
++const ADDED = "\n## Team\n\n- [[AI Platform]]\n";
++
++const stateOf = (d: Y.Doc) => Y.encodeStateAsUpdate(d);
++const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
++
++/** The server's copy of the note: ONE Yjs history, as the real server has. */
++function serverDoc(text: string): Y.Doc {
++  const remote = new Y.Doc();
++  remote.getText("content").insert(0, text);
++  return remote;
++}
++
++describe("cold apply: a local store behind its own file", () => {
++  it("does not re-insert text the incoming update already carries", async () => {
++    const { io, fs } = makeHarness({ [PATH]: BASE });
++    const store = new VaultDocStore({ io, resolvePath: () => PATH });
++    const server = serverDoc(BASE);
++
++    // Round one: the doc, the local CRDT store and the file all hold BASE.
++    await store.applyUpdate(DOC, stateOf(server));
++    expect(fs.get(PATH)).toBe(BASE);
++
++    // A teammate adds a block. It reaches this device's FILE (an earlier apply
++    // egested it) but not its local CRDT store — the state the loop feeds on.
++    server.getText("content").insert(BASE.length, ADDED);
++    fs.externalWrite(PATH, BASE + ADDED);
++
++    // The same block now arrives as an update.
++    await store.applyUpdate(DOC, stateOf(server));
++
++    expect(occurrences(fs.get(PATH)!, "## Team")).toBe(1);
++    expect(fs.get(PATH)).toBe(BASE + ADDED);
++    await store.destroyAll();
++  });
++
++  it("does not compound across successive updates", async () => {
++    const { io, fs } = makeHarness({ [PATH]: BASE });
++    const store = new VaultDocStore({ io, resolvePath: () => PATH });
++    const server = serverDoc(BASE);
++    await store.applyUpdate(DOC, stateOf(server));
++
++    // Four rounds of the same shape — the loop that reached 2^16. Each round
++    // opens a fresh transient bridge with a fresh clientID, and each round the
++    // file is one step ahead of the local store.
++    server.getText("content").insert(BASE.length, ADDED);
++    for (let i = 0; i < 4; i++) {
++      fs.externalWrite(PATH, server.getText("content").toString());
++      await store.applyUpdate(DOC, stateOf(server));
++    }
++
++    expect(occurrences(fs.get(PATH)!, "## Team")).toBe(1);
++    expect(fs.get(PATH)).toBe(BASE + ADDED);
++    await store.destroyAll();
++  });
++
++  it("still merges a genuine external edit the server has never seen", async () => {
++    const { io, fs } = makeHarness({ [PATH]: BASE });
++    const store = new VaultDocStore({ io, resolvePath: () => PATH });
++    const server = serverDoc(BASE);
++    await store.applyUpdate(DOC, stateOf(server));
++
++    // An AI edits the file while no bridge is alive, and a teammate's update
++    // lands for the same note. Both contributions must survive.
++    fs.externalWrite(PATH, BASE + "- [[Written by the AI]]\n");
++    server.getText("content").insert(BASE.length, "- [[From a teammate]]\n");
++    await store.applyUpdate(DOC, stateOf(server));
++
++    const onDisk = fs.get(PATH)!;
++    expect(onDisk).toContain("- [[Written by the AI]]");
++    expect(onDisk).toContain("- [[From a teammate]]");
++    await store.destroyAll();
++  });
++});
+diff --git a/app/apps/desktop/src/lib/sync/vaultDocStore.ts b/app/apps/desktop/src/lib/sync/vaultDocStore.ts
+index e589f8e8..8a9acdfb 100644
+--- a/app/apps/desktop/src/lib/sync/vaultDocStore.ts
++++ b/app/apps/desktop/src/lib/sync/vaultDocStore.ts
+@@ -416,6 +416,43 @@ export class VaultDocStore implements DocUpdateSink {
+     return this.hot.get(docId)?.bridge ?? null;
+   }
+ 
++  /**
++   * Does the file hold an edit neither the doc nor the incoming update has?
++   *
++   * Three answers, and only the third is an edit worth ingesting:
++   *  - the file matches the doc ⇒ nothing to fold in;
++   *  - the file matches what the update alone would produce ⇒ the file is the
++   *    echo of an apply that already happened (this doc's local CRDT is simply
++   *    behind its own file), and ingesting it would re-create the update's text
++   *    under this bridge's fresh clientID — the doubling loop;
++   *  - anything else ⇒ a genuine out-of-band write, ingest it.
++   *
++   * The probe costs one doc copy and only runs when the file and the doc already
++   * disagree, which is the uncommon case. A read failure answers "not external",
++   * because the flush below is a no-op against a file we cannot read anyway.
++   */
++  private async isExternalEdit(
++    bridge: NoteBridge,
++    path: string,
++    update: Uint8Array,
++  ): Promise<boolean> {
++    let fileText: string;
++    try {
++      fileText = await this.io.readFile(path);
++    } catch {
++      return false;
++    }
++    if (fileText === bridge.serialize()) return false;
++    const probe = new Y.Doc();
++    try {
++      Y.applyUpdate(probe, Y.encodeStateAsUpdate(bridge.doc));
++      Y.applyUpdate(probe, update);
++      return fileText !== probe.getText("content").toString();
++    } finally {
++      probe.destroy();
++    }
++  }
++
+   private async coldApply(docId: string, update: Uint8Array): Promise<void> {
+     const path = this.resolvePath(docId);
+     if (!path) return; // unknown doc (not yet materialised) — skip; next reconnect retries
+@@ -423,13 +460,6 @@ export class VaultDocStore implements DocUpdateSink {
+     // evict. seedFromFile:false — the server feed is the source for background docs.
+     const bridge = await NoteBridge.open(this.io, { docId, path, seedFromFile: false });
+     try {
+-      // Fold in any external edit sitting on disk BEFORE the remote delta lands
+-      // and gets egested: the flush below rewrites the file from the doc, and a
+-      // file the doc has never ingested (an AI edited it while no bridge was
+-      // alive) would be silently overwritten. The doc-non-empty guard keeps an
+-      // unhydrated placeholder on the pull-before-seed path (never a pre-sync
+-      // seed); converged content makes this a no-op read. A genuine merge is
+-      // reported up so the session pushes it (see `onExternalMerge`).
+       // Whether this doc held ANY local CRDT ops before the remote state landed.
+       // Only a doc that had none — the empty placeholder a fresh join
+       // materializes — can be declared converged below: a doc with prior local
+@@ -437,8 +467,36 @@ export class VaultDocStore implements DocUpdateSink {
+       // before the flush; NOT in `divergedDocs`, which only tracks out-of-band
+       // file merges), and marking it pushed would strand exactly those bytes.
+       const hadLocalState = bridge.doc.store.clients.size > 0;
++      // Fold in any external edit sitting on disk BEFORE the remote delta lands
++      // and gets egested: the flush below rewrites the file from the doc, and a
++      // file the doc has never ingested (an AI edited it while no bridge was
++      // alive) would be silently overwritten. Ingesting FIRST is what makes that
++      // a three-way merge — the file is diffed against the doc as it was, so the
++      // file's contribution and the server's both survive. The doc-non-empty
++      // guard keeps an unhydrated placeholder on the pull-before-seed path
++      // (never a pre-sync seed); converged content makes this a no-op read. A
++      // genuine merge is reported up so the session pushes it (`onExternalMerge`).
++      //
++      // But only for a file that really is an external edit. Ingest turns file
++      // bytes into ops attributed to THIS client, and this bridge is a brand-new
++      // Y.Doc with a brand-new clientID every time — so a file that already
++      // holds the text of the update about to be applied gets that text inserted
++      // TWICE, once as this client's fresh ops and once as the server's, and Yjs
++      // keeps both. `flushEgest` then writes the doubled text back to the file,
++      // and the next update through here doubles twice as much. That is the
++      // 16 MB `Map of Content.md` in a customer vault on 2026-09-04: eighteen
++      // updates, each from a different clientID, each re-inserting the whole
++      // current delta, ending at 2^16 copies of one added block.
++      //
++      // `isExternalEdit` is the distinction, and it is exact rather than
++      // heuristic: ask what the update ALONE would make the text, and if the
++      // file already says that, the file is this loop's own echo, not an edit.
+       let merged = false;
+-      if (bridge.serialize().length > 0 && (await bridge.ingestNow())) {
++      if (
++        bridge.serialize().length > 0 &&
++        (await this.isExternalEdit(bridge, path, update)) &&
++        (await bridge.ingestNow())
++      ) {
+         merged = true;
+         this.onExternalMerge?.(docId);
+       }
+@@ -454,6 +512,11 @@ export class VaultDocStore implements DocUpdateSink {
+       // there is" holds by construction.
+       if (!merged && !hadLocalState) this.onConverged?.(docId);
+     } finally {
++      // The ops this bridge just applied must reach the local CRDT store before
++      // it goes away: the file already holds their text (`flushEgest` above), so
++      // dropping them here would leave the store behind its own file — the exact
++      // gap the next cold apply re-inserts from, and doubles.
++      await bridge.whenPersisted();
+       bridge.destroy();
+     }
+   }
+@@ -485,6 +548,7 @@ export class VaultDocStore implements DocUpdateSink {
+     } catch (e) {
+       console.error("[vaultDocStore] flush on retire failed", e);
+     }
++    await bridge.whenPersisted();
+     bridge.destroy();
+   }
+ }
+diff --git a/app/apps/server/src/sync/hocuspocus.ts b/app/apps/server/src/sync/hocuspocus.ts
+index c475ae44..af69e109 100644
+--- a/app/apps/server/src/sync/hocuspocus.ts
++++ b/app/apps/server/src/sync/hocuspocus.ts
+@@ -87,6 +87,34 @@ export type DocEditedHook = (
+   userId: string | null,
+ ) => void;
+ 
++/**
++ * Why this message must be refused, or null to let it through.
++ *
++ * TWO ceilings, and the second is the one experience added. Capping the MESSAGE
++ * alone bounds a single step, and a note that doubles doubles from small: a
++ * customer's `Map of Content.md` went 276 bytes → 8 MB in seventeen messages,
++ * not one of them near the cap, and ended at 16 MB of Yjs state holding
++ * 1,179,679 lines of 35 distinct ones. Capping the DOC makes the limit a wall
++ * the note cannot be pushed through rather than a step size: a doc under it
++ * always accepts one more message, a doc over it accepts none and is a repair
++ * job (`POST /api/notes/:id/reset-crdt`).
++ *
++ * The doc length is `Y.Text`'s own counter, so asking costs nothing.
++ */
++export function noteSizeRefusal(
++  updateBytes: number,
++  docChars: number,
++  capBytes: number = config.maxNoteMb * 1024 * 1024,
++): string | null {
++  if (updateBytes > capBytes) {
++    return `Rejecting oversized sync message: ${updateBytes} bytes (cap ${capBytes})`;
++  }
++  if (docChars > capBytes) {
++    return `Refusing writes to oversized doc: ${docChars} chars (cap ${capBytes}) — needs /reset-crdt`;
++  }
++  return null;
++}
++
+ export function createSyncServer(
+   port: number = config.hocuspocusPort,
+   onDocChanged?: DocChangedHook,
+@@ -117,12 +145,12 @@ export function createSyncServer(
+      * a second for as long as the app was open.
+      */
+     async beforeHandleMessage(data) {
+-      const cap = config.maxNoteMb * 1024 * 1024;
+-      if (data.update.byteLength > cap) {
+-        console.error(
+-          `Rejecting oversized sync message for ${data.documentName}: ` +
+-            `${data.update.byteLength} bytes (cap ${cap})`,
+-        );
++      const refusal = noteSizeRefusal(
++        data.update.byteLength,
++        data.document.getText("content").length,
++      );
++      if (refusal) {
++        console.error(`${refusal} for ${data.documentName}`);
+         throw new NoteTooLargeError();
+       }
+     },
+diff --git a/app/apps/server/tests/repair-oversized-doc.test.ts b/app/apps/server/tests/repair-oversized-doc.test.ts
+index a7e51fda..8afbb935 100644
+--- a/app/apps/server/tests/repair-oversized-doc.test.ts
++++ b/app/apps/server/tests/repair-oversized-doc.test.ts
+@@ -3,7 +3,7 @@ import * as Y from "yjs";
+ import { createApp } from "../src/http/app.js";
+ import { config } from "../src/config.js";
+ import { pool } from "../src/db/pool.js";
+-import { CLOSE_NOTE_TOO_LARGE } from "../src/sync/hocuspocus.js";
++import { CLOSE_NOTE_TOO_LARGE, noteSizeRefusal } from "../src/sync/hocuspocus.js";
+ import { appendUpdate, docStoredBytes, loadDocState, resetDocCrdt } from "../src/yjs/persistence.js";
+ import { recordingAppDeps, type RecordingAppDeps } from "./helpers/app.js";
+ import { signUp, type TestUser } from "./helpers/auth.js";
+@@ -56,6 +56,30 @@ describe("oversized-doc repair", () => {
+     expect(CLOSE_NOTE_TOO_LARGE).toBe(4413);
+   });
+ 
++  describe("the size gate", () => {
++    const CAP = 1000;
++
++    it("lets an ordinary message through", () => {
++      expect(noteSizeRefusal(500, 400, CAP)).toBeNull();
++    });
++
++    it("refuses a single message bigger than the cap", () => {
++      expect(noteSizeRefusal(CAP + 1, 0, CAP)).toMatch(/oversized sync message/);
++    });
++
++    it("refuses any write to a doc already over the cap", () => {
++      // The half that experience added. A note that doubles doubles from small:
++      // every message in the cascade that took a customer's `Map of Content.md`
++      // from 276 bytes to 16 MB was comfortably under the message cap, so the
++      // message cap alone never fired. The doc cap turns the limit into a wall.
++      expect(noteSizeRefusal(10, CAP + 1, CAP)).toMatch(/oversized doc/);
++    });
++
++    it("still accepts one more message from a doc at the cap, so it can be edited down", () => {
++      expect(noteSizeRefusal(10, CAP, CAP)).toBeNull();
++    });
++  });
++
+   it("resets a doc's history and re-seeds it from the supplied text", async () => {
+     const user = await signUp("reset@t.com");
+     const org = await seedOrg("Acme", "acme-r1");
+diff --git a/docs/RELEASE_NOTES.md b/docs/RELEASE_NOTES.md
+index fac8126c..30873e73 100644
+--- a/docs/RELEASE_NOTES.md
++++ b/docs/RELEASE_NOTES.md
+@@ -37,3 +37,4 @@
+ - Baalda now double-checks with the server before it removes anything from your disk after an access change. If the two answers disagree, or the check cannot be made, the file stays where it is
+ - Private now means private for everyone. Setting a vault to Private used to leave owners and admins reading every note in it, and left everyone the notes they had written themselves — so in a vault you set up yourself, pressing Private appeared to do nothing at all. It now seals the vault: nobody opens anything, you included, until you share a folder or a note by name. Nothing is lost, and switching back to Shared brings it all back. Vaults that were never shared with a team are not affected until you press it
+ - The Access page's Entire vault control now shows what the team can actually reach. If you set every folder and note to Private one by one, it used to keep saying Shared; it now reads Private and tells you the vault-wide setting still says otherwise
++- Fixed a bug that could make a note grow enormous by repeating a block of its own text over and over. It happened while a note was syncing quietly in the background: Baalda could fold the same paragraph in twice, once as your copy and once as the one arriving from the server, then save the doubled text and do it again on the next change. One note reached 16 MB of a single section repeated thousands of times. Baalda now recognises the text as its own before merging it, and the server refuses to let any note grow past its size limit rather than only capping each change

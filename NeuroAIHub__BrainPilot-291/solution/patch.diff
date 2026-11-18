@@ -1,0 +1,853 @@
+diff --git a/packages/backend-core/src/app.ts b/packages/backend-core/src/app.ts
+index 31f6345f..8cf81cd0 100644
+--- a/packages/backend-core/src/app.ts
++++ b/packages/backend-core/src/app.ts
+@@ -271,7 +271,12 @@ export function createApp(options: CreateAppOptions): Hono {
+     const p = profiles.find((x) => x.id === c.req.param("id"));
+     if (!p) return c.json({ error: "not found" }, 404);
+     const result = await probeProvider(
+-      { baseUrl: p.baseUrl, apiKey: p.apiKey },
++      {
++        baseUrl: p.baseUrl,
++        apiKey: p.apiKey,
++        model: p.models[0],
++        api: p.api ?? deriveProviderApi(p.adapter) ?? "anthropic-messages",
++      },
+       { fetchFn: options.fetchFn, timeoutMs: options.providerProbeTimeoutMs },
+     );
+     // #69: persist the probe outcome so a later GET /provider/profiles (card
+diff --git a/packages/backend-core/src/config.ts b/packages/backend-core/src/config.ts
+index fbd500bc..ed3a1017 100644
+--- a/packages/backend-core/src/config.ts
++++ b/packages/backend-core/src/config.ts
+@@ -407,7 +407,7 @@ export async function readLocalSettings(
+  */
+ export async function writeLocalSettings(
+   dataDir: string,
+-  patch: Partial<{ model: string; apiKey: string; baseUrl: string }>,
++  patch: Partial<{ model: string; apiKey: string; baseUrl: string; api: ProviderApi }>,
+ ): Promise<void> {
+   const current = await selectedProfile(dataDir);
+   const models = patch.model ? [patch.model] : undefined;
+@@ -415,6 +415,7 @@ export async function writeLocalSettings(
+     await createProfile(dataDir, {
+       name: "Local",
+       baseUrl: patch.baseUrl ?? "",
++      api: patch.api,
+       apiKey: patch.apiKey ?? "",
+       models: models ?? [],
+     });
+@@ -422,6 +423,7 @@ export async function writeLocalSettings(
+   }
+   await updateProfile(dataDir, current.id, {
+     ...(patch.baseUrl !== undefined ? { baseUrl: patch.baseUrl } : {}),
++    ...(patch.api !== undefined ? { api: patch.api } : {}),
+     ...(patch.apiKey !== undefined ? { apiKey: patch.apiKey } : {}),
+     // merge the model into the profile's model list (front of list = default)
+     ...(models ? { models: Array.from(new Set([...models, ...current.models])) } : {}),
+diff --git a/packages/backend-core/src/provider-probe.ts b/packages/backend-core/src/provider-probe.ts
+index 0d3a3187..e6e9773c 100644
+--- a/packages/backend-core/src/provider-probe.ts
++++ b/packages/backend-core/src/provider-probe.ts
+@@ -1,21 +1,11 @@
+ /**
+- * #55: real provider connectivity probe for the Settings → Providers "Test"
+- * button. Previously the /test route only echoed the stored profile with
+- * health_status:"unknown", so even an unreachable gateway looked "tested".
++ * Protocol-aware provider probe for Settings → Providers → Test.
+  *
+- * Strategy (kept deliberately generic so it works across OpenAI-compatible and
+- * Anthropic-compatible gateways without hardcoding a vendor):
+- *   - best-effort GET {baseUrl}/models with the API key as a Bearer token;
+- *   - a 2xx ⇒ healthy (connected + authenticated);
+- *   - 401/403 ⇒ error (reachable but auth rejected);
+- *   - other 4xx/5xx ⇒ reachable, so still "healthy" at the connectivity level —
+- *     many Anthropic-style gateways have no /models endpoint and answer 404, and
+- *     that does NOT mean the gateway is down;
+- *   - a network/DNS/timeout failure ⇒ unavailable.
+- *
+- * Error messages are redacted (no absolute node_modules paths) consistent with
+- * the #45 hardening.
++ * The probe sends one minimal request using the same four wire protocols the
++ * runtime accepts. This catches endpoint/protocol/model mismatches that a
++ * generic GET /models connectivity check cannot detect.
+  */
++import type { ProviderApi } from "@brainpilot/protocol";
+ 
+ export type ProbeStatus = "healthy" | "unavailable" | "error";
+ 
+@@ -29,16 +19,12 @@ export interface ProbeResult {
+ export interface ProbeInput {
+   baseUrl: string;
+   apiKey: string;
++  model?: string;
++  /** Legacy profiles may omit this; the historical default is Anthropic Messages. */
++  api?: ProviderApi;
+ }
+ 
+-/**
+- * Strip absolute node_modules paths from any error text before surfacing it.
+- *
+- * Cross-platform (#157): accept BOTH `/` and `\` separators, plus an optional
+- * Windows drive prefix. A native Windows path like
+- * `C:\Users\<user>\…\node_modules\@pkg\file.md` previously slipped through
+- * unredacted, leaking the username into the Test-button error toast.
+- */
++/** Strip absolute node_modules paths from any error text before surfacing it. */
+ function redact(text: string): string {
+   return text
+     .replace(/(?:[A-Za-z]:)?(?:[\\/][^\s:]*)?node_modules[\\/][^\s)]*/g, "<path>")
+@@ -46,67 +32,138 @@ function redact(text: string): string {
+     .trim();
+ }
+ 
+-function joinUrl(base: string, path: string): string {
+-  const b = base.replace(/\/+$/, "");
+-  const p = path.replace(/^\/+/, "");
+-  return `${b}/${p}`;
++/** OpenAI SDK appends resource paths directly to the configured base URL. */
++function appendEndpoint(baseUrl: string, endpoint: string): string {
++  const root = baseUrl.trim().replace(/\/+$/, "");
++  new URL(root);
++  return `${root}/${endpoint}`;
+ }
+ 
+-/**
+- * Probe a provider gateway. `fetchFn`/`timeoutMs` are injectable for tests.
+- * Never throws — always resolves to a ProbeResult.
+- */
++function anthropicMessagesEndpoint(baseUrl: string): string {
++  const root = baseUrl.trim().replace(/\/+$/, "");
++  const path = new URL(root).pathname.replace(/\/+$/, "");
++  return `${root}${path.endsWith("/v1") ? "" : "/v1"}/messages`;
++}
++
++/** Match the Azure base-URL normalization used by Pi's Azure Responses transport. */
++function azureResponsesEndpoint(baseUrl: string): string {
++  const url = new URL(baseUrl.trim().replace(/\/+$/, ""));
++  const isAzureHost =
++    url.hostname.endsWith(".openai.azure.com") ||
++    url.hostname.endsWith(".cognitiveservices.azure.com");
++  const path = url.pathname.replace(/\/+$/, "");
++  if (isAzureHost && (path === "" || path === "/" || path === "/openai")) {
++    url.pathname = "/openai/v1";
++  }
++  url.pathname = `${url.pathname.replace(/\/+$/, "")}/responses`;
++  if (!url.searchParams.has("api-version")) url.searchParams.set("api-version", "v1");
++  return url.toString();
++}
++
++function buildRequest(input: ProbeInput): {
++  url: string;
++  headers: Record<string, string>;
++  body: Record<string, unknown>;
++} {
++  const api = input.api ?? "anthropic-messages";
++  const model = input.model?.trim();
++  if (!model) throw new Error("No model configured for this provider.");
++
++  switch (api) {
++    case "anthropic-messages":
++      return {
++        url: anthropicMessagesEndpoint(input.baseUrl),
++        headers: {
++          "x-api-key": input.apiKey,
++          "anthropic-version": "2023-06-01",
++          "content-type": "application/json",
++        },
++        body: {
++          model,
++          max_tokens: 1,
++          messages: [{ role: "user", content: "ping" }],
++        },
++      };
++    case "openai-completions":
++      return {
++        url: appendEndpoint(input.baseUrl, "chat/completions"),
++        headers: {
++          authorization: `Bearer ${input.apiKey}`,
++          "content-type": "application/json",
++        },
++        body: {
++          model,
++          messages: [{ role: "user", content: "Reply with OK." }],
++        },
++      };
++    case "openai-responses":
++      return {
++        url: appendEndpoint(input.baseUrl, "responses"),
++        headers: {
++          authorization: `Bearer ${input.apiKey}`,
++          "content-type": "application/json",
++        },
++        body: { model, input: "ping", max_output_tokens: 16, store: false },
++      };
++    case "azure-openai-responses":
++      return {
++        url: azureResponsesEndpoint(input.baseUrl),
++        headers: { "api-key": input.apiKey, "content-type": "application/json" },
++        body: { model, input: "ping", max_output_tokens: 16, store: false },
++      };
++  }
++}
++
++/** Probe a provider with its selected wire protocol. Never throws. */
+ export async function probeProvider(
+   input: ProbeInput,
+   opts: { fetchFn?: typeof fetch; timeoutMs?: number } = {},
+ ): Promise<ProbeResult> {
+-  const fetchFn = opts.fetchFn ?? fetch;
+-  const timeoutMs = opts.timeoutMs ?? 5000;
+-
+-  const base = (input.baseUrl ?? "").trim();
+-  if (!base) {
++  if (!input.baseUrl?.trim()) {
+     return { status: "error", message: "No base URL configured for this provider." };
+   }
+-  let url: string;
++
++  let request: ReturnType<typeof buildRequest>;
+   try {
+-    url = joinUrl(base, "models");
+-    // validate it parses as a URL
+-    new URL(url);
+-  } catch {
+-    return { status: "error", message: "Invalid base URL." };
++    request = buildRequest(input);
++  } catch (e) {
++    return { status: "error", message: redact((e as Error).message) };
+   }
+ 
++  const fetchFn = opts.fetchFn ?? fetch;
++  const timeoutMs = opts.timeoutMs ?? 5000;
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), timeoutMs);
+   const startedAt = Date.now();
+   try {
+-    const headers: Record<string, string> = { accept: "application/json" };
+-    if (input.apiKey) headers.authorization = `Bearer ${input.apiKey}`;
+-    const res = await fetchFn(url, { method: "GET", headers, signal: controller.signal });
++    const response = await fetchFn(request.url, {
++      method: "POST",
++      headers: request.headers,
++      body: JSON.stringify(request.body),
++      signal: controller.signal,
++    });
+     const latencyMs = Date.now() - startedAt;
++    if (response.ok) return { status: "healthy", latencyMs };
+ 
+-    if (res.ok) {
+-      return { status: "healthy", latencyMs };
+-    }
+-    if (res.status === 401 || res.status === 403) {
+-      return {
+-        status: "error",
+-        message: `Authentication rejected (HTTP ${res.status}). Check the API key.`,
+-        latencyMs,
+-      };
++    let detail = "";
++    try {
++      detail = redact((await response.text()).slice(0, 300));
++    } catch {
++      // The status code still provides a useful error when the body is unreadable.
+     }
+-    // Reachable but the endpoint answered non-2xx (e.g. an Anthropic gateway
+-    // with no /models route). Connectivity is fine, so report healthy.
++    const authHint =
++      response.status === 401 || response.status === 403 ? " Check the API key." : "";
+     return {
+-      status: "healthy",
+-      message: `Reached gateway (HTTP ${res.status}); /models probe not supported.`,
++      status: "error",
++      message: `Provider request failed (HTTP ${response.status}).${authHint}${detail ? ` ${detail}` : ""}`,
+       latencyMs,
+     };
+   } catch (err) {
+     const latencyMs = Date.now() - startedAt;
+-    const raw = (err as Error)?.name === "AbortError"
+-      ? `Timed out after ${timeoutMs}ms.`
+-      : (err as Error)?.message ?? String(err);
++    const raw =
++      (err as Error)?.name === "AbortError"
++        ? `Timed out after ${timeoutMs}ms.`
++        : (err as Error)?.message ?? String(err);
+     return { status: "unavailable", message: redact(raw), latencyMs };
+   } finally {
+     clearTimeout(timer);
+diff --git a/packages/backend-core/test/config.test.ts b/packages/backend-core/test/config.test.ts
+index 25c46a49..c895fdf9 100644
+--- a/packages/backend-core/test/config.test.ts
++++ b/packages/backend-core/test/config.test.ts
+@@ -172,7 +172,12 @@ describe("formatProviderGuidance", () => {
+ describe("writeLocalSettings", () => {
+   it("creates then updates the selected profile in providers.json", async () => {
+     const dir = await tmp();
+-    await writeLocalSettings(dir, { model: "m1", apiKey: "sk-1", baseUrl: "u1" });
++    await writeLocalSettings(dir, {
++      model: "m1",
++      apiKey: "sk-1",
++      baseUrl: "u1",
++      api: "openai-responses",
++    });
+     await writeLocalSettings(dir, { model: "m2" }); // update: keep apiKey/baseUrl
+     const raw = JSON.parse(
+       await readFile(path.join(dir, "bp_template", "providers.json"), "utf8"),
+@@ -181,6 +186,7 @@ describe("writeLocalSettings", () => {
+     const p = raw.profiles[0];
+     expect(p.apiKey).toBe("sk-1");
+     expect(p.baseUrl).toBe("u1");
++    expect(p.api).toBe("openai-responses");
+     // newest model is the default (front of the model list)
+     expect(p.models[0]).toBe("m2");
+     expect(p.models).toContain("m1");
+diff --git a/packages/backend-core/test/provider-probe.test.ts b/packages/backend-core/test/provider-probe.test.ts
+index 7bbb66f4..76f1eea1 100644
+--- a/packages/backend-core/test/provider-probe.test.ts
++++ b/packages/backend-core/test/provider-probe.test.ts
+@@ -1,112 +1,168 @@
+ import { describe, expect, it, vi } from "vitest";
+ import { probeProvider } from "../src/provider-probe.js";
+ 
+-describe("probeProvider (#55)", () => {
+-  it("reports healthy on a 2xx /models response", async () => {
+-    const fetchFn = vi.fn(async (url: string) => {
+-      expect(url).toBe("https://gw.example.com/api/models");
+-      return new Response('{"data":[]}', { status: 200 });
++describe("probeProvider — protocol-aware model test", () => {
++  it("probes Anthropic Messages with Anthropic headers", async () => {
++    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
++      expect(url).toBe("https://api.anthropic.com/v1/messages");
++      expect((init.headers as Record<string, string>)["x-api-key"]).toBe("sk-ant");
++      expect(JSON.parse(String(init.body))).toMatchObject({ model: "claude", max_tokens: 1 });
++      return new Response("{}", { status: 200 });
++    });
++    const result = await probeProvider(
++      {
++        baseUrl: "https://api.anthropic.com",
++        apiKey: "sk-ant",
++        model: "claude",
++        api: "anthropic-messages",
++      },
++      { fetchFn: fetchFn as never },
++    );
++    expect(result.status).toBe("healthy");
++  });
++
++  it("probes OpenAI Completions at the configured version root", async () => {
++    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
++      expect(url).toBe("https://open.bigmodel.cn/api/paas/v4/chat/completions");
++      expect((init.headers as Record<string, string>).authorization).toBe("Bearer sk-oai");
++      expect(JSON.parse(String(init.body))).toHaveProperty("messages");
++      return new Response("{}", { status: 200 });
++    });
++    await probeProvider(
++      {
++        baseUrl: "https://open.bigmodel.cn/api/paas/v4",
++        apiKey: "sk-oai",
++        model: "glm",
++        api: "openai-completions",
++      },
++      { fetchFn: fetchFn as never },
++    );
++  });
++
++  it("probes OpenAI Responses with store:false", async () => {
++    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
++      expect(url).toBe("https://api.openai.com/v1/responses");
++      expect((init.headers as Record<string, string>).authorization).toBe("Bearer sk-resp");
++      expect(JSON.parse(String(init.body))).toMatchObject({
++        model: "gpt-test",
++        input: "ping",
++        store: false,
++      });
++      return new Response("{}", { status: 200 });
+     });
+-    const r = await probeProvider(
+-      { baseUrl: "https://gw.example.com/api", apiKey: "sk-x" },
++    await probeProvider(
++      {
++        baseUrl: "https://api.openai.com/v1",
++        apiKey: "sk-resp",
++        model: "gpt-test",
++        api: "openai-responses",
++      },
+       { fetchFn: fetchFn as never },
+     );
+-    expect(r.status).toBe("healthy");
+   });
+ 
+-  it("sends the API key as a Bearer token", async () => {
+-    const fetchFn = vi.fn(async (_url: string, init: RequestInit) => {
+-      const headers = init.headers as Record<string, string>;
+-      expect(headers.authorization).toBe("Bearer sk-secret");
++  it("probes Azure OpenAI Responses with normalized resource URL and api-key", async () => {
++    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
++      expect(url).toBe("https://research.openai.azure.com/openai/v1/responses?api-version=v1");
++      expect((init.headers as Record<string, string>)["api-key"]).toBe("azure-key");
++      expect(JSON.parse(String(init.body))).toMatchObject({ model: "deployment-name", store: false });
+       return new Response("{}", { status: 200 });
+     });
+     await probeProvider(
+-      { baseUrl: "https://gw/api", apiKey: "sk-secret" },
++      {
++        baseUrl: "https://research.openai.azure.com",
++        apiKey: "azure-key",
++        model: "deployment-name",
++        api: "azure-openai-responses",
++      },
+       { fetchFn: fetchFn as never },
+     );
+-    expect(fetchFn).toHaveBeenCalledTimes(1);
+   });
+ 
+-  it("reports unavailable when the gateway is unreachable (network error)", async () => {
++  it("defaults legacy profiles to Anthropic Messages", async () => {
++    const fetchFn = vi.fn(async (url: string) => {
++      expect(url).toBe("https://gw.example.com/v1/messages");
++      return new Response("{}", { status: 200 });
++    });
++    await probeProvider(
++      { baseUrl: "https://gw.example.com", apiKey: "sk", model: "m" },
++      { fetchFn: fetchFn as never },
++    );
++  });
++
++  it("reports unavailable when the gateway is unreachable", async () => {
+     const fetchFn = vi.fn(async () => {
+       throw new TypeError("fetch failed: ENOTFOUND example.invalid");
+     });
+-    const r = await probeProvider(
+-      { baseUrl: "https://example.invalid/api", apiKey: "sk" },
++    const result = await probeProvider(
++      { baseUrl: "https://example.invalid", apiKey: "sk", model: "m" },
+       { fetchFn: fetchFn as never },
+     );
+-    expect(r.status).toBe("unavailable");
+-    expect(r.message).toContain("ENOTFOUND");
++    expect(result.status).toBe("unavailable");
++    expect(result.message).toContain("ENOTFOUND");
+   });
+ 
+   it("reports unavailable on timeout", async () => {
+     const fetchFn = vi.fn((_url: string, init: RequestInit) => {
+       return new Promise<Response>((_resolve, reject) => {
+         const signal = init.signal as AbortSignal;
+-        signal?.addEventListener("abort", () => {
+-          const e = new Error("aborted");
+-          e.name = "AbortError";
+-          reject(e);
++        signal.addEventListener("abort", () => {
++          const error = new Error("aborted");
++          error.name = "AbortError";
++          reject(error);
+         });
+       });
+     });
+-    const r = await probeProvider(
+-      { baseUrl: "https://slow/api", apiKey: "sk" },
++    const result = await probeProvider(
++      { baseUrl: "https://slow.example.com", apiKey: "sk", model: "m" },
+       { fetchFn: fetchFn as never, timeoutMs: 10 },
+     );
+-    expect(r.status).toBe("unavailable");
+-    expect(r.message).toMatch(/timed out/i);
++    expect(result.status).toBe("unavailable");
++    expect(result.message).toMatch(/timed out/i);
+   });
+ 
+-  it("reports error on 401/403 (auth rejected)", async () => {
+-    const fetchFn = vi.fn(async () => new Response("nope", { status: 401 }));
+-    const r = await probeProvider(
+-      { baseUrl: "https://gw/api", apiKey: "bad" },
++  it("reports protocol/model HTTP failures instead of false healthy", async () => {
++    const fetchFn = vi.fn(async () => new Response("wrong endpoint", { status: 404 }));
++    const result = await probeProvider(
++      {
++        baseUrl: "https://gw.example.com/v1",
++        apiKey: "sk",
++        model: "m",
++        api: "openai-responses",
++      },
+       { fetchFn: fetchFn as never },
+     );
+-    expect(r.status).toBe("error");
+-    expect(r.message).toMatch(/auth/i);
++    expect(result.status).toBe("error");
++    expect(result.message).toContain("HTTP 404");
++    expect(result.message).toContain("wrong endpoint");
+   });
+ 
+-  it("treats a non-2xx, non-auth response (e.g. 404 no /models) as healthy connectivity", async () => {
+-    const fetchFn = vi.fn(async () => new Response("not found", { status: 404 }));
+-    const r = await probeProvider(
+-      { baseUrl: "https://anthropic-gw/api", apiKey: "sk" },
++  it("returns configuration errors without calling fetch", async () => {
++    const fetchFn = vi.fn();
++    const noUrl = await probeProvider(
++      { baseUrl: "", apiKey: "sk", model: "m" },
+       { fetchFn: fetchFn as never },
+     );
+-    expect(r.status).toBe("healthy");
+-  });
+-
+-  it("errors on an empty base URL without calling fetch", async () => {
+-    const fetchFn = vi.fn();
+-    const r = await probeProvider({ baseUrl: "", apiKey: "sk" }, { fetchFn: fetchFn as never });
+-    expect(r.status).toBe("error");
+-    expect(fetchFn).not.toHaveBeenCalled();
+-  });
+-
+-  it("redacts node_modules paths from error messages", async () => {
+-    const fetchFn = vi.fn(async () => {
+-      throw new Error("boom at /home/u/app/node_modules/undici/lib/x.js:1");
+-    });
+-    const r = await probeProvider(
+-      { baseUrl: "https://gw/api", apiKey: "sk" },
++    const noModel = await probeProvider(
++      { baseUrl: "https://gw.example.com", apiKey: "sk" },
+       { fetchFn: fetchFn as never },
+     );
+-    expect(r.message).not.toMatch(/node_modules/);
++    expect(noUrl.status).toBe("error");
++    expect(noModel.status).toBe("error");
++    expect(fetchFn).not.toHaveBeenCalled();
+   });
+ 
+-  it("redacts native Windows node_modules paths (incl. username) from error messages (#157)", async () => {
+-    const fetchFn = vi.fn(async () => {
+-      throw new Error(
+-        "boom at C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\undici\\lib\\x.js:1",
++  it("redacts native and POSIX node_modules paths from errors", async () => {
++    for (const message of [
++      "boom at /home/u/app/node_modules/undici/lib/x.js:1",
++      "boom at C:\\Users\\alice\\npm\\node_modules\\undici\\lib\\x.js:1",
++    ]) {
++      const result = await probeProvider(
++        { baseUrl: "https://gw.example.com", apiKey: "sk", model: "m" },
++        { fetchFn: vi.fn(async () => { throw new Error(message); }) as never },
+       );
+-    });
+-    const r = await probeProvider(
+-      { baseUrl: "https://gw/api", apiKey: "sk" },
+-      { fetchFn: fetchFn as never },
+-    );
+-    expect(r.message).not.toMatch(/node_modules/);
+-    expect(r.message).not.toMatch(/alice/);
+-    expect(r.message).not.toMatch(/C:\\Users/i);
++      expect(result.message).not.toMatch(/node_modules/);
++      expect(result.message).not.toMatch(/alice/);
++    }
+   });
+ });
+diff --git a/packages/cli/README.md b/packages/cli/README.md
+index bd2222ba..20b4e706 100644
+--- a/packages/cli/README.md
++++ b/packages/cli/README.md
+@@ -48,10 +48,15 @@ for verifying the install end-to-end without an API key.
+ 
+ ```bash
+ brainpilot init --api-key <key> \
+-  --base-url https://your-gateway.example.com/api \
+-  --model kimi-k2.6
++  --base-url https://api.openai.com/v1 \
++  --model <model-id> \
++  --api openai-responses
+ ```
+ 
++`--api` accepts `anthropic-messages`, `openai-completions`, `openai-responses`, or
++`azure-openai-responses`. If omitted, the provider uses the backward-compatible
++`anthropic-messages` default.
++
+ You can also omit `--api-key` and supply credentials via the `ANTHROPIC_API_KEY`
+ environment variable instead.
+ 
+diff --git a/packages/cli/src/commands/init.test.ts b/packages/cli/src/commands/init.test.ts
+index bbae9a5a..d443279f 100644
+--- a/packages/cli/src/commands/init.test.ts
++++ b/packages/cli/src/commands/init.test.ts
+@@ -26,12 +26,23 @@ describe("init — onboarding guidance", () => {
+     const root = await tmp();
+     const writeSettings = vi.fn().mockResolvedValue(undefined);
+     await init(
+-      { dir: root, apiKey: "sk-1", baseUrl: "https://gw/api", model: "m1" },
++      {
++        dir: root,
++        apiKey: "sk-1",
++        baseUrl: "https://gw/api",
++        model: "m1",
++        api: "openai-responses",
++      },
+       { env: {}, log: () => {}, writeSettings },
+     );
+     expect(writeSettings).toHaveBeenCalledWith(
+       root,
+-      expect.objectContaining({ apiKey: "sk-1", baseUrl: "https://gw/api", model: "m1" }),
++      expect.objectContaining({
++        apiKey: "sk-1",
++        baseUrl: "https://gw/api",
++        model: "m1",
++        api: "openai-responses",
++      }),
+     );
+   });
+ 
+diff --git a/packages/cli/src/commands/init.ts b/packages/cli/src/commands/init.ts
+index e2c9b2d2..cf083a6d 100644
+--- a/packages/cli/src/commands/init.ts
++++ b/packages/cli/src/commands/init.ts
+@@ -8,18 +8,21 @@ import {
+   describeProviderConfig,
+   formatProviderGuidance,
+ } from "@brainpilot/backend-core";
++import type { ProviderApi } from "@brainpilot/protocol";
+ import { resolveDataDir } from "../paths.js";
+ import { scaffold } from "../scaffold.js";
+ 
+ export interface InitOptions {
+   dir?: string;
+   port?: number;
+-  /** Optional API key to persist into bp_template/settings.json. */
++  /** Optional API key to persist into bp_template/providers.json. */
+   apiKey?: string;
+   /** Optional base URL (gateway) to persist. */
+   baseUrl?: string;
+   /** Optional model id to persist. */
+   model?: string;
++  /** Optional wire protocol; omitted profiles retain the legacy Anthropic default. */
++  api?: ProviderApi;
+ }
+ 
+ export interface InitDeps {
+@@ -51,12 +54,13 @@ export async function init(
+   );
+ 
+   let keyPersisted = false;
+-  if (options.apiKey || options.baseUrl || options.model) {
++  if (options.apiKey || options.baseUrl || options.model || options.api) {
+     const writeSettings = deps.writeSettings ?? writeLocalSettings;
+     await writeSettings(dataDir, {
+       ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+       ...(options.baseUrl ? { baseUrl: options.baseUrl } : {}),
+       ...(options.model ? { model: options.model } : {}),
++      ...(options.api ? { api: options.api } : {}),
+     });
+     keyPersisted = Boolean(options.apiKey);
+     log(pc.green("Provider settings saved to bp_template/providers.json."));
+diff --git a/packages/cli/src/program.test.ts b/packages/cli/src/program.test.ts
+index fbc76708..62f918c1 100644
+--- a/packages/cli/src/program.test.ts
++++ b/packages/cli/src/program.test.ts
+@@ -65,15 +65,35 @@ describe("program — commander wiring", () => {
+     expect(initFn.mock.calls[0]![0]).toMatchObject({ apiKey: "sk-1" });
+   });
+ 
+-  it("dispatches `init` with --base-url and --model", async () => {
++  it("dispatches `init` with --base-url, --model, and --api", async () => {
+     const initFn = vi.fn().mockResolvedValue({ dataDir: "/d", created: [], keyPersisted: false });
+-    await run(["init", "--base-url", "https://gw/api", "--model", "m1"], { initFn });
++    await run(
++      [
++        "init",
++        "--base-url",
++        "https://gw/api",
++        "--model",
++        "m1",
++        "--api",
++        "openai-responses",
++      ],
++      { initFn },
++    );
+     expect(initFn.mock.calls[0]![0]).toMatchObject({
+       baseUrl: "https://gw/api",
+       model: "m1",
++      api: "openai-responses",
+     });
+   });
+ 
++  it("rejects an invalid provider api", async () => {
++    const initFn = vi.fn();
++    await expect(run(["init", "--api", "openai-magic"], { initFn })).rejects.toThrow(
++      /Invalid provider API/,
++    );
++    expect(initFn).not.toHaveBeenCalled();
++  });
++
+   it("dispatches `logs --runtime`", async () => {
+     const logsFn = vi.fn().mockResolvedValue("");
+     await run(["logs", "--runtime"], { logsFn });
+diff --git a/packages/cli/src/program.ts b/packages/cli/src/program.ts
+index c00e7c02..a7c812dc 100644
+--- a/packages/cli/src/program.ts
++++ b/packages/cli/src/program.ts
+@@ -6,6 +6,7 @@
+ import { Command } from "commander";
+ import { createRequire } from "node:module";
+ import pc from "picocolors";
++import { ProviderApiSchema, type ProviderApi } from "@brainpilot/protocol";
+ import { up } from "./commands/up.js";
+ import { down } from "./commands/down.js";
+ import { status } from "./commands/status.js";
+@@ -43,6 +44,16 @@ function parseMode(value: string): "local" | "static" | "docker" {
+   throw new Error(`Invalid mode: ${value} (expected local | static | docker)`);
+ }
+ 
++function parseProviderApi(value: string): ProviderApi {
++  const parsed = ProviderApiSchema.safeParse(value);
++  if (!parsed.success) {
++    throw new Error(
++      `Invalid provider API: ${value} (expected anthropic-messages | openai-completions | openai-responses | azure-openai-responses)`,
++    );
++  }
++  return parsed.data;
++}
++
+ /** Read the CLI package version from its own package.json (single source of truth). */
+ function requireVersion(): string {
+   const require = createRequire(import.meta.url);
+@@ -117,6 +128,7 @@ export function buildProgram(deps: ProgramDeps = {}): Command {
+     .option("--api-key <key>", "provider API key to persist")
+     .option("--base-url <url>", "provider base URL (gateway) to persist")
+     .option("--model <id>", "default model id")
++    .option("--api <protocol>", "provider wire protocol", parseProviderApi)
+     .action(async (opts) => {
+       await initFn({
+         dir: opts.dir,
+@@ -124,6 +136,7 @@ export function buildProgram(deps: ProgramDeps = {}): Command {
+         apiKey: opts.apiKey,
+         baseUrl: opts.baseUrl,
+         model: opts.model,
++        api: opts.api,
+       });
+     });
+ 
+diff --git a/packages/docs/content/docs/providers.mdx b/packages/docs/content/docs/providers.mdx
+index 6e4b03ad..e7a8e86c 100644
+--- a/packages/docs/content/docs/providers.mdx
++++ b/packages/docs/content/docs/providers.mdx
+@@ -12,6 +12,9 @@ BrainPilot can talk to multiple model provider protocols:
+ 
+ The safest beginner path is the web UI because it writes the configuration file for you.
+ 
++BrainPilot does not infer the Responses API from a model name. The new-provider form defaults
++to `Anthropic Messages`; explicitly select the protocol exposed by your provider.
++
+ ## Add a Provider in the UI
+ 
+ 1. Start BrainPilot with `brainpilot up`.
+@@ -47,11 +50,15 @@ For a custom endpoint:
+ ```bash
+ brainpilot init \
+   --api-key <your-api-key> \
+-  --base-url https://your-gateway.example.com \
+-  --model glm-5.2
++  --base-url https://api.openai.com/v1 \
++  --model <model-id> \
++  --api openai-responses
+ ```
+ 
+-The UI remains the recommended path for multiple providers and model lists.
++`--api` accepts `anthropic-messages`, `openai-completions`, `openai-responses`, or
++`azure-openai-responses`. Omitting it retains the backward-compatible
++`anthropic-messages` default. The UI remains the recommended path for multiple providers and
++model lists.
+ 
+ ## Where Provider Config Lives
+ 
+@@ -67,18 +74,26 @@ If you launch with `--dir` or `BP_DATA_DIR`, look under that data directory inst
+ 
+ Use the protocol that matches your model gateway:
+ 
+-| Gateway behavior | Protocol to try first |
+-| --- | --- |
+-| Anthropic-compatible `/messages` API | `Anthropic Messages` |
+-| OpenAI-compatible chat/completions API | `OpenAI Completions` |
+-| OpenAI Responses API | `OpenAI Responses` |
+-| Azure-hosted Responses API | `Azure OpenAI Responses` |
++| Gateway behavior | Protocol | Example base URL | Model ID |
++| --- | --- | --- | --- |
++| Anthropic-compatible `/messages` API | `Anthropic Messages` | `https://api.anthropic.com` | Provider model ID |
++| OpenAI-compatible chat/completions API | `OpenAI Completions` | `https://api.openai.com/v1` | Provider model ID |
++| OpenAI Responses API | `OpenAI Responses` | `https://api.openai.com/v1` | Responses-capable model ID |
++| Azure-hosted Responses API | `Azure OpenAI Responses` | `https://<resource>.openai.azure.com` | Azure deployment name |
++
++For Azure, prefer the resource root URL; BrainPilot normalizes Azure OpenAI resource URLs to
++`/openai/v1`. If the Azure deployment name differs from the base model name, enter the
++deployment name as the Model ID.
++
++**Test** sends one minimal real model request through the selected protocol so it can validate
++the URL, protocol, model, and key together. This may incur a small amount of model usage.
+ 
+ If provider testing fails, confirm the base URL, protocol, model ID, and key with your provider.
+ 
+ ## Beginner Checklist
+ 
+ - The base URL should not include random trailing path segments unless your gateway requires them.
++- Official OpenAI endpoints normally use an API root ending in `/v1`; follow the gateway's own documentation for compatible third-party services.
+ - The model ID must match exactly what the gateway expects.
+ - Save first, then click **Use**.
+ - Start a new session after changing the active provider if an existing session still uses the old setting.
+diff --git a/packages/docs/content/docs/providers.zh-cn.mdx b/packages/docs/content/docs/providers.zh-cn.mdx
+index 51782d07..2c320b49 100644
+--- a/packages/docs/content/docs/providers.zh-cn.mdx
++++ b/packages/docs/content/docs/providers.zh-cn.mdx
+@@ -12,6 +12,9 @@ BrainPilot 支持多种模型服务商协议：
+ 
+ 对新手来说，最稳妥的方式是使用 Web UI，因为它会自动写入配置文件。
+ 
++BrainPilot 不会根据模型名称自动切换到 Responses API。新增 Provider 时，界面默认选择
++`Anthropic Messages`；请根据服务商实际提供的接口明确选择协议。
++
+ ## 在界面中添加服务商
+ 
+ 1. 运行 `brainpilot up`。
+@@ -47,11 +50,14 @@ brainpilot init --api-key <your-api-key>
+ ```bash
+ brainpilot init \
+   --api-key <your-api-key> \
+-  --base-url https://your-gateway.example.com \
+-  --model glm-5.2
++  --base-url https://api.openai.com/v1 \
++  --model <model-id> \
++  --api openai-responses
+ ```
+ 
+-如果需要多个 provider 或模型列表，仍然建议使用 UI 配置。
++`--api` 可取 `anthropic-messages`、`openai-completions`、`openai-responses` 或
++`azure-openai-responses`。省略时保留向后兼容默认值 `anthropic-messages`。如果需要多个
++provider 或模型列表，仍然建议使用 UI 配置。
+ 
+ ## 配置文件在哪里
+ 
+@@ -67,18 +73,26 @@ brainpilot/bp_template/providers.json
+ 
+ 选择与你的模型网关匹配的协议：
+ 
+-| 网关行为 | 优先尝试的协议 |
+-| --- | --- |
+-| Anthropic 兼容的 `/messages` API | `Anthropic Messages` |
+-| OpenAI 兼容的 chat/completions API | `OpenAI Completions` |
+-| OpenAI Responses API | `OpenAI Responses` |
+-| Azure 托管的 Responses API | `Azure OpenAI Responses` |
++| 网关行为 | 协议 | Base URL 示例 | Model ID |
++| --- | --- | --- | --- |
++| Anthropic 兼容的 `/messages` API | `Anthropic Messages` | `https://api.anthropic.com` | 服务商模型 ID |
++| OpenAI 兼容的 chat/completions API | `OpenAI Completions` | `https://api.openai.com/v1` | 服务商模型 ID |
++| OpenAI Responses API | `OpenAI Responses` | `https://api.openai.com/v1` | 支持 Responses 的模型 ID |
++| Azure 托管的 Responses API | `Azure OpenAI Responses` | `https://<resource>.openai.azure.com` | Azure deployment 名称 |
++
++Azure 建议填写资源根地址；BrainPilot 会将 Azure OpenAI 资源地址归一化到
++`/openai/v1`。如果 Azure 中的 deployment 名称与基础模型名称不同，请在 Model ID 中填写
++deployment 名称。
++
++**Test** 会使用所选协议发起一次极小的真实模型请求，用于同时检查 URL、协议、模型和
++key。该请求可能产生少量模型用量。
+ 
+ 如果测试失败，先确认 base URL、协议、模型 ID 和 key 是否与服务商要求一致。
+ 
+ ## 新手检查清单
+ 
+ - Base URL 不要随意带多余路径，除非网关明确要求。
++- OpenAI 官方接口通常填写包含 `/v1` 的 API 根地址；第三方兼容网关以其文档为准。
+ - 模型 ID 必须与网关支持的 ID 完全一致。
+ - 先保存，再点 **Use（使用）**。
+ - 如果已有会话仍在使用旧配置，修改当前服务商后新建一个会话。

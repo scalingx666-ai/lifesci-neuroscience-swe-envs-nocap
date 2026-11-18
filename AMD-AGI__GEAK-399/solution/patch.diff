@@ -1,0 +1,1171 @@
+diff --git a/.github/workflows/ci-l0-checks.yml b/.github/workflows/ci-l0-checks.yml
+index 82a19599a..4c22ceb3d 100644
+--- a/.github/workflows/ci-l0-checks.yml
++++ b/.github/workflows/ci-l0-checks.yml
+@@ -37,6 +37,16 @@ jobs:
+         continue-on-error: true
+         run: ruff check .
+ 
++      # Blocking, unlike ruff: the shell here is not advisory decoration, it is the
++      # server-kill contract (server_teardown.sh) and the dispatcher that must find it.
++      # A parse error there means the EXIT trap never binds and a served model is left
++      # holding its VRAM and port. `bash -n` catches that in milliseconds; no shellcheck
++      # dependency, so the job keeps its no-install-beyond-ruff shape.
++      - name: bash syntax check (e2e shell contract)
++        run: |
++          find e2e_workflow/scripts kernel_workflow/scripts -name '*.sh' -print0 \
++            | xargs -0 -n1 bash -n
++
+   pytest:
+     name: Python unit tests + coverage
+     runs-on: ubuntu-latest
+@@ -73,6 +83,8 @@ jobs:
+             e2e_workflow/scripts/tests/test_attribute_weights_edges.py \
+             e2e_workflow/scripts/tests/test_op_bench.py \
+             e2e_workflow/scripts/tests/test_harness_lib.py \
++            e2e_workflow/scripts/tests/test_server_teardown.py \
++            e2e_workflow/scripts/tests/test_bench_e2e_teardown_lookup.py \
+             geak/test_bootstrap.py
+ 
+       # Renders the per-file table + total into the run's Job Summary, which is
+diff --git a/e2e_workflow/README.md b/e2e_workflow/README.md
+index 0dec16886..aa792cdd1 100644
+--- a/e2e_workflow/README.md
++++ b/e2e_workflow/README.md
+@@ -208,6 +208,7 @@ roles/                 director, system_architect, profiler, config_tuner, kerne
+ knowledge/             e2e_optimization, profile_parse, preflight (env self-check), backend_playbook + gemm_attention_backends (persistent), sglang_internals, shape_capture
+ knowledge/analysis_skills/  pluggable profile-analysis skills (INDEX.md + one dir per skill; `roofline` ships by default)
+ scripts/               bench_e2e.sh (backend-agnostic dispatcher), adapters/{sglang,vllm}.sh, parse_profile.py (Top-N), op_bench.py, capture_shapes.py, overlay_setup.py
++scripts/server_teardown.sh  the shared server-kill contract (identity verified at LAUNCH: pid, pgid, /proc start time). Every script that launches a server, including role-authored capture scripts, must source it instead of hand-rolling a kill.
+ ```
+ 
+ ## Generality
+diff --git a/e2e_workflow/e2e_workflow.js b/e2e_workflow/e2e_workflow.js
+index f620762c5..8143ef69f 100644
+--- a/e2e_workflow/e2e_workflow.js
++++ b/e2e_workflow/e2e_workflow.js
+@@ -613,7 +613,32 @@ Return ONLY the structured JSON the role file specifies (a StructuredOutput tool
+ // it to 45min so a single hung/slow agent can't blow the wall-clock budget (still ample for the director
+ // baseline + the head e2e A/B). Default mode keeps 120min → unchanged.
+ const AGENT_TIMEOUT_MS = parseInt(A.agent_timeout_ms != null ? A.agent_timeout_ms : (FAST_MODE ? 2700000 : 7200000), 10);
+-function agentBounded(prompt, opts) {
++// Process-safety rule prepended to EVERY agent prompt. It is injected at this funnel
++// (the one place `agent()` is ever called) rather than in roleAgent(), because several
++// prompts are built inline and would otherwise never see it — and any future call site
++// inherits it automatically instead of having to remember it. Bash-capable agents own
++// server lifecycles, and a pattern-matched kill is indistinguishable from a correct one
++// until it TERMs the caller's orchestrator and fails the whole task.
++const PROCESS_SAFETY = `## PROCESS SAFETY (a violation can kill the caller's orchestrator, failing the whole task)
++This container's PID 1 is the CALLER's orchestrator process, not yours, and it is NOT restartable.
++NEVER run global or pattern-matched process cleanup: no \`pkill -f\` / \`pgrep -f ... | xargs kill\` /
++\`killall\` / \`ps aux | grep ... | xargs kill\`, and never \`kill -- -PGID\` for a group you did not
++create. A pattern as innocent as \`-f vllm\` matches the orchestrator's own command line and TERMs it.
++Manage ONLY processes you started, by the pid you captured at launch. When a script of yours launches a
++server, do NOT hand-roll the shutdown — source the shared teardown contract, which verifies process
++identity (pid, pgid, /proc start time) before signalling anything:
++    source ${WORKFLOW_DIR}/scripts/server_teardown.sh
++    trap server_teardown EXIT
++    \${SERVER_LAUNCH_PREFIX:-} <launch server> &   # own session => pgid == pid
++    SERVER_PID=\$!; server_record_identity "\$SERVER_PID"
++
++`;
++function withProcessSafety(prompt) {
++  return typeof prompt === 'string' ? PROCESS_SAFETY + prompt : prompt;
++}
++
++function agentBounded(rawPrompt, opts) {
++  const prompt = withProcessSafety(rawPrompt);
+   if (typeof setTimeout !== 'function' || !(AGENT_TIMEOUT_MS > 0)) return agent(prompt, opts);
+   let to;
+   const guard = new Promise((resolve) => {
+diff --git a/e2e_workflow/roles/director.md b/e2e_workflow/roles/director.md
+index 8b4ed9c05..128f8720e 100644
+--- a/e2e_workflow/roles/director.md
++++ b/e2e_workflow/roles/director.md
+@@ -46,6 +46,7 @@ Steps:
+    echo "$MODEL_PATH" > "$EVAL_DIR/model_path.txt"
+    [ -n "$LAUNCH_SCRIPT" ] && cp "$LAUNCH_SCRIPT" "$EVAL_DIR/launch_baseline.sh"
+    cp "$SKILL_DIR/scripts/bench_e2e.sh" "$EVAL_DIR/bench_e2e.sh"
++   cp "$SKILL_DIR/scripts/server_teardown.sh" "$EVAL_DIR/server_teardown.sh"   # the server-kill contract; bench_e2e.sh REFUSES to run without it
+    cp -r "$SKILL_DIR/scripts/adapters" "$EVAL_DIR/adapters"   # bench_e2e.sh sources adapters/<backend>.sh next to itself
+    cp "$SKILL_DIR/scripts/parse_profile.py" "$EVAL_DIR/parse_profile.py"
+    ```
+diff --git a/e2e_workflow/roles/profiler.md b/e2e_workflow/roles/profiler.md
+index 27d1dabdd..7a65ed5ae 100644
+--- a/e2e_workflow/roles/profiler.md
++++ b/e2e_workflow/roles/profiler.md
+@@ -142,7 +142,16 @@ degrade to whatever is available, and if both analysis.md and trace are unusable
+    - rocprofv3 finalization is SLOW on multi-rank serving (TP>1): on shutdown the multiprocessing
+      `resource_tracker` reaps the vLLM TP workers' leaked shm/semaphores, and the CSV is flushed only
+      AFTER that — this routinely takes **8–20 min. That is normal, not a hang.**
+-   - So after the bench: stop the server with SIGINT/`kill` (NEVER `kill -9` the rocprofv3 parent) and
++   - So after the bench: **stop nothing yourself.** `bench_e2e.sh` has already torn the server down
++     through the shared teardown contract (`scripts/server_teardown.sh`) in its EXIT trap by the time
++     the command in step 1 returns, so there is no server left for you to stop, and a `pgrep`/`pkill`
++     hunt for the "leftover" rocprofv3 or server process is the exact banned action (see PROCESS
++     SAFETY in your prompt) — never a hand-rolled or pattern-matched kill, and NEVER `kill -9` the
++     rocprofv3 parent. If you ever launch a long-lived server YOURSELF rather than through
++     `bench_e2e.sh`, you must launch it through that same contract
++     (`source "$EVAL_DIR/server_teardown.sh"; trap server_teardown EXIT; ${SERVER_LAUNCH_PREFIX:-}
++     <launch> & server_record_identity "$!"`) — sourcing it in a shell that did not launch the server
++     is a no-op by design. Then
+      **WAIT PATIENTLY for the CSV to flush — poll for `*kernel*trace*.csv` / `*kernel*stats*.csv` to
+      appear, up to ~25 min, and only then continue. Do NOT abandon at 3–5 min.** (The instrumented
+      server's health-wait may stay bounded at ~10 min, since a genuinely stuck load is a real failure;
+diff --git a/e2e_workflow/scripts/adapters/launchers/magpie.sh b/e2e_workflow/scripts/adapters/launchers/magpie.sh
+index fada00cac..5995f671d 100644
+--- a/e2e_workflow/scripts/adapters/launchers/magpie.sh
++++ b/e2e_workflow/scripts/adapters/launchers/magpie.sh
+@@ -92,5 +92,29 @@ adapter_launch() {
+     tail -n 60 "$LOG" 2>/dev/null || true
+     return 2
+   fi
+-  echo ">>> magpie launcher: $BACKEND server up (pid $SERVER_PID) via $(basename "$script")."
++  # This pid came from an EXTERNAL script's pid file, so we cannot assume it leads its
++  # own group, and a stale file can name a pid that now belongs to someone else
++  # entirely (worst case: the caller's orchestrator). Either case must DISABLE group
++  # teardown here, at launch, rather than be discovered by a kill that already fired.
++  local _mp_pgid _mp_args
++  _mp_pgid="$(ps -o pgid= -p "$SERVER_PID" 2>/dev/null | tr -d ' ')"
++  _mp_args="$(ps -o args= -p "$SERVER_PID" 2>/dev/null)"
++  if [ "$_mp_pgid" != "$SERVER_PID" ]; then
++    SERVER_GROUP_UNVERIFIED=1
++    echo "!!! magpie launcher: pid $SERVER_PID does not lead its own group (pgid=${_mp_pgid:-?});" \
++         "group teardown disabled for this launch." >&2
++  fi
++  # The "is this actually our server?" test is DERIVED from this run's own config
++  # ($BACKEND, $PORT) — never a hard-coded backend list, which would silently
++  # mis-judge every future Magpie backend the same way it mis-judges a stale pid.
++  case "$_mp_args" in
++    *"$BACKEND"*|*"$PORT"*) : ;;
++    *)
++      SERVER_GROUP_UNVERIFIED=1
++      echo "!!! magpie launcher: pid $SERVER_PID matches neither BACKEND='$BACKEND' nor" \
++           "PORT='$PORT' (args='$(printf '%s' "$_mp_args" | cut -c1-120)') — stale pid file?" \
++           "group teardown disabled for this launch." >&2 ;;
++  esac
++  export SERVER_GROUP_UNVERIFIED
++  echo ">>> magpie launcher: $BACKEND server up (pid $SERVER_PID, pgid=${_mp_pgid:-?}) via $(basename "$script")."
+ }
+diff --git a/e2e_workflow/scripts/adapters/sglang.sh b/e2e_workflow/scripts/adapters/sglang.sh
+index a771e4cea..8c2a90a52 100644
+--- a/e2e_workflow/scripts/adapters/sglang.sh
++++ b/e2e_workflow/scripts/adapters/sglang.sh
+@@ -28,8 +28,10 @@ adapter_launch() {
+   # (~77 per import), which hang under GPU/KFD contention and pile up into a box-degrading storm
+   # (observed: 561 procs, e2e throughput halved). Detect once here; honor a caller-set value.
+   local _ga="${GPU_ARCHS:-$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-f]+' || true)}"
++  # Launch through $SERVER_LAUNCH_PREFIX (adapter contract): it puts the server in its
++  # own session so teardown can prove the process group is ours. Empty when unset.
+   # shellcheck disable=SC2086
+-  env $EXTRA_ENV \
++  ${SERVER_LAUNCH_PREFIX:-} env $EXTRA_ENV \
+     ${_ga:+GPU_ARCHS=$_ga} \
+     HIP_VISIBLE_DEVICES=$GPU CUDA_VISIBLE_DEVICES=$GPU \
+     SGLANG_TORCH_PROFILER_DIR="$PROFILE_DIR" \
+diff --git a/e2e_workflow/scripts/adapters/vllm.sh b/e2e_workflow/scripts/adapters/vllm.sh
+index 899458650..8a7de54ef 100644
+--- a/e2e_workflow/scripts/adapters/vllm.sh
++++ b/e2e_workflow/scripts/adapters/vllm.sh
+@@ -46,8 +46,10 @@ adapter_launch() {
+       _prof_env=(VLLM_TORCH_PROFILER_DIR="$PROFILE_DIR")
+     fi
+   fi
++  # Launch through $SERVER_LAUNCH_PREFIX (adapter contract): it puts the server in its
++  # own session so teardown can prove the process group is ours. Empty when unset.
+   # shellcheck disable=SC2086
+-  env $EXTRA_ENV \
++  ${SERVER_LAUNCH_PREFIX:-} env $EXTRA_ENV \
+     ${_ga:+GPU_ARCHS=$_ga} \
+     HIP_VISIBLE_DEVICES=$GPU CUDA_VISIBLE_DEVICES=$GPU \
+     "${_prof_env[@]}" \
+diff --git a/e2e_workflow/scripts/bench_e2e.sh b/e2e_workflow/scripts/bench_e2e.sh
+index 857e6e0b9..008c7c308 100755
+--- a/e2e_workflow/scripts/bench_e2e.sh
++++ b/e2e_workflow/scripts/bench_e2e.sh
+@@ -15,6 +15,16 @@
+ #   adapter_launch                  -> launch the server in background; set global SERVER_PID; write $LOG.
+ #                                      Reads: MODEL HOST PORT TP GPU MEM_FRACTION EXTRA_SERVER_ARGS
+ #                                             EXTRA_ENV OVERLAY_PYTHONPATH PROFILE PROFILE_DIR
++#                                      MUST launch through the shared prefix:
++#                                        ${SERVER_LAUNCH_PREFIX:-} env ... <server> ... & SERVER_PID=$!
++#                                      That prefix (server_teardown.sh) puts the server in its OWN
++#                                      session, which is the ONLY thing that lets teardown PROVE the
++#                                      process group belongs to this launch and reap the whole tree.
++#                                      An adapter that launches without it still works, but its
++#                                      teardown degrades to pid+descendants. A launcher that cannot
++#                                      control the launch (it delegates to an external script) must
++#                                      instead set SERVER_GROUP_UNVERIFIED=1 unless it can show the
++#                                      pid leads its own group.
+ #   adapter_health                  -> return 0 iff $BASE_URL is serving (e.g. curl /health)
+ #   adapter_bench  NUMP MAXC PROF   -> run ONE bench (random ISL/OSL), append a result JSON line to
+ #                                      $RESULT_JSONL with canonical keys (output_throughput,
+@@ -323,32 +333,37 @@ echo "Out dir:      $OUT_DIR"
+ echo
+ 
+ SERVER_PID=""
+-cleanup() {
+-  [ -n "${SERVER_PID:-}" ] || return 0
+-  echo ">>> Shutting down server (pid $SERVER_PID) ..."
+-  # A launcher that starts the server in its OWN process group / session (e.g.
+-  # the Magpie launcher uses `setsid`) leaves the worker/child procs OUTSIDE
+-  # $SERVER_PID, so a bare `kill $SERVER_PID` orphans them (leaked VRAM, ghost
+-  # listeners on the port). When the server's process group differs from OURS,
+-  # reap the WHOLE group (TERM, then KILL after a grace window). The own-group
+-  # guard is critical: for a NATIVE launch the server shares our group, so we
+-  # must NOT group-kill (that would kill bench_e2e.sh itself) — fall back to the
+-  # single-pid kill, byte-identical to before.
+-  local _pgid _self
+-  _pgid="$(ps -o pgid= -p "$SERVER_PID" 2>/dev/null | tr -d ' ')"
+-  _self="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+-  if [ -n "$_pgid" ] && [ "$_pgid" != "$_self" ]; then
+-    kill -TERM "-$_pgid" 2>/dev/null || kill -TERM "$SERVER_PID" 2>/dev/null || true
+-    for _i in $(seq 1 "${SERVER_STOP_GRACE_S:-10}"); do
+-      kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1
+-    done
+-    kill -0 "$SERVER_PID" 2>/dev/null && kill -KILL "-$_pgid" 2>/dev/null || true
+-  else
+-    kill "$SERVER_PID" 2>/dev/null || true
+-  fi
+-  wait "$SERVER_PID" 2>/dev/null || true
+-}
+-trap cleanup EXIT
++# Server lifecycle: the teardown contract lives in server_teardown.sh so the SAME
++# identity-verified kill is used by this dispatcher and by any role-authored capture
++# script (which previously hand-rolled its own kill). The old cleanup resolved the
++# server's pgid AT KILL TIME and group-killed whenever it differed from ours — a pid
++# that had exited and been recycled resolved to a stranger's group, which is how a
++# teardown can reach the caller's orchestrator / PID 1.
++#
++# This script is COPIED into $EVAL_DIR (roles/director.md) and run from there, so the
++# library has to be found next to the copy. If it is not, the teardown silently becomes
++# a no-op: `source` fails, the EXIT trap resolves to a missing function, and the served
++# model is left running with its VRAM and port held while the serving-GPU lock is
++# released — the next launch then OOMs. So look next to us, then in the ORIGINAL scripts
++# dir when the caller told us where that is, and REFUSE to run otherwise. A benchmark
++# that cannot stop what it starts must not start it.
++TEARDOWN_LIB=""
++for _cand in "$HERE/server_teardown.sh" "${SKILL_DIR:-}/scripts/server_teardown.sh" \
++             "${WORKFLOW_DIR:-}/scripts/server_teardown.sh"; do
++  case "$_cand" in /scripts/server_teardown.sh) continue ;; esac   # unset SKILL_DIR/WORKFLOW_DIR
++  [ -f "$_cand" ] && { TEARDOWN_LIB="$_cand"; break; }
++done
++if [ -z "$TEARDOWN_LIB" ]; then
++  echo "!!! server_teardown.sh not found next to this script ($HERE) or under SKILL_DIR/WORKFLOW_DIR." >&2
++  echo "    It carries the server-kill contract; without it the EXIT trap is a no-op and the" >&2
++  echo "    launched server would be LEAKED (VRAM + port held, serving-GPU lock released)." >&2
++  echo "    Stage it alongside bench_e2e.sh: cp \"\$SKILL_DIR/scripts/server_teardown.sh\" \"\$EVAL_DIR/\"" >&2
++  exit 3
++fi
++[ "$TEARDOWN_LIB" = "$HERE/server_teardown.sh" ] || echo ">>> teardown contract: $TEARDOWN_LIB (not staged next to this copy)"
++# shellcheck disable=SC1090
++source "$TEARDOWN_LIB"
++trap server_teardown EXIT
+ 
+ # ---- serving-GPU mutex ----
+ # TP=N on an N-GPU box means SERVING_GPU = ALL gpus = a SINGLE serving slot.
+@@ -374,6 +389,9 @@ if [ "$REUSE_SERVER" != "1" ]; then
+   echo ">>> Launching $BACKEND server (log: $LOG) ..."
+   adapter_launch
+   if [ -z "${SERVER_PID:-}" ]; then echo "!!! adapter_launch did not set SERVER_PID"; exit 2; fi
++  # Freeze the server's process identity NOW (pid, pgid, /proc start time) so the
++  # EXIT teardown never has to ask "who owns this pid?" after the pid may be gone.
++  server_record_identity "$SERVER_PID"
+ 
+   echo ">>> Waiting for server health ..."
+   # An overlaid candidate can wedge: process stays alive but /health 503s forever (JIT deadlock /
+diff --git a/e2e_workflow/scripts/server_teardown.sh b/e2e_workflow/scripts/server_teardown.sh
+new file mode 100644
+index 000000000..bdc49f331
+--- /dev/null
++++ b/e2e_workflow/scripts/server_teardown.sh
+@@ -0,0 +1,245 @@
++#!/usr/bin/env bash
++# Server teardown driven by LAUNCH-TIME process identity.  Sourced, never executed.
++#
++# WHY THIS EXISTS: resolving `ps -o pgid= -p $PID` during cleanup answers a question
++# about whoever owns that pid *now*. Once the server exits and its pid is recycled the
++# answer is an unrelated process's group, and a group TERM aimed at it can reach the
++# caller's orchestrator or container PID 1 (a benchmark teardown was observed TERMing
++# the parent coordinator running as PID 1, which failed the whole task ~72min later).
++# So WHAT we launched is frozen at launch and never re-derived at kill time. The same
++# rule is already enforced elsewhere in the org: a kill path must not consult
++# getpgid(pid), because pid reuse makes the answer a stranger.
++#
++# Contract for callers (scripts/bench_e2e.sh and any agent-authored capture script):
++#     source "<scripts>/server_teardown.sh"
++#     trap server_teardown EXIT
++#     <launch the server, setting SERVER_PID>
++#     server_record_identity "$SERVER_PID"
++#
++# Teardown picks ONE of two modes and says which, plus why, on stdout:
++#   GROUP kill  -- only when the launch PROVED pgid == pid, i.e. the group can contain
++#                  nothing but our server's descendants.
++#   PID kill    -- the server pid plus its verified transitive descendants. Keeps the
++#                  anti-orphan intent (setsid'd vLLM/sglang workers live outside
++#                  SERVER_PID and leak VRAM) without ever signalling a group.
++#
++# Optional env:
++#   GEAK_PROTECTED_PGIDS  space-separated pgids that must NEVER be group-signalled
++#                         (a caller exports its own so our teardown cannot reach it).
++#   SERVER_GROUP_UNVERIFIED=1  set by a launcher that cannot vouch for the group
++#                         (e.g. the pid came from an external script's pid file).
++#   SERVER_STOP_GRACE_S   seconds between TERM and KILL (default 10).
++
++# `setsid` skips its internal fork only when the caller is NOT a process-group leader.
++# Non-interactive bash has job control off, so a backgrounded `setsid cmd` keeps
++# $! == the server pid and the server stays our child (wait / kill -0 keep working).
++# With job control ON, $! would be a wrapper that exits immediately and the real
++# server would be unreachable, so pin job control off for every sourcing shell.
++set +m
++
++# The launch prefix EVERY adapter must launch through (see the adapter contract in
++# bench_e2e.sh): `${SERVER_LAUNCH_PREFIX:-} env ... server ... &`.
++# `setsid` makes the server lead its own session, so pgid == pid -- the one condition
++# under which teardown can PROVE a process group is ours and reap the whole tree
++# (framework worker procs escape SERVER_PID and otherwise leak VRAM). Defined ONCE
++# here rather than per adapter so a new backend inherits it by following the contract
++# instead of by remembering to copy a line. Empty when the binary is absent, and a
++# scalar (not an array) so `${SERVER_LAUNCH_PREFIX:-}` degrades to NO argument under
++# `set -u` even in a shell that never sourced this file.
++SERVER_LAUNCH_PREFIX=""
++command -v setsid >/dev/null 2>&1 && SERVER_LAUNCH_PREFIX="setsid"
++
++SERVER_PID="${SERVER_PID:-}"
++SERVER_PGID=""                                    # set ONLY when the group is proven ours
++SERVER_START_TICKS=""                             # /proc starttime -> detects pid reuse
++SERVER_GROUP_UNVERIFIED="${SERVER_GROUP_UNVERIFIED:-0}"
++BENCH_PID=$$
++BENCH_PGID="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
++# 1 is always protected: container init / a PID-1 orchestrator. Our own group is
++# protected because signalling it would take down the benchmark shell itself.
++SERVER_PROTECTED_PGIDS="1 ${BENCH_PGID} ${GEAK_PROTECTED_PGIDS:-}"
++
++_pgid_of() {  # _pgid_of PID -> pgid, or "" when the pid is gone
++  ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '
++}
++
++# Root of the proc filesystem. Overridable so the start-time parser can be exercised
++# against fixture files — `comm` may contain spaces AND parens, and getting that wrong
++# silently disables the pid-reuse gate (an empty start time reads as "cannot verify").
++SERVER_PROC_ROOT="${SERVER_PROC_ROOT:-/proc}"
++
++_start_ticks_of() {  # _start_ticks_of PID -> /proc/PID/stat starttime (field 22)
++  local _stat
++  _stat="$(cat "$SERVER_PROC_ROOT/$1/stat" 2>/dev/null)" || return 1
++  # comm (field 2) can contain spaces AND parens -> cut through the LAST ") ".
++  _stat="${_stat##*\) }"
++  # The remainder begins at `state` (field 3), so starttime (field 22) is $20.
++  printf '%s\n' "$_stat" | awk '{print $20}'
++}
++
++# server_record_identity PID -- freeze the launched server's identity. Call ONCE,
++# immediately after the launch, before anything can exit and recycle the pid.
++server_record_identity() {
++  SERVER_PID="$1"
++  SERVER_PGID=""
++  SERVER_START_TICKS="$(_start_ticks_of "$SERVER_PID" || true)"
++  local _pgid
++  _pgid="$(_pgid_of "$SERVER_PID")"
++  # pgid == pid is the ONLY structural proof that the group belongs to this launch:
++  # a group led by our own server can contain nothing but its own descendants, so it
++  # cannot contain PID 1 or the caller's tree. Anything else (a group inherited from
++  # us, or a pid read out of an external pid file) is treated as unproven.
++  if [ -n "$_pgid" ] && [ "$_pgid" = "$SERVER_PID" ] && [ "$SERVER_GROUP_UNVERIFIED" != "1" ]; then
++    SERVER_PGID="$SERVER_PID"
++  fi
++  local _mode="pid+descendants"
++  [ -n "$SERVER_PGID" ] && _mode="group"
++  echo ">>> server identity: pid=$SERVER_PID pgid=${_pgid:-?} start_ticks=${SERVER_START_TICKS:-?}" \
++       "teardown_mode=$_mode | bench pid=$BENCH_PID pgid=${BENCH_PGID:-?}" \
++       "protected_pgids='$SERVER_PROTECTED_PGIDS'"
++}
++
++# Sets $_deny with the refusal reason when it returns non-zero.
++_group_kill_allowed() {
++  local _p
++  [ -n "$SERVER_PGID" ] || { _deny="group was not verified at launch"; return 1; }
++  case "$SERVER_PGID" in ''|*[!0-9]*) _deny="pgid '$SERVER_PGID' is not numeric"; return 1 ;; esac
++  # `kill -TERM -1` is NOT a group kill: it is a broadcast to every process we are
++  # allowed to signal. It must be unreachable, including from an empty/zero lookup.
++  [ "$SERVER_PGID" -gt 1 ] || { _deny="pgid<=1 (would broadcast, not group-kill)"; return 1; }
++  for _p in $SERVER_PROTECTED_PGIDS; do
++    if [ "$SERVER_PGID" = "$_p" ]; then
++      _deny="pgid $SERVER_PGID is protected (matches $_p)"
++      return 1
++    fi
++  done
++  # Defence in depth: refuse if the LIVE group somehow holds pid 1 or ourselves.
++  for _p in $(ps -eo pid=,pgid= 2>/dev/null | awk -v g="$SERVER_PGID" '$2==g{print $1}'); do
++    if [ "$_p" = "1" ] || [ "$_p" = "$BENCH_PID" ]; then
++      _deny="group $SERVER_PGID contains pid $_p"
++      return 1
++    fi
++  done
++  return 0
++}
++
++# Does the frozen identity still hold? "" start ticks means we could never verify in
++# the first place (unreadable /proc) -- that fails OPEN by design, since the pgid==pid
++# proof and the protected-pgid veto still stand between us and a stranger's group.
++_identity_still_matches() {
++  local _now
++  [ -n "$SERVER_START_TICKS" ] || return 0
++  _now="$(_start_ticks_of "$SERVER_PID" || true)"
++  [ -z "$_now" ] || [ "$_now" = "$SERVER_START_TICKS" ]
++}
++
++# Is PID an ancestor of the benchmark shell? Such a pid CANNOT be a server we launched:
++# it is our parent chain -- the run_e2e driver, the caller's orchestrator, init. A pid
++# file that names one (stale, or recycled into the caller's tree) would otherwise send
++# the teardown walking UP the process tree, which is exactly how issue #397 killed the
++# coordinator. Checked on the pid path too, where the pgid==pid proof does not apply.
++_is_bench_ancestor() {  # _is_bench_ancestor PID
++  local _map _p="$BENCH_PID" _parent _hops=0
++  _map="$(ps -eo pid=,ppid= 2>/dev/null)"
++  while [ "$_hops" -lt 64 ]; do
++    _parent="$(printf '%s\n' "$_map" | awk -v k="$_p" '$1==k{print $2; exit}')"
++    [ -n "$_parent" ] || return 1
++    [ "$_parent" = "$1" ] && return 0
++    [ "$_parent" -gt 1 ] 2>/dev/null || return 1
++    _p="$_parent"
++    _hops=$((_hops + 1))
++  done
++  return 1
++}
++
++# Transitive descendants of SERVER_PID, excluding pid 1 and ourselves.
++_server_descendants() {
++  ps -eo pid=,ppid= 2>/dev/null | awk -v root="$SERVER_PID" -v self="$BENCH_PID" '
++    { parent[$1] = $2 }
++    END {
++      mark[root] = 1
++      changed = 1
++      while (changed) {
++        changed = 0
++        for (p in parent) if (!mark[p] && parent[p] in mark && mark[parent[p]]) { mark[p] = 1; changed = 1 }
++      }
++      for (p in mark) if (mark[p] && p != root && p != self && p != 1) print p
++    }'
++}
++
++server_teardown() {
++  [ -n "${SERVER_PID:-}" ] || return 0
++  # A server we launched can never BE init, and a non-numeric pid means a pid file /
++  # launcher handed us garbage. Refuse before any signal, so the pid-only fallback
++  # can no more reach PID 1 than the group path can.
++  case "$SERVER_PID" in
++    *[!0-9]*)
++      echo "!!! SERVER_PID='$SERVER_PID' is not a pid; no signal sent." >&2
++      return 0 ;;
++  esac
++  if [ "$SERVER_PID" -le 1 ]; then
++    echo "!!! refusing to signal pid $SERVER_PID (container init / invalid pid)." >&2
++    return 0
++  fi
++  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
++    echo ">>> server pid $SERVER_PID already gone; no signal sent."
++    wait "$SERVER_PID" 2>/dev/null || true
++    return 0
++  fi
++  # PID-reuse gate: a pid whose start time moved is a DIFFERENT process. Send nothing.
++  if ! _identity_still_matches; then
++    echo "!!! pid $SERVER_PID start_time changed (was $SERVER_START_TICKS): the pid was REUSED;" \
++         "refusing to signal an unrelated process." >&2
++    return 0
++  fi
++  # Never signal our own ancestors, whatever the mode.
++  if _is_bench_ancestor "$SERVER_PID"; then
++    echo "!!! pid $SERVER_PID is an ANCESTOR of this benchmark shell (pid $BENCH_PID), so it cannot" \
++         "be a server we launched; no signal sent." >&2
++    return 0
++  fi
++  local _grace="${SERVER_STOP_GRACE_S:-10}" _deny="" _i _k _kids _kids_now
++  # An unusable grace makes `seq` fail, which would collapse TERM->KILL to no wait at all.
++  case "$_grace" in ''|*[!0-9]*) _grace=10 ;; esac
++  if _group_kill_allowed; then
++    echo ">>> Shutting down server (pid $SERVER_PID) -- GROUP kill pgid=$SERVER_PGID ..."
++    kill -TERM "-$SERVER_PGID" 2>/dev/null || kill -TERM "$SERVER_PID" 2>/dev/null || true
++    for _i in $(seq 1 "$_grace"); do
++      kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1
++    done
++    # Re-check identity before escalating: `kill -0` also succeeds against a stranger
++    # who inherited the pid during the grace window, and SIGKILL cannot be ignored.
++    if kill -0 "$SERVER_PID" 2>/dev/null; then
++      if _identity_still_matches; then
++        kill -KILL "-$SERVER_PGID" 2>/dev/null || true
++      else
++        echo "!!! pid $SERVER_PID was REUSED during the grace window; skipping SIGKILL." >&2
++      fi
++    fi
++  else
++    echo ">>> Shutting down server (pid $SERVER_PID) -- PID+descendants kill;" \
++         "group kill REFUSED: $_deny"
++    _kids="$(_server_descendants)"   # collect BEFORE signalling anything
++    kill -TERM "$SERVER_PID" 2>/dev/null || true
++    for _k in $_kids; do kill -TERM "$_k" 2>/dev/null || true; done
++    for _i in $(seq 1 "$_grace"); do
++      kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1
++    done
++    if kill -0 "$SERVER_PID" 2>/dev/null; then
++      if _identity_still_matches; then
++        kill -KILL "$SERVER_PID" 2>/dev/null || true
++      else
++        echo "!!! pid $SERVER_PID was REUSED during the grace window; skipping SIGKILL." >&2
++        _kids=""   # the tree we mapped belonged to the old process; do not escalate into it
++      fi
++    fi
++    # Escalate only against pids that are STILL descendants: one that no longer is was
++    # either reaped (and possibly recycled) or was never ours.
++    _kids_now="$(_server_descendants)"
++    for _k in $_kids; do
++      case " $_kids_now " in *" $_k "*) ;; *) continue ;; esac
++      kill -0 "$_k" 2>/dev/null && kill -KILL "$_k" 2>/dev/null || true
++    done
++  fi
++  wait "$SERVER_PID" 2>/dev/null || true
++}
+diff --git a/e2e_workflow/scripts/tests/test_bench_e2e_teardown_lookup.py b/e2e_workflow/scripts/tests/test_bench_e2e_teardown_lookup.py
+new file mode 100644
+index 000000000..8568c6452
+--- /dev/null
++++ b/e2e_workflow/scripts/tests/test_bench_e2e_teardown_lookup.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python3
++"""Unit tests for bench_e2e.sh's teardown-contract lookup.
++
++Run:  python3 -m unittest discover -s e2e_workflow/scripts/tests -v
++  or: python3 e2e_workflow/scripts/tests/test_bench_e2e_teardown_lookup.py
++
++WHY THESE EXIST: bench_e2e.sh is COPIED into $EVAL_DIR and run from there, so
++server_teardown.sh -- the identity-verified kill contract -- has to be staged beside
++the copy. When it was merely `source`d, a staging miss was SILENT: under `set -uo
++pipefail` (no -e) the failed source does not abort, the `trap server_teardown EXIT`
++binds a function that does not exist, and the benchmark launches a server it can never
++stop (VRAM + port held, serving-GPU lock released, next launch OOMs). The dispatcher
++now refuses to run instead -- a benchmark that cannot stop what it starts must not
++start it -- and that refusal is on the launch path of EVERY server in the product, so
++it is asserted here rather than trusted.
++
++The gate sits before the serving-GPU lock and before any launch, so these tests need
++neither a GPU nor a model: they assert the exit code and the stderr remedy.
++"""
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++BENCH = os.path.join(SCRIPTS_DIR, "bench_e2e.sh")
++LIB = os.path.join(SCRIPTS_DIR, "server_teardown.sh")
++ADAPTERS = os.path.join(SCRIPTS_DIR, "adapters")
++
++BASH = shutil.which("bash")
++MISSING_LIB_RC = 3
++
++
++@unittest.skipIf(BASH is None, "bash is required to exercise the shell dispatcher")
++class BenchTeardownLookupTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.mkdtemp(prefix="bench_lookup_")
++        self.addCleanup(shutil.rmtree, self.tmp, True)
++        self.eval_dir = os.path.join(self.tmp, "eval")
++        os.makedirs(self.eval_dir)
++        # Stage exactly what roles/director.md stages, minus the file under test.
++        shutil.copy(BENCH, os.path.join(self.eval_dir, "bench_e2e.sh"))
++        shutil.copytree(ADAPTERS, os.path.join(self.eval_dir, "adapters"))
++
++        # A stub backend adapter (sourced at the top, long before the gate) so a run
++        # that gets PAST the gate stops immediately at the launch instead of spending
++        # the health-wait on an absent vLLM. Keeps these tests sub-second.
++        self.adapter = os.path.join(self.tmp, "stub_adapter.sh")
++        with open(self.adapter, "w", encoding="utf-8") as fh:
++            fh.write(
++                "adapter_default_port() { echo 18080; }\n"
++                "adapter_launch() { echo 'STUB_LAUNCH_REACHED'; exit 0; }\n"
++                "adapter_health() { return 0; }\n"
++                "adapter_bench() { return 0; }\n"
++            )
++
++    def stage_lib(self, into):
++        os.makedirs(into, exist_ok=True)
++        shutil.copy(LIB, os.path.join(into, "server_teardown.sh"))
++
++    def run_bench(self, **env):
++        """Run the staged dispatcher; it must decide the lookup before any launch."""
++        run_env = dict(os.environ)
++        run_env.pop("SKILL_DIR", None)
++        run_env.pop("WORKFLOW_DIR", None)
++        run_env.update(
++            ADAPTER=self.adapter,
++            BACKEND="vllm",
++            MODEL=os.path.join(self.tmp, "model"),
++            OUT_DIR=os.path.join(self.tmp, "out"),
++            REPEATS="1",
++            PROFILE="0",
++        )
++        run_env.update(env)
++        return subprocess.run(
++            [BASH, os.path.join(self.eval_dir, "bench_e2e.sh")],
++            env=run_env, capture_output=True, text=True, timeout=120,
++        )
++
++    def test_missing_contract_refuses_to_run(self):
++        """The staging miss that used to leak a server is now a hard, legible stop."""
++        proc = self.run_bench()
++        self.assertEqual(proc.returncode, MISSING_LIB_RC, proc.stderr[-2000:])
++        self.assertIn("server_teardown.sh not found", proc.stderr)
++        # The message must say what to do, not just that something is missing.
++        self.assertIn("cp ", proc.stderr)
++        self.assertIn("LEAKED", proc.stderr)
++
++    def test_contract_staged_beside_the_copy_passes_the_gate(self):
++        """The director-staged layout must get PAST the gate (it may fail later, for
++        want of a GPU/model -- it just must not fail with the refusal)."""
++        self.stage_lib(self.eval_dir)
++        proc = self.run_bench()
++        self.assertNotEqual(proc.returncode, MISSING_LIB_RC, proc.stderr[-2000:])
++        self.assertNotIn("server_teardown.sh not found", proc.stderr)
++        self.assertIn("STUB_LAUNCH_REACHED", proc.stdout, "never reached the launch")
++
++    def test_skill_dir_fallback_is_used_and_announced(self):
++        """A caller that exports SKILL_DIR keeps working from an unstaged copy -- but
++        the run says so, because the copy is then not self-contained."""
++        skill = os.path.join(self.tmp, "skill")
++        self.stage_lib(os.path.join(skill, "scripts"))
++        proc = self.run_bench(SKILL_DIR=skill)
++        self.assertNotEqual(proc.returncode, MISSING_LIB_RC, proc.stderr[-2000:])
++        self.assertIn("teardown contract:", proc.stdout + proc.stderr)
++        self.assertIn("STUB_LAUNCH_REACHED", proc.stdout, "never reached the launch")
++
++    def test_empty_skill_dir_does_not_resolve_to_an_absolute_path(self):
++        """With SKILL_DIR="" the candidate degrades to /scripts/server_teardown.sh; a
++        file there (or a symlink attack) must not be mistaken for the contract."""
++        proc = self.run_bench(SKILL_DIR="", WORKFLOW_DIR="")
++        self.assertEqual(proc.returncode, MISSING_LIB_RC, proc.stderr[-2000:])
++        self.assertNotIn("/scripts/server_teardown.sh", proc.stdout)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/e2e_workflow/scripts/tests/test_server_teardown.py b/e2e_workflow/scripts/tests/test_server_teardown.py
+new file mode 100644
+index 000000000..f6cd4e65f
+--- /dev/null
++++ b/e2e_workflow/scripts/tests/test_server_teardown.py
+@@ -0,0 +1,341 @@
++#!/usr/bin/env python3
++"""Unit tests for server_teardown.sh -- the server kill contract.
++
++Run:  python3 -m unittest discover -s e2e_workflow/scripts/tests -v
++  or: python3 e2e_workflow/scripts/tests/test_server_teardown.py
++
++WHY THESE EXIST: the previous teardown resolved the server's process group AT KILL
++TIME and group-killed whenever it differed from the benchmark shell's own group. That
++guard proves nothing about OWNERSHIP -- a pid that already exited and was recycled
++resolves to a stranger's group, and a group TERM aimed at it can reach the caller's
++orchestrator or container PID 1 (observed: a capture teardown TERMed the coordinator
++running as PID 1, which failed the whole task 72 minutes later).
++
++So the behaviour under test is WHICH TERMINATION MODE IS CHOSEN, asserted from the
++signals actually sent rather than from a log line:
++
++  group kill allowed        only when the launch proved pgid == pid
++  bench-inherited group     -> pid kill (never signal our own group)
++  protected pgid (caller)   -> refused, even when pgid == pid
++  group holds pid 1         -> refused
++  pgid == 1                 -> refused (`kill -TERM -1` is a BROADCAST, not a group)
++  pid start time moved      -> the pid was reused; send NOTHING at all
++  reuse during TERM->KILL   -> escalation re-verifies, so no SIGKILL to a stranger
++  pid is our own ancestor   -> refused (a server we launched can never be one)
++  pid-kill path             -> still reaps verified descendants (no leaked VRAM)
++
++`ps`, `kill` and `sleep` are replaced by fakes on PATH (the `kill` builtin is disabled
++with `enable -n` so the fake is reachable), and every process table is a fixture, so
++no test signals a real process.
++"""
++import os
++import shutil
++import subprocess
++import tempfile
++import textwrap
++import unittest
++
++SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++LIB = os.path.join(SCRIPTS_DIR, "server_teardown.sh")
++
++BASH = shutil.which("bash")
++
++# Fake `ps`: answers only the queries the library makes, from fixture files.
++FAKE_PS = """#!/usr/bin/env bash
++case "$*" in
++  "-o pgid= -p "*)
++    _pid="${@: -1}"
++    cat "$FIX/pgid_$_pid" 2>/dev/null || cat "$FIX/pgid_default" 2>/dev/null || exit 1 ;;
++  "-o args= -p "*)
++    _pid="${@: -1}"; cat "$FIX/args_$_pid" 2>/dev/null || true ;;
++  "-eo pid=,pgid=") cat "$FIX/pid_pgid" 2>/dev/null || true ;;
++  "-eo pid=,ppid=") cat "$FIX/pid_ppid" 2>/dev/null || true ;;
++  *) exit 1 ;;
++esac
++"""
++
++# Fake `kill`: records every invocation and answers -0 liveness from $FIX/alive. A
++# TERM/KILL marks its target(s) dead so the library's grace loop exits immediately.
++FAKE_KILL = """#!/usr/bin/env bash
++printf '%s\\n' "$*" >> "$FIX/kill.log"
++_target="${2:-}"
++if [ "$1" = "-0" ]; then
++  grep -qx -- "$_target" "$FIX/alive" 2>/dev/null && exit 0
++  exit 1
++fi
++_reap() {
++  # $FIX/no_reap models a server that ignores SIGTERM, so the grace window expires
++  # and the library reaches its SIGKILL escalation.
++  [ -e "$FIX/no_reap" ] && return 0
++  grep -vx -- "$1" "$FIX/alive" > "$FIX/alive.next" 2>/dev/null
++  mv "$FIX/alive.next" "$FIX/alive"
++}
++case "$_target" in
++  -*)
++    for _p in $(awk -v g="${_target#-}" '$2==g{print $1}' "$FIX/pid_pgid" 2>/dev/null); do
++      _reap "$_p"
++    done ;;
++  *) _reap "$_target" ;;
++esac
++exit 0
++"""
++
++FAKE_SLEEP = "#!/usr/bin/env bash\nexit 0\n"
++
++
++@unittest.skipIf(BASH is None, "bash is required to exercise the shell teardown library")
++class ServerTeardownTest(unittest.TestCase):
++    def setUp(self):
++        self.fix = tempfile.mkdtemp(prefix="teardown_fix_")
++        self.addCleanup(shutil.rmtree, self.fix, True)
++        bindir = os.path.join(self.fix, "bin")
++        os.makedirs(bindir)
++        for name, body in (("ps", FAKE_PS), ("kill", FAKE_KILL), ("sleep", FAKE_SLEEP)):
++            path = os.path.join(bindir, name)
++            with open(path, "w", encoding="utf-8") as fh:
++                fh.write(body)
++            os.chmod(path, 0o755)
++        # Defaults: the benchmark shell sits in pgid 4242; the server pid is 500 and
++        # leads its own group; only the server is alive.
++        self.write("pgid_default", "4242\n")
++        self.write("pgid_500", "500\n")
++        self.write("pid_pgid", "500 500\n4242 4242\n1 1\n")
++        self.write("pid_ppid", "500 4242\n4242 1\n")
++        self.write("alive", "500\n")
++        self.write("kill.log", "")
++
++    def write(self, name, text):
++        with open(os.path.join(self.fix, name), "w", encoding="utf-8") as fh:
++            fh.write(text)
++
++    def run_body(self, body, env=None):
++        """Source the library with the fakes on PATH and run `body`; return kill args."""
++        driver = os.path.join(self.fix, "driver.sh")
++        with open(driver, "w", encoding="utf-8") as fh:
++            fh.write(
++                "#!/usr/bin/env bash\nset -uo pipefail\n"
++                'export PATH="$FIX/bin:$PATH"\n'
++                "enable -n kill\n"          # else the builtin shadows the fake
++                'source "$LIB"\n'
++                # Deterministic start times: the real reader needs a live /proc.
++                "_start_ticks_of() { printf '%s\\n' \"${FAKE_TICKS:-}\"; }\n"
++                + textwrap.dedent(body)
++            )
++        run_env = dict(os.environ, FIX=self.fix, LIB=LIB, FAKE_TICKS="100")
++        run_env.update(env or {})
++        proc = subprocess.run(
++            [BASH, driver], env=run_env, capture_output=True, text=True, timeout=60
++        )
++        self.assertEqual(proc.returncode, 0, f"driver failed: {proc.stderr}")
++        with open(os.path.join(self.fix, "kill.log"), encoding="utf-8") as fh:
++            calls = [line.strip() for line in fh if line.strip()]
++        # Liveness probes are noise for mode assertions; keep the real signals.
++        return [c for c in calls if not c.startswith("-0 ")], proc.stdout + proc.stderr
++
++    # ---- the fixture itself ---------------------------------------------------
++    def test_fake_ps_answers_per_pid_not_the_default(self):
++        """Guard the fixture: `ps -o pgid= -p <pid>` must read pgid_<pid>.
++
++        The pid is the LAST word of the query, and `${*##* }` strips the pattern from
++        every positional parameter separately rather than from the joined string -- so
++        it returns the whole query unchanged, every lookup misses `pgid_<pid>` and
++        silently falls through to `pgid_default`. Every server then looks like it sits
++        in the bench's group, which turns the group-kill tests green no matter what the
++        library does. Assert the resolution directly so that failure can't hide.
++        """
++        env = dict(os.environ, FIX=self.fix, PATH=os.path.join(self.fix, "bin") + os.pathsep + os.environ["PATH"])
++        got = subprocess.run(
++            ["ps", "-o", "pgid=", "-p", "500"], env=env, capture_output=True, text=True, timeout=30
++        )
++        self.assertEqual(got.stdout.strip(), "500", "fake ps fell back to pgid_default")
++
++    # ---- mode selection -------------------------------------------------------
++    def test_own_group_leader_allows_group_kill(self):
++        """pgid == pid PROVES the group holds only our descendants -> group kill."""
++        signals, out = self.run_body('server_record_identity 500\nserver_teardown\n')
++        self.assertIn("-TERM -500", signals)
++        self.assertIn("teardown_mode=group", out)
++
++    def test_group_inherited_from_bench_falls_back_to_pid_kill(self):
++        """A native launch that shares our group must never be group-killed."""
++        self.write("pgid_500", "4242\n")
++        self.write("pid_pgid", "500 4242\n4242 4242\n1 1\n")
++        signals, out = self.run_body('server_record_identity 500\nserver_teardown\n')
++        self.assertIn("-TERM 500", signals)
++        self.assertFalse([s for s in signals if " -" in s], f"group-killed: {signals}")
++        self.assertIn("group kill REFUSED", out)
++
++    def test_protected_pgid_is_never_group_killed(self):
++        """The caller exports its own pgid; a group matching it is refused outright."""
++        signals, out = self.run_body(
++            'server_record_identity 500\nserver_teardown\n',
++            env={"GEAK_PROTECTED_PGIDS": "500 7"},
++        )
++        self.assertIn("-TERM 500", signals)
++        self.assertFalse([s for s in signals if " -" in s], f"group-killed: {signals}")
++        self.assertIn("is protected", out)
++
++    def test_group_containing_pid_1_is_refused(self):
++        """Defence in depth: a group holding container init is never signalled."""
++        self.write("pid_pgid", "500 500\n1 500\n4242 4242\n")
++        signals, out = self.run_body('server_record_identity 500\nserver_teardown\n')
++        self.assertIn("-TERM 500", signals)
++        self.assertFalse([s for s in signals if " -" in s], f"group-killed: {signals}")
++        self.assertIn("contains pid 1", out)
++
++    def test_pgid_one_never_becomes_a_broadcast(self):
++        """`kill -TERM -1` signals EVERY permitted process; it must be unreachable.
++
++        White-box: pin SERVER_PGID=1 so a future regression that trusts a pgid of 1
++        (an empty or inherited lookup) is caught at the guard rather than in prod.
++        """
++        signals, out = self.run_body(
++            'server_record_identity 500\nSERVER_PGID=1\nserver_teardown\n'
++        )
++        self.assertNotIn("-TERM -1", signals)
++        self.assertIn("-TERM 500", signals)
++        self.assertIn("would broadcast", out)
++
++    def test_pid_one_is_never_signalled_on_the_pid_path(self):
++        """The pid-only fallback must be as unable to reach init as the group path."""
++        self.write("pgid_1", "1\n")
++        self.write("alive", "1\n")
++        signals, out = self.run_body('server_record_identity 1\nserver_teardown\n')
++        self.assertEqual(signals, [], f"signalled init: {signals}")
++        self.assertIn("refusing to signal pid 1", out)
++
++    def test_launcher_marked_group_unverified_uses_pid_kill(self):
++        """An externally-supplied pid (magpie pid file) never earns a group kill."""
++        signals, _ = self.run_body(
++            'SERVER_GROUP_UNVERIFIED=1\nserver_record_identity 500\nserver_teardown\n'
++        )
++        self.assertIn("-TERM 500", signals)
++        self.assertFalse([s for s in signals if " -" in s], f"group-killed: {signals}")
++
++    # ---- identity gates -------------------------------------------------------
++    def test_reused_pid_is_not_signalled_at_all(self):
++        """A pid whose start time moved is a DIFFERENT process: send nothing."""
++        signals, _ = self.run_body(
++            'server_record_identity 500\nFAKE_TICKS=999\nserver_teardown\n'
++        )
++        self.assertEqual(signals, [], f"signalled a recycled pid: {signals}")
++
++    # Installed AFTER server_record_identity has frozen ticks=100, so reading #1 is the
++    # pre-signal gate (still 100, teardown proceeds) and every later reading is 999 --
++    # i.e. the pid is reused exactly inside the TERM->KILL grace window.
++    _TICKS_FLIP_AFTER_FIRST_READ = (
++        '_start_ticks_of() { local _n; _n="$(cat "$FIX/ncalls" 2>/dev/null || echo 0)";'
++        ' echo $((_n + 1)) > "$FIX/ncalls";'
++        ' if [ "$_n" -ge 1 ]; then echo 999; else echo 100; fi; }\n'
++    )
++
++    def test_reuse_during_the_grace_window_blocks_the_group_sigkill(self):
++        """`kill -0` also succeeds against the STRANGER who inherited the pid while we
++        waited, and SIGKILL cannot be ignored -- so re-verify before escalating."""
++        self.write("no_reap", "")
++        signals, out = self.run_body(
++            "server_record_identity 500\n" + self._TICKS_FLIP_AFTER_FIRST_READ + "server_teardown\n"
++        )
++        self.assertIn("-TERM -500", signals)
++        self.assertNotIn("-KILL -500", signals, "SIGKILLed a recycled pid's group")
++        self.assertIn("REUSED during the grace window", out)
++
++    def test_reuse_during_the_grace_window_blocks_the_pid_sigkill(self):
++        """Same gate on the pid path, including the descendants mapped before TERM."""
++        self.write("no_reap", "")
++        self.write("pgid_500", "4242\n")
++        self.write("pid_pgid", "500 4242\n4242 4242\n1 1\n")
++        self.write("pid_ppid", "500 4242\n610 500\n4242 1\n")
++        self.write("alive", "500\n610\n")
++        signals, out = self.run_body(
++            "server_record_identity 500\n" + self._TICKS_FLIP_AFTER_FIRST_READ + "server_teardown\n"
++        )
++        self.assertIn("-TERM 500", signals)
++        self.assertFalse([s for s in signals if s.startswith("-KILL")],
++                         f"SIGKILLed after the identity moved: {signals}")
++
++    def test_stubborn_server_is_still_escalated_when_identity_holds(self):
++        """The re-check must not disarm the escalation for the normal case."""
++        self.write("no_reap", "")
++        signals, _ = self.run_body('server_record_identity 500\nserver_teardown\n')
++        self.assertIn("-TERM -500", signals)
++        self.assertIn("-KILL -500", signals, "a TERM-ignoring server would leak VRAM")
++
++    def test_ancestor_of_the_bench_is_never_signalled(self):
++        """A stale pid file naming a pid in OUR parent chain (the run_e2e driver, the
++        caller's orchestrator) must send nothing: we cannot have launched it."""
++        self.write("pgid_500", "4242\n")
++        self.write("pid_pgid", "500 4242\n4242 4242\n1 1\n")
++        self.write("pid_ppid", "4242 500\n500 300\n300 1\n")
++        self.write("alive", "500\n")
++        signals, out = self.run_body(
++            'BENCH_PID=4242\nserver_record_identity 500\nserver_teardown\n'
++        )
++        self.assertEqual(signals, [], f"signalled an ancestor: {signals}")
++        self.assertIn("ANCESTOR", out)
++
++    def test_non_numeric_grace_does_not_collapse_the_term_kill_window(self):
++        """`seq 1 abc` fails, which would turn the grace window into zero waits."""
++        self.write("no_reap", "")
++        signals, _ = self.run_body(
++            'server_record_identity 500\nserver_teardown\n',
++            env={"SERVER_STOP_GRACE_S": "abc"},
++        )
++        self.assertGreaterEqual(
++            len([s for s in signals if s == "-TERM -500"]), 1
++        )
++        self.assertIn("-KILL -500", signals)
++
++    def test_dead_pid_is_not_signalled(self):
++        self.write("alive", "")
++        signals, out = self.run_body('server_record_identity 500\nserver_teardown\n')
++        self.assertEqual(signals, [])
++        self.assertIn("already gone", out)
++
++    def test_no_server_pid_is_a_noop(self):
++        """REUSE_SERVER=1 leaves SERVER_PID empty; the EXIT trap must do nothing."""
++        signals, _ = self.run_body('SERVER_PID=""\nserver_teardown\n')
++        self.assertEqual(signals, [])
++
++    # ---- anti-orphan behaviour on the pid path --------------------------------
++    def test_pid_kill_still_reaps_descendants(self):
++        """The group kill existed to catch workers outside SERVER_PID; keep that."""
++        self.write("pgid_500", "4242\n")
++        self.write("pid_pgid", "500 4242\n4242 4242\n1 1\n")
++        self.write("pid_ppid", "500 4242\n610 500\n611 610\n4242 1\n999 1\n")
++        self.write("alive", "500\n610\n611\n")
++        signals, _ = self.run_body('server_record_identity 500\nserver_teardown\n')
++        self.assertIn("-TERM 500", signals)
++        self.assertIn("-TERM 610", signals)
++        self.assertIn("-TERM 611", signals, "grandchild worker leaked")
++        self.assertNotIn("-TERM 999", signals, "signalled an unrelated process")
++        self.assertNotIn("-TERM 1", signals)
++
++    # ---- /proc parsing --------------------------------------------------------
++    def test_start_ticks_parses_comm_with_spaces_and_parens(self):
++        """comm is attacker-shaped free text; mis-parsing silently voids the gate."""
++        proc_root = os.path.join(self.fix, "proc", "777")
++        os.makedirs(proc_root)
++        filler = " ".join(str(i) for i in range(1, 19))   # fields 4..21
++        with open(os.path.join(proc_root, "stat"), "w", encoding="utf-8") as fh:
++            fh.write(f"777 (vllm serve (worker)) S {filler} 555777 0 0 0\n")
++        driver = os.path.join(self.fix, "ticks.sh")
++        with open(driver, "w", encoding="utf-8") as fh:
++            fh.write(
++                "#!/usr/bin/env bash\nset -uo pipefail\n"
++                'export PATH="$FIX/bin:$PATH"\n'
++                'source "$LIB"\n_start_ticks_of 777\n'
++            )
++        env = dict(
++            os.environ, FIX=self.fix, LIB=LIB,
++            SERVER_PROC_ROOT=os.path.join(self.fix, "proc"),
++        )
++        out = subprocess.run(
++            [BASH, driver], env=env, capture_output=True, text=True, timeout=60
++        )
++        self.assertEqual(out.returncode, 0, out.stderr)
++        self.assertEqual(out.stdout.strip(), "555777")
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/interface/run_e2e.py b/interface/run_e2e.py
+index 812d5e2ca..333a27084 100644
+--- a/interface/run_e2e.py
++++ b/interface/run_e2e.py
+@@ -353,6 +353,26 @@ def resolve_tracelens_report(exp_root: str) -> dict:
+     return report
+ 
+ 
++# The e2e workflow prepends this to every role agent it spawns (PROCESS_SAFETY in
++# e2e_workflow.js). The TOP-LEVEL driver agent we spawn here was the one agent that
++# never saw it, yet it is the one closest to the caller: its Bash tool runs with
++# bypassPermissions as a direct child of this process, so a single `pkill -f vllm`
++# from it reproduces issue #397 (a pattern kill that reaches the caller's orchestrator)
++# with nothing in between. Same rule, same wording, one level up.
++PROCESS_SAFETY = (
++    "## PROCESS SAFETY (a violation can kill the caller's orchestrator, failing the "
++    "whole task)\n"
++    "This container's PID 1 is the CALLER's orchestrator process, not yours, and it is "
++    "NOT restartable. NEVER run global or pattern-matched process cleanup: no "
++    "`pkill -f` / `pgrep -f ... | xargs kill` / `killall` / `ps aux | grep ... | xargs "
++    "kill`, and never `kill -- -PGID` for a group you did not create. A pattern as "
++    "innocent as `-f vllm` matches the orchestrator's own command line and TERMs it.\n"
++    "Manage ONLY processes you started, by the pid you captured at launch. Freeing a "
++    "GPU, unwedging a port, or recovering from a failed Workflow call is NOT an "
++    "exception to this rule: leave the process alone and report it instead.\n\n"
++)
++
++
+ def build_prompt(ps_args: dict) -> str:
+     eval_dir = ps_args.get("eval_dir", "")
+     # Locate the upstream TraceLens / kernel-agent artifacts (analysis.md,
+@@ -373,7 +393,8 @@ def build_prompt(ps_args: dict) -> str:
+     # budget; enforcement lives entirely in the JS (the time_budget_s arg drives the
+     # setTimeout deadlines), and the value is already passed via args.time_budget_s.
+     return (
+-        "Invoke the Workflow tool exactly once with:\n"
++        PROCESS_SAFETY
++        + "Invoke the Workflow tool exactly once with:\n"
+         f'  scriptPath: "{E2E_SCRIPT}"\n'
+         f"  args: {json.dumps(ps_args)}\n"
+         "CRITICAL: pass `args` as a real JSON OBJECT (a mapping), NOT as a "
+@@ -2371,6 +2392,39 @@ def _write_kernel_journey(eval_dir: Path, wf: dict | None, normalized: dict) ->
+     return str(path)
+ 
+ 
++def _publish_protected_pgids() -> str:
++    """Tell the benchmark teardown which process groups it must NEVER signal.
++
++    ``e2e_workflow/scripts/server_teardown.sh`` refuses a group kill against any pgid
++    in ``GEAK_PROTECTED_PGIDS``. Nothing was ever publishing that list, so the hook
++    only ever held its two built-in defaults. We are the process the caller (Hyperloom)
++    launches, so we are the one place that knows the two groups a bench cleanup must
++    never reach: OUR group (the whole GEAK subtree runs in it) and our PARENT's — the
++    orchestrator that was TERMed by a bench teardown in issue #397. pid 1 is included
++    explicitly because a container's init IS that orchestrator in the deployment where
++    this happened.
++
++    Purely additive: a group kill is only ever allowed for a server that leads its own
++    session (pgid == pid), which can never be one of these groups, so no legitimate
++    teardown is downgraded by this.
++
++    Returns:
++        str: the published, space-separated pgid list (also set in ``os.environ``).
++    """
++    protected: set[str] = {"1"}
++    for pid in (0, os.getppid()):
++        try:
++            protected.add(str(os.getpgid(pid)))
++        except OSError:  # racing parent exit / unsupported platform
++            pass
++    protected.update(
++        tok for tok in os.environ.get("GEAK_PROTECTED_PGIDS", "").split() if tok.isdigit()
++    )
++    value = " ".join(sorted(protected, key=int))
++    os.environ["GEAK_PROTECTED_PGIDS"] = value
++    return value
++
++
+ # ---------------------------------------------------------------------------
+ # Main
+ # ---------------------------------------------------------------------------
+@@ -2395,6 +2449,7 @@ def main(argv: list[str]) -> int:
+     # check (_workflow_done_on_disk) and the scrape-independent disk recovery
+     # (_discover_eval_dir) target EXACTLY this run's dir, deterministically.
+     os.environ["GEAK_EVAL_DIR"] = ps_args["eval_dir"]
++    _publish_protected_pgids()
+     bench_client = apply_bench_client(h)
+     bench_launcher = apply_bench_launcher(h)
+     bench_protocol = apply_bench_protocol(h)
+diff --git a/interface/test_run_e2e_dispatch.py b/interface/test_run_e2e_dispatch.py
+index 26ad9eb2d..2f4dca9e6 100644
+--- a/interface/test_run_e2e_dispatch.py
++++ b/interface/test_run_e2e_dispatch.py
+@@ -346,6 +346,55 @@ def test_build_prompt_carries_script_args_and_tracelens_block(self):
+         # search_root is internal bookkeeping and must never reach the agent.
+         self.assertNotIn("search_root", prompt)
+ 
++    def test_build_prompt_leads_with_process_safety(self):
++        """The driver agent holds Bash under bypassPermissions as a direct child of
++        this process, so it needs the same pattern-kill ban the role agents get: one
++        `pkill -f vllm` from it reaches the caller's orchestrator (issue #397)."""
++        ps = rx.map_args(self._handoff(eval_dir=str(self.tmp / "e2e_safety")))
++        prompt = rx.build_prompt(ps)
++        self.assertTrue(prompt.startswith("## PROCESS SAFETY"), prompt[:80])
++        for banned in ("pkill -f", "killall", "kill -- -PGID"):
++            self.assertIn(banned, prompt)
++
++
++class TestProtectedPgids(_RunE2ECase):
++    """`_publish_protected_pgids` is the caller-side half of the #397 fix: the
++    teardown in e2e_workflow/scripts/server_teardown.sh vetoes a group kill against
++    any pgid listed in GEAK_PROTECTED_PGIDS, and this is the only publisher."""
++
++    def setUp(self):
++        super().setUp()
++        self._saved = os.environ.get("GEAK_PROTECTED_PGIDS")
++        self.addCleanup(self._restore)
++
++    def _restore(self):
++        if self._saved is None:
++            os.environ.pop("GEAK_PROTECTED_PGIDS", None)
++        else:
++            os.environ["GEAK_PROTECTED_PGIDS"] = self._saved
++
++    def test_publishes_own_group_parent_group_and_init(self):
++        os.environ.pop("GEAK_PROTECTED_PGIDS", None)
++        value = rx._publish_protected_pgids()
++        published = value.split()
++        self.assertEqual(value, os.environ["GEAK_PROTECTED_PGIDS"])
++        self.assertIn("1", published)
++        self.assertIn(str(os.getpgid(0)), published)
++        self.assertIn(str(os.getpgid(os.getppid())), published)
++
++    def test_merges_existing_value_and_drops_non_numeric(self):
++        """A caller may pre-export its own pgids; keep them, drop garbage, no dupes."""
++        os.environ["GEAK_PROTECTED_PGIDS"] = "77 bogus 77"
++        published = rx._publish_protected_pgids().split()
++        self.assertIn("77", published)
++        self.assertNotIn("bogus", published)
++        self.assertEqual(len(published), len(set(published)))
++
++    def test_is_idempotent(self):
++        os.environ.pop("GEAK_PROTECTED_PGIDS", None)
++        first = rx._publish_protected_pgids()
++        self.assertEqual(first, rx._publish_protected_pgids())
++
+ 
+ class TestFlagPresent(_RunE2ECase):
+     def test_unbalanced_quote_falls_back_to_whitespace_split(self):
+@@ -1467,6 +1516,23 @@ def test_dry_run_reports_the_full_dispatch_plan_without_invoking(self):
+         self.assertIn("Invoke the Workflow tool exactly once", plan["prompt"])
+         self.assertFalse(self.result_path.exists())
+ 
++    def test_protected_pgids_are_published_before_any_launch(self):
++        """Pins the CALL SITE, not just the helper: the veto must be in the
++        environment before main() can reach a bench, so it is set even on the
++        --dry-run path, which returns before invoke_workflow()."""
++        saved = os.environ.pop("GEAK_PROTECTED_PGIDS", None)
++        if saved is not None:
++            self.addCleanup(os.environ.__setitem__, "GEAK_PROTECTED_PGIDS", saved)
++        else:
++            self.addCleanup(os.environ.pop, "GEAK_PROTECTED_PGIDS", None)
++        self.patch_rx("invoke_workflow",
++                      lambda *a, **k: self.fail("dry-run must not invoke"))
++        rc, _stdout = self._run(self._handoff(), "--dry-run")
++        self.assertEqual(rc, 0)
++        published = os.environ["GEAK_PROTECTED_PGIDS"].split()
++        self.assertIn("1", published)
++        self.assertIn(str(os.getpgid(0)), published)
++
+     def test_timeout_budget_is_read_from_the_environment(self):
+         os.environ["GEAK_E2E_TIMEOUT_S"] = "600"
+         self.patch_rx("invoke_workflow", lambda *a, **k: {})

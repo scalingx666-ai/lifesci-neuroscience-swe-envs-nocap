@@ -1,0 +1,807 @@
+diff --git a/frontend/javascripts/libs/resumable_upload/resumable_chunk.ts b/frontend/javascripts/libs/resumable_upload/resumable_chunk.ts
+index 8d8dcf6ff7c..3b0de5b80f3 100644
+--- a/frontend/javascripts/libs/resumable_upload/resumable_chunk.ts
++++ b/frontend/javascripts/libs/resumable_upload/resumable_chunk.ts
+@@ -21,7 +21,12 @@ export class ResumableChunk {
+   startByte: number;
+   endByte: number;
+ 
+-  private abortController: AbortController | null = null;
++  // A run is one attempt to get the chunk to the server, started by send(): the optional probe,
++  // all upload attempts and the waits between retries. It ends when the chunk succeeds or fails,
++  // or when abort() is called. Each run creates its own controller and only ever observes that
++  // controller's signal, so an aborted run can neither restart nor change the chunk's state,
++  // even after a new run has started. runController belongs to the current run.
++  private runController: AbortController | null = null;
+   private _status: "pending" | "uploading" | "success" | "error" = "pending";
+   private _message: string = "";
+ 
+@@ -55,9 +60,62 @@ export class ResumableChunk {
+     return this.fileObj.getOpt(key);
+   }
+ 
+-  async test(): Promise<void> {
+-    this.abortController = new AbortController();
++  // send() starts uploading the chunk. If testChunks is enabled, the server is asked first
++  // whether it already has the chunk.
++  send(): void {
++    // Never run two probes/uploads for the same chunk concurrently.
++    if (this._status === "uploading") return;
+ 
++    const runController = new AbortController();
++    this.runController = runController;
++    // Probing counts as uploading so that the scheduler, pause and cancel take it into account.
++    this._status = "uploading";
++    this.run(runController.signal).catch((error) => {
++      if (runController.signal.aborted) return;
++      if (this._status !== "uploading") {
++        // The chunk already finished, e.g. a success or error callback threw.
++        console.error(error);
++        return;
++      }
++      // E.g. a query or headers option threw or the file could not be read.
++      this.finish("error", error instanceof Error ? error.message : String(error));
++    });
++  }
++
++  private async run(signal: AbortSignal): Promise<void> {
++    if (this.getOpt("testChunks") && !this.tested) {
++      const existingChunkMessage = await this.test(signal);
++      if (signal.aborted) return;
++      this.tested = true;
++      if (existingChunkMessage != null) {
++        this.markComplete = true;
++        this.finish("success", existingChunkMessage);
++        return;
++      }
++    }
++
++    for (;;) {
++      const retryReason = await this.upload(signal);
++      if (retryReason == null || signal.aborted) return;
++
++      this.callback("retry", retryReason);
++      // A retry listener may have paused or cancelled the upload.
++      if (signal.aborted) return;
++      this.retries++;
++
++      const retryInterval = this.getOpt("chunkRetryInterval");
++      if (retryInterval != null) {
++        this.pendingRetry = true;
++        await abortableSleep(retryInterval, signal);
++        if (signal.aborted) return;
++        this.pendingRetry = false;
++      }
++    }
++  }
++
++  // test() checks whether the chunk already exists on the server in a GET call.
++  // Resolves to the server's message if it does and to null if the chunk needs to be uploaded.
++  private async test(signal: AbortSignal): Promise<string | null> {
+     let customQueryParameters = this.getOpt("query");
+ 
+     if (typeof customQueryParameters === "function") {
+@@ -88,55 +146,31 @@ export class ResumableChunk {
+       customHeaders = customHeaders(this.fileObj, this);
+     }
+ 
+-    const fetchTimeout = this.getOpt("fetchTimeout");
+-    let hasTimedOut = false;
+-    const timeoutId =
+-      fetchTimeout > 0
+-        ? setTimeout(() => {
+-            hasTimedOut = true;
+-            this.abortController?.abort();
+-          }, fetchTimeout)
+-        : null;
+-
++    const fetchSignal = this.withFetchTimeout(signal);
+     try {
+       const response = await fetch(targetUrl, {
+         method: "GET",
+         headers: customHeaders,
+-        signal: this.abortController.signal,
++        signal: fetchSignal.signal,
+         credentials: this.getOpt("withCredentials") ? "include" : "same-origin",
+       });
+-      if (timeoutId != null) clearTimeout(timeoutId);
+-      this.tested = true;
+-
+       // Status 200: chunk already exists on server
+       // Status 204: chunk does not exist on server, please upload
+       if (response.ok && response.status !== 204) {
+-        this.markComplete = true;
+-        this._message = await response.text();
+-        this.callback("success", this._message);
+-        this.resumableObj.uploadNextChunk();
+-      } else {
+-        this.send();
++        return await response.text();
+       }
+-    } catch (error: any) {
+-      if (timeoutId != null) clearTimeout(timeoutId);
+-      if (error.name === "AbortError" && !hasTimedOut) return;
+-
+-      this.tested = true;
+-      this.send();
++      discardBody(response);
++    } catch (_error) {
++      // Aborted, timed out or failed: run() either stops or falls back to uploading the chunk.
++    } finally {
++      fetchSignal.dispose();
+     }
++    return null;
+   }
+ 
+-  // send() uploads the actual data in a POST call
+-  async send(): Promise<void> {
+-    if (this.getOpt("testChunks") && !this.tested) {
+-      this.test();
+-      return;
+-    }
+-
+-    this.abortController = new AbortController();
+-    this._status = "uploading";
+-    this.pendingRetry = false;
++  // upload() uploads the actual data in a POST call.
++  // Resolves to the reason for a retry if the upload should be retried and to null otherwise.
++  private async upload(signal: AbortSignal): Promise<string | null> {
+     this.callback("progress");
+ 
+     const standardQueryParameters: Partial<Record<string, any>> = {
+@@ -182,78 +216,102 @@ export class ResumableChunk {
+       data = formData;
+     } else {
+       // chunkFormat == base64
+-      const readPromise = new Promise<string>((resolve) => {
++      const readPromise = new Promise<string>((resolve, reject) => {
+         const fr = new FileReader();
+         fr.onload = () => resolve(fr.result as string);
++        fr.onerror = () => reject(fr.error);
+         fr.readAsDataURL(bytes);
+       });
+       const base64Data = await readPromise;
++      if (signal.aborted) return null;
+       formData.append(this.getOpt("fileParameterName"), base64Data);
+       data = formData;
+     }
+ 
+     const targetUrl = getTargetURI(this.resumableObj, queryParameters);
+-    const fetchTimeout = this.getOpt("fetchTimeout");
+-    let hasTimedOut = false;
+-    const timeoutId =
+-      fetchTimeout > 0
+-        ? setTimeout(() => {
+-            hasTimedOut = true;
+-            this.abortController?.abort();
+-          }, fetchTimeout)
+-        : null;
++    const fetchSignal = this.withFetchTimeout(signal);
+ 
++    let status: "success" | "error";
++    let message: string;
+     try {
+       const response = await fetch(targetUrl, {
+         method: "POST",
+         headers,
+         body: data,
+-        signal: this.abortController.signal,
++        signal: fetchSignal.signal,
+         credentials: this.getOpt("withCredentials") ? "include" : "same-origin",
+       });
+-      if (timeoutId != null) clearTimeout(timeoutId);
+ 
+       if (response.ok) {
+-        this._status = "success";
+-        this._message = await response.text();
+-        this.callback("success", this._message);
+-        this.resumableObj.uploadNextChunk();
++        status = "success";
+       } else if (
+         this.getOpt("permanentErrors").includes(response.status) ||
+         this.retries >= this.getOpt("maxChunkRetries")
+       ) {
+-        this._status = "error";
+-        this._message = await response.text();
+-        this.callback("error", this._message);
+-        this.resumableObj.uploadNextChunk();
++        status = "error";
+       } else {
+-        throw new Error(`Server responded with ${response.status}`);
++        discardBody(response);
++        return `Server responded with ${response.status}`;
+       }
++      message = await response.text();
+     } catch (error: any) {
+-      if (timeoutId != null) clearTimeout(timeoutId);
+-      if (error.name === "AbortError" && !hasTimedOut) {
+-        return;
+-      }
++      if (signal.aborted) return null;
++      // Network errors and timeouts are retried indefinitely. Only HTTP errors are checked
++      // against maxChunkRetries, although every retry increments this.retries.
++      return fetchSignal.hasTimedOut() ? "Timeout" : error.message;
++    } finally {
++      fetchSignal.dispose();
++    }
+ 
+-      this.callback("retry", hasTimedOut ? "Timeout" : error.message);
+-      this.abort();
+-      this.retries++;
++    if (signal.aborted) return null;
++    // Outside of the try block, so that an error thrown by a callback isn't mistaken for a
++    // network error, which would upload the finished chunk again.
++    this.finish(status, message);
++    return null;
++  }
+ 
+-      const retryInterval = this.getOpt("chunkRetryInterval");
+-      if (retryInterval != null) {
+-        this.pendingRetry = true;
+-        setTimeout(() => this.send(), retryInterval);
+-      } else {
+-        this.send();
+-      }
+-    }
++  // Combines the run's signal with the fetchTimeout option. dispose() must be called once the
++  // request has finished so that neither the timer nor the abort listener outlive it.
++  private withFetchTimeout(signal: AbortSignal) {
++    const controller = new AbortController();
++    const abort = () => controller.abort();
++    // A synchronous listener (e.g. of the progress callback) may already have aborted the run.
++    // The abort event doesn't fire again for it.
++    if (signal.aborted) abort();
++    signal.addEventListener("abort", abort, { once: true });
++
++    const fetchTimeout = this.getOpt("fetchTimeout");
++    let hasTimedOut = false;
++    const timeoutId =
++      fetchTimeout > 0
++        ? setTimeout(() => {
++            hasTimedOut = true;
++            controller.abort();
++          }, fetchTimeout)
++        : null;
++
++    return {
++      signal: controller.signal,
++      hasTimedOut: () => hasTimedOut,
++      dispose: () => {
++        if (timeoutId != null) clearTimeout(timeoutId);
++        signal.removeEventListener("abort", abort);
++      },
++    };
++  }
++
++  private finish(status: "success" | "error", message: string): void {
++    this._status = status;
++    this._message = message;
++    this.callback(status, message);
++    this.resumableObj.uploadNextChunk();
+   }
+ 
+   abort(): void {
+-    if (this.abortController) {
+-      this.abortController.abort();
+-      this.abortController = null;
+-    }
++    // Stops in-flight requests and pending retries of this chunk.
++    this.runController?.abort();
++    this.runController = null;
++    this.pendingRetry = false;
+     this._status = "pending";
+   }
+ 
+@@ -286,3 +344,24 @@ export class ResumableChunk {
+     }
+   }
+ }
++
++// Releases the connection of a response whose body is not needed.
++function discardBody(response: Response): void {
++  response.body?.cancel().catch(() => {});
++}
++
++// Resolves after ms or as soon as the signal is aborted. Removes its abort listener when the
++// timer fires, because a run may wait many times on the same signal.
++function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
++  return new Promise((resolve) => {
++    const onAbort = () => {
++      clearTimeout(timeoutId);
++      resolve();
++    };
++    const timeoutId = setTimeout(() => {
++      signal.removeEventListener("abort", onAbort);
++      resolve();
++    }, ms);
++    signal.addEventListener("abort", onAbort, { once: true });
++  });
++}
+diff --git a/frontend/javascripts/libs/resumable_upload/resumable_file.ts b/frontend/javascripts/libs/resumable_upload/resumable_file.ts
+index face6f7dd5c..31f07c19679 100644
+--- a/frontend/javascripts/libs/resumable_upload/resumable_file.ts
++++ b/frontend/javascripts/libs/resumable_upload/resumable_file.ts
+@@ -129,8 +129,10 @@ export class ResumableFile {
+     const handler = (e: Event) => {
+       const detail = (e as CustomEvent).detail;
+       if (detail.file === this) {
+-        this.resumableObj.upload();
+         this.resumableObj.removeEventListener("chunkingComplete", handler);
++        // Don't resume a paused upload (e.g. while a cancel confirmation is shown). Its
++        // rebuilt chunks are sent once the upload is resumed.
++        if (!this.isPaused()) this.resumableObj.upload();
+       }
+     };
+     this.resumableObj.addEventListener("chunkingComplete", handler);
+diff --git a/frontend/javascripts/test/libs/resumable-upload-lifecycle.spec.ts b/frontend/javascripts/test/libs/resumable-upload-lifecycle.spec.ts
+new file mode 100644
+index 00000000000..a4246387446
+--- /dev/null
++++ b/frontend/javascripts/test/libs/resumable-upload-lifecycle.spec.ts
+@@ -0,0 +1,358 @@
++import { ResumableUpload } from "libs/resumable_upload/resumable_upload";
++import { sleep } from "libs/utils";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++type CapturedRequest = {
++  method: string;
++  chunkNumber: number;
++  signal: AbortSignal;
++  settled: boolean;
++  resolve: (response: Response) => void;
++  reject: (error: Error) => void;
++};
++
++// A fetch stub whose requests stay pending until the test settles them, so
++// that intermediate states (probe in flight, retry timer pending) are observable.
++function installControllableFetch() {
++  const requests: CapturedRequest[] = [];
++  vi.stubGlobal(
++    "fetch",
++    vi.fn((url: string, init: RequestInit) => {
++      const chunkNumber = Number(new URL(url).searchParams.get("resumableChunkNumber"));
++      return new Promise<Response>((resolve, reject) => {
++        const request: CapturedRequest = {
++          method: init.method ?? "GET",
++          chunkNumber,
++          signal: init.signal as AbortSignal,
++          settled: false,
++          resolve: (response) => {
++            request.settled = true;
++            resolve(response);
++          },
++          reject: (error) => {
++            request.settled = true;
++            reject(error);
++          },
++        };
++        requests.push(request);
++        init.signal?.addEventListener("abort", () => {
++          request.reject(new DOMException("Aborted", "AbortError"));
++        });
++      });
++    }),
++  );
++  return requests;
++}
++
++const activeRequests = (requests: CapturedRequest[]) => requests.filter((r) => !r.settled);
++
++function createUpload(options: { testChunks: boolean; chunkRetryInterval?: number }) {
++  const resumable = new ResumableUpload({
++    target: "/upload",
++    chunkSize: 10,
++    simultaneousUploads: 3,
++    ...options,
++  });
++  // 6 chunks of 10 bytes each
++  resumable.addFile(new File(["x".repeat(60)], "test.txt"));
++  return resumable;
++}
++
++beforeEach(() => {
++  const mockLocation = new URL("http://localhost");
++  vi.stubGlobal("location", mockLocation);
++  vi.stubGlobal("window", { location: mockLocation });
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++describe("Resumable chunk lifecycle", () => {
++  describe("chunk probes (testChunks: true)", () => {
++    it("should probe distinct chunks when starting the upload", async () => {
++      const requests = installControllableFetch();
++      const resumable = createUpload({ testChunks: true });
++      await sleep(0);
++
++      resumable.upload();
++      await sleep(0);
++
++      expect(requests.map((r) => [r.method, r.chunkNumber])).toEqual([
++        ["GET", 1],
++        ["GET", 2],
++        ["GET", 3],
++      ]);
++      expect(resumable.isUploading()).toBe(true);
++    });
++
++    it("should not exceed simultaneousUploads when probes turn into uploads", async () => {
++      const requests = installControllableFetch();
++      const resumable = createUpload({ testChunks: true });
++      await sleep(0);
++
++      resumable.upload();
++      await sleep(0);
++      // Server reports none of the chunks exists yet
++      for (const probe of [...requests]) probe.resolve(new Response(null, { status: 204 }));
++      await sleep(0);
++
++      expect(activeRequests(requests).map((r) => [r.method, r.chunkNumber])).toEqual([
++        ["POST", 1],
++        ["POST", 2],
++        ["POST", 3],
++      ]);
++    });
++
++    it("should abort pending probes when pausing", async () => {
++      const requests = installControllableFetch();
++      const resumable = createUpload({ testChunks: true });
++      await sleep(0);
++
++      resumable.upload();
++      await sleep(0);
++      expect(requests.length).toBeGreaterThan(0);
++
++      resumable.pause();
++
++      expect(requests.every((r) => r.signal.aborted)).toBe(true);
++      expect(resumable.isUploading()).toBe(false);
++    });
++
++    it("should abort pending probes when cancelling", async () => {
++      const requests = installControllableFetch();
++      const resumable = createUpload({ testChunks: true });
++      await sleep(0);
++
++      resumable.upload();
++      await sleep(0);
++      resumable.cancel();
++
++      expect(requests.every((r) => r.signal.aborted)).toBe(true);
++    });
++  });
++
++  it("should not send a request when a progress listener pauses the upload", async () => {
++    const requests = installControllableFetch();
++    const resumable = createUpload({ testChunks: false });
++    await sleep(0);
++    resumable.addEventListener("progress", () => resumable.pause(), { once: true });
++
++    resumable.upload();
++    await sleep(0);
++
++    expect(requests.every((r) => r.signal.aborted)).toBe(true);
++    expect(resumable.isUploading()).toBe(false);
++  });
++
++  it("should mark a chunk as failed instead of leaving it uploading when preparing a request throws", async () => {
++    const requests = installControllableFetch();
++    const resumable = new ResumableUpload({
++      target: "/upload",
++      chunkSize: 10,
++      simultaneousUploads: 3,
++      testChunks: true,
++      query: () => {
++        throw new Error("No token");
++      },
++    });
++    resumable.addFile(new File(["x".repeat(60)], "test.txt"));
++    const fileErrorSpy = vi.fn();
++    resumable.addEventListener("fileError", fileErrorSpy);
++    await sleep(0);
++
++    resumable.upload();
++    await sleep(0);
++
++    expect(requests).toEqual([]);
++    expect(resumable.isUploading()).toBe(false);
++    expect(fileErrorSpy).toHaveBeenCalled();
++  });
++
++  it("should log instead of uploading a finished chunk again when finishing it throws", async () => {
++    const requests = installControllableFetch();
++    const resumable = createUpload({ testChunks: false });
++    await sleep(0);
++    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
++
++    try {
++      resumable.upload();
++      await sleep(0);
++      const error = new Error("Scheduler failed");
++      vi.spyOn(resumable, "uploadNextChunk").mockImplementation(() => {
++        throw error;
++      });
++      requests[0].resolve(new Response("ok"));
++      await sleep(0);
++
++      expect(resumable.files[0].chunks[0].status()).toBe("success");
++      expect(requests.filter((r) => r.chunkNumber === 1)).toHaveLength(1);
++      expect(consoleErrorSpy).toHaveBeenCalledWith(error);
++    } finally {
++      consoleErrorSpy.mockRestore();
++    }
++  });
++
++  it("should keep retrying network errors beyond maxChunkRetries", async () => {
++    let attempts = 0;
++    const fetchMock = vi.fn(() =>
++      ++attempts <= 5
++        ? Promise.reject(new TypeError("Network failure"))
++        : Promise.resolve(new Response("ok")),
++    );
++    vi.stubGlobal("fetch", fetchMock);
++    const resumable = new ResumableUpload({
++      target: "/upload",
++      chunkSize: 10,
++      testChunks: false,
++      maxChunkRetries: 2,
++      chunkRetryInterval: 1,
++    });
++    resumable.addFile(new File(["x".repeat(10)], "test.txt"));
++    const fileErrorSpy = vi.fn();
++    resumable.addEventListener("fileError", fileErrorSpy);
++    const fileSuccess = new Promise<void>((resolve) =>
++      resumable.addEventListener("fileSuccess", () => resolve()),
++    );
++    await sleep(0);
++
++    resumable.upload();
++
++    await fileSuccess;
++    expect(fetchMock).toHaveBeenCalledTimes(6);
++    expect(fileErrorSpy).not.toHaveBeenCalled();
++  });
++
++  it("should not leave abort listeners behind after waiting for retries", async () => {
++    let attempts = 0;
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(() =>
++        ++attempts <= 5
++          ? Promise.reject(new TypeError("Network failure"))
++          : Promise.resolve(new Response("ok")),
++      ),
++    );
++    const addSpy = vi.spyOn(EventTarget.prototype, "addEventListener");
++    const removeSpy = vi.spyOn(EventTarget.prototype, "removeEventListener");
++    const abortListenerCount = (spy: typeof addSpy | typeof removeSpy) =>
++      spy.mock.calls.filter(([type]) => type === "abort").length;
++    const resumable = new ResumableUpload({
++      target: "/upload",
++      chunkSize: 10,
++      testChunks: false,
++      chunkRetryInterval: 1,
++    });
++    resumable.addFile(new File(["x".repeat(10)], "test.txt"));
++    const fileSuccess = new Promise<void>((resolve) =>
++      resumable.addEventListener("fileSuccess", () => resolve()),
++    );
++    await sleep(0);
++
++    try {
++      resumable.upload();
++      await fileSuccess;
++
++      // One listener per request and one per retry wait, each removed again.
++      expect(abortListenerCount(addSpy)).toBe(6 + 5);
++      expect(abortListenerCount(removeSpy)).toBe(abortListenerCount(addSpy));
++    } finally {
++      addSpy.mockRestore();
++      removeSpy.mockRestore();
++    }
++  });
++
++  it("should not resume a paused upload when retrying a failed file", async () => {
++    const requests = installControllableFetch();
++    const resumable = createUpload({ testChunks: false });
++    await sleep(0);
++    const file = resumable.files[0];
++
++    resumable.upload();
++    await sleep(0);
++    // A permanent error fails the file, then the user pauses, e.g. in the cancel dialog.
++    requests[0].resolve(new Response("Forbidden", { status: 403 }));
++    await sleep(0);
++    resumable.pause();
++    const requestCountBeforeRetry = requests.length;
++
++    file.retry();
++    await sleep(10);
++
++    expect(file.isPaused()).toBe(true);
++    expect(requests.length).toBe(requestCountBeforeRetry);
++
++    resumable.upload();
++    await sleep(0);
++
++    expect(activeRequests(requests).map((r) => r.chunkNumber)).toEqual([1, 2, 3]);
++  });
++
++  describe("retry timers", () => {
++    const RETRY_INTERVAL = 30;
++
++    async function startAndFailFirstUpload() {
++      const requests = installControllableFetch();
++      const resumable = createUpload({ testChunks: false, chunkRetryInterval: RETRY_INTERVAL });
++      await sleep(0);
++
++      resumable.upload();
++      await sleep(0);
++      requests[0].reject(new TypeError("Network failure"));
++      await sleep(0);
++      const chunk = resumable.files[0].chunks[0];
++      expect(chunk.pendingRetry).toBe(true);
++      return { requests, resumable, chunk };
++    }
++
++    it("should not restart a chunk after pausing", async () => {
++      const { requests, resumable } = await startAndFailFirstUpload();
++      const requestCountBeforePause = requests.length;
++
++      resumable.pause();
++      await sleep(RETRY_INTERVAL * 3);
++
++      expect(resumable.files[0].isPaused()).toBe(true);
++      expect(requests.length).toBe(requestCountBeforePause);
++      expect(activeRequests(requests)).toEqual([]);
++    });
++
++    it("should not restart a chunk after cancelling", async () => {
++      const { requests, resumable } = await startAndFailFirstUpload();
++      const requestCountBeforeCancel = requests.length;
++
++      resumable.cancel();
++      await sleep(RETRY_INTERVAL * 3);
++
++      expect(resumable.files).toEqual([]);
++      expect(requests.length).toBe(requestCountBeforeCancel);
++    });
++
++    it("should upload the chunk again once resumed", async () => {
++      const { requests, resumable } = await startAndFailFirstUpload();
++
++      resumable.pause();
++      resumable.upload();
++      await sleep(RETRY_INTERVAL * 3);
++
++      const activeChunks = activeRequests(requests).map((r) => r.chunkNumber);
++      expect(activeChunks.sort()).toEqual([1, 2, 3]);
++    });
++
++    it("should not restart a stale chunk after retrying the file", async () => {
++      const { requests, resumable, chunk: staleChunk } = await startAndFailFirstUpload();
++      const file = resumable.files[0];
++
++      resumable.pause();
++      file.retry();
++      await sleep(RETRY_INTERVAL * 3);
++
++      expect(file.chunks).not.toContain(staleChunk);
++      expect(staleChunk.pendingRetry).toBe(false);
++      // Only the rebuilt chunks may be uploading, at most once each
++      const activeChunks = activeRequests(requests).map((r) => r.chunkNumber);
++      expect(new Set(activeChunks).size).toBe(activeChunks.length);
++      expect(activeChunks.length).toBeLessThanOrEqual(3);
++    });
++  });
++});
+diff --git a/frontend/javascripts/test/libs/resumable-upload-use-cases.spec.ts b/frontend/javascripts/test/libs/resumable-upload-use-cases.spec.ts
+index 0c8bdc4f16a..3ebf3ade492 100644
+--- a/frontend/javascripts/test/libs/resumable-upload-use-cases.spec.ts
++++ b/frontend/javascripts/test/libs/resumable-upload-use-cases.spec.ts
+@@ -613,18 +613,9 @@ describe("Resumable Use Cases (WEBKNOSSOS Patterns)", () => {
+ 
+   describe("Race Condition: chunk test body-read gap", () => {
+     it("should not send a duplicate POST when uploadNextChunk is re-entered during test body read", async () => {
+-      // Race condition in ResumableChunk.test():
+-      //   1. GET returns 200 (chunk exists) → `tested = true` is set synchronously.
+-      //   2. `await response.text()` yields — async gap before `markComplete = true`.
+-      //   3. Something calls uploadNextChunk() → file.upload() finds chunk 1 "pending".
+-      //   4. send() sees tested=true, skips the test check, fires a duplicate POST.
+-      //   5. test() resumes → markComplete=true → complete event fires.
+-      //   6. Duplicate POST still in-flight after complete.
+-      //
+-      // We reproduce step 3 by calling resumable.upload() a second time after we
+-      // have verified that tested=true has been set (but before releasing the body).
+-      // simultaneousUploads:1 avoids the double-test-request-for-chunk-1 problem
+-      // that would occur with simultaneousUploads:2.
++      // GET returns 200 (chunk exists), but the body is still being read when another
++      // chunk finishing re-enters uploadNextChunk(). Chunk 1 must still count as uploading,
++      // otherwise send() starts a second run that POSTs a chunk the server already has.
+ 
+       const {
+         handler,
+@@ -644,30 +635,60 @@ describe("Resumable Use Cases (WEBKNOSSOS Patterns)", () => {
+       resumable.addFile(file);
+       resumable.upload();
+ 
+-      // Wait until chunk 1's GET handler has fired (response headers are being sent).
++      // Wait until chunk 1's GET handler has fired and its response headers have arrived.
+       await chunk1GetArrived;
+-      // Give the event loop a moment for fetch() to resolve in test() and set
+-      // `this.tested = true` before we proceed.
+       await sleep(10);
+ 
+-      // Re-enter upload() to simulate what happens when another chunk finishes and
+-      // calls uploadNextChunk() while chunk 1's body is still pending.
+-      // isUploading() is false (chunk 1 is "pending", not "uploading"), so upload()
+-      // proceeds and calls uploadNextChunk() → file.upload() → chunk1.send().
+-      // send() sees tested=true → skips test → fires a duplicate POST. (RACE!)
++      resumable.uploadNextChunk();
++      releaseChunk1Body();
++
++      await resumable.waitForComplete();
++      // Allow any in-flight duplicate POST to land on the backend before asserting.
++      await backendMock.waitForIdle();
++
++      // Chunk 1 existed on the server, so only chunk 2 may have been POSTed.
++      expect(backendMock.getUploadRequestCount()).toBe(1);
++      expect(backendMock.requestLog.filter((e) => e.method === "POST").length).toBe(1);
++    });
++
++    it("should not POST an existing chunk when pausing and resuming during the test body read", async () => {
++      // GET returns 200 (chunk exists), but the body is still being read when the user
++      // pauses and resumes. The probe's result must not count until the body has been
++      // read, otherwise the resumed run skips the probe and POSTs a chunk the server has.
++
++      const {
++        handler,
++        trigger: releaseChunk1Body,
++        getArrived: chunk1GetArrived,
++      } = makeSlowChunk1Handler();
++      server.use(handler);
++
++      resumable = new ResumableUpload({
++        target: "/upload",
++        chunkSize: 10,
++        testChunks: true,
++        simultaneousUploads: 1,
++      });
++
++      const file = new File(["12345678901234567890"], "race.txt", { type: "text/plain" });
++      resumable.addFile(file);
+       resumable.upload();
+ 
+-      // Release chunk 1's body so test() can finish: markComplete=true is set, then
+-      // uploadNextChunk() is called to continue with chunk 2.
++      // Wait until chunk 1's GET handler has fired and its response headers have arrived.
++      await chunk1GetArrived;
++      await sleep(10);
++
++      resumable.pause();
++      resumable.upload();
++      // Let the resumed run probe chunk 1 again before releasing the body.
++      await sleep(10);
+       releaseChunk1Body();
+ 
+       await resumable.waitForComplete();
+       // Allow any in-flight duplicate POST to land on the backend before asserting.
+       await backendMock.waitForIdle();
+ 
+-      // Chunk 1 existed on the server, so no POST should have been sent for it.
+-      // If the race fires: uploadRequestCount=2 (chunk1 duplicate + chunk2).
+-      // If fixed:          uploadRequestCount=1 (only chunk2).
++      // Chunk 1 existed on the server, so only chunk 2 may have been POSTed.
+       expect(backendMock.getUploadRequestCount()).toBe(1);
+       expect(backendMock.requestLog.filter((e) => e.method === "POST").length).toBe(1);
+     });
+diff --git a/unreleased_changes/10253.md b/unreleased_changes/10253.md
+new file mode 100644
+index 00000000000..cdb8765c6f5
+--- /dev/null
++++ b/unreleased_changes/10253.md
+@@ -0,0 +1,2 @@
++### Fixed
++- Fixed that pausing or cancelling a dataset upload did not stop all running requests, that resuming it could leave the upload stuck, and that some chunks were uploaded multiple times.

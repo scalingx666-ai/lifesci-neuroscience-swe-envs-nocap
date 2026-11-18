@@ -1,0 +1,1956 @@
+diff --git a/tests/test_multi_trace.py b/tests/test_multi_trace.py
+new file mode 100644
+index 0000000000..0eaddefe54
+--- /dev/null
++++ b/tests/test_multi_trace.py
+@@ -0,0 +1,457 @@
++"""Tests for the multi_trace subpackage (TraceBundle + supergraph).
++
++Covers the 21 required cases from the Phase 1 spec plus a handful of edge
++cases discovered during implementation.  Each test is self-contained --
++fixtures live in the test file itself rather than in conftest.py because
++the multi_trace tests are the only callers.
++"""
++
++from __future__ import annotations
++
++import warnings
++from typing import List
++
++import pytest
++import torch
++from torch import nn
++
++import torchlens as tl
++from torchlens.multi_trace import (
++    NodeView,
++    TopologyDiff,
++    TraceBundle,
++    bundle,
++    compare_topology,
++)
++from torchlens.multi_trace.metrics import (
++    METRIC_REGISTRY,
++    cosine_distance,
++    relative_l1_scalar,
++    resolve_metric,
++)
++
++
++# ---------------------------------------------------------------------------
++# Tiny model fixtures
++# ---------------------------------------------------------------------------
++
++
++class _LinearNet(nn.Module):
++    """Small static model used for shared-topology tests."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.fc1 = nn.Linear(4, 4)
++        self.fc2 = nn.Linear(4, 4)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return torch.relu(self.fc2(torch.relu(self.fc1(x))))
++
++
++class _BranchNet(nn.Module):
++    """Conditionally branching model used for divergent-topology tests.
++
++    Picks between ``relu`` and ``sigmoid`` based on the sign of the input
++    mean, producing distinct supergraph nodes on each branch.
++    """
++
++    def __init__(self) -> None:
++        super().__init__()
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        if x.mean() > 0:
++            return torch.relu(x)
++        return torch.sigmoid(x)
++
++
++class _ScalarOutNet(nn.Module):
++    """Model whose output is a 0-d tensor (sum reduction)."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.fc = nn.Linear(4, 4)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.fc(x).sum()
++
++
++def _trace_linear(n_traces: int, batch: int = 2) -> List[tl.ModelLog]:
++    model = _LinearNet()
++    return [tl.log_forward_pass(model, torch.rand(batch, 4)) for _ in range(n_traces)]
++
++
++def _trace_branch_pair() -> tuple[tl.ModelLog, tl.ModelLog]:
++    model = _BranchNet()
++    ml_pos = tl.log_forward_pass(model, torch.ones(2, 4))
++    ml_neg = tl.log_forward_pass(model, -torch.ones(2, 4))
++    return ml_pos, ml_neg
++
++
++# ---------------------------------------------------------------------------
++# 1. Construction tests
++# ---------------------------------------------------------------------------
++
++
++def test_bundle_construction_shared_topology() -> None:
++    traces = _trace_linear(3)
++    b = TraceBundle(traces)
++    assert len(b) == 3
++    assert b.is_shared_topology is True
++    assert len(b.universal_nodes) == len(b.nodes)
++    assert b.coverage("trace_0") == pytest.approx(1.0)
++    assert b.coverage("trace_2") == pytest.approx(1.0)
++
++
++def test_bundle_construction_divergent_topology() -> None:
++    ml_pos, ml_neg = _trace_branch_pair()
++    b = TraceBundle([ml_pos, ml_neg])
++    assert b.is_shared_topology is False
++    selective = b.selective_nodes()
++    assert len(selective) > 0, "Expected at least the relu/sigmoid branch nodes to be selective"
++    # Both branch ops must appear somewhere in the supergraph.
++    nodes = b.nodes
++    assert any("relu" in name for name in nodes), f"relu not in supergraph nodes: {nodes}"
++    assert any("sigmoid" in name for name in nodes), f"sigmoid not in supergraph nodes: {nodes}"
++
++
++# ---------------------------------------------------------------------------
++# 2. Node view tests
++# ---------------------------------------------------------------------------
++
++
++def test_node_view_shared_topology_stacked() -> None:
++    traces = _trace_linear(3, batch=2)
++    b = TraceBundle(traces)
++    # Pick a node that all traces traverse: relu_1_2 on first call.
++    nodes = b.nodes
++    relu_nodes = [n for n in nodes if "relu" in n]
++    assert relu_nodes, f"no relu in nodes: {nodes}"
++    target = relu_nodes[0]
++    view = b[target]
++    assert isinstance(view, NodeView)
++    activations = view.activations
++    assert len(activations) == 3
++    assert all(t is not None for t in activations)
++    stacked = view.activation
++    assert stacked.shape[0] == 2 * 3  # batch=2 across 3 traces
++    assert stacked.shape[1:] == activations[0].shape[1:]
++
++
++def test_node_view_divergent_topology_list() -> None:
++    ml_pos, ml_neg = _trace_branch_pair()
++    b = TraceBundle([ml_pos, ml_neg])
++    # Find the relu node -- only ml_pos traverses it.
++    relu_node_names = [n for n in b.nodes if "relu" in n]
++    assert relu_node_names, f"no relu in {b.nodes}"
++    relu_view = b[relu_node_names[0]]
++    assert isinstance(relu_view, NodeView)
++    assert len(relu_view.activations) < len(b)
++    with pytest.raises(ValueError) as exc:
++        _ = relu_view.activation
++    msg = str(exc.value)
++    assert "not all" in msg.lower() or "missing" in msg.lower()
++
++
++def test_node_view_traces_set() -> None:
++    ml_pos, ml_neg = _trace_branch_pair()
++    b = TraceBundle([ml_pos, ml_neg], names=["pos", "neg"])
++    relu_nodes = [n for n in b.nodes if "relu" in n]
++    sigmoid_nodes = [n for n in b.nodes if "sigmoid" in n]
++    assert relu_nodes and sigmoid_nodes
++    assert b[relu_nodes[0]].traces == {"pos"}
++    assert b[sigmoid_nodes[0]].traces == {"neg"}
++
++
++# ---------------------------------------------------------------------------
++# 3. Diff tests
++# ---------------------------------------------------------------------------
++
++
++def test_diff_cosine_pairwise() -> None:
++    traces = _trace_linear(3)
++    b = TraceBundle(traces)
++    target = next(n for n in b.nodes if "relu" in n)
++    matrix = b[target].diff(metric="cosine")
++    assert matrix.shape == (3, 3)
++    # Diagonal must be 0 (or near-zero for floating point).
++    for i in range(3):
++        assert float(matrix[i, i]) == pytest.approx(0.0, abs=1e-6)
++    # Symmetric
++    for i in range(3):
++        for j in range(3):
++            assert float(matrix[i, j]) == pytest.approx(float(matrix[j, i]), abs=1e-6)
++
++
++def test_diff_scalar_fallback() -> None:
++    model = _ScalarOutNet()
++    traces = [tl.log_forward_pass(model, torch.rand(2, 4)) for _ in range(3)]
++    b = TraceBundle(traces)
++    # output_1 is a scalar (sum reduction).
++    output_node = next(n for n in b.nodes if n.startswith("output"))
++    view = b[output_node]
++    matrix = view.diff(metric="cosine")
++    assert matrix.shape == (3, 3)
++    assert torch.isnan(matrix).any().item() is False
++    # Diagonal still zero.
++    for i in range(3):
++        assert float(matrix[i, i]) == pytest.approx(0.0, abs=1e-6)
++
++
++def test_diff_to_specific_other() -> None:
++    traces = _trace_linear(3)
++    b = TraceBundle(traces, names=["a", "b", "c"])
++    target = next(n for n in b.nodes if "relu" in n)
++    row = b[target].diff(other="a", metric="cosine")
++    assert row.shape == (1, 3)
++    # diff to self should be 0.
++    a_idx = b.names.index("a")
++    assert float(row[0, a_idx]) == pytest.approx(0.0, abs=1e-6)
++
++
++def test_diff_on_gradient() -> None:
++    model = _LinearNet()
++    traces: List[tl.ModelLog] = []
++    for _ in range(2):
++        x = torch.rand(2, 4, requires_grad=True)
++        ml = tl.log_forward_pass(model, x, save_gradients=True, train_mode=True)
++        loss = ml.layer_logs[ml.output_layers[0]].activation.sum()
++        loss.backward()
++        traces.append(ml)
++    b = TraceBundle(traces)
++    assert b.has_gradients is True
++    target = next(n for n in b.nodes if "relu" in n)
++    matrix = b[target].diff(metric="cosine", on="gradient")
++    assert matrix.shape == (2, 2)
++    assert float(matrix[0, 0]) == pytest.approx(0.0, abs=1e-6)
++
++
++# ---------------------------------------------------------------------------
++# 4. Aggregate / ranking tests
++# ---------------------------------------------------------------------------
++
++
++def test_aggregate_mean() -> None:
++    traces = _trace_linear(3)
++    b = TraceBundle(traces)
++    target = next(n for n in b.nodes if "relu" in n)
++    mean = b[target].aggregate("mean")
++    # Manual: average of the three per-trace activations along axis 0.
++    activations = b[target].activations
++    stacked = torch.stack([a.to(torch.float32) for a in activations], dim=0)
++    expected = stacked.mean(dim=0)
++    assert torch.allclose(mean, expected, atol=1e-6)
++
++
++def test_most_changed() -> None:
++    # Construct three traces with a node guaranteed to vary heavily.
++    model = _LinearNet()
++    inputs = [torch.zeros(2, 4), torch.ones(2, 4) * 5.0, torch.ones(2, 4) * -5.0]
++    traces = [tl.log_forward_pass(model, x) for x in inputs]
++    b = TraceBundle(traces)
++    ranked = b.most_changed(top_k=10, metric="cosine")
++    assert len(ranked) > 0
++    # Strictly non-increasing scores.
++    for prior, latter in zip(ranked, ranked[1:]):
++        assert prior[1] >= latter[1] - 1e-9
++    # Each score should be a finite number.
++    for _, score in ranked:
++        assert score == score  # NaN check
++        assert score >= -1e-9
++
++
++# ---------------------------------------------------------------------------
++# 5. Groups + coverage tests
++# ---------------------------------------------------------------------------
++
++
++def test_groups() -> None:
++    ml_pos1, ml_neg = _trace_branch_pair()
++    # Add a second positive trace so 'cats' has 2 members and 'dogs' has 1.
++    model = _BranchNet()
++    ml_pos2 = tl.log_forward_pass(model, torch.ones(2, 4) * 0.5)
++    b = TraceBundle(
++        [ml_pos1, ml_pos2, ml_neg],
++        names=["cat_01", "cat_02", "dog_01"],
++        groups={"cats": ["cat_01", "cat_02"], "dogs": ["dog_01"]},
++    )
++    cat_only = b.selective_nodes(group="cats")
++    dog_only = b.selective_nodes(group="dogs")
++    # Cats traversed relu, dogs traversed sigmoid.
++    relu_nodes = [n for n in cat_only if "relu" in n]
++    sigmoid_nodes = [n for n in dog_only if "sigmoid" in n]
++    assert relu_nodes, f"expected relu node in cats-only nodes: {cat_only}"
++    assert sigmoid_nodes, f"expected sigmoid node in dogs-only nodes: {dog_only}"
++
++
++def test_coverage() -> None:
++    ml_pos, ml_neg = _trace_branch_pair()
++    b = TraceBundle([ml_pos, ml_neg], names=["pos", "neg"])
++    cov_pos = b.coverage("pos")
++    cov_neg = b.coverage("neg")
++    # Each trace traversed only its own branch, so neither has full coverage.
++    assert 0.0 < cov_pos < 1.0
++    assert 0.0 < cov_neg < 1.0
++
++
++# ---------------------------------------------------------------------------
++# 6. Edge case + assertion tests
++# ---------------------------------------------------------------------------
++
++
++def test_empty_bundle_errors() -> None:
++    with pytest.raises(ValueError):
++        TraceBundle([])
++
++
++def test_single_trace_bundle() -> None:
++    traces = _trace_linear(1)
++    b = TraceBundle(traces)
++    assert len(b) == 1
++    assert b.is_shared_topology is True
++    target = next(n for n in b.nodes if "relu" in n)
++    # most_changed returns nothing because no node has 2+ traversers.
++    ranked = b.most_changed(top_k=5)
++    assert ranked == []
++    # diff on a single-trace node yields a 1x1 zero matrix.
++    matrix = b[target].diff(metric="cosine")
++    assert matrix.shape == (1, 1)
++    assert float(matrix[0, 0]) == pytest.approx(0.0, abs=1e-6)
++
++
++def test_assert_shared_topology() -> None:
++    ml_pos, ml_neg = _trace_branch_pair()
++    b_div = TraceBundle([ml_pos, ml_neg])
++    with pytest.raises(ValueError):
++        b_div.assert_shared_topology()
++    b_shared = TraceBundle(_trace_linear(2))
++    # Should not raise.
++    b_shared.assert_shared_topology()
++
++
++# ---------------------------------------------------------------------------
++# 7. Topology comparison tests
++# ---------------------------------------------------------------------------
++
++
++def test_topology_compare_identical() -> None:
++    traces = _trace_linear(1)
++    diff = compare_topology(traces[0], traces[0])
++    assert isinstance(diff, TopologyDiff)
++    assert diff.is_identical is True
++    assert diff.unmatched_a == []
++    assert diff.unmatched_b == []
++    assert len(diff.matched) == len(traces[0].layer_logs)
++
++
++def test_topology_compare_divergent() -> None:
++    ml_pos, ml_neg = _trace_branch_pair()
++    diff = compare_topology(ml_pos, ml_neg)
++    assert diff.is_identical is False
++    # ml_pos has the relu node only; ml_neg has the sigmoid node only.
++    pos_only = set(diff.unmatched_a)
++    neg_only = set(diff.unmatched_b)
++    assert any("relu" in n for n in pos_only), f"unmatched_a missing relu: {pos_only}"
++    assert any("sigmoid" in n for n in neg_only), f"unmatched_b missing sigmoid: {neg_only}"
++    # Matched should include the shared input/output/mean/gt nodes.
++    assert len(diff.matched) > 0
++
++
++# ---------------------------------------------------------------------------
++# 8. Repr + factory + smoke
++# ---------------------------------------------------------------------------
++
++
++def test_repr() -> None:
++    traces = _trace_linear(3)
++    b = TraceBundle(traces)
++    r = repr(b)
++    assert "N=3" in r
++    assert "supergraph nodes" in r
++    assert "shared_topology=True" in r
++    assert "has_gradients=" in r
++
++
++@pytest.mark.smoke
++def test_smoke_basic_bundle() -> None:
++    traces = _trace_linear(2)
++    b = bundle(traces)
++    assert len(b) == 2
++    assert b.is_shared_topology is True
++    target = next(n for n in b.nodes if "relu" in n)
++    view = b[target]
++    assert isinstance(view, NodeView)
++    assert view.activation.shape[0] >= 2
++
++
++def test_factory_function() -> None:
++    traces = _trace_linear(2)
++    b1 = bundle(traces)
++    b2 = TraceBundle(traces)
++    assert isinstance(b1, TraceBundle)
++    assert b1.names == b2.names
++    assert b1.nodes == b2.nodes
++
++
++# ---------------------------------------------------------------------------
++# Bonus / edge-case coverage (additive, beyond the spec's 21)
++# ---------------------------------------------------------------------------
++
++
++def test_metric_registry_contains_expected_keys() -> None:
++    assert "cosine" in METRIC_REGISTRY
++    assert "relative_l2" in METRIC_REGISTRY
++    assert "pearson" in METRIC_REGISTRY
++
++
++def test_resolve_metric_callable_passthrough() -> None:
++    sentinel = lambda a, b: torch.tensor(7.0)  # noqa: E731
++    assert resolve_metric(sentinel) is sentinel
++    with pytest.raises(ValueError):
++        resolve_metric("not_a_metric")
++
++
++def test_invalid_indexing() -> None:
++    b = TraceBundle(_trace_linear(2))
++    with pytest.raises(KeyError):
++        _ = b["does_not_exist"]
++    with pytest.raises(TypeError):
++        _ = b[1.5]  # type: ignore[arg-type]
++
++
++def test_groups_unknown_member_rejected() -> None:
++    traces = _trace_linear(2)
++    with pytest.raises(ValueError):
++        TraceBundle(traces, names=["a", "b"], groups={"x": ["c"]})
++
++
++def test_names_mismatch_raises() -> None:
++    traces = _trace_linear(2)
++    with pytest.raises(ValueError):
++        TraceBundle(traces, names=["a"])
++    with pytest.raises(ValueError):
++        TraceBundle(traces, names=["a", "a"])  # duplicates
++
++
++def test_large_bundle_warning() -> None:
++    # Build a fake list of MLs by reusing a single trace; the warning fires
++    # purely on length.
++    one = _trace_linear(1)[0]
++    fake = [one] * 101
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        TraceBundle(fake)
++    assert any("100" in str(w.message) or "stats" in str(w.message).lower() for w in caught)
++
++
++def test_metric_helpers_sanity() -> None:
++    a = torch.tensor([1.0, 0.0, 0.0])
++    b = torch.tensor([0.0, 1.0, 0.0])
++    cos_d = cosine_distance(a, b).item()
++    assert cos_d == pytest.approx(1.0, abs=1e-6)
++    same = cosine_distance(a, a).item()
++    assert same == pytest.approx(0.0, abs=1e-6)
++    # Scalar fallback
++    s1 = torch.tensor(2.0)
++    s2 = torch.tensor(3.0)
++    val = relative_l1_scalar(s1, s2).item()
++    assert val == pytest.approx(0.5, abs=1e-6)
+diff --git a/torchlens/__init__.py b/torchlens/__init__.py
+index 5220aa1a9c..a96282befa 100644
+--- a/torchlens/__init__.py
++++ b/torchlens/__init__.py
+@@ -50,6 +50,10 @@
+     render_model_log_with_dagua,
+ )
+ 
++# ---- Public API: multi-trace analysis ------------------------------------
++
++from .multi_trace import NodeView, TraceBundle, bundle
++
+ # ---- Public API: decoration lifecycle ------------------------------------
+ 
+ from .decoration import wrap_torch, unwrap_torch, wrapped
+@@ -90,13 +94,16 @@ def preview_fastlog(model_log: ModelLog, *args, **kwargs) -> str:
+     "ModuleLog",
+     "ModulePassLog",
+     "NodeSpec",
++    "NodeView",
+     "ParamLog",
+     "StreamingOptions",
+     "TensorLog",
+     "TorchLensPostfuncError",
++    "TraceBundle",
+     "TrainingModeConfigError",
+     "VisualizationOptions",
+     "build_render_audit",
++    "bundle",
+     "check_metadata_invariants",
+     "cleanup_tmp",
+     "fastlog",
+diff --git a/torchlens/multi_trace/__init__.py b/torchlens/multi_trace/__init__.py
+new file mode 100644
+index 0000000000..c901a77d70
+--- /dev/null
++++ b/torchlens/multi_trace/__init__.py
+@@ -0,0 +1,78 @@
++"""Multi-trace analysis for TorchLens.
++
++Public surface:
++
++* :class:`TraceBundle` -- container for N ``ModelLog`` instances, with a
++  union supergraph and per-node accessors.
++* :class:`NodeView` -- per-node view returned by ``bundle[node_name]``.
++* :func:`bundle` -- thin factory wrapper around :class:`TraceBundle` for
++  ergonomic construction (``tl.bundle([ml1, ml2, ml3])``).
++* :func:`compare_topology` / :class:`TopologyDiff` -- pairwise structural
++  diff between two ``ModelLog`` graphs.
++* :class:`Supergraph` / :class:`SupergraphNode` -- the union graph data
++  structure produced by :func:`build_supergraph`.
++* Metric primitives (cosine_distance, relative_l2, pearson_correlation_distance,
++  relative_l1_scalar) and :func:`resolve_metric`.
++
++Visualization, counterfactual branch enumeration, intervention APIs, and
++streaming aggregate are deferred to a Phase 2 dispatch -- see
++``.project-context/todos.md``.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Dict, List, Optional
++
++from .bundle import TraceBundle
++from .metrics import (
++    METRIC_REGISTRY,
++    cosine_distance,
++    pearson_correlation_distance,
++    relative_l1_scalar,
++    relative_l2,
++    resolve_metric,
++)
++from .node_view import NodeView
++from .topology import (
++    Supergraph,
++    SupergraphNode,
++    TopologyDiff,
++    build_supergraph,
++    compare_topology,
++)
++
++if TYPE_CHECKING:  # pragma: no cover - typing-only
++    from ..data_classes.model_log import ModelLog
++
++
++def bundle(
++    traces: List["ModelLog"],
++    names: Optional[List[str]] = None,
++    groups: Optional[Dict[str, List[str]]] = None,
++) -> TraceBundle:
++    """Construct a :class:`TraceBundle` from a list of ``ModelLog`` instances.
++
++    Thin wrapper around the :class:`TraceBundle` constructor; offered so
++    user code can read as ``tl.bundle([ml1, ml2, ml3])`` rather than
++    ``tl.TraceBundle([ml1, ml2, ml3])``.
++    """
++
++    return TraceBundle(traces, names=names, groups=groups)
++
++
++__all__ = [
++    "METRIC_REGISTRY",
++    "NodeView",
++    "Supergraph",
++    "SupergraphNode",
++    "TopologyDiff",
++    "TraceBundle",
++    "build_supergraph",
++    "bundle",
++    "compare_topology",
++    "cosine_distance",
++    "pearson_correlation_distance",
++    "relative_l1_scalar",
++    "relative_l2",
++    "resolve_metric",
++]
+diff --git a/torchlens/multi_trace/bundle.py b/torchlens/multi_trace/bundle.py
+new file mode 100644
+index 0000000000..9342acb1fb
+--- /dev/null
++++ b/torchlens/multi_trace/bundle.py
+@@ -0,0 +1,374 @@
++"""TraceBundle: container for N ModelLog instances with supergraph access.
++
++The bundle is the core abstraction for any multi-pass analysis: aggregate
++statistics across many forward passes, comparison of two or more traces,
++or coverage analysis on dynamic networks.  One class handles both
++shared-topology bundles (every trace traverses the same nodes) and
++divergent-topology bundles (e.g. dynamic branching, MoE routing); the
++shared case is just a degenerate Overlay where every node is universal.
++
++Construction is cheap -- the bundle holds references, never copies tensors,
++and the supergraph is built once in :meth:`__init__` then cached.
++
++Visualization, counterfactual branch enumeration, intervention APIs, and
++streaming aggregate are explicitly out of scope for this phase. See
++``.project-context/todos.md`` for the deferred Phase 2 items.
++"""
++
++from __future__ import annotations
++
++import warnings
++from typing import (
++    TYPE_CHECKING,
++    Callable,
++    Dict,
++    Iterator,
++    List,
++    Literal,
++    Optional,
++    Union,
++)
++
++import torch
++
++from .metrics import is_scalar_like, relative_l1_scalar, resolve_metric
++from .node_view import NodeView
++from .topology import Supergraph, build_supergraph
++
++if TYPE_CHECKING:  # pragma: no cover - typing-only
++    from ..data_classes.model_log import ModelLog
++
++
++# Threshold above which we surface a "consider stats-only storage" warning.
++# Chosen to match the spec; users with explicit intent (long-running sweeps)
++# can suppress the warning via the standard ``warnings`` machinery.
++_LARGE_BUNDLE_THRESHOLD = 100
++
++
++class TraceBundle:
++    """Holds N ``ModelLog`` instances and exposes aggregate / comparison APIs.
++
++    Construct from a list of ``ModelLog`` objects (held by reference, never
++    copied or mutated).  Optionally provide ``names`` to label each trace
++    and ``groups`` to partition them.
++
++    The supergraph is built at construction time.  Selective and universal
++    node views are derived from it; per-node accessors are returned via
++    ``bundle[node_name]``.
++
++    Examples
++    --------
++
++    >>> import torchlens as tl
++    >>> ml1 = tl.log_forward_pass(model, x1)
++    >>> ml2 = tl.log_forward_pass(model, x2)
++    >>> bundle = tl.bundle([ml1, ml2])
++    >>> bundle.is_shared_topology
++    True
++    >>> bundle['relu_1_2'].activation.shape
++    torch.Size([12, 4])  # batch_size 6 * 2 traces
++    >>> bundle.most_changed(top_k=3)
++    [('linear_1_1', 0.42), ('relu_1_2', 0.18), ('output_1', 0.05)]
++    """
++
++    def __init__(
++        self,
++        traces: List["ModelLog"],
++        names: Optional[List[str]] = None,
++        groups: Optional[Dict[str, List[str]]] = None,
++    ) -> None:
++        if not isinstance(traces, list) or any(t is None for t in traces):
++            raise TypeError("traces must be a list of ModelLog instances")
++        if len(traces) == 0:
++            raise ValueError("TraceBundle requires at least one ModelLog; got empty list.")
++
++        # Default names
++        if names is None:
++            names = [f"trace_{i}" for i in range(len(traces))]
++        else:
++            if len(names) != len(traces):
++                raise ValueError(
++                    f"names length ({len(names)}) must equal traces length ({len(traces)})"
++                )
++            if len(set(names)) != len(names):
++                raise ValueError("names must be unique")
++        # Validate groups
++        if groups is None:
++            groups = {}
++        else:
++            name_set = set(names)
++            for group_name, members in groups.items():
++                if not isinstance(members, list):
++                    raise TypeError(f"groups['{group_name}'] must be a list of trace names")
++                unknown = [m for m in members if m not in name_set]
++                if unknown:
++                    raise ValueError(
++                        f"groups['{group_name}'] references unknown trace names: "
++                        f"{unknown}. Known: {sorted(name_set)}"
++                    )
++
++        self._traces: List["ModelLog"] = list(traces)
++        self._names: List[str] = list(names)
++        self._groups: Dict[str, List[str]] = {k: list(v) for k, v in groups.items()}
++
++        if len(self._traces) > _LARGE_BUNDLE_THRESHOLD:
++            warnings.warn(
++                f"TraceBundle was constructed with {len(self._traces)} traces. "
++                "Holding many full ModelLog instances in memory can be expensive; "
++                "consider using stats-only storage upstream (e.g. trace with "
++                "save_outputs reduced) if you only need aggregates.",
++                stacklevel=2,
++            )
++
++        # Build supergraph once, cache.
++        self._supergraph: Supergraph = build_supergraph(self._traces, self._names)
++
++    # ------------------------------------------------------------------
++    # Iteration / indexing
++    # ------------------------------------------------------------------
++
++    def __len__(self) -> int:
++        """Number of bundled ``ModelLog`` traces."""
++
++        return len(self._traces)
++
++    def __iter__(self) -> Iterator["ModelLog"]:
++        """Iterate the underlying ``ModelLog`` instances in bundle order."""
++
++        return iter(self._traces)
++
++    def __getitem__(self, key: Union[str, int]) -> Union[NodeView, "ModelLog"]:
++        """Look up a node by name or a trace by index.
++
++        ``str`` arguments resolve to a :class:`NodeView` for the supergraph
++        node with that canonical name.  ``int`` arguments resolve to the
++        i-th ``ModelLog`` in bundle order.
++        """
++
++        if isinstance(key, int):
++            return self._traces[key]
++        if isinstance(key, str):
++            node = self._supergraph.nodes.get(key)
++            if node is None:
++                raise KeyError(f"Node '{key}' not found in supergraph. Use `bundle.nodes` to list.")
++            return NodeView(key, node, self._names)
++        raise TypeError(f"TraceBundle indices must be int or str, got {type(key).__name__}")
++
++    def __contains__(self, node_name: str) -> bool:
++        """Whether ``node_name`` is present in the supergraph."""
++
++        return node_name in self._supergraph.nodes
++
++    # ------------------------------------------------------------------
++    # Properties
++    # ------------------------------------------------------------------
++
++    @property
++    def traces(self) -> List["ModelLog"]:
++        """The bundled ``ModelLog`` instances, in construction order."""
++
++        return list(self._traces)
++
++    @property
++    def names(self) -> List[str]:
++        """Trace names in construction order."""
++
++        return list(self._names)
++
++    @property
++    def groups(self) -> Dict[str, List[str]]:
++        """A copy of the configured trace groups."""
++
++        return {k: list(v) for k, v in self._groups.items()}
++
++    @property
++    def is_shared_topology(self) -> bool:
++        """Whether every trace traversed every supergraph node."""
++
++        n = len(self._names)
++        for node in self._supergraph.nodes.values():
++            if len(node.traces) != n:
++                return False
++        return True
++
++    @property
++    def nodes(self) -> List[str]:
++        """Supergraph node names in topological order."""
++
++        return list(self._supergraph.topological_order)
++
++    @property
++    def universal_nodes(self) -> List[str]:
++        """Supergraph nodes traversed by ALL bundled traces."""
++
++        n = len(self._names)
++        return [
++            name
++            for name in self._supergraph.topological_order
++            if len(self._supergraph.nodes[name].traces) == n
++        ]
++
++    @property
++    def has_gradients(self) -> bool:
++        """Whether any bundled trace has backward gradient data."""
++
++        return any(getattr(ml, "has_gradients", False) for ml in self._traces)
++
++    # ------------------------------------------------------------------
++    # Selection / coverage
++    # ------------------------------------------------------------------
++
++    def selective_nodes(self, group: Optional[str] = None) -> List[str]:
++        """Nodes traversed only by a subset of traces.
++
++        With ``group=None`` (default), returns all nodes that are NOT
++        universal -- i.e. trace-selective overall.  With ``group=<name>``,
++        returns nodes traversed exactly by the traces in that group (and
++        no others).  Empty list if topology is shared and ``group`` is
++        ``None``.
++        """
++
++        if group is None:
++            n = len(self._names)
++            return [
++                name
++                for name in self._supergraph.topological_order
++                if len(self._supergraph.nodes[name].traces) != n
++            ]
++        if group not in self._groups:
++            raise KeyError(f"Unknown group '{group}'. Known groups: {sorted(self._groups)}")
++        members = set(self._groups[group])
++        out: List[str] = []
++        for name in self._supergraph.topological_order:
++            traces_at = set(self._supergraph.nodes[name].traces)
++            # "Only traversed by traces in `group`" = traces_at is non-empty
++            # AND a subset of members AND has at least one member.
++            if traces_at and traces_at.issubset(members):
++                out.append(name)
++        return out
++
++    def coverage(self, trace_name: str) -> float:
++        """Fraction of supergraph nodes that ``trace_name`` traversed.
++
++        Returns 0.0 if the supergraph is empty.  Raises ``KeyError`` if
++        ``trace_name`` is not a known trace.
++        """
++
++        if trace_name not in self._names:
++            raise KeyError(f"Unknown trace '{trace_name}'. Known: {self._names}")
++        total = len(self._supergraph.nodes)
++        if total == 0:
++            return 0.0
++        count = sum(1 for node in self._supergraph.nodes.values() if trace_name in node.layer_refs)
++        return count / total
++
++    # ------------------------------------------------------------------
++    # Aggregate analysis
++    # ------------------------------------------------------------------
++
++    def most_changed(
++        self,
++        top_k: int = 10,
++        metric: Union[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = "cosine",
++        on: Literal["activation", "gradient"] = "activation",
++    ) -> List[tuple[str, float]]:
++        """Rank nodes by mean pairwise distance across traversing traces.
++
++        Skips nodes traversed by fewer than 2 traces (no pair to compare).
++        Returns ``(node_name, score)`` tuples sorted by descending score.
++        ``top_k`` may be larger than the number of eligible nodes; the
++        result simply truncates to as many as exist.
++        """
++
++        if top_k <= 0:
++            raise ValueError(f"top_k must be positive, got {top_k}")
++
++        metric_fn = resolve_metric(metric)
++        scored: List[tuple[str, float]] = []
++        for name in self._supergraph.topological_order:
++            node = self._supergraph.nodes[name]
++            tensors: List[torch.Tensor] = []
++            for trace_name in node.traces:
++                layer = node.layer_refs[trace_name]
++                if on == "activation":
++                    has = getattr(layer, "has_saved_activations", False)
++                    value = getattr(layer, "activation", None) if has else None
++                else:
++                    has = getattr(layer, "has_gradient", False)
++                    value = getattr(layer, "gradient", None) if has else None
++                if isinstance(value, torch.Tensor):
++                    tensors.append(value)
++            if len(tensors) < 2:
++                continue
++            distances: List[float] = []
++            for i in range(len(tensors)):
++                for j in range(i + 1, len(tensors)):
++                    ti, tj = tensors[i], tensors[j]
++                    if is_scalar_like(ti) or is_scalar_like(tj):
++                        d = relative_l1_scalar(ti, tj)
++                    else:
++                        d = metric_fn(ti, tj)
++                    distances.append(float(d.detach().item()))
++            if not distances:
++                continue
++            mean_d = sum(distances) / len(distances)
++            scored.append((name, mean_d))
++
++        scored.sort(key=lambda pair: pair[1], reverse=True)
++        return scored[:top_k]
++
++    def aggregate(
++        self,
++        node: str,
++        statistic: Literal["mean", "std", "var", "norm"] = "mean",
++        on: Literal["activation", "gradient"] = "activation",
++    ) -> torch.Tensor:
++        """Compute an aggregate statistic at a single supergraph node.
++
++        Thin wrapper around ``bundle[node].aggregate(...)``.  Raises
++        ``KeyError`` if the node is unknown.
++        """
++
++        view = self[node]
++        if not isinstance(view, NodeView):  # pragma: no cover - defensive
++            raise TypeError("aggregate requires a node name (str), not a trace index")
++        return view.aggregate(statistic=statistic, on=on)
++
++    # ------------------------------------------------------------------
++    # Hard checks
++    # ------------------------------------------------------------------
++
++    def assert_shared_topology(self) -> None:
++        """Raise ``ValueError`` if topology is not shared across all traces.
++
++        Useful as a guard in code that assumes universal coverage and would
++        otherwise fail with a less informative error from a downstream
++        accessor.
++        """
++
++        if not self.is_shared_topology:
++            n = len(self._names)
++            divergent = [
++                name for name, node in self._supergraph.nodes.items() if len(node.traces) != n
++            ]
++            raise ValueError(
++                f"TraceBundle is not shared-topology: {len(divergent)} "
++                f"node(s) are traversed by only some traces. Examples: "
++                f"{divergent[:5]}"
++            )
++
++    # ------------------------------------------------------------------
++    # Repr
++    # ------------------------------------------------------------------
++
++    def __repr__(self) -> str:
++        n_traces = len(self._traces)
++        n_nodes = len(self._supergraph.nodes)
++        n_universal = len(self.universal_nodes)
++        shared = self.is_shared_topology
++        has_grads = self.has_gradients
++        return (
++            f"TraceBundle(N={n_traces} traces, {n_nodes} supergraph nodes, "
++            f"{n_universal} universal, shared_topology={shared}, "
++            f"has_gradients={has_grads})"
++        )
+diff --git a/torchlens/multi_trace/metrics.py b/torchlens/multi_trace/metrics.py
+new file mode 100644
+index 0000000000..d376cd74ce
+--- /dev/null
++++ b/torchlens/multi_trace/metrics.py
+@@ -0,0 +1,183 @@
++"""Pairwise distance metrics for the multi-trace subpackage.
++
++These primitives operate on pairs of activation (or gradient) tensors and return
++a scalar tensor in the [0, ~] range -- larger means more dissimilar. The
++`METRIC_REGISTRY` and `resolve_metric` helper let callers pass either a string
++name or a callable.
++
++The fallback ``relative_l1_scalar`` is used implicitly by NodeView.diff when the
++inputs are 0-d (scalar) tensors -- cosine and pearson are meaningless on a single
++value.
++"""
++
++from __future__ import annotations
++
++from typing import Callable, Dict, Union
++
++import torch
++
++
++# Small floor used to keep denominators away from zero. Empirically chosen to be
++# negligible compared to typical activation magnitudes while preventing 0/0
++# explosions on dead/zero tensors.
++_EPS = 1e-12
++
++
++def _as_flat_float(t: torch.Tensor) -> torch.Tensor:
++    """Return a 1-D float tensor view of ``t`` for metric arithmetic.
++
++    Promotes integer/bool/half tensors to float32 to avoid integer-division
++    pitfalls. Always returns a contiguous flattened view (no copy if already
++    flat and float).
++    """
++
++    if not isinstance(t, torch.Tensor):
++        raise TypeError(f"expected torch.Tensor, got {type(t).__name__}")
++    if t.is_floating_point():
++        flat = t.detach().reshape(-1)
++    else:
++        flat = t.detach().to(torch.float32).reshape(-1)
++    return flat
++
++
++def cosine_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++    """Return ``1 - cosine_similarity(a, b)`` as a 0-d tensor.
++
++    Both inputs are flattened first. If either flattened vector has zero norm,
++    the cosine similarity is defined as 0 (and thus the distance is 1) unless
++    the two flattened tensors are bitwise-equal -- in which case we treat them
++    as identical (distance 0). This guards self-comparisons of dead/zero
++    activations from showing up as maximally-different.
++    """
++
++    fa = _as_flat_float(a)
++    fb = _as_flat_float(b)
++    if fa.numel() != fb.numel():
++        raise ValueError(
++            f"cosine_distance requires equal element counts, got {fa.numel()} vs {fb.numel()}"
++        )
++    na = torch.linalg.vector_norm(fa)
++    nb = torch.linalg.vector_norm(fb)
++    denom = na * nb
++    if denom.item() < _EPS:
++        if torch.equal(fa, fb):
++            return torch.tensor(0.0, dtype=fa.dtype)
++        return torch.tensor(1.0, dtype=fa.dtype)
++    return 1.0 - (fa @ fb) / denom
++
++
++def relative_l2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++    """Return ``norm(a - b) / max(norm(a), eps)`` as a 0-d tensor.
++
++    This is asymmetric on purpose -- the denominator is anchored on ``a`` so
++    that a "row" comparison `node.diff(other='trace_x')` reads as relative to
++    that trace.
++    """
++
++    fa = _as_flat_float(a)
++    fb = _as_flat_float(b)
++    if fa.numel() != fb.numel():
++        raise ValueError(
++            f"relative_l2 requires equal element counts, got {fa.numel()} vs {fb.numel()}"
++        )
++    diff = torch.linalg.vector_norm(fa - fb)
++    denom = torch.linalg.vector_norm(fa)
++    if denom.item() < _EPS:
++        # When the reference tensor is the zero tensor, fall back to absolute
++        # L2 distance so we still expose the magnitude of the difference.
++        return diff
++    return diff / denom
++
++
++def pearson_correlation_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++    """Return ``1 - pearson_r(a, b)`` as a 0-d tensor.
++
++    If either flattened input has zero variance, Pearson is undefined; we
++    fall back to 1.0 (maximally uncorrelated) unless the inputs are
++    bitwise-equal (treated as identical, distance 0).
++    """
++
++    fa = _as_flat_float(a)
++    fb = _as_flat_float(b)
++    if fa.numel() != fb.numel():
++        raise ValueError(
++            f"pearson_correlation_distance requires equal element counts, got "
++            f"{fa.numel()} vs {fb.numel()}"
++        )
++    if fa.numel() < 2:
++        if torch.equal(fa, fb):
++            return torch.tensor(0.0, dtype=fa.dtype)
++        return torch.tensor(1.0, dtype=fa.dtype)
++    fa_c = fa - fa.mean()
++    fb_c = fb - fb.mean()
++    denom = torch.linalg.vector_norm(fa_c) * torch.linalg.vector_norm(fb_c)
++    if denom.item() < _EPS:
++        if torch.equal(fa, fb):
++            return torch.tensor(0.0, dtype=fa.dtype)
++        return torch.tensor(1.0, dtype=fa.dtype)
++    r = (fa_c @ fb_c) / denom
++    return 1.0 - r
++
++
++def relative_l1_scalar(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++    """Return ``|a - b| / max(|a|, eps)`` as a 0-d tensor.
++
++    Used as the implicit fallback for scalar (0-d or 1-element) outputs because
++    cosine, relative-L2, and Pearson are all meaningless or near-degenerate on a
++    single value.
++    """
++
++    fa = _as_flat_float(a)
++    fb = _as_flat_float(b)
++    # A scalar fallback is only well-defined for 1-element comparisons; clamp
++    # gracefully if the caller hands us a longer vector by reducing to
++    # element-wise absolute difference.
++    if fa.numel() == 0 or fb.numel() == 0:
++        return torch.tensor(0.0, dtype=fa.dtype)
++    a_val = fa.flatten()[0]
++    b_val = fb.flatten()[0]
++    diff = torch.abs(a_val - b_val)
++    denom = torch.abs(a_val)
++    if denom.item() < _EPS:
++        return diff
++    return diff / denom
++
++
++METRIC_REGISTRY: Dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
++    "cosine": cosine_distance,
++    "relative_l2": relative_l2,
++    "pearson": pearson_correlation_distance,
++}
++
++
++def resolve_metric(
++    metric: Union[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
++) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
++    """Resolve a metric specifier to a callable.
++
++    A string is looked up in ``METRIC_REGISTRY``; a callable passes through
++    unchanged. Anything else raises ``TypeError``.
++    """
++
++    if isinstance(metric, str):
++        if metric not in METRIC_REGISTRY:
++            valid = ", ".join(sorted(METRIC_REGISTRY))
++            raise ValueError(
++                f"Unknown metric '{metric}'. Valid metrics: {valid}, or pass a callable."
++            )
++        return METRIC_REGISTRY[metric]
++    if callable(metric):
++        return metric
++    raise TypeError(f"metric must be a string or callable, got {type(metric).__name__}")
++
++
++def is_scalar_like(t: torch.Tensor) -> bool:
++    """Whether ``t`` should be treated as scalar for diff fallback purposes.
++
++    Treats 0-d tensors and 1-element 1-d tensors uniformly. Anything with 2+
++    elements is treated as a vector.
++    """
++
++    if not isinstance(t, torch.Tensor):
++        return False
++    return t.numel() <= 1
+diff --git a/torchlens/multi_trace/node_view.py b/torchlens/multi_trace/node_view.py
+new file mode 100644
+index 0000000000..5491eec235
+--- /dev/null
++++ b/torchlens/multi_trace/node_view.py
+@@ -0,0 +1,404 @@
++"""NodeView: per-node accessor for a TraceBundle.
++
++A :class:`NodeView` is a lightweight, view-style object returned by
++``bundle[node_name]``.  It carries enough context to answer per-trace queries
++without holding any tensor copies; tensors are read on demand from the
++underlying ``LayerLog`` references in the supergraph.
++
++Two flavours of accessor are provided per data field:
++
++* ``.activations`` / ``.gradients`` -- list view, length == number of traces
++  that traversed this node, never raises on partial coverage; entries are
++  ``None`` when a traversing trace has no stored tensor.
++* ``.activation`` / ``.gradient`` -- stacked tensor view, requires every
++  bundled trace to have traversed the node and produced consistent shapes.
++  Raises ``ValueError`` with a hint pointing the caller to the list form
++  otherwise.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Set, Union
++
++import torch
++
++from .metrics import (
++    is_scalar_like,
++    relative_l1_scalar,
++    resolve_metric,
++)
++
++if TYPE_CHECKING:  # pragma: no cover - typing-only
++    from .topology import SupergraphNode
++
++
++_TENSOR_FIELD_LITERAL = Literal["activation", "gradient"]
++
++
++class NodeView:
++    """Read-only view of one supergraph node across all bundled traces.
++
++    Construct via ``bundle[node_name]`` -- not directly. Holds references
++    only; never copies tensors. Cheap to recreate, so callers should not
++    cache instances.
++    """
++
++    def __init__(
++        self,
++        node_name: str,
++        node: "SupergraphNode",
++        bundle_trace_names: List[str],
++    ) -> None:
++        self._node_name = node_name
++        self._node = node
++        # The full bundle ordering of trace names so list views align even
++        # when some traces are absent from this node.
++        self._bundle_trace_names = list(bundle_trace_names)
++
++    # ------------------------------------------------------------------
++    # Identity / metadata
++    # ------------------------------------------------------------------
++
++    @property
++    def node_name(self) -> str:
++        """Canonical supergraph node name."""
++
++        return self._node_name
++
++    @property
++    def traces(self) -> Set[str]:
++        """Names of bundled traces that traversed this node."""
++
++        return set(self._node.traces)
++
++    @property
++    def coverage(self) -> float:
++        """Fraction of bundled traces that traversed this node, in ``[0, 1]``."""
++
++        if not self._bundle_trace_names:
++            return 0.0
++        return len(self._node.traces) / len(self._bundle_trace_names)
++
++    @property
++    def op_type(self) -> str:
++        """Operation type, e.g. ``'relu'``, ``'conv2d'``, ``'matmul'``."""
++
++        return self._node.op_type
++
++    @property
++    def module_path(self) -> Optional[str]:
++        """``containing_module`` from the underlying LayerLog, or ``None``."""
++
++        return self._node.module_path
++
++    @property
++    def shape(self) -> tuple:
++        """Tensor shape excluding the batch dim.
++
++        Verifies consistency across all traversing traces; raises
++        ``ValueError`` on mismatch.  Returns an empty tuple ``()`` for
++        scalar (0-d) outputs.
++        """
++
++        shapes: list[tuple] = []
++        for trace_name in self._node.traces:
++            layer = self._node.layer_refs[trace_name]
++            t_shape = getattr(layer, "tensor_shape", None)
++            if t_shape is None:
++                continue
++            t_shape_tuple = tuple(t_shape)
++            if len(t_shape_tuple) == 0:
++                shapes.append(())
++            else:
++                shapes.append(tuple(t_shape_tuple[1:]))
++        unique_shapes = set(shapes)
++        if len(unique_shapes) > 1:
++            raise ValueError(
++                f"Shape mismatch across traces at node '{self._node_name}': {sorted(unique_shapes)}"
++            )
++        if not shapes:
++            return ()
++        return shapes[0]
++
++    # ------------------------------------------------------------------
++    # Tensor accessors -- list form (always works)
++    # ------------------------------------------------------------------
++
++    def _tensor_list(self, field: _TENSOR_FIELD_LITERAL) -> List[Optional[torch.Tensor]]:
++        """Return the per-trace tensor list for the requested field.
++
++        Iterates in bundle-trace order; entries for traces that did not
++        traverse this node are simply omitted (NOT padded with None) so the
++        list length equals ``len(self.traces)``. For traversing traces that
++        lack a stored value (e.g. ``save_outputs=False`` at trace time), the
++        entry is ``None``.
++        """
++
++        out: List[Optional[torch.Tensor]] = []
++        # Iterate in bundle-trace order to keep the list deterministic.
++        for trace_name in self._bundle_trace_names:
++            if trace_name not in self._node.layer_refs:
++                continue
++            layer = self._node.layer_refs[trace_name]
++            if field == "activation":
++                has = getattr(layer, "has_saved_activations", False)
++                value = getattr(layer, "activation", None) if has else None
++            else:  # gradient
++                has = getattr(layer, "has_gradient", False)
++                value = getattr(layer, "gradient", None) if has else None
++            out.append(value if isinstance(value, torch.Tensor) else None)
++        return out
++
++    @property
++    def activations(self) -> List[Optional[torch.Tensor]]:
++        """Per-trace activation tensors, in bundle-trace order.
++
++        Length equals ``len(self.traces)``. Entries are ``None`` for
++        traversing traces with no stored activation.
++        """
++
++        return self._tensor_list("activation")
++
++    @property
++    def gradients(self) -> List[Optional[torch.Tensor]]:
++        """Per-trace gradient tensors, in bundle-trace order.
++
++        Same contract as :attr:`activations` but for gradients.
++        """
++
++        return self._tensor_list("gradient")
++
++    # ------------------------------------------------------------------
++    # Tensor accessors -- stacked form (strict)
++    # ------------------------------------------------------------------
++
++    def _stacked(self, field: _TENSOR_FIELD_LITERAL) -> torch.Tensor:
++        """Return a single stacked tensor across all bundled traces.
++
++        Strict contract: every trace in the bundle must have traversed this
++        node AND have a stored tensor AND share the same shape excluding
++        the batch dim. Otherwise raises ``ValueError`` with a hint pointing
++        to the list form.
++        """
++
++        missing: List[str] = []
++        no_stored: List[str] = []
++        tensors: List[torch.Tensor] = []
++        per_trace_shapes: List[tuple] = []
++
++        for trace_name in self._bundle_trace_names:
++            if trace_name not in self._node.layer_refs:
++                missing.append(trace_name)
++                continue
++            layer = self._node.layer_refs[trace_name]
++            if field == "activation":
++                has = getattr(layer, "has_saved_activations", False)
++                value = getattr(layer, "activation", None) if has else None
++            else:
++                has = getattr(layer, "has_gradient", False)
++                value = getattr(layer, "gradient", None) if has else None
++            if not isinstance(value, torch.Tensor):
++                no_stored.append(trace_name)
++                continue
++            tensors.append(value)
++            shape = tuple(value.shape)
++            per_trace_shapes.append(shape[1:] if len(shape) > 0 else ())
++
++        list_attr = "activations" if field == "activation" else "gradients"
++
++        if missing:
++            raise ValueError(
++                f"Cannot stack '{field}' for node '{self._node_name}': not all "
++                f"bundled traces traversed it ({len(missing)} missing). Use "
++                f"`bundle['{self._node_name}'].{list_attr}` for the list form."
++            )
++        if no_stored:
++            raise ValueError(
++                f"Cannot stack '{field}' for node '{self._node_name}': "
++                f"{len(no_stored)} trace(s) have no stored {field}. Use "
++                f"`bundle['{self._node_name}'].{list_attr}` for the list form."
++            )
++        unique_shapes = set(per_trace_shapes)
++        if len(unique_shapes) > 1:
++            raise ValueError(
++                f"Cannot stack '{field}' for node '{self._node_name}': shapes "
++                f"differ across traces (excluding batch dim): {sorted(unique_shapes)}."
++                f" Use `bundle['{self._node_name}'].{list_attr}` for the list form."
++            )
++
++        if not tensors:
++            raise ValueError(
++                f"Cannot stack '{field}' for node '{self._node_name}': no traces"
++                f" provided this node."
++            )
++
++        # 0-d outputs cannot be concatenated along a "batch" dim -- stack instead.
++        if tensors[0].dim() == 0:
++            return torch.stack(tensors, dim=0)
++        return torch.cat(tensors, dim=0)
++
++    @property
++    def activation(self) -> torch.Tensor:
++        """Single stacked activation tensor across all traces.
++
++        Concatenated along the batch dim (dim 0). Raises ``ValueError`` if
++        not every trace traversed this node, any traversing trace lacks a
++        stored activation, or shapes disagree.
++        """
++
++        return self._stacked("activation")
++
++    @property
++    def gradient(self) -> torch.Tensor:
++        """Single stacked gradient tensor across all traces.
++
++        Same contract as :attr:`activation` but for gradients.
++        """
++
++        return self._stacked("gradient")
++
++    # ------------------------------------------------------------------
++    # Per-node analysis
++    # ------------------------------------------------------------------
++
++    def _select_tensors(self, on: _TENSOR_FIELD_LITERAL) -> tuple[list[str], list[torch.Tensor]]:
++        """Return (trace_names, tensors) restricted to traces with usable data."""
++
++        usable_names: List[str] = []
++        usable_tensors: List[torch.Tensor] = []
++        for trace_name in self._bundle_trace_names:
++            if trace_name not in self._node.layer_refs:
++                continue
++            layer = self._node.layer_refs[trace_name]
++            if on == "activation":
++                has = getattr(layer, "has_saved_activations", False)
++                value = getattr(layer, "activation", None) if has else None
++            else:
++                has = getattr(layer, "has_gradient", False)
++                value = getattr(layer, "gradient", None) if has else None
++            if isinstance(value, torch.Tensor):
++                usable_names.append(trace_name)
++                usable_tensors.append(value)
++        return usable_names, usable_tensors
++
++    def diff(
++        self,
++        other: Optional[str] = None,
++        metric: Union[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = "cosine",
++        on: _TENSOR_FIELD_LITERAL = "activation",
++    ) -> torch.Tensor:
++        """Pairwise distances between traversing traces at this node.
++
++        Parameters
++        ----------
++        other:
++            Name of a single trace.  When ``None`` (default), returns a
++            ``KxK`` matrix of pairwise distances across the K traces that
++            traversed this node.  When provided, returns a ``1xK`` row of
++            distances from ``other`` to every traversing trace.
++        metric:
++            ``'cosine'`` (default), ``'relative_l2'``, ``'pearson'``, or any
++            callable taking ``(Tensor, Tensor) -> Tensor``.
++        on:
++            ``'activation'`` (default) or ``'gradient'``.
++
++        Notes
++        -----
++        For scalar outputs (0-d or 1-element tensors), automatically falls
++        back to :func:`relative_l1_scalar` regardless of the requested
++        metric. Cosine and Pearson are meaningless on scalars.
++        """
++
++        metric_fn = resolve_metric(metric)
++        usable_names, usable_tensors = self._select_tensors(on)
++        k = len(usable_tensors)
++
++        if other is not None:
++            if other not in self._bundle_trace_names:
++                raise ValueError(
++                    f"Unknown trace name '{other}'. Bundle traces: {self._bundle_trace_names}"
++                )
++            if other not in usable_names:
++                raise ValueError(
++                    f"Trace '{other}' has no usable {on} at node "
++                    f"'{self._node_name}' (did not traverse, or no stored value)."
++                )
++            row = torch.zeros(1, max(k, 1))
++            ref_idx = usable_names.index(other)
++            ref = usable_tensors[ref_idx]
++            for j, t in enumerate(usable_tensors):
++                if j == ref_idx:
++                    # Self-comparison is exactly zero by construction; skip
++                    # the metric to avoid floating-point near-zero noise.
++                    continue
++                if is_scalar_like(ref) or is_scalar_like(t):
++                    val = relative_l1_scalar(ref, t)
++                else:
++                    val = metric_fn(ref, t)
++                row[0, j] = float(val.detach().item())
++            return row
++
++        # Square pairwise matrix
++        out = torch.zeros(k, k)
++        for i in range(k):
++            for j in range(i, k):
++                if i == j:
++                    out[i, j] = 0.0
++                    continue
++                ti = usable_tensors[i]
++                tj = usable_tensors[j]
++                if is_scalar_like(ti) or is_scalar_like(tj):
++                    val = relative_l1_scalar(ti, tj)
++                else:
++                    val = metric_fn(ti, tj)
++                fval = float(val.detach().item())
++                out[i, j] = fval
++                out[j, i] = fval
++        return out
++
++    def aggregate(
++        self,
++        statistic: Literal["mean", "std", "var", "norm"] = "mean",
++        on: _TENSOR_FIELD_LITERAL = "activation",
++    ) -> torch.Tensor:
++        """Compute an aggregate statistic across all traces at this node.
++
++        Stacks the per-trace tensors along a new leading axis and reduces
++        along it.  Requires every traversing trace to have a stored tensor
++        and matching shapes; raises ``ValueError`` otherwise.
++        """
++
++        usable_names, usable_tensors = self._select_tensors(on)
++        if not usable_tensors:
++            raise ValueError(
++                f"No traces have stored {on} at node '{self._node_name}'; cannot aggregate."
++            )
++        # Verify shape compatibility.
++        shapes = {tuple(t.shape) for t in usable_tensors}
++        if len(shapes) > 1:
++            raise ValueError(
++                f"Cannot aggregate '{on}' at node '{self._node_name}': shapes "
++                f"differ across traces: {sorted(shapes)}"
++            )
++
++        stacked = torch.stack(usable_tensors, dim=0).to(torch.float32)
++        if statistic == "mean":
++            return stacked.mean(dim=0)
++        if statistic == "std":
++            return stacked.std(dim=0)
++        if statistic == "var":
++            return stacked.var(dim=0)
++        if statistic == "norm":
++            return torch.linalg.vector_norm(stacked, dim=0)
++        raise ValueError(f"Unknown statistic '{statistic}'. Valid: 'mean', 'std', 'var', 'norm'.")
++
++    # ------------------------------------------------------------------
++    # Repr
++    # ------------------------------------------------------------------
++
++    def __repr__(self) -> str:
++        cov_pct = self.coverage * 100
++        return (
++            f"NodeView(name='{self._node_name}', op_type='{self.op_type}', "
++            f"traces={sorted(self._node.traces)}, coverage={cov_pct:.0f}%)"
++        )
+diff --git a/torchlens/multi_trace/topology.py b/torchlens/multi_trace/topology.py
+new file mode 100644
+index 0000000000..d2f3ec29f0
+--- /dev/null
++++ b/torchlens/multi_trace/topology.py
+@@ -0,0 +1,392 @@
++"""Topology comparison + supergraph construction for multi-trace bundles.
++
++Given N ``ModelLog`` instances of the same architecture (or close variants)
++this module produces:
++
++* :func:`compare_topology` -- a pairwise structural diff between two ModelLogs.
++* :class:`TopologyDiff` -- the result type for the pairwise comparison.
++* :class:`Supergraph` (and :class:`SupergraphNode`) -- the union of N graphs,
++  with each node carrying which traces traversed it plus per-trace LayerLog
++  pointers.
++* :func:`build_supergraph` -- the constructor used by ``TraceBundle``.
++
++Matching is intentionally simple: a linear scan in topological order with a
++greedy fingerprint match. The fingerprint is ``(containing_module, func_name)``
++-- the same module address and the same function under the hood. Topological
++position breaks ties when a fingerprint repeats (e.g. multiple ``relu`` calls
++in the same block).
++
++This catches the common cases (same model, different inputs, conditional
++branches that fire or not) without needing graph-isomorphism machinery.
++Models whose graphs disagree in subtle ways -- e.g. operands swapped on a
++commutative op, identical fingerprints in a different order -- will not match
++perfectly; we document the limitation and let downstream errors surface
++clearly.
++"""
++
++from __future__ import annotations
++
++import warnings
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
++
++if TYPE_CHECKING:  # pragma: no cover - typing-only
++    from ..data_classes.layer_log import LayerLog
++    from ..data_classes.model_log import ModelLog
++
++
++# A fingerprint is (containing_module, func_name).  Both fields normalize to
++# strings; ``containing_module`` is None when the op was logged outside of a
++# named submodule (we map that to the empty string so equality works cleanly).
++Fingerprint = Tuple[str, str]
++
++
++def _fingerprint(layer: "LayerLog") -> Fingerprint:
++    """Return the structural fingerprint used for cross-trace node matching.
++
++    Composed of ``(containing_module or "", func_name or "")`` -- both
++    coerced to strings.  Module pass labels (e.g. ``"fc1:1"``) include the
++    pass index so multi-call modules disambiguate naturally.
++    """
++
++    mod = layer.containing_module if layer.containing_module is not None else ""
++    func = layer.func_name if layer.func_name is not None else ""
++    return (str(mod), str(func))
++
++
++def _shape_excluding_batch(layer: "LayerLog") -> Optional[Tuple[int, ...]]:
++    """Return the layer's tensor shape excluding the leading (batch) dim.
++
++    Returns ``None`` if the shape is unavailable. 0-d tensors yield ``()``;
++    1-d tensors yield ``()`` because the single dim is treated as the batch
++    dim. (This matches the bundle's stacking semantics.)
++    """
++
++    shape = getattr(layer, "tensor_shape", None)
++    if shape is None:
++        return None
++    shape_t = tuple(shape)
++    if len(shape_t) == 0:
++        return ()
++    return shape_t[1:]
++
++
++@dataclass(frozen=True)
++class TopologyDiff:
++    """Result of :func:`compare_topology` for two ModelLogs.
++
++    Attributes
++    ----------
++    matched:
++        Pairs of node names that aligned across the two traces, in
++        topological-order on ``a``.
++    unmatched_a:
++        Node names that appear only in trace ``a``.
++    unmatched_b:
++        Node names that appear only in trace ``b``.
++    is_identical:
++        ``True`` iff both unmatched lists are empty.
++    """
++
++    matched: List[Tuple[str, str]]
++    unmatched_a: List[str]
++    unmatched_b: List[str]
++    is_identical: bool
++
++
++def compare_topology(a: "ModelLog", b: "ModelLog") -> TopologyDiff:
++    """Compare two ModelLogs structurally.
++
++    Two nodes match when their :func:`_fingerprint` values agree -- i.e.
++    they are inside the same module pass and run the same torch function.
++    The match algorithm is a greedy linear scan in topological order: for
++    each node in ``a``, we consume the next ``b`` node whose fingerprint
++    matches and which has not been claimed yet.  Anything not consumed on
++    either side becomes ``unmatched_a`` / ``unmatched_b``.
++
++    Shapes (excluding the batch dim) at matched nodes are checked for
++    consistency.  A mismatch emits a :func:`warnings.warn` but still leaves
++    the nodes paired -- the bundle will raise a clearer error later if
++    stacked accessors hit the disagreement.
++
++    Limitations: the simple fingerprint match does not solve graph
++    isomorphism.  If the same fingerprint appears multiple times in
++    different orders across traces (rare in practice for the same model
++    architecture), the greedy scan can mis-pair them.  In those cases the
++    user should treat the bundle as divergent and rely on per-trace
++    accessors (``.activations``, not ``.activation``).
++    """
++
++    a_layers = list(a.layer_logs.values())
++    b_layers = list(b.layer_logs.values())
++
++    matched: List[Tuple[str, str]] = []
++    consumed_b: Set[int] = set()
++
++    # For each fingerprint we maintain a queue of available indices in b.
++    fingerprint_to_b_indices: Dict[Fingerprint, List[int]] = {}
++    for idx, layer in enumerate(b_layers):
++        fingerprint_to_b_indices.setdefault(_fingerprint(layer), []).append(idx)
++
++    for a_layer in a_layers:
++        fp = _fingerprint(a_layer)
++        candidates = fingerprint_to_b_indices.get(fp)
++        if not candidates:
++            continue
++        # Take the earliest unconsumed b match.
++        b_idx = candidates.pop(0)
++        consumed_b.add(b_idx)
++        b_layer = b_layers[b_idx]
++        a_shape = _shape_excluding_batch(a_layer)
++        b_shape = _shape_excluding_batch(b_layer)
++        if a_shape is not None and b_shape is not None and a_shape != b_shape:
++            warnings.warn(
++                f"Shape mismatch at matched node '{a_layer.layer_label}' "
++                f"(a={a_shape}, b={b_shape}); pairing kept but stacked accessors"
++                " will raise.",
++                stacklevel=2,
++            )
++        matched.append((a_layer.layer_label, b_layer.layer_label))
++
++    matched_a_names = {pair[0] for pair in matched}
++    matched_b_names = {pair[1] for pair in matched}
++    unmatched_a = [
++        layer.layer_label for layer in a_layers if layer.layer_label not in matched_a_names
++    ]
++    unmatched_b = [
++        layer.layer_label for layer in b_layers if layer.layer_label not in matched_b_names
++    ]
++
++    return TopologyDiff(
++        matched=matched,
++        unmatched_a=unmatched_a,
++        unmatched_b=unmatched_b,
++        is_identical=(not unmatched_a and not unmatched_b),
++    )
++
++
++@dataclass
++class SupergraphNode:
++    """One node in the union supergraph.
++
++    Attributes
++    ----------
++    name:
++        Canonical supergraph node name. Equal to one of the per-trace
++        ``LayerLog.layer_label`` values (chosen from the first trace that
++        contributed the node).
++    fingerprint:
++        ``(containing_module, func_name)`` tuple used for matching.
++    traces:
++        Ordered list of trace names that traversed this node, preserving
++        bundle order.
++    layer_refs:
++        Maps each trace name to the ``LayerLog`` for that trace at this node.
++    op_type:
++        Representative function name (taken from the first contributing
++        trace's LayerLog).
++    module_path:
++        Representative ``containing_module`` (or ``None`` if not in a module).
++    """
++
++    name: str
++    fingerprint: Fingerprint
++    traces: List[str] = field(default_factory=list)
++    layer_refs: Dict[str, "LayerLog"] = field(default_factory=dict)
++    op_type: str = ""
++    module_path: Optional[str] = None
++
++
++@dataclass
++class Supergraph:
++    """Union of N ModelLog graphs.
++
++    Attributes
++    ----------
++    nodes:
++        Maps canonical node name -> :class:`SupergraphNode`.
++    edges:
++        Maps an edge (parent_name, child_name) -> set of trace names that
++        traversed it. Stored as ``edge_key -> set[str]`` rather than a multi-
++        graph for compactness.
++    topological_order:
++        The canonical node names in a stable order compatible with all
++        contributing traces.  Constructed by overlaying each trace's order;
++        unmatched nodes are placed where they fit relative to their nearest
++        matched neighbour, falling back to "after the last matched node"
++        otherwise.
++    """
++
++    nodes: Dict[str, SupergraphNode] = field(default_factory=dict)
++    edges: Dict[Tuple[str, str], Set[str]] = field(default_factory=dict)
++    topological_order: List[str] = field(default_factory=list)
++
++
++def _per_trace_fingerprint_to_canonical(
++    canonical_assignments: Dict[Tuple[str, Fingerprint, int], str],
++    trace_name: str,
++    layer: "LayerLog",
++    fp_seen_count: Dict[Tuple[str, Fingerprint], int],
++) -> str:
++    """Compute the canonical node name for a per-trace LayerLog.
++
++    Each fingerprint may legitimately repeat (e.g. multiple ``relu`` calls
++    in the same module pass).  We disambiguate by pairing the trace name
++    with the (fingerprint, occurrence-index) tuple.  ``canonical_assignments``
++    persists those decisions across the build pass.
++    """
++
++    fp = _fingerprint(layer)
++    occurrence = fp_seen_count.get((trace_name, fp), 0)
++    fp_seen_count[(trace_name, fp)] = occurrence + 1
++    key = (trace_name, fp, occurrence)
++    return canonical_assignments[key]
++
++
++def build_supergraph(traces: List["ModelLog"], names: List[str]) -> Supergraph:
++    """Build the union supergraph from N ModelLogs.
++
++    The construction proceeds in three passes:
++
++    1. **Canonical-name assignment.** For every (trace, layer) we compute a
++       fingerprint occurrence index.  The same (fingerprint,
++       occurrence-index) across traces resolves to a single canonical node
++       name (the layer_label from the first trace that contributed it).
++
++    2. **Node payloads.** Walk each trace's layer_logs in order, populating
++       :class:`SupergraphNode` entries with the per-trace LayerLog refs and
++       the trace coverage list.
++
++    3. **Edges + topological order.** Merge per-trace adjacency and per-
++       trace ordering into a single canonical sequence.  Unmatched nodes
++       (those traversed by only some traces) keep their relative position
++       from the trace that produced them.
++    """
++
++    if len(traces) != len(names):
++        raise ValueError(
++            f"build_supergraph expected len(traces)==len(names), got {len(traces)} vs {len(names)}"
++        )
++
++    # Pass 1a: collect per-trace ordered (layer_label, fingerprint, occurrence)
++    per_trace_layers: List[List[Tuple[str, Fingerprint, int]]] = []
++    fp_occurrence_per_trace: List[Dict[Fingerprint, int]] = []
++    for trace in traces:
++        ordered: List[Tuple[str, Fingerprint, int]] = []
++        seen: Dict[Fingerprint, int] = {}
++        for layer in trace.layer_logs.values():
++            fp = _fingerprint(layer)
++            occ = seen.get(fp, 0)
++            seen[fp] = occ + 1
++            ordered.append((layer.layer_label, fp, occ))
++        per_trace_layers.append(ordered)
++        fp_occurrence_per_trace.append(seen)
++
++    # Pass 1b: deterministic canonical names. For each (fingerprint, occ)
++    # we use the first trace's layer_label that produced it.
++    canonical_name: Dict[Tuple[Fingerprint, int], str] = {}
++    for trace_idx, ordered in enumerate(per_trace_layers):
++        for layer_label, fp, occ in ordered:
++            key = (fp, occ)
++            if key not in canonical_name:
++                canonical_name[key] = layer_label
++
++    super_g = Supergraph()
++
++    # Pass 2: node payloads
++    for trace_idx, trace in enumerate(traces):
++        trace_name = names[trace_idx]
++        for layer in trace.layer_logs.values():
++            fp = _fingerprint(layer)
++            # Recompute occurrence in scan order for this trace.
++            # NB: per_trace_layers[trace_idx] preserves the order, so we
++            # zip-match by position.
++            pass  # actual zip below
++        # Walk per_trace_layers[trace_idx] alongside the layer_logs
++        # iteration order (they're constructed from the same iteration).
++        for (_, fp, occ), layer in zip(per_trace_layers[trace_idx], trace.layer_logs.values()):
++            cname = canonical_name[(fp, occ)]
++            node = super_g.nodes.get(cname)
++            if node is None:
++                node = SupergraphNode(
++                    name=cname,
++                    fingerprint=fp,
++                    op_type=str(layer.func_name) if layer.func_name is not None else "",
++                    module_path=(
++                        str(layer.containing_module)
++                        if layer.containing_module is not None
++                        else None
++                    ),
++                )
++                super_g.nodes[cname] = node
++            if trace_name not in node.layer_refs:
++                node.layer_refs[trace_name] = layer
++                node.traces.append(trace_name)
++
++    # Pass 3a: edges. We rebuild per-trace edges using each trace's
++    # parent_layers structure, mapped through canonical names.
++    for trace_idx, trace in enumerate(traces):
++        trace_name = names[trace_idx]
++        # Build trace-local layer_label -> (fingerprint, occurrence) lookup
++        local_lookup: Dict[str, Tuple[Fingerprint, int]] = {
++            label: (fp, occ) for label, fp, occ in per_trace_layers[trace_idx]
++        }
++        for layer in trace.layer_logs.values():
++            child_label = layer.layer_label
++            child_key = local_lookup.get(child_label)
++            if child_key is None:
++                continue
++            child_canonical = canonical_name[child_key]
++            for parent_label in layer.parent_layers:
++                parent_layer = trace.layer_logs.get(parent_label)
++                if parent_layer is None:
++                    # parent_layers are typically pass-qualified strings; map
++                    # back to no_pass labels via the source ModelLog index.
++                    try:
++                        ref = trace[parent_label]
++                    except (KeyError, IndexError):
++                        continue
++                    parent_no_pass = getattr(ref, "layer_label_no_pass", None)
++                    if parent_no_pass is None:
++                        continue
++                    parent_layer = trace.layer_logs.get(parent_no_pass)
++                if parent_layer is None:
++                    continue
++                parent_key = local_lookup.get(parent_layer.layer_label)
++                if parent_key is None:
++                    continue
++                parent_canonical = canonical_name[parent_key]
++                edge_key = (parent_canonical, child_canonical)
++                edge_traces = super_g.edges.setdefault(edge_key, set())
++                edge_traces.add(trace_name)
++
++    # Pass 3b: stable topological order.  Start from the first trace's
++    # canonical-name sequence; for each subsequent trace, insert any
++    # canonical names not yet placed by anchoring on the nearest already-
++    # placed neighbour.
++    placed: List[str] = []
++    placed_set: Set[str] = set()
++    if per_trace_layers:
++        for _, fp, occ in per_trace_layers[0]:
++            cname = canonical_name[(fp, occ)]
++            if cname not in placed_set:
++                placed.append(cname)
++                placed_set.add(cname)
++
++    for trace_idx in range(1, len(traces)):
++        # Walk this trace's canonical names; for each not-yet-placed one,
++        # insert it just after the nearest previously-placed canonical name
++        # that came before it in this trace, or append if none exists.
++        last_placed_idx_in_overall = -1
++        for _, fp, occ in per_trace_layers[trace_idx]:
++            cname = canonical_name[(fp, occ)]
++            if cname in placed_set:
++                last_placed_idx_in_overall = placed.index(cname)
++                continue
++            insertion_pos = last_placed_idx_in_overall + 1
++            placed.insert(insertion_pos, cname)
++            placed_set.add(cname)
++            last_placed_idx_in_overall = insertion_pos
++
++    super_g.topological_order = placed
++    return super_g

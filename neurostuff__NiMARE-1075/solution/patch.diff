@@ -1,0 +1,1061 @@
+diff --git a/nimare/diagnostics.py b/nimare/diagnostics.py
+index 844d4b6e6..1d5c3a69b 100644
+--- a/nimare/diagnostics.py
++++ b/nimare/diagnostics.py
+@@ -27,12 +27,14 @@
+ )
+ from nimare.meta.ibma import IBMAEstimator
+ from nimare.nimads import Studyset
++from nimare.results import MetaResult
+ from nimare.studyset import normalize_collection
+ from nimare.utils import (
+     DEFAULT_FLOAT_DTYPE,
+     _check_ncores,
+     _filter_kwargs,
+     _mask_coverage_to_null_ijk,
++    _mask_img_to_bool,
+     get_masker,
+     mm2vox,
+ )
+@@ -715,6 +717,9 @@ class ResampledStability(NiMAREBase):
+     n_cores : int, optional
+         Number of cores to use for parallelization.
+         If <=0, defaults to using all available cores. Default is 1.
++    generate_description : bool, optional
++        Whether to append boilerplate text and extract references for the returned result.
++        Default is True.
+     """
+ 
+     def __init__(
+@@ -730,6 +735,7 @@ def __init__(
+         mask_coverage="gm",
+         alpha=0.05,
+         n_cores=1,
++        generate_description=True,
+     ):
+         if mask_coverage not in ("gm", "brain"):
+             raise ValueError("mask_coverage must be 'gm' or 'brain'.")
+@@ -746,6 +752,7 @@ def __init__(
+         self.mask_coverage = mask_coverage
+         self.alpha = alpha
+         self.n_cores = _check_ncores(n_cores)
++        self.generate_description = generate_description
+ 
+     def _resolve_subsets(self, n_studies):
+         """Build a replicate schedule in study-index space."""
+@@ -815,17 +822,27 @@ def _fit_replicate(self, kept_ids, result):
+         return self._extract_binary_support(replicate_result)
+ 
+     def _fit_cbma_subset_replicate(
+-        self, subset_idx, ma_maps, estimator, study_ids, cluster_threshold
++        self,
++        subset_idx,
++        ma_maps,
++        estimator,
++        study_ids,
++        cluster_threshold,
++        precomputed_null=None,
++        mask_arr=None,
+     ):
+         """Compute one CBMA replicate from cached MA maps for a retained-study subset."""
+         subset_ma = ma_maps[subset_idx, :]
+         subset_study_ids = study_ids[subset_idx]
+-        _, z_values = _approximate_z_from_ma(estimator, subset_ma, subset_study_ids)
++        _, z_values = _approximate_z_from_ma(
++            estimator, subset_ma, subset_study_ids, precomputed_null=precomputed_null
++        )
+         z_values, _ = _threshold_z_clusters(
+             z_values,
+             estimator.masker,
+             voxel_thresh=self.voxel_thresh or 0.001,
+             cluster_size_threshold=cluster_threshold,
++            mask_arr=mask_arr,
+         )
+         return (z_values > 0).astype(DEFAULT_FLOAT_DTYPE, copy=False)
+ 
+@@ -846,16 +863,30 @@ def _cbma_subset_stability(self, result, subsets, target_n):
+             estimator.masker, mask_coverage=self.mask_coverage
+         ).astype(np.int32, copy=False)
+ 
++        # Build the full-dataset approximate null once and reuse it for every
++        # subsample and null-MA iteration (mirrors JALE's hx_conv reuse).
++        full_null_temp = copy.deepcopy(estimator)
++        full_null_temp.null_distributions_ = {}
++        full_null_temp._prepare_subsample_null(ma_maps)
++        full_null_temp._compute_approximate_z_values(ma_maps)
++        precomputed_null = full_null_temp.null_distributions_
++
++        # Precompute boolean mask array once to avoid NiBabel round-trip in hot loops.
++        mask_arr = _mask_img_to_bool(estimator.masker.mask_img)
++
+         rng = np.random.RandomState(self.random_state)
+         null_cluster_sizes = np.zeros(montecarlo_iters, dtype=np.int32)
+         for i_iter in range(montecarlo_iters):
+             null_ma, subset_ids = estimator._generate_random_null_ma(target_n, sample_space, rng)
+-            _, null_z = _approximate_z_from_ma(estimator, null_ma, subset_ids)
++            _, null_z = _approximate_z_from_ma(
++                estimator, null_ma, subset_ids, precomputed_null=precomputed_null
++            )
+             _, null_cluster_sizes[i_iter] = _threshold_z_clusters(
+                 null_z,
+                 estimator.masker,
+                 voxel_thresh=cluster_forming_threshold,
+                 cluster_size_threshold=None,
++                mask_arr=mask_arr,
+             )
+ 
+         cluster_threshold = np.percentile(null_cluster_sizes, 100.0 * (1.0 - self.alpha))
+@@ -865,7 +896,13 @@ def _cbma_subset_stability(self, result, subsets, target_n):
+         for support in tqdm(
+             Parallel(return_as="generator", n_jobs=self.n_cores)(
+                 delayed(self._fit_cbma_subset_replicate)(
+-                    subset_idx, ma_maps, estimator, study_ids, cluster_threshold
++                    subset_idx,
++                    ma_maps,
++                    estimator,
++                    study_ids,
++                    cluster_threshold,
++                    precomputed_null=precomputed_null,
++                    mask_arr=mask_arr,
+                 )
+                 for subset_idx in subsets
+             ),
+@@ -880,7 +917,7 @@ def _cbma_subset_stability(self, result, subsets, target_n):
+ 
+     def _finalize_result(self, result, stability_map, n_resamples_used, target_n_used):
+         """Attach stability map and summary table to a copied result object."""
+-        result = result.copy()
++        result = self._copy_result_for_diagnostic(result)
+         map_name = f"{self.target_image}_diag-ResampledStability"
+         result.maps[map_name] = stability_map
+         result.tables[f"{map_name}_tab-summary"] = pd.DataFrame(
+@@ -896,14 +933,30 @@ def _finalize_result(self, result, stability_map, n_resamples_used, target_n_use
+             ]
+         )
+         result.diagnostics.append(self)
+-        result.description_ += (
+-            " Voxelwise stability of thresholded results was estimated by repeatedly "
+-            "resampling the input dataset, recomputing thresholded support maps, and averaging "
+-            "the binary support across resamples. This diagnostic follows the resampling-based "
+-            "stability approach implemented in JALE \\citep{Frahm_Monimu_Hoffstaedter}."
+-        )
++        if self.generate_description:
++            result.description_ += (
++                " Voxelwise stability of thresholded results was estimated by repeatedly "
++                "resampling the input dataset, recomputing thresholded support maps, and "
++                "averaging the binary support across resamples. This diagnostic follows the "
++                "resampling-based stability approach implemented "
++                "in JALE \\citep{Frahm_Monimu_Hoffstaedter}."
++            )
+         return result
+ 
++    @staticmethod
++    def _copy_result_for_diagnostic(result):
++        """Return a lightweight MetaResult copy suitable for adding diagnostic outputs."""
++        new = object.__new__(MetaResult)
++        new.estimator = result.estimator
++        new.corrector = result.corrector
++        new.diagnostics = list(result.diagnostics)
++        new.masker = result.masker
++        new.maps = dict(result.maps)
++        new.tables = dict(result.tables)
++        new.metadata = dict(getattr(result, "metadata", {}))
++        new._set_description(result.description_)
++        return new
++
+     def transform(self, result):
+         """Apply the resampling diagnostic to a fitted meta-analytic result."""
+         if issubclass(type(result.estimator), PairwiseCBMAEstimator):
+diff --git a/nimare/meta/cbma/ale.py b/nimare/meta/cbma/ale.py
+index d18935a89..5e4b15072 100755
+--- a/nimare/meta/cbma/ale.py
++++ b/nimare/meta/cbma/ale.py
+@@ -62,6 +62,7 @@
+     DEFAULT_FLOAT_DTYPE,
+     _check_ncores,
+     _mask_coverage_to_mask,
++    _mask_img_to_bool,
+     _p_to_logp_values,
+     mm2vox,
+     use_memmap,
+@@ -626,6 +627,10 @@ class ALESubtraction(PairwiseCBMAEstimator):
+     vfwe_only : :obj:`bool`, default=True
+         If True, only compute voxel-level null information. If False, also compute and retain
+         cluster size and mass null distributions from the permutation maps.
++    restrict_to_inference_mask : :obj:`bool`, default=False
++        If True and directional inference maps are supplied to ``fit``, restrict permutation
++        inference to the union of nonzero inference-map voxels. Observed group and contrast
++        summary-statistic maps are still reported across the full estimator mask.
+     memory : instance of :class:`joblib.Memory`, :obj:`str`, or :class:`pathlib.Path`
+         Used to cache the output of a function. By default, no caching is done.
+         If a :obj:`str` is given, it is the path to the caching directory.
+@@ -684,6 +689,7 @@ def __init__(
+         voxel_thresh=0.001,
+         low_memory="auto",
+         vfwe_only=True,
++        restrict_to_inference_mask=False,
+         memory=Memory(location=None, verbose=0),
+         memory_level=0,
+         n_cores=1,
+@@ -710,6 +716,7 @@ def __init__(
+         self.voxel_thresh = voxel_thresh
+         self.low_memory = low_memory
+         self.vfwe_only = vfwe_only
++        self.restrict_to_inference_mask = restrict_to_inference_mask
+         self.n_cores = _check_ncores(n_cores)
+         self._permutation_parallel_backend = "threading"
+         self._low_memory_fraction = 0.5
+@@ -839,6 +846,60 @@ def _compute_summarystat_est(self, ma_values):
+             require_masked_csr(ma_values) if sp_sparse.isspmatrix(ma_values) else ma_values
+         )
+ 
++    @staticmethod
++    def _inference_union_mask(group1_mask, group2_mask):
++        """Build the voxel union for directional inference maps."""
++        if group1_mask is None and group2_mask is None:
++            return None
++
++        base = group1_mask if group1_mask is not None else group2_mask
++        union_mask = np.zeros(base.shape, dtype=bool)
++        if group1_mask is not None:
++            union_mask |= group1_mask
++        if group2_mask is not None:
++            union_mask |= group2_mask
++        if not np.any(union_mask):
++            raise ValueError(
++                "Directional ALESubtraction inference requires at least one nonzero voxel in "
++                "inference_map1 or inference_map2."
++            )
++        return union_mask
++
++    def _restrict_pairwise_ma_store(self, ma_store, union_mask):
++        """Slice a pairwise MA store to the inference union mask."""
++        if union_mask is None:
++            return ma_store
++
++        return _PairwiseMAStore(
++            group1=self._slice_ma_group_columns(ma_store.group1, union_mask),
++            group2=self._slice_ma_group_columns(ma_store.group2, union_mask),
++            group1_stat=ma_store.group1_stat[union_mask],
++            group2_stat=ma_store.group2_stat[union_mask],
++            temp_files=[],
++        )
++
++    @staticmethod
++    def _slice_ma_group_columns(ma_group, column_mask):
++        """Slice CSR or chunked CSR MA maps to selected columns."""
++        if isinstance(ma_group, _ChunkedCSRGroup):
++            chunks = [chunk[:, column_mask] for chunk in ma_group.chunks]
++            return _ChunkedCSRGroup(
++                chunks=chunks,
++                row_offsets=ma_group.row_offsets.copy(),
++                shape=(ma_group.shape[0], int(np.count_nonzero(column_mask))),
++            )
++        return ma_group[:, column_mask]
++
++    @staticmethod
++    def _scatter_to_full_mask(values, union_mask, fill_value=0):
++        """Scatter restricted masked values back to the full masker vector."""
++        if union_mask is None:
++            return values
++
++        full_values = np.full(union_mask.shape[0], fill_value, dtype=np.asarray(values).dtype)
++        full_values[union_mask] = values
++        return full_values
++
+     @use_memmap(LGR, n_files=3)
+     def _fit(self, dataset1, dataset2):
+         self.dataset1 = dataset1
+@@ -851,13 +912,28 @@ def _fit(self, dataset1, dataset2):
+         group1_mask = None if inference_map1 is None else np.asarray(inference_map1) > 0
+         group2_mask = None if inference_map2 is None else np.asarray(inference_map2) > 0
+ 
++        union_mask = None
++        has_inference_mask = group1_mask is not None or group2_mask is not None
++        if has_inference_mask:
++            inference_union_mask = self._inference_union_mask(group1_mask, group2_mask)
++            if self.restrict_to_inference_mask:
++                union_mask = inference_union_mask
++
+         with self._managed_pairwise_ma_store(
+             maps_key1="ma_maps1",
+             coords_key1="coordinates1",
+             maps_key2="ma_maps2",
+             coords_key2="coordinates2",
+         ) as ma_store:
+-            diff_ale_values = ma_store.group1_stat - ma_store.group2_stat
++            fit_store = self._restrict_pairwise_ma_store(ma_store, union_mask)
++            if union_mask is None:
++                fit_group1_mask = group1_mask
++                fit_group2_mask = group2_mask
++            else:
++                fit_group1_mask = None if group1_mask is None else group1_mask[union_mask]
++                fit_group2_mask = None if group2_mask is None else group2_mask[union_mask]
++            full_diff_ale_values = ma_store.group1_stat - ma_store.group2_stat
++            diff_ale_values = fit_store.group1_stat - fit_store.group2_stat
+ 
+             try:
+                 if not self.vfwe_only:
+@@ -866,17 +942,17 @@ def _fit(self, dataset1, dataset2):
+                         self.memmap_filenames[2],
+                         dtype=DEFAULT_FLOAT_DTYPE,
+                         mode="w+",
+-                        shape=(self.n_iters, ma_store.n_voxels),
++                        shape=(self.n_iters, fit_store.n_voxels),
+                     )
+ 
+                 iter_abs_max, p_values, diff_signs = self._run_null_permutations(
+-                    ma_store,
++                    fit_store,
+                     n_iters=self.n_iters,
+                     n_cores=self.n_cores,
+                     diff_ale_values=diff_ale_values,
+                     iter_diff_values=iter_diff_values,
+-                    group1_mask=group1_mask,
+-                    group2_mask=group2_mask,
++                    group1_mask=fit_group1_mask,
++                    group2_mask=fit_group2_mask,
+                 )
+                 self.null_distributions_["values_level-voxel_corr-fwe_method-montecarlo"] = (
+                     iter_abs_max
+@@ -890,6 +966,7 @@ def _fit(self, dataset1, dataset2):
+                         iter_diff_values,
+                         voxel_thresh=self.voxel_thresh,
+                         n_iters=self.n_iters,
++                        union_mask=union_mask,
+                     )
+                     self.null_distributions_[
+                         "summary_stat_thresh_level-voxel_corr-fwe_method-montecarlo"
+@@ -922,9 +999,12 @@ def _fit(self, dataset1, dataset2):
+         z_tail = "one" if (group1_mask is not None or group2_mask is not None) else "two"
+         z_arr = p_to_z(p_values, tail=z_tail) * diff_signs
+         logp_arr = _p_to_logp_values(p_values, dtype=DEFAULT_FLOAT_DTYPE)
++        p_values = self._scatter_to_full_mask(p_values, union_mask, fill_value=1)
++        z_arr = self._scatter_to_full_mask(z_arr, union_mask)
++        logp_arr = self._scatter_to_full_mask(logp_arr, union_mask)
+ 
+         maps = {
+-            "stat_desc-group1MinusGroup2": diff_ale_values,
++            "stat_desc-group1MinusGroup2": full_diff_ale_values,
+             "p_desc-group1MinusGroup2": p_values,
+             "z_desc-group1MinusGroup2": z_arr,
+             "logp_desc-group1MinusGroup2": logp_arr,
+@@ -1013,15 +1093,27 @@ def _run_null_permutations(
+ 
+         return iter_abs_max, p_values, diff_signs
+ 
+-    def _compute_cluster_nulls(self, iter_diff_values, voxel_thresh, n_iters):
++    def _compute_cluster_nulls(self, iter_diff_values, voxel_thresh, n_iters, union_mask=None):
+         """Compute cluster-forming threshold and cluster null summaries from permutation maps."""
+-        ss_thresh = np.quantile(np.abs(iter_diff_values), 1 - voxel_thresh)
++        # When union_mask is provided, restrict the ss_thresh quantile and cluster stats to the
++        # masked region so that null clusters can only form where inference maps have signal.
++        is_restricted = union_mask is not None and iter_diff_values.shape[1] == union_mask.sum()
++        if union_mask is not None and not is_restricted:
++            ss_thresh = np.quantile(np.abs(iter_diff_values[:, union_mask]), 1 - voxel_thresh)
++        else:
++            ss_thresh = np.quantile(np.abs(iter_diff_values), 1 - voxel_thresh)
+         conn = ndimage.generate_binary_structure(rank=3, connectivity=1)
+         iter_max_sizes = np.zeros(n_iters, dtype=DEFAULT_FLOAT_DTYPE)
+         iter_max_masses = np.zeros(n_iters, dtype=DEFAULT_FLOAT_DTYPE)
+ 
+         for i_iter in range(n_iters):
+-            iter_map = self.masker.inverse_transform(iter_diff_values[i_iter, :]).get_fdata(
++            iter_vals = iter_diff_values[i_iter, :]
++            if is_restricted:
++                iter_vals = self._scatter_to_full_mask(iter_vals, union_mask)
++            elif union_mask is not None:
++                iter_vals = iter_vals.copy()
++                iter_vals[~union_mask] = 0
++            iter_map = self.masker.inverse_transform(iter_vals).get_fdata(
+                 dtype=DEFAULT_FLOAT_DTYPE
+             )
+             iter_max_sizes[i_iter], iter_max_masses[i_iter] = _calculate_cluster_measures(
+@@ -1624,6 +1716,9 @@ def _probabilistic_map(self, dataset, target_n, seed):
+         sample_space = np.vstack(np.where(prior_img)).T.astype(np.int32, copy=False)
+         rng = np.random.RandomState(seed)
+ 
++        # Precompute boolean mask once to avoid NiBabel round-trip in hot loops.
++        mask_arr = _mask_img_to_bool(estimator.masker.mask_img)
++
+         null_cluster_sizes = np.zeros(self.n_iters, dtype=np.int32)
+         for i_iter in range(self.n_iters):
+             if target_n < ma_maps.shape[0]:
+@@ -1646,6 +1741,7 @@ def _probabilistic_map(self, dataset, target_n, seed):
+                 estimator.masker,
+                 voxel_thresh=self.voxel_thresh,
+                 cluster_size_threshold=None,
++                mask_arr=mask_arr,
+             )
+ 
+         cluster_threshold = np.percentile(null_cluster_sizes, 100.0 * (1.0 - self.alpha))
+@@ -1664,6 +1760,7 @@ def _probabilistic_map(self, dataset, target_n, seed):
+                 estimator.masker,
+                 voxel_thresh=self.voxel_thresh,
+                 cluster_size_threshold=cluster_threshold,
++                mask_arr=mask_arr,
+             )
+             prob_map += (z_values > 0).astype(DEFAULT_FLOAT_DTYPE, copy=False)
+         return (
+diff --git a/nimare/meta/cbma/base.py b/nimare/meta/cbma/base.py
+index 08966600f..daa3b0422 100644
+--- a/nimare/meta/cbma/base.py
++++ b/nimare/meta/cbma/base.py
+@@ -771,6 +771,7 @@ def _correct_fwe_montecarlo_permutation(
+         conn,
+         voxel_thresh,
+         vfwe_only,
++        mask_arr=None,
+     ):
+         """Run a single Monte Carlo permutation of a dataset.
+ 
+@@ -806,12 +807,12 @@ def _correct_fwe_montecarlo_permutation(
+         if vfwe_only:
+             iter_max_size, iter_max_mass = None, None
+         else:
+-            # Cluster-level inference
+-            iter_ss_map = self.masker.inverse_transform(iter_ss_map).get_fdata(
+-                dtype=DEFAULT_FLOAT_DTYPE
+-            )
++            # Cluster-level inference: unpack masked 1D array to 3D directly to
++            # avoid inverse_transform → NiBabel → gc.collect() overhead.
++            iter_ss_3d = np.zeros(mask_arr.shape, dtype=DEFAULT_FLOAT_DTYPE)
++            iter_ss_3d[mask_arr] = iter_ss_map
+             iter_max_size, iter_max_mass = _calculate_cluster_measures(
+-                iter_ss_map, voxel_thresh, conn, tail="upper"
++                iter_ss_3d, voxel_thresh, conn, tail="upper"
+             )
+         return iter_max_value, iter_max_size, iter_max_mass
+ 
+@@ -950,6 +951,10 @@ def correct_fwe_montecarlo(
+             # Define connectivity matrix for cluster labeling
+             conn = ndimage.generate_binary_structure(rank=3, connectivity=1)
+ 
++            # Pre-compute boolean mask array once; passed to each permutation to
++            # avoid inverse_transform → NiBabel → gc.collect() per iteration.
++            mask_arr = _mask_img_to_bool(self.masker.mask_img)
++
+             perm_results = Parallel(**parallel_kwargs)(
+                 delayed(self._correct_fwe_montecarlo_permutation)(
+                     iter_ijks[i_iter],
+@@ -957,6 +962,7 @@ def correct_fwe_montecarlo(
+                     conn=conn,
+                     voxel_thresh=ss_thresh,
+                     vfwe_only=vfwe_only,
++                    mask_arr=mask_arr,
+                 )
+                 for i_iter in range(n_iters)
+             )
+@@ -981,9 +987,8 @@ def correct_fwe_montecarlo(
+                 # Cluster-level FWE
+                 # Extract the summary statistics in voxel-wise (3D) form, threshold, and
+                 # cluster-label
+-                thresh_stat_values = self.masker.inverse_transform(stat_values).get_fdata(
+-                    dtype=DEFAULT_FLOAT_DTYPE
+-                )
++                thresh_stat_values = np.zeros(mask_arr.shape, dtype=DEFAULT_FLOAT_DTYPE)
++                thresh_stat_values[mask_arr] = stat_values
+                 thresh_stat_values[thresh_stat_values <= ss_thresh] = 0
+                 labeled_matrix, _ = ndimage.label(thresh_stat_values, conn)
+ 
+@@ -1163,7 +1168,7 @@ def _coerce_inference_map(inference_map, masker, label):
+                 )
+ 
+         _, mask_img = get_masker_mask_image(masker)
+-        expected_n_voxels = int(np.squeeze(masker.transform(mask_img)).shape[0])
++        expected_n_voxels = int(np.count_nonzero(_mask_img_to_bool(mask_img)))
+         if values.shape[0] != expected_n_voxels:
+             raise ValueError(
+                 f"{label} has {values.shape[0]} voxels, but the estimator mask has "
+@@ -1284,12 +1289,15 @@ def fit(
+         return MetaResult(self, mask=masker, maps=maps, tables=tables, description=description)
+ 
+ 
+-def _approximate_z_from_ma(estimator, ma_maps, subset_study_ids=None):
++def _approximate_z_from_ma(estimator, ma_maps, subset_study_ids=None, precomputed_null=None):
+     """Compute summary statistics and approximate-null z-values for a (sub)set of MA maps.
+ 
+-    The null distribution is derived from *ma_maps* itself, so each call is
+-    self-contained and safe to call in parallel.  The estimator is deep-copied
+-    internally, so the caller's object is never mutated.
++    The null distribution is derived from *ma_maps* itself by default, so each
++    call is self-contained and safe to call in parallel.  The estimator is
++    shallow-copied internally; only ``inputs_`` (a dict whose keys may be
++    reassigned by ``_prepare_subsample_null``) receives its own dict copy.
++    All attribute assignments on the temporary object are isolated from the
++    caller's estimator by the shallow-copy semantics.
+ 
+     Parameters
+     ----------
+@@ -1302,6 +1310,11 @@ def _approximate_z_from_ma(estimator, ma_maps, subset_study_ids=None):
+         ``_prepare_subsample_null`` so that estimators with dataset-dependent
+         pre-state (e.g. MKDADensity ``weight_vec_``) can recompute it
+         correctly for the subset.  ``None`` means all studies.
++    precomputed_null : dict, optional
++        Pre-computed ``null_distributions_`` dict (e.g. derived from the full
++        dataset).  When supplied the per-subset null recomputation is skipped
++        and this distribution is reused instead, matching JALE's behaviour of
++        applying the full-sample histogram convolution to every subsample.
+ 
+     Returns
+     -------
+@@ -1310,7 +1323,22 @@ def _approximate_z_from_ma(estimator, ma_maps, subset_study_ids=None):
+     z_values : :class:`numpy.ndarray` of shape (n_voxels,)
+         Approximate-null z-values.
+     """
+-    temp = copy.deepcopy(estimator)
+-    temp.null_distributions_ = {}
++    # Shallow-copy avoids duplicating large shared state (masker, sparse MA matrices,
++    # kernel_transformer, null_distributions_, DataFrames).  The only shared container
++    # whose *keys* may be reassigned is inputs_ (e.g. MKDADensity._prepare_subsample_null
++    # does self.inputs_["coordinates"] = filtered_df), so we give the temp object its own
++    # inputs_ dict (same values, new dict).  All other mutations from _prepare_subsample_null
++    # and null-building are attribute assignments on temp, which are invisible to the caller.
++    temp = copy.copy(estimator)
++    temp.inputs_ = dict(estimator.inputs_)
+     temp._prepare_subsample_null(ma_maps, subset_study_ids)
++    if precomputed_null is not None:
++        temp.null_distributions_ = precomputed_null
++        stat_values = temp._compute_summarystat_est(ma_maps)
++        _, z_values = temp._summarystat_to_p(stat_values, null_method="approximate")
++        return (
++            stat_values.astype(DEFAULT_FLOAT_DTYPE, copy=False),
++            z_values.astype(DEFAULT_FLOAT_DTYPE, copy=False),
++        )
++    temp.null_distributions_ = {}
+     return temp._compute_approximate_z_values(ma_maps)
+diff --git a/nimare/meta/cbma/pairwise_utils.py b/nimare/meta/cbma/pairwise_utils.py
+index cda59da4a..0cfb81a57 100644
+--- a/nimare/meta/cbma/pairwise_utils.py
++++ b/nimare/meta/cbma/pairwise_utils.py
+@@ -166,7 +166,8 @@ def close(self):
+         self.group1_stat = None
+         self.group2_stat = None
+         self.temp_files = []
+-        gc.collect()
++        if temp_files:
++            gc.collect()
+         _cleanup_temp_files(temp_files)
+ 
+ 
+diff --git a/nimare/meta/cbma/utils.py b/nimare/meta/cbma/utils.py
+index b107e31dd..fc40275a2 100644
+--- a/nimare/meta/cbma/utils.py
++++ b/nimare/meta/cbma/utils.py
+@@ -2,19 +2,42 @@
+ 
+ from itertools import combinations
+ 
+-import nibabel as nib
+ import numpy as np
+ from scipy import ndimage
+ from scipy import sparse as sp_sparse
+ from scipy.special import comb
+ from scipy.stats import norm
+ 
+-from nimare.utils import DEFAULT_FLOAT_DTYPE
++from nimare.utils import DEFAULT_FLOAT_DTYPE, _mask_img_to_bool
+ 
+ 
+-def _threshold_z_clusters(z_values, masker, voxel_thresh, cluster_size_threshold=None):
+-    """Apply cluster thresholding to a z map in masked-array space."""
+-    z_map = masker.inverse_transform(z_values).get_fdata(dtype=DEFAULT_FLOAT_DTYPE)
++def _threshold_z_clusters(
++    z_values, masker, voxel_thresh, cluster_size_threshold=None, mask_arr=None
++):
++    """Apply cluster thresholding to a z map in masked-array space.
++
++    Parameters
++    ----------
++    z_values : numpy.ndarray of shape (n_voxels,)
++        Masked z-values.
++    masker : NiftiMasker
++        Fitted masker; used only when ``mask_arr`` is ``None``.
++    voxel_thresh : float
++        Uncorrected voxel-level p-threshold for defining clusters.
++    cluster_size_threshold : int or None
++        Minimum cluster size in voxels; ``None`` skips size filtering.
++    mask_arr : numpy.ndarray of shape (X, Y, Z), dtype bool, optional
++        Pre-computed boolean brain mask.  When supplied the NiBabel
++        round-trip (and its ``gc.collect()`` overhead) is avoided.
++        Callers in hot loops should precompute this once and pass it in.
++    """
++    if mask_arr is None:
++        mask_arr = _mask_img_to_bool(masker.mask_img)
++
++    # 1D masked → 3D: direct numpy fill avoids inverse_transform → gc.collect
++    z_map = np.zeros(mask_arr.shape, dtype=DEFAULT_FLOAT_DTYPE)
++    z_map[mask_arr] = z_values
++
+     sig_arr = z_map > norm.ppf(1 - voxel_thresh)
+     labels, cluster_count = ndimage.label(sig_arr)
+     if cluster_count < 1:
+@@ -26,7 +49,9 @@ def _threshold_z_clusters(z_values, masker, voxel_thresh, cluster_size_threshold
+         significant_clusters = voxel_count_clusters > cluster_size_threshold
+         sig_clust_labels = np.where(significant_clusters)[0]
+         z_map = z_map * np.isin(labels, sig_clust_labels)
+-    return np.squeeze(masker.transform(nib.Nifti1Image(z_map, masker.mask_img.affine))), max_clust
++
++    # 3D → 1D masked: direct boolean index avoids masker.transform → gc.collect
++    return z_map[mask_arr].astype(DEFAULT_FLOAT_DTYPE, copy=False), max_clust
+ 
+ 
+ def resolve_subset_size(policy, total_n, k=None, target_n=None):
+diff --git a/nimare/tests/test_jale_port.py b/nimare/tests/test_jale_port.py
+index 355ce6b28..a4722f5fc 100644
+--- a/nimare/tests/test_jale_port.py
++++ b/nimare/tests/test_jale_port.py
+@@ -88,6 +88,28 @@ def test_resampled_stability_smoke(testdata_cbma_full):
+     assert "Frahm_Monimu_Hoffstaedter" in result.bibtex_
+ 
+ 
++def test_resampled_stability_can_skip_description_generation(testdata_cbma_full):
++    """ResampledStability should optionally skip boilerplate/reference extraction."""  # noqa: D403
++    dset = testdata_cbma_full.slice(testdata_cbma_full.ids[:5])
++    result = ALE(generate_description=False).fit(dset)
++    result = FWECorrector(method="montecarlo", n_iters=2, n_cores=1).transform(result)
++    original_description = result.description_
++    original_maps = set(result.maps)
++
++    stability_result = ResampledStability(
++        target_image="z_level-voxel_corr-FWE_method-montecarlo",
++        resampling_policy="leave_1_out",
++        generate_description=False,
++        n_cores=1,
++    ).transform(result)
++
++    map_name = "z_level-voxel_corr-FWE_method-montecarlo_diag-ResampledStability"
++    assert map_name in stability_result.maps
++    assert map_name not in result.maps
++    assert set(result.maps) == original_maps
++    assert stability_result.description_ == original_description
++
++
+ def test_resampled_stability_leave_k_out_matches_leave_1_out(testdata_cbma_full):
+     """Leave-k-out with k=1 should match leave-one-out for CBMA fast paths."""
+     dset = testdata_cbma_full.slice(testdata_cbma_full.ids[:5])
+diff --git a/nimare/tests/test_meta_ale.py b/nimare/tests/test_meta_ale.py
+index ec3382f6b..4f18aad3a 100644
+--- a/nimare/tests/test_meta_ale.py
++++ b/nimare/tests/test_meta_ale.py
+@@ -1076,6 +1076,118 @@ def test_ALESubtraction_directional_inference_maps_gate_pairwise_results(testdat
+     assert np.all(z_values[neg_map <= 0] >= 0)
+ 
+ 
++def test_ALESubtraction_restrict_to_inference_mask_slices_permutation_voxels(
++    monkeypatch, testdata_cbma_full
++):
++    """Restricted ALE subtraction should permute only inference-union voxels."""
++    dset1 = testdata_cbma_full.slice(testdata_cbma_full.ids[:10])
++    dset2 = testdata_cbma_full.slice(testdata_cbma_full.ids[10:20])
++
++    baseline = ale.ALESubtraction(n_iters=2, n_cores=1, generate_description=False).fit(
++        dset1, dset2
++    )
++    baseline_z = baseline.get_map("z_desc-group1MinusGroup2", return_type="array")
++    pos_map = baseline_z > 0
++    neg_map = baseline_z < 0
++    union = pos_map | neg_map
++    seen_n_voxels = []
++    original = ale.ALESubtraction._run_null_permutations
++
++    def _wrapped_run_null_permutations(self, ma_store, *args, **kwargs):
++        seen_n_voxels.append(ma_store.n_voxels)
++        return original(self, ma_store, *args, **kwargs)
++
++    monkeypatch.setattr(
++        ale.ALESubtraction,
++        "_run_null_permutations",
++        _wrapped_run_null_permutations,
++    )
++
++    restricted = ale.ALESubtraction(
++        n_iters=2,
++        n_cores=1,
++        generate_description=False,
++        restrict_to_inference_mask=True,
++    ).fit(dset1, dset2, inference_map1=pos_map, inference_map2=neg_map)
++
++    z_values = restricted.get_map("z_desc-group1MinusGroup2", return_type="array")
++    p_values = restricted.get_map("p_desc-group1MinusGroup2", return_type="array")
++    stat_values = restricted.get_map("stat_desc-group1MinusGroup2", return_type="array")
++    baseline_stat = baseline.get_map("stat_desc-group1MinusGroup2", return_type="array")
++
++    assert seen_n_voxels == [int(union.sum())]
++    assert z_values.shape == baseline_z.shape
++    assert p_values.shape == baseline_z.shape
++    np.testing.assert_allclose(stat_values, baseline_stat)
++    assert np.all(z_values[~union] == 0)
++    np.testing.assert_allclose(p_values[~union], 1.0)
++
++
++@pytest.mark.parametrize("restrict_to_inference_mask", [False, True])
++def test_ALESubtraction_rejects_empty_inference_union(
++    testdata_cbma_full, restrict_to_inference_mask
++):
++    """Directional ALE subtraction should fail clearly when inference maps are empty."""
++    dset1 = testdata_cbma_full.slice(testdata_cbma_full.ids[:10])
++    dset2 = testdata_cbma_full.slice(testdata_cbma_full.ids[10:20])
++    n_voxels = int(np.count_nonzero(testdata_cbma_full.masker.mask_img.get_fdata()))
++    empty_map = np.zeros(n_voxels, dtype=bool)
++
++    meta = ale.ALESubtraction(
++        n_iters=2,
++        n_cores=1,
++        generate_description=False,
++        restrict_to_inference_mask=restrict_to_inference_mask,
++    )
++    with pytest.raises(ValueError, match="at least one nonzero voxel"):
++        meta.fit(dset1, dset2, inference_map1=empty_map, inference_map2=empty_map)
++
++
++def test_ALESubtraction_restrict_to_inference_mask_cluster_nulls(testdata_cbma_full):
++    """Restricted ALE subtraction should support cluster nulls through the full image mask."""
++    dset1 = testdata_cbma_full.slice(testdata_cbma_full.ids[:10])
++    dset2 = testdata_cbma_full.slice(testdata_cbma_full.ids[10:20])
++
++    baseline = ale.ALESubtraction(n_iters=2, n_cores=1, generate_description=False).fit(
++        dset1, dset2
++    )
++    baseline_z = baseline.get_map("z_desc-group1MinusGroup2", return_type="array")
++    pos_map = baseline_z > 0
++    neg_map = baseline_z < 0
++
++    restricted = ale.ALESubtraction(
++        n_iters=2,
++        n_cores=1,
++        generate_description=False,
++        restrict_to_inference_mask=True,
++        vfwe_only=False,
++    ).fit(dset1, dset2, inference_map1=pos_map, inference_map2=neg_map)
++
++    assert "values_desc-size_level-cluster_corr-fwe_method-montecarlo" in (
++        restricted.estimator.null_distributions_
++    )
++    assert restricted.get_map("z_desc-group1MinusGroup2", return_type="array").shape == (
++        baseline_z.shape
++    )
++
++
++def test_pairwise_ma_store_close_skips_gc_without_temp_files(monkeypatch):
++    """In-memory pairwise MA stores should not force a global GC pass on close."""
++    calls = []
++    store = pairwise_utils._PairwiseMAStore(
++        group1=sp_sparse.csr_matrix(np.zeros((1, 2))),
++        group2=sp_sparse.csr_matrix(np.zeros((1, 2))),
++        group1_stat=np.zeros(2),
++        group2_stat=np.zeros(2),
++        temp_files=[],
++    )
++
++    monkeypatch.setattr(pairwise_utils.gc, "collect", lambda: calls.append("gc"))
++    store.close()
++
++    assert calls == []
++
++
+ def test_ALESubtraction_low_memory_chunk_rows_scale_with_available_ram():
+     """Chunk size should shrink when available RAM shrinks."""
+     meta = ale.ALESubtraction()
+diff --git a/nimare/tests/test_workflows.py b/nimare/tests/test_workflows.py
+index ffb6c835e..6d874c354 100644
+--- a/nimare/tests/test_workflows.py
++++ b/nimare/tests/test_workflows.py
+@@ -227,12 +227,12 @@ def test_conjunction_analysis_smoke(tmp_path_factory):
+     [
+         (
+             ALE(),
+-            FWECorrector(method="montecarlo", n_iters=8, voxel_thresh=0.05, n_cores=1),
++            FWECorrector(method="montecarlo", n_iters=32, voxel_thresh=0.05, n_cores=1),
+             ALESubtraction(n_iters=8, n_cores=1, generate_description=False),
+         ),
+         (
+             MKDADensity(),
+-            FWECorrector(method="montecarlo", n_iters=8, voxel_thresh=0.05, n_cores=1),
++            FWECorrector(method="montecarlo", n_iters=32, voxel_thresh=0.05, n_cores=1),
+             MKDAChi2(generate_description=False),
+         ),
+         (
+@@ -314,6 +314,52 @@ def test_contrast_workflow_string_and_none_inputs(
+     assert "z_desc-contrast" in result.maps
+ 
+ 
++def test_contrast_workflow_can_skip_description_generation(testdata_cbma_full):
++    """Contrast Workflow should optionally skip boilerplate and reference extraction."""
++    dset1 = testdata_cbma_full.slice(testdata_cbma_full.ids[:10])
++    dset2 = testdata_cbma_full.slice(testdata_cbma_full.ids[10:20])
++
++    workflow = ContrastWorkflow(
++        corrector=FDRCorrector(method="indep", alpha=0.05),
++        pairwise_estimator=ALESubtraction(n_iters=8, n_cores=1, generate_description=False),
++        alpha=0.05,
++        generate_description=False,
++        n_cores=1,
++    )
++    result = workflow.fit(dset1, dset2)
++
++    assert isinstance(result, nimare.results.MetaResult)
++    assert result.description_ == ""
++    assert result.bibtex_ == ""
++    assert "z_desc-contrast" in result.maps
++
++
++def test_contrast_workflow_rejects_mismatched_cached_correction(testdata_cbma_full):
++    """Cached corrected main-effect results must match their uncorrected result."""
++    dset1 = testdata_cbma_full.slice(testdata_cbma_full.ids[:10])
++    dset2 = testdata_cbma_full.slice(testdata_cbma_full.ids[10:20])
++
++    workflow = ContrastWorkflow(
++        corrector=FDRCorrector(method="indep", alpha=0.05),
++        pairwise_estimator=ALESubtraction(n_iters=2, n_cores=1, generate_description=False),
++        generate_description=False,
++        n_cores=1,
++    )
++    result1 = workflow.main_estimator.fit(dset1)
++    result2 = workflow.main_estimator.fit(dset2)
++    corr_result2 = workflow.corrector.transform(result2)
++
++    with pytest.raises(ValueError, match="study ids"):
++        workflow.fit(
++            dset1,
++            dset2,
++            result1=result1,
++            result2=result2,
++            corr_result1=corr_result2,
++            corr_result2=corr_result2,
++        )
++
++
+ def test_contrast_workflow_ale_thresholding_path_smoke(testdata_cbma_full):
+     """ALE ContrastWorkflow should run without the removed estimator helper."""
+     assert not hasattr(ALE, "jale_corrected_map")
+@@ -321,7 +367,7 @@ def test_contrast_workflow_ale_thresholding_path_smoke(testdata_cbma_full):
+     dset1 = testdata_cbma_full.slice(testdata_cbma_full.ids[:10])
+     dset2 = testdata_cbma_full.slice(testdata_cbma_full.ids[10:20])
+     workflow = ContrastWorkflow(
+-        corrector=FWECorrector(method="montecarlo", n_iters=8, voxel_thresh=0.05, n_cores=1),
++        corrector=FWECorrector(method="montecarlo", n_iters=32, voxel_thresh=0.05, n_cores=1),
+         pairwise_estimator=ALESubtraction(n_iters=8, n_cores=1, generate_description=False),
+         alpha=0.05,
+         n_cores=1,
+diff --git a/nimare/utils.py b/nimare/utils.py
+index ea339ddf7..c6141bb8c 100755
+--- a/nimare/utils.py
++++ b/nimare/utils.py
+@@ -28,6 +28,7 @@
+ 
+ LGR = logging.getLogger(__name__)
+ DEFAULT_FLOAT_DTYPE = np.float32
++_RESAMPLED_GM_PRIOR_CACHE = {}
+ 
+ 
+ def _minimum_positive_float(dtype=DEFAULT_FLOAT_DTYPE):
+@@ -98,9 +99,17 @@ def _mask_coverage_to_mask(masker, mask_coverage="brain", gm_threshold=0.1):
+     if mask_coverage != "gm":
+         raise ValueError(f"mask_coverage must be 'gm' or 'brain'; got {mask_coverage!r}.")
+ 
+-    gm_img = datasets.load_mni152_gm_template(resolution=2)
+-    gm_img = resample_to_img(gm_img, masker.mask_img, interpolation="continuous")
+-    gm_bool = np.asanyarray(gm_img.dataobj) > gm_threshold
++    cache_key = (
++        masker.mask_img.shape,
++        tuple(np.asarray(masker.mask_img.affine).ravel()),
++        float(gm_threshold),
++    )
++    gm_bool = _RESAMPLED_GM_PRIOR_CACHE.get(cache_key)
++    if gm_bool is None:
++        gm_img = datasets.load_mni152_gm_template(resolution=2)
++        gm_img = resample_to_img(gm_img, masker.mask_img, interpolation="continuous")
++        gm_bool = np.asanyarray(gm_img.dataobj) > gm_threshold
++        _RESAMPLED_GM_PRIOR_CACHE[cache_key] = gm_bool
+     return mask_bool & gm_bool
+ 
+ 
+diff --git a/nimare/workflows/cbma.py b/nimare/workflows/cbma.py
+index 84aa4f0bd..583778551 100644
+--- a/nimare/workflows/cbma.py
++++ b/nimare/workflows/cbma.py
+@@ -294,6 +294,9 @@ class ContrastWorkflow(NiMAREBase):
+     output_dir : :obj:`str`, optional
+         Output directory in which to save results. If the directory doesn't
+         exist, it will be created. Default is None (the results are not saved).
++    generate_description : :obj:`bool`, optional
++        Whether to generate workflow boilerplate and extract references for the
++        returned result. Default is True.
+     n_cores : :obj:`int`, optional
+         Number of cores to use for parallelization.
+         If ``main_estimator``, ``pairwise_estimator``, or ``corrector`` are passed as
+@@ -312,6 +315,7 @@ def __init__(
+         corrector=None,
+         alpha=0.05,
+         output_dir=None,
++        generate_description=True,
+         n_cores=1,
+     ):
+         if not 0 < alpha < 1:
+@@ -319,6 +323,7 @@ def __init__(
+ 
+         self.alpha = alpha
+         self.output_dir = output_dir
++        self.generate_description = generate_description
+         self.n_cores = _check_ncores(n_cores)
+ 
+         self.main_estimator = _check_input(
+@@ -337,9 +342,12 @@ def __init__(
+         else:
+             self.corrector = _check_input(corrector, Corrector, self._corr_options)
+ 
+-    def _compute_main_effect_map(self, result):
++    def _compute_main_effect_map(self, result, corr_result=None):
+         """Compute the directional inference map used to gate pairwise contrast."""
+-        corr_result = self.corrector.transform(result)
++        if corr_result is None:
++            corr_result = self.corrector.transform(result)
++        else:
++            self._validate_cached_corrected_result(result, corr_result)
+         z_map_name, threshold_map_name, threshold_kind = _infer_corrected_main_effect_maps(
+             corr_result
+         )
+@@ -352,6 +360,52 @@ def _compute_main_effect_map(self, result):
+         )
+         return thresholded_map, corr_result
+ 
++    def _validate_cached_corrected_result(self, result, corr_result):
++        """Validate that a cached corrected result can be used with a main-effect result."""
++        if corr_result.corrector is None:
++            raise ValueError("corr_result must be a corrected MetaResult.")
++
++        if type(corr_result.corrector) is not type(self.corrector):
++            raise ValueError(
++                "corr_result was generated with a different corrector type; "
++                f"expected {type(self.corrector).__name__}, got "
++                f"{type(corr_result.corrector).__name__}."
++            )
++
++        if corr_result.corrector.get_params(deep=False) != self.corrector.get_params(deep=False):
++            raise ValueError("corr_result was generated with different corrector parameters.")
++
++        result_ids = result.estimator.inputs_.get("id")
++        corr_ids = corr_result.estimator.inputs_.get("id")
++        if (
++            result_ids is not None
++            and corr_ids is not None
++            and not np.array_equal(result_ids, corr_ids)
++        ):
++            raise ValueError("corr_result does not match the study ids in result.")
++
++        result_n_voxels = next(
++            (value.shape[0] for value in result.maps.values() if isinstance(value, np.ndarray)),
++            None,
++        )
++        corr_n_voxels = next(
++            (
++                value.shape[0]
++                for value in corr_result.maps.values()
++                if isinstance(value, np.ndarray)
++            ),
++            None,
++        )
++        if (
++            result_n_voxels is not None
++            and corr_n_voxels is not None
++            and result_n_voxels != corr_n_voxels
++        ):
++            raise ValueError(
++                "corr_result maps are not aligned with result maps; "
++                f"got {corr_n_voxels} and {result_n_voxels} voxels."
++            )
++
+     def _generate_description(self, group1_result, group2_result, pairwise_result):
+         """Generate a workflow description that preserves component boilerplate."""
+         sections = []
+@@ -402,21 +456,62 @@ def _save_result(self, result):
+         with open(op.join(self.output_dir, "references.bib"), "w") as fo:
+             fo.write(result.bibtex_)
+ 
+-    def fit(self, dataset1, dataset2, drop_invalid=True):
+-        """Fit the masked contrast workflow to two Studyset-backed collections."""
+-        LGR.info("Fitting group 1 main effect...")
+-        group1_result = self.main_estimator.fit(dataset1, drop_invalid=drop_invalid)
+-        LGR.info("Fitting group 2 main effect...")
+-        group2_result = self.main_estimator.fit(dataset2, drop_invalid=drop_invalid)
++    def fit(
++        self,
++        dataset1,
++        dataset2,
++        drop_invalid=True,
++        result1=None,
++        result2=None,
++        corr_result1=None,
++        corr_result2=None,
++    ):
++        """Fit the masked contrast workflow to two Studyset-backed collections.
+ 
+-        group1_map, group1_corr_result = self._compute_main_effect_map(group1_result)
+-        group2_map, group2_corr_result = self._compute_main_effect_map(group2_result)
++        Parameters
++        ----------
++        dataset1, dataset2 : :class:`~nimare.dataset.Dataset`
++            The two groups to contrast.
++        drop_invalid : bool, optional
++            Passed through to the main estimator when fitting from scratch.
++        result1, result2 : :class:`~nimare.results.MetaResult`, optional
++            Pre-fitted main-effect results for each group.  When supplied the
++            per-group ``main_estimator.fit()`` call is skipped and the cached
++            MA maps are passed directly to the pairwise estimator, avoiding
++            redundant kernel convolution.
++        corr_result1, corr_result2 : :class:`~nimare.results.MetaResult`, optional
++            Pre-computed corrected main-effect results (i.e. the output of
++            ``corrector.transform(result)``).  When supplied the per-group
++            ``corrector.transform()`` call inside ``_compute_main_effect_map``
++            is skipped.  If corresponding ``result1``/``result2`` values are
++            not provided, the workflow fits them before validating and using
++            the cached corrected results.
++        """
++        if result1 is None:
++            LGR.info("Fitting group 1 main effect...")
++            result1 = self.main_estimator.fit(dataset1, drop_invalid=drop_invalid)
++        if result2 is None:
++            LGR.info("Fitting group 2 main effect...")
++            result2 = self.main_estimator.fit(dataset2, drop_invalid=drop_invalid)
++
++        group1_result = result1
++        group2_result = result2
++        group1_map, group1_corr_result = self._compute_main_effect_map(
++            group1_result, corr_result=corr_result1
++        )
++        group2_map, group2_corr_result = self._compute_main_effect_map(
++            group2_result, corr_result=corr_result2
++        )
+ 
+         LGR.info("Fitting masked pairwise contrast...")
++        ma_maps1 = group1_result.estimator.inputs_.get("ma_maps")
++        ma_maps2 = group2_result.estimator.inputs_.get("ma_maps")
+         pairwise_result = self.pairwise_estimator.fit(
+             dataset1,
+             dataset2,
+             drop_invalid=drop_invalid,
++            ma_maps1=ma_maps1,
++            ma_maps2=ma_maps2,
+             inference_map1=group1_map,
+             inference_map2=group2_map,
+         )
+@@ -457,10 +552,13 @@ def fit(self, dataset1, dataset2, drop_invalid=True):
+                 }
+             ]
+         )
+-        result.description_ = self._generate_description(
+-            group1_corr_result,
+-            group2_corr_result,
+-            pairwise_result,
+-        )
++        if self.generate_description:
++            result.description_ = self._generate_description(
++                group1_corr_result,
++                group2_corr_result,
++                pairwise_result,
++            )
++        else:
++            result.description_ = ""
+         self._save_result(result)
+         return result

@@ -1,0 +1,218 @@
+diff --git a/docs/source/whats_new.rst b/docs/source/whats_new.rst
+index c60ffcfffb..b2f19cf366 100644
+--- a/docs/source/whats_new.rst
++++ b/docs/source/whats_new.rst
+@@ -61,6 +61,7 @@ Requirements
+ 
+ Bugs
+ ~~~~
++- Prefetch the NEMAR sourcedata store inside :meth:`moabb.datasets.base.BaseDataset.get_data`: the store introduced in :gh:`1146` was only filled by an explicit :meth:`~moabb.datasets.base.BaseDataset.download` call, so a plain ``get_data()`` on a fresh machine still fetched from the upstream host even with the provider pinned to ``"nemar"``. The requested subjects' ``sourcedata/`` is now fetched before loading, with the provider policy ``download`` already implements: ``"upstream"`` skips NEMAR, ``"nemar"`` treats a failure as fatal, ``"auto"`` warns per subject and leaves that subject to the dataset's own downloader. Also fix the store fill in the deprecated :func:`moabb.datasets.download.data_path`: ``pooch.retrieve`` treats its destination as a *directory* holding ``<md5(url)>-<basename>``, and loaders such as :class:`moabb.datasets.Rodrigues2017`'s ``os.listdir()`` it, so a store hit written as a plain file at the destination raised ``NotADirectoryError``; the hit now lands inside the wrapper directory under pooch's unique name (by `Bruno Aristimunha`_)
+ - Wire the NEMAR sourcedata store into loading (:gh:`1147`): ``data_dl`` and the deprecated ``data_path`` now serve a requested file from the dataset's ``NEMAR/<nemar_id>/sourcedata/`` store before consulting the URL-derived layout, probing the store by the trailing segments of the URL path since it keeps the upstream filenames. ``dataset.download()`` followed by ``get_data()`` therefore no longer re-contacts the upstream host -- verified live against ``Schirrmeister2017``, whose host is currently unreachable. The URL-derived trees remain as lookups so nothing already downloaded is fetched again; ``force_update`` still refetches upstream and pinning the provider to ``"upstream"`` opts loading out of the store (:gh:`1146` by `Bruno Aristimunha`_)
+ - Store :class:`moabb.datasets.ErpCore2021` as the single combined BIDS dataset it is, with components separated by the ``task-`` entity in one shared ``MNE-erpcore2021-data`` root, instead of seven standalone per-component BIDS datasets; likewise store Dreyer2023 in one shared ``MNE-dreyer2023-data`` root, since the A/B/C classes only select subject ranges of one globally numbered dataset. Pre-existing downloads in the legacy separated layouts are still read without re-fetching (:gh:`1146` by `Bruno Aristimunha`_)
+ - Honor the download-flag contract across every dataset: ``CacheConfig.overwrite_*`` now erases the cache even when ``use=False`` (previously a silent no-op with the default config), :class:`moabb.datasets.CompoundDataset` forwards ``path``/``force_update``/``update_path``/``verbose`` to the wrapped dataset, ``data_path`` implementations that ignored ``path`` or ``force_update`` (14 datasets, including Kojima2024's narrowed signature that made ``download()`` raise ``TypeError``) now honor them, ``force_update`` also re-extracts stale archives, and a regression test enforces the contract for every future dataset. On the NEMAR side, :meth:`moabb.datasets.base.BaseDataset.download` falls back to the upstream host per failing subject instead of discarding the whole NEMAR batch, :meth:`~moabb.datasets.base.BaseDataset.sourcedata_path` matches provenance subjects by both the raw MOABB id and the dataset's ``nemar_subject_template`` label, transport failures are no longer misreported as "deposit publishes no sourcedata", and manifest filenames containing glob metacharacters are escaped before selection (:gh:`1146` by `Bruno Aristimunha`_)
+diff --git a/moabb/datasets/base.py b/moabb/datasets/base.py
+index 8ee9325798..092024c9ed 100644
+--- a/moabb/datasets/base.py
++++ b/moabb/datasets/base.py
+@@ -886,6 +886,8 @@ def get_data(self, subjects=None, cache_config=None, process_pipeline=None, n_jo
+             if subject not in self.subject_list:
+                 raise ValueError("Invalid subject {:d} given".format(subject))
+ 
++        self._prefetch_nemar_sourcedata(subjects)
++
+         results = Parallel(n_jobs=n_jobs)(
+             delayed(self._get_selected_subject_data)(
+                 subject, cache_config, process_pipeline, str_sessions, pat
+@@ -1091,6 +1093,43 @@ def _download_nemar(
+             **(self.nemar_bids_filters or {}),
+         )
+ 
++    def _prefetch_nemar_sourcedata(self, subjects, verbose=None):
++        """Fill the NEMAR sourcedata store for these subjects before loading.
++
++        :meth:`get_data` serves loads through the store (see
++        :meth:`_sourcedata_store`), but the store only has content once
++        something fetched it -- previously that something was an explicit
++        :meth:`download` call, so a plain ``get_data()`` on a fresh machine
++        still reached the upstream host even with the provider pinned to
++        ``"nemar"``. Fetch each requested subject's ``sourcedata/`` here,
++        with the provider policy :meth:`download` already implements:
++        ``"upstream"`` skips NEMAR entirely, ``"nemar"`` treats a failure as
++        fatal rather than silently reaching the host the caller opted out
++        of, and ``"auto"`` warns per subject and leaves that subject to the
++        dataset's own downloader. A non-empty store is trusted as-is and
++        costs no network at all -- refresh or extend it with
++        :meth:`download` (``force_update=True`` to refetch).
++        """
++        provider = get_download_provider()
++        if self.nemar_id is None or provider == "upstream":
++            return
++        store = self._sourcedata_store()
++        if store is not None and store.is_dir() and any(store.iterdir()):
++            return
++        for subject in subjects:
++            try:
++                self.sourcedata_path(subject=subject, verbose=verbose)
++            except NemarDownloadError as exc:
++                if provider == "nemar":
++                    raise
++                warnings.warn(
++                    f"Could not fetch {self.code} subject {subject!r} "
++                    f"sourcedata from NEMAR ({self.nemar_id}); its load will "
++                    f"use the dataset's own downloader. Original error: {exc}",
++                    RuntimeWarning,
++                    stacklevel=2,
++                )
++
+     def _sourcedata_store(self):
+         """Local NEMAR sourcedata store to serve this dataset's loads from.
+ 
+diff --git a/moabb/datasets/download.py b/moabb/datasets/download.py
+index 902d295802..aa7d092b00 100644
+--- a/moabb/datasets/download.py
++++ b/moabb/datasets/download.py
+@@ -25,6 +25,7 @@
+ from nemar.errors import NemarError, SelectionError
+ from pooch import file_hash, retrieve
+ from pooch.downloaders import choose_downloader
++from pooch.utils import unique_file_name
+ from requests.exceptions import HTTPError
+ 
+ 
+@@ -215,14 +216,19 @@ def data_path(url, sign, path=None, force_update=False, update_path=True, verbos
+     path = get_dataset_path(sign, path)
+     key_dest = "MNE-{:s}-data".format(sign.lower())
+     destination = _url_to_local_path(url, osp.join(path, key_dest))
+-    if not force_update and not osp.isfile(destination):
++    # retrieve() below treats `destination` as a directory and stores the file
++    # inside it under pooch's unique name; several loaders then listdir() that
++    # directory. Fill the store copy at the same wrapped path -- a plain file
++    # at `destination` would shadow the directory and break those loaders.
++    wrapped = osp.join(destination, unique_file_name(url))
++    if not force_update and not osp.isfile(wrapped):
+         mirror = _store_lookup(url)
+         if mirror is not None:
+-            os.makedirs(osp.dirname(destination), exist_ok=True)
++            os.makedirs(destination, exist_ok=True)
+             try:
+-                os.link(mirror, destination)
++                os.link(mirror, wrapped)
+             except OSError:
+-                shutil.copy2(mirror, destination)
++                shutil.copy2(mirror, wrapped)
+     # Fetch the file
+     if not osp.isfile(destination) or force_update:
+         if osp.isfile(destination):
+diff --git a/moabb/tests/test_download.py b/moabb/tests/test_download.py
+index 6a675f81f7..7a112fb695 100644
+--- a/moabb/tests/test_download.py
++++ b/moabb/tests/test_download.py
+@@ -903,6 +903,35 @@ def test_data_dl_store_survives_dataset_moves(tmp_path, monkeypatch):
+     assert (store / "train" / "1.edf").read_text() == "train"
+ 
+ 
++def test_data_path_store_fill_matches_pooch_layout(tmp_path, monkeypatch):
++    """A store hit must land inside retrieve()'s wrapper directory.
++
++    The deprecated ``data_path`` passes its destination to ``pooch.retrieve``
++    as the *directory*, which stores ``<md5(url)>-<basename>`` inside it, and
++    loaders such as Rodrigues2017's then ``os.listdir()`` that directory. A
++    store hit written as a plain file at the destination shadows the wrapper
++    directory and turns those loads into ``NotADirectoryError``.
++    """
++    from pooch.utils import unique_file_name
++
++    store = tmp_path / "NEMAR" / "nm000221" / "sourcedata"
++    store.mkdir(parents=True)
++    # nm000221 stores the upstream basenames flat, as the real deposit does.
++    (store / "subject_01.mat").write_text("mirrored")
++    monkeypatch.setattr(socket.socket, "connect", _forbid_connect)
++
++    url = "https://zenodo.org/record/2348892/files/subject_01.mat"
++    with dl.active_sourcedata_store(store):
++        returned = dl.data_path(url, "ALPHAWAVES", path=tmp_path)
++
++    returned = Path(returned)
++    assert returned.is_dir()
++    wrapped = returned / unique_file_name(url)
++    assert wrapped.is_file()
++    assert wrapped.read_text() == "mirrored"
++    assert os.listdir(returned) == [unique_file_name(url)]
++
++
+ def test_get_data_reads_the_nemar_store_end_to_end(tmp_path, monkeypatch):
+     """The loader resolves and publishes the dataset's store down to data_dl."""
+     monkeypatch.delenv("MOABB_DOWNLOAD_PROVIDER", raising=False)
+@@ -1091,3 +1120,72 @@ def fake_retrieve(url, known_hash, fname=None, path=None, **kwargs):
+ 
+     assert captured["fname"] == fname
+     assert Path(result).parts[-2:] == expected_parts
++
++
++# --------------------------------------------------------------------------
++# get_data(): prefetching the NEMAR sourcedata store
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("provider", "expectation"),
++    [
++        pytest.param("upstream", "skipped", id="upstream-skips-nemar"),
++        pytest.param("nemar", "raised", id="nemar-treats-failure-as-fatal"),
++        pytest.param("auto", "warned", id="auto-warns-and-falls-back"),
++    ],
++)
++def test_prefetch_follows_the_provider(monkeypatch, provider, expectation):
++    dataset = FakeDataset()
++    dataset.nemar_id = "nm000341"
++    monkeypatch.setattr(base_module, "get_download_provider", lambda: provider)
++
++    calls = []
++
++    def failing_fetch(subject=None, verbose=None):
++        calls.append(subject)
++        raise dl.NemarDownloadError("mirror unavailable")
++
++    monkeypatch.setattr(dataset, "sourcedata_path", failing_fetch)
++
++    if expectation == "raised":
++        with pytest.raises(dl.NemarDownloadError):
++            dataset._prefetch_nemar_sourcedata([1, 2])
++        assert calls == [1]
++    elif expectation == "warned":
++        with pytest.warns(RuntimeWarning, match="own downloader"):
++            dataset._prefetch_nemar_sourcedata([1, 2])
++        assert calls == [1, 2]  # per subject, not per batch
++    else:
++        dataset._prefetch_nemar_sourcedata([1, 2])
++        assert calls == []
++
++
++def test_prefetch_skips_datasets_without_a_nemar_id(monkeypatch):
++    dataset = FakeDataset()
++    assert dataset.nemar_id is None
++    monkeypatch.setattr(base_module, "get_download_provider", lambda: "nemar")
++
++    def unexpected(**kwargs):  # pragma: no cover - the assertion is the test
++        raise AssertionError("should not fetch without a nemar_id")
++
++    monkeypatch.setattr(dataset, "sourcedata_path", unexpected)
++    dataset._prefetch_nemar_sourcedata([1])
++
++
++def test_get_data_prefetches_the_requested_subjects(monkeypatch):
++    dataset = FakeDataset(n_subjects=3)
++    dataset.nemar_id = "nm000341"
++    monkeypatch.setattr(base_module, "get_download_provider", lambda: "auto")
++
++    fetched = []
++    monkeypatch.setattr(
++        dataset,
++        "sourcedata_path",
++        lambda subject=None, verbose=None: fetched.append(subject),
++    )
++
++    data = dataset.get_data(subjects=[1, 3])
++
++    assert fetched == [1, 3]
++    assert sorted(data) == [1, 3]

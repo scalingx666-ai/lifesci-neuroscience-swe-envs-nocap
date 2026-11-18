@@ -1,0 +1,344 @@
+diff --git a/app/apps/server/migrations/091_blob_text_score.sql b/app/apps/server/migrations/091_blob_text_score.sql
+new file mode 100644
+index 00000000..a07431df
+--- /dev/null
++++ b/app/apps/server/migrations/091_blob_text_score.sql
+@@ -0,0 +1,10 @@
++SET LOCAL lock_timeout = '10s';
++-- SPDX-License-Identifier: Apache-2.0
++--
++-- The attachment half of 090: a keyed file's ranking data (vector + token set)
++-- sealed apart from its extracted text, so a search ranks files from ~1 KB
++-- each. One vault's file search opened 371 MB per query (2026-11-02). Additive.
++ALTER TABLE blob_text ADD COLUMN search_score_enc BYTEA;
++
++UPDATE vault_crypto_state SET cursors = cursors - 'completedAt'
++ WHERE vault_id IN (SELECT id FROM vaults WHERE vk_check IS NOT NULL);
+diff --git a/app/apps/server/src/crypto/backfill.ts b/app/apps/server/src/crypto/backfill.ts
+index 9a8fb6ab..7a35a989 100644
+--- a/app/apps/server/src/crypto/backfill.ts
++++ b/app/apps/server/src/crypto/backfill.ts
+@@ -36,7 +36,16 @@
+ import type pg from "pg";
+ import { pool as defaultPool } from "../db/pool.js";
+ import { inc } from "../metrics/sync-metrics.js";
+-import { openBlobTextRow, openScoreRow, openSearchRow, sealBlobTextRow, sealScoreRow, sealSearchRow } from "../index/sealed-index.js";
++import {
++  openBlobScoreRow,
++  openBlobTextRow,
++  openScoreRow,
++  openSearchRow,
++  sealBlobScoreRow,
++  sealBlobTextRow,
++  sealScoreRow,
++  sealSearchRow,
++} from "../index/sealed-index.js";
+ import { searchTokenSet } from "../index/search-tokens.js";
+ import { openNoteTextBytes, sealNoteText } from "../versions/texts.js";
+ import { sha256Hex } from "../versions/capture.js";
+@@ -63,6 +72,7 @@ export const BACKFILL_TABLES = [
+   // (`note_index.search_score_enc`). Never counted by `encryptionStatus`, so it
+   // neither delays the null-out nor reads as plaintext remaining.
+   "note_index_score",
++  "blob_text_score",
+ ] as const;
+ export type BackfillTable = (typeof BACKFILL_TABLES)[number];
+ 
+@@ -179,6 +189,8 @@ async function runBatch(
+       return batchInlineTexts("checkpoint_docs_inline", c, after, limit, db);
+     case "note_index_score":
+       return batchNoteIndexScore(c, after, limit, db);
++    case "blob_text_score":
++      return batchBlobTextScore(c, after, limit, db);
+   }
+ }
+ 
+@@ -296,9 +308,9 @@ function searchJson(body: string, vectorText: string | null, tokens: string | nu
+  * answers alone. Written only while `search_enc` is still the row just read.
+  */
+ async function batchNoteIndexScore(c: DocCrypto, after: string | null, limit: number, db: Queryable): Promise<BatchResult> {
+-  const { rows } = await db.query<{ doc_id: string; title: string | null; search_enc: Buffer }>(
++  const { rows } = await db.query<{ doc_id: string; title: string | null; search_enc: Buffer; updated_at: string }>(
+     byteBudgeted(
+-      `SELECT doc_id, title, search_enc
++      `SELECT doc_id, title, search_enc, updated_at::text AS updated_at
+          FROM note_index
+         WHERE vault_id = $1 AND doc_id > $2 AND search_enc IS NOT NULL AND search_score_enc IS NULL
+         ORDER BY doc_id
+@@ -333,15 +345,61 @@ async function batchNoteIndexScore(c: DocCrypto, after: string | null, limit: nu
+     await write(
+       "note_index_score",
+       r.doc_id,
++      // A re-index since the read moved `updated_at` (and wrote its own score).
+       `UPDATE note_index SET search_score_enc = $2
+-        WHERE doc_id = $1 AND vault_id = $4 AND search_score_enc IS NULL AND search_enc = $3`,
+-      [r.doc_id, sealed, r.search_enc, c.vaultId],
++        WHERE doc_id = $1 AND vault_id = $4 AND search_score_enc IS NULL AND updated_at = $3::timestamptz`,
++      [r.doc_id, sealed, r.updated_at, c.vaultId],
+       db,
+     );
+   }
+   return { ...scanned(rows), last: rows.at(-1)?.doc_id ?? after };
+ }
+ 
++/** The file half of {@link batchNoteIndexScore} (`blob_text.search_score_enc`). */
++async function batchBlobTextScore(c: DocCrypto, after: string | null, limit: number, db: Queryable): Promise<BatchResult> {
++  const { rows } = await db.query<{ blob_id: string; search_enc: Buffer; updated_at: string }>(
++    byteBudgeted(
++      `SELECT blob_id, search_enc, updated_at::text AS updated_at
++         FROM blob_text
++        WHERE vault_id = $1 AND blob_id > $2 AND search_enc IS NOT NULL AND search_score_enc IS NULL
++        ORDER BY blob_id
++        LIMIT $3`,
++      "x.search_enc",
++      "x.blob_id",
++      4,
++    ),
++    [c.vaultId, after ?? "", limit, BACKFILL_BATCH_BYTES],
++  );
++  for (const r of rows) {
++    let full: ReturnType<typeof openBlobTextRow>;
++    try {
++      full = openBlobTextRow(c, r.blob_id, r.search_enc);
++    } catch {
++      metric("blob_text_score", "verify_failed");
++      continue;
++    }
++    const score = { vector: full.vector, tokens: full.tokens ?? searchTokenSet(full.body) ?? null };
++    const json = Buffer.from(JSON.stringify(score), "utf8");
++    const sealed = sealVerified(
++      "blob_text_score",
++      r.blob_id,
++      json,
++      () => sealBlobScoreRow(c, r.blob_id, score),
++      (s) => Buffer.from(JSON.stringify(openBlobScoreRow(c, r.blob_id, s)), "utf8"),
++    );
++    if (!sealed) continue;
++    await write(
++      "blob_text_score",
++      r.blob_id,
++      `UPDATE blob_text SET search_score_enc = $2
++        WHERE blob_id = $1 AND vault_id = $4 AND search_score_enc IS NULL AND updated_at = $3::timestamptz`,
++      [r.blob_id, sealed, r.updated_at, c.vaultId],
++      db,
++    );
++  }
++  return { ...scanned(rows), last: rows.at(-1)?.blob_id ?? after };
++}
++
+ async function batchNoteIndex(c: DocCrypto, after: string | null, limit: number, db: Queryable): Promise<BatchResult> {
+   const { rows } = await db.query<{
+     doc_id: string;
+diff --git a/app/apps/server/src/http/routes/blobs.ts b/app/apps/server/src/http/routes/blobs.ts
+index f98d620f..d66bd107 100644
+--- a/app/apps/server/src/http/routes/blobs.ts
++++ b/app/apps/server/src/http/routes/blobs.ts
+@@ -1,4 +1,4 @@
+-import { sealBlobTextRow } from "../../index/sealed-index.js";
++import { sealBlobScoreRow, sealBlobTextRow } from "../../index/sealed-index.js";
+ import { docCryptoOf, refuseKeyIncapableClient, requireVaultKey } from "../../crypto/transport.js";
+ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+ import { Readable, Transform } from "node:stream";
+@@ -1889,27 +1889,27 @@ blobRoutes.put("/vaults/:vaultId/blobs/:blobId/text", async (c) => {
+   if (!vkr.ok) return vkr.response;
+   const textCrypto = docCryptoOf(vaultId, vkr);
+   if (textCrypto) {
++    const vector = embed(stored);
++    const tokens = searchTokenSet(stored) ?? null;
+     await pool.query(
+-      `INSERT INTO blob_text (blob_id, vault_id, doc_id, chars, content, source, updated_at, search_enc)
+-       VALUES ($1, $2, $3, $4, '', $5, now(), $6)
++      `INSERT INTO blob_text (blob_id, vault_id, doc_id, chars, content, source, updated_at, search_enc, search_score_enc)
++       VALUES ($1, $2, $3, $4, '', $5, now(), $6, $7)
+        ON CONFLICT (blob_id) DO UPDATE
+          SET vault_id = EXCLUDED.vault_id,
+              doc_id = EXCLUDED.doc_id,
+              chars = EXCLUDED.chars,
+              source = EXCLUDED.source,
+              updated_at = now(),
+-             search_enc = EXCLUDED.search_enc`,
++             search_enc = EXCLUDED.search_enc,
++             search_score_enc = EXCLUDED.search_score_enc`,
+       [
+         row.id,
+         vaultId,
+         row.doc_id,
+         chars,
+         source,
+-        sealBlobTextRow(textCrypto, row.id, {
+-          body: stored,
+-          vector: embed(stored),
+-          tokens: searchTokenSet(stored) ?? null,
+-        }),
++        sealBlobTextRow(textCrypto, row.id, { body: stored, vector, tokens }),
++        sealBlobScoreRow(textCrypto, row.id, { vector, tokens }),
+       ],
+     );
+     return c.body(null, 204);
+diff --git a/app/apps/server/src/index/indexer.ts b/app/apps/server/src/index/indexer.ts
+index 75d35cc8..51b35c10 100644
+--- a/app/apps/server/src/index/indexer.ts
++++ b/app/apps/server/src/index/indexer.ts
+@@ -1,6 +1,7 @@
+ import type { DocCrypto } from "../crypto/doc-crypto.js";
+ import {
+   indexCryptoFor,
++  openBlobScoreRow,
+   openBlobTextRow,
+   openScoreRow,
+   openSearchRow,
+@@ -761,6 +762,7 @@ async function searchBlobText(opts: {
+ }): Promise<NoteSearchHit[]> {
+   const { rows } = await opts.db.query<{
+     search_enc: Buffer | null;
++    search_score_enc: Buffer | null;
+     blob_id: string;
+     doc_id: string | null;
+     rel_path: string | null;
+@@ -769,8 +771,10 @@ async function searchBlobText(opts: {
+     search_tokens: string | null;
+     matched_legacy: number | null;
+   }>(
++    // A sealed row with a score blob sends only that (~1 KB), never the text.
+     `SELECT bt.blob_id,
+-            bt.search_enc,
++            CASE WHEN bt.search_score_enc IS NULL THEN bt.search_enc END AS search_enc,
++            bt.search_score_enc,
+             b.doc_id,
+             b.rel_path,
+             b.filename,
+@@ -792,11 +796,29 @@ async function searchBlobText(opts: {
+     [opts.vaultId, opts.readableDocIds, opts.qTokens, opts.vaultWideReader, FILE_SEARCH_CAP, opts.legacySql],
+   );
+ 
+-  const scored = rows.map((r) => {
++  const scored: NoteSearchHit[] = [];
++  for (const r of rows) {
+     const relPath = r.rel_path ?? "";
+     let vector = r.vector;
+     let matchedSealed: number | null = null;
+-    if (r.search_enc) {
++    if (r.search_score_enc) {
++      if (!opts.crypto) throw new KeyRequiredError();
++      let s: SealedScoreRow | null = null;
++      try {
++        s = openBlobScoreRow(opts.crypto, r.blob_id, r.search_score_enc);
++      } catch {
++        s = null;
++      }
++      // Answers alone unless the match needs the text (no token set, legacy
++      // mode, a non-ASCII rel_path): then the full row, as before.
++      if (s && Array.isArray(s.vector) && s.tokens !== null && !opts.legacySql && !/[^\x01-\x7f]/.test(relPath)) {
++        vector = s.vector;
++        matchedSealed = keywordMatchCount(opts.qTokens, `${searchTokenSet(relPath) ?? ""} ${s.tokens}`);
++      } else {
++        r.search_enc = await fullBlobTextRow(opts.db, r.blob_id);
++      }
++    }
++    if (r.search_enc && matchedSealed === null) {
+       // W3 sealed row: the same formula over the decrypted fields. The SQL
+       // count (no stored set, a non-ASCII rel_path, or legacy mode) becomes the
+       // identical substring count over lower(rel_path || ' ' || body).
+@@ -822,7 +844,7 @@ async function searchBlobText(opts: {
+         ? (r.matched_legacy ?? 0)
+         : keywordMatchCount(opts.qTokens, `${searchTokenSet(relPath) ?? ""} ${r.search_tokens}`);
+     const boost = opts.qTokens.length > 0 ? 0.1 * (matched / opts.qTokens.length) : 0;
+-    return {
++    scored.push({
+       docId: r.doc_id,
+       blobId: r.blob_id,
+       relPath,
+@@ -830,11 +852,19 @@ async function searchBlobText(opts: {
+       ext: extOf(relPath),
+       score: sim + boost,
+       kind: "file" as const,
+-    };
+-  });
++    } as NoteSearchHit);
++  }
+   return scored.sort((a, b) => b.score - a.score).slice(0, opts.k);
+ }
+ 
++async function fullBlobTextRow(db: Queryable, blobId: string): Promise<Buffer | null> {
++  const { rows } = await db.query<{ search_enc: Buffer | null }>(
++    "SELECT search_enc FROM blob_text WHERE blob_id = $1",
++    [blobId],
++  );
++  return rows[0]?.search_enc ?? null;
++}
++
+ /** Filename stem of a rel_path, used as a fallback title. */
+ function relPathStem(relPath: string): string {
+   const base = relPath.split("/").pop() ?? relPath;
+diff --git a/app/apps/server/src/index/sealed-index.ts b/app/apps/server/src/index/sealed-index.ts
+index b8572d5d..a9c0ffe7 100644
+--- a/app/apps/server/src/index/sealed-index.ts
++++ b/app/apps/server/src/index/sealed-index.ts
+@@ -66,6 +66,19 @@ export function openBlobTextRow(c: DocCrypto, blobId: string, sealed: Buffer): S
+   return JSON.parse(open(c.key, blobAad(c.vaultId, blobId), sealed).toString("utf8")) as SealedSearchRow;
+ }
+ 
++function blobScoreAad(vaultId: string, blobId: string): Buffer {
++  return aadFor("blob_text", "search_score_enc", vaultId, blobId);
++}
++
++/** A file's ranking data, sealed apart from its text (`blob_text.search_score_enc`). */
++export function sealBlobScoreRow(c: DocCrypto, blobId: string, row: SealedScoreRow): Buffer {
++  return seal(c.key, blobScoreAad(c.vaultId, blobId), Buffer.from(JSON.stringify(row), "utf8"), c.generation);
++}
++
++export function openBlobScoreRow(c: DocCrypto, blobId: string, sealed: Buffer): SealedScoreRow {
++  return JSON.parse(open(c.key, blobScoreAad(c.vaultId, blobId), sealed).toString("utf8")) as SealedScoreRow;
++}
++
+ /**
+  * Background indexing's view of a vault's key: `undefined` = unkeyed (today's
+  * plaintext path), `null` = keyed but no member connected (defer: write
+diff --git a/app/apps/server/tests/sealed-blob-text.test.ts b/app/apps/server/tests/sealed-blob-text.test.ts
+index 0b3ae382..6bbe6583 100644
+--- a/app/apps/server/tests/sealed-blob-text.test.ts
++++ b/app/apps/server/tests/sealed-blob-text.test.ts
+@@ -4,6 +4,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
+ import { createApp } from "../src/http/app.js";
+ import { pool } from "../src/db/pool.js";
+ import { searchNoteIndex } from "../src/index/indexer.js";
++import { backfillVault } from "../src/crypto/backfill.js";
++import { vaultKeyCache } from "../src/crypto/key-cache.js";
+ import { makeVkCheck } from "../src/crypto/vk-check.js";
+ import { KeyRequiredError } from "../src/crypto/transport.js";
+ import { VAULT_KEYS_MIN_DESKTOP } from "../src/http/client-version.js";
+@@ -91,6 +93,34 @@ describe("sealed blob_text (W3)", () => {
+     ).rejects.toBeInstanceOf(KeyRequiredError);
+   });
+ 
++  it("files rank from the small score blob; a missing or damaged one falls back to the full row", async () => {
++    const keyedVault = await seedVault(org, "Keyed");
++    const blob = await upload(owner.token, keyedVault, "attachments/q3.xlsx");
++    const vk = randomBytes(32);
++    await pool.query("UPDATE vaults SET vk_check = $2, key_generation = 1 WHERE id = $1", [keyedVault, makeVkCheck(vk, keyedVault)]);
++    expect((await putText(owner.token, keyedVault, blob, vk)).status).toBe(204);
++    expect((await pool.query("SELECT 1 FROM blob_text WHERE blob_id = $1 AND search_score_enc IS NOT NULL", [blob.id])).rowCount).toBe(1);
++    const crypto = { vaultId: keyedVault, key: vk, generation: 1 };
++    const search = () =>
++      Promise.all(["revenue north", "q3", "nothing here"].map((query) =>
++        searchNoteIndex({ vaultId: keyedVault, query, k: 5, readableDocIds: [], vaultWideReader: true, crypto })));
++    const before = await search();
++
++    await pool.query("UPDATE blob_text SET search_score_enc = $2 WHERE blob_id = $1", [blob.id, randomBytes(64)]);
++    expect(await search()).toEqual(before);
++    await pool.query("UPDATE blob_text SET search_score_enc = NULL WHERE blob_id = $1", [blob.id]);
++    expect(await search()).toEqual(before);
++
++    await pool.query("INSERT INTO vault_crypto_state (vault_id, phase, generation) VALUES ($1, 'keyed', 1) ON CONFLICT DO NOTHING", [keyedVault]);
++    vaultKeyCache.clear();
++    const hold = vaultKeyCache.acquire(keyedVault, vk, 1);
++    expect(await backfillVault(keyedVault, { throttleMs: 0 })).toBe("complete");
++    hold();
++    vaultKeyCache.clear();
++    expect((await pool.query("SELECT 1 FROM blob_text WHERE blob_id = $1 AND search_score_enc IS NOT NULL", [blob.id])).rowCount).toBe(1);
++    expect(await search()).toEqual(before);
++  });
++
+   it("a keyed rewrite leaves an older plaintext row's columns untouched", async () => {
+     const vaultId = await seedVault(org, "Later keyed");
+     const blob = await upload(owner.token, vaultId, "attachments/a.pdf");

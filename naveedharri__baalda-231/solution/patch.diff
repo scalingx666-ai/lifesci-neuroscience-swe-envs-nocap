@@ -1,0 +1,150 @@
+diff --git a/app/apps/server/src/permissions/http-gates.ts b/app/apps/server/src/permissions/http-gates.ts
+index 7ecadf99..d4c22eca 100644
+--- a/app/apps/server/src/permissions/http-gates.ts
++++ b/app/apps/server/src/permissions/http-gates.ts
+@@ -7,6 +7,7 @@ import {
+   effectivePermission,
+   isDenied,
+   isLocked,
++  memberAccessSnapshot,
+   resolveAccessForUser,
+   vaultBaseline,
+   type ResolverCache,
+@@ -68,8 +69,9 @@ export async function canEditFolder(
+   const { rows } = await db.query<{
+     created_by: string | null;
+     organization_id: string;
++    created_at: Date;
+   }>(
+-    `SELECT f.created_by, v.organization_id
++    `SELECT f.created_by, v.organization_id, f.created_at
+        FROM folders f JOIN vaults v ON v.id = f.vault_id
+       WHERE f.id = $1`,
+     [folderId],
+@@ -96,11 +98,18 @@ export async function canEditFolder(
+   const readOnlyVault = baseline === "view";
+   const sealedVault = baseline === "sealed";
+   const ungrantedVault = baseline === null;
++  // A folder that already existed when this person joined is judged by their
++  // join snapshot, exactly as reading it is — an admin who joined under a
++  // Private default must not restructure a folder they cannot see.
++  const snapshot = cache
++    ? await cache.snapshot(db, row.organization_id, userId)
++    : await memberAccessSnapshot(db, row.organization_id, userId);
++  const existingAtJoin = !!snapshot && row.created_at <= snapshot.snapshotAt;
+ 
+-  // An item set Private, a Read-only vault and a sealed vault all skip the
+-  // shortcuts AND the creator rule, and let the share lookup decide — that is
+-  // how a folder marked Shared still lifts someone out of any of the three.
+-  if (itemPrivate || readOnlyVault || sealedVault) {
++  // An item set Private, a Read-only vault, a sealed vault and a pre-join
++  // folder all skip the shortcuts AND the creator rule, and let the share
++  // lookup decide — that is how a folder marked Shared still lifts someone out.
++  if (itemPrivate || readOnlyVault || sealedVault || existingAtJoin) {
+     const ctx = await buildAccessContext("folder", folderId, db, cache);
+     if (!ctx) return false;
+     return (await resolveAccessForUser(ctx, userId, role, db, cache)).permission === "edit";
+diff --git a/app/apps/server/tests/bulk-registry-scale.test.ts b/app/apps/server/tests/bulk-registry-scale.test.ts
+index 24d9b4db..a7e9add2 100644
+--- a/app/apps/server/tests/bulk-registry-scale.test.ts
++++ b/app/apps/server/tests/bulk-registry-scale.test.ts
+@@ -61,14 +61,15 @@ describe("registration batch query count", () => {
+   /**
+    * 200 brand-new notes in ONE folder.
+    *
+-   * 10 statements, and every one of them is named:
++   * 11 statements, and every one of them is named:
+    *   1 — the adopt probe, prefilled for all 200 paths with `lower(rel_path) = ANY`
+    *   1 — the parent-folder map, ditto for the one directory they name
+-   *   7 — `canCreateIn` on that folder (memoised per folder, as it always was)
++   *   8 — `canCreateIn` on that folder (memoised per folder, as it always was;
++   *       one of them is the member's join snapshot, memoised per vault)
+    *   1 — the `INSERT … SELECT FROM unnest(…) ON CONFLICT (id) DO NOTHING`
+    * The frozen-root latch adds none: nothing here resolves to the root.
+    */
+-  it("registers 200 new notes in one folder in a constant 10 statements", async () => {
++  it("registers 200 new notes in one folder in a constant 11 statements", async () => {
+     await seedFolder(vault, null, "Docs", "Docs");
+     const counter = countingDb();
+     const ctx = registerCtx(vault, owner.userId, counter.db);
+@@ -81,7 +82,7 @@ describe("registration batch query count", () => {
+       })),
+     );
+     expect(out.every((r) => r.status === "created")).toBe(true);
+-    expect(counter.count()).toBe(10);
++    expect(counter.count()).toBe(11);
+ 
+     const { rows } = await pool.query<{ n: number }>(
+       "SELECT count(*)::int AS n FROM notes WHERE vault_id = $1 AND deleted_at IS NULL",
+@@ -129,12 +130,12 @@ describe("registration batch query count", () => {
+       })),
+     );
+     expect(out.every((r) => r.status === "created")).toBe(true);
+-    // 105 = 1 adopt probe + 1 folder map + 1 insert + 102 for the write gate
+-    // (~5 per folder; the member role and the vault baseline are now memoised
+-    // for the whole request, down from ~7). Before this change the same call was
++    // 106 = 1 adopt probe + 1 folder map + 1 insert + 103 for the write gate
++    // (~5 per folder; the member role, the vault baseline and the join snapshot
++    // are memoised for the whole request, down from ~7). Before this change the same call was
+     // ~740 statements — 200 adopt probes + 200 parent lookups + 20×7 + 200
+     // inserts — run serially on one connection. The number that matters is that
+     // NOTHING here scales with the note count any more.
+-    expect(counter.count()).toBe(105);
++    expect(counter.count()).toBe(106);
+   });
+ });
+diff --git a/app/apps/server/tests/member-access-defaults.test.ts b/app/apps/server/tests/member-access-defaults.test.ts
+index 77c0c138..fa3583d0 100644
+--- a/app/apps/server/tests/member-access-defaults.test.ts
++++ b/app/apps/server/tests/member-access-defaults.test.ts
+@@ -3,6 +3,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
+ import { randomUUID } from "node:crypto";
+ import { pool } from "../src/db/pool.js";
+ import { applyBulkAccess, setJoinDefault } from "../src/permissions/access-management.js";
++import { canCreateIn, canEditFolder } from "../src/permissions/http-gates.js";
+ import { effectivePermission } from "../src/permissions/resolver.js";
+ import { listReadableDocsInVault } from "../src/permissions/vault-docs.js";
+ import { resetDb } from "./helpers/db.js";
+@@ -94,6 +95,42 @@ describe("future-member access snapshots", () => {
+     expect(await effectivePermission(owner, doc)).toBe("edit");
+   });
+ 
++  it("refuses a Private-snapshot admin writes inside a pre-join folder until access is granted", async () => {
++    const { org, owner, vault, folder } = await fixture();
++    const admin = await seedUser(`private-admin-write-${randomUUID()}@test.dev`);
++    await seedMember(org, admin, "admin");
++
++    expect(await canEditFolder(admin, folder)).toBe(false);
++    expect(await canCreateIn(admin, vault, folder)).toBe(false);
++    // The owner has no snapshot and keeps the role shortcut.
++    expect(await canEditFolder(owner, folder)).toBe(true);
++    // Content created after the join follows the live posture.
++    const later = await seedFolder(vault, null, "Later", "Later", owner);
++    expect(await canCreateIn(admin, vault, later)).toBe(true);
++    // Root creation follows the live posture, never the join default.
++    expect(await canCreateIn(admin, vault, null)).toBe(true);
++
++    await applyBulkAccess({
++      organizationId: org,
++      actorUserId: owner,
++      resources: [{ resourceType: "folder", resourceId: folder }],
++      audience: { type: "org" },
++      mode: "open",
++    });
++    expect(await canCreateIn(admin, vault, folder)).toBe(true);
++  });
++
++  it("keeps the admin shortcut for a legacy membership with no snapshot", async () => {
++    const { org, vault, folder } = await fixture();
++    const admin = await seedUser(`legacy-admin-${randomUUID()}@test.dev`);
++    await seedMember(org, admin, "admin");
++    await pool.query(
++      "DELETE FROM member_access_snapshots WHERE organization_id = $1 AND user_id = $2",
++      [org, admin],
++    );
++    expect(await canCreateIn(admin, vault, folder)).toBe(true);
++  });
++
+   it("changes only future joins and keeps legacy memberships unchanged", async () => {
+     const { org, owner, doc } = await fixture();
+     const existing = await seedUser(`existing-${randomUUID()}@test.dev`);
